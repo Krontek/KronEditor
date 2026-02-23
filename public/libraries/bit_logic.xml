@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Library>
+  <Category name="BIT_LOGIC">
+    <Block type="R_TRIG" description="Rising Edge" class="FunctionBlock">
+      <Inputs>
+        <Variable name="CLK" type="BOOL" default="FALSE" />
+      </Inputs>
+      <Outputs>
+        <Variable name="Q" type="BOOL" />
+      </Outputs>
+    </Block>
+     <Block type="F_TRIG" description="Falling Edge" class="FunctionBlock">
+      <Inputs>
+        <Variable name="CLK" type="BOOL" default="FALSE" />
+      </Inputs>
+      <Outputs>
+        <Variable name="Q" type="BOOL" />
+      </Outputs>
+    </Block>
+     <Block type="RS" description="Reset Dominant" class="FunctionBlock">
+      <Inputs>
+        <Variable name="S" type="BOOL" default="FALSE" />
+        <Variable name="R1" type="BOOL" default="FALSE" />
+      </Inputs>
+      <Outputs>
+        <Variable name="Q1" type="BOOL" />
+      </Outputs>
+    </Block>
+     <Block type="SR" description="Set Dominant" class="FunctionBlock">
+      <Inputs>
+        <Variable name="S1" type="BOOL" default="FALSE" />
+        <Variable name="R" type="BOOL" default="FALSE" />
+      </Inputs>
+      <Outputs>
+        <Variable name="Q1" type="BOOL" />
+      </Outputs>
+    </Block>
+  </Category>
+</Library>

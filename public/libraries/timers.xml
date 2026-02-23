@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Library>
+  <Category name="TIMERS">
+    <Block type="TON" description="On-Delay Timer" class="FunctionBlock">
+      <Inputs>
+        <Variable name="IN" type="BOOL" default="FALSE" />
+        <Variable name="PT" type="TIME" default="T#0ms" />
+      </Inputs>
+      <Outputs>
+        <Variable name="Q" type="BOOL" />
+        <Variable name="ET" type="TIME" />
+      </Outputs>
+    </Block>
+    <Block type="TOF" description="Off-Delay Timer" class="FunctionBlock">
+       <Inputs>
+        <Variable name="IN" type="BOOL" default="FALSE" />
+        <Variable name="PT" type="TIME" default="T#0ms" />
+      </Inputs>
+      <Outputs>
+        <Variable name="Q" type="BOOL" />
+        <Variable name="ET" type="TIME" />
+      </Outputs>
+    </Block>
+    <Block type="TP" description="Pulse Timer" class="FunctionBlock">
+       <Inputs>
+        <Variable name="IN" type="BOOL" default="FALSE" />
+        <Variable name="PT" type="TIME" default="T#0ms" />
+      </Inputs>
+      <Outputs>
+        <Variable name="Q" type="BOOL" />
+        <Variable name="ET" type="TIME" />
+      </Outputs>
+    </Block>
+  </Category>
+</Library>

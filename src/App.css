@@ -1,0 +1,64 @@
+/* src/App.css */
+body { margin: 0; padding: 0; background: #1e1e1e; color: #d4d4d4; font-family: 'Segoe UI', sans-serif; overflow: hidden; }
+
+/* ANA IZGARA YAPISI */
+.app-layout {
+  display: grid;
+  height: 100vh;
+  width: 100vw;
+  /* Grid Şablonu:
+     Üst: 50px
+     Orta: Kalan boşluk (1fr)
+     Alt: 150px
+  */
+  grid-template-rows: 50px 1fr 150px;
+  /* Sütunlar:
+     Sol: 250px
+     Orta: Kalan boşluk (1fr)
+     Sağ: 250px
+  */
+  grid-template-columns: 250px 1fr 250px;
+  
+  /* Alan İsimlendirmeleri */
+  grid-template-areas:
+    "header header header"
+    "sidebar-left main sidebar-right"
+    "footer footer footer";
+}
+
+/* BÖLGELERİN STİLLERİ */
+.header { grid-area: header; background: #2d2d2d; border-bottom: 1px solid #3e3e42; display: flex; align-items: center; padding: 0 15px; }
+.sidebar-left { grid-area: sidebar-left; background: #252526; border-right: 1px solid #3e3e42; overflow-y: auto; }
+.main { grid-area: main; background: #1e1e1e; position: relative; overflow: hidden; }
+.sidebar-right { grid-area: sidebar-right; background: #252526; border-left: 1px solid #3e3e42; overflow-y: auto; }
+.footer { grid-area: footer; background: #007acc; /* Konsol rengi genellikle mavidir ama değiştirebiliriz */ background: #1e1e1e; border-top: 1px solid #3e3e42; padding: 10px; font-family: 'Consolas', monospace; font-size: 12px; overflow-y: auto; }
+
+/* Header Butonları */
+.toolbar-btn {
+  background: #3e3e42; border: 1px solid #555; color: white; padding: 5px 15px; margin-right: 10px; cursor: pointer; border-radius: 3px; font-size: 13px; display: flex; align-items: center; gap: 5px;
+}
+.toolbar-btn:hover { background: #505050; }
+.toolbar-btn.run { background: #1b5e20; border-color: #2e7d32; } /* Yeşil Run butonu */
+.toolbar-btn.stop { background: #b71c1c; border-color: #d32f2f; } /* Kırmızı Stop butonu */
+
+/* Proje Ağacı Stilleri */
+.project-tree-item { padding: 8px 15px; cursor: pointer; display: flex; align-items: center; gap: 8px; font-size: 13px; color: #ccc; }
+.project-tree-item:hover { background: #2a2d2e; color: white; }
+.project-tree-item.active { background: #37373d; color: white; border-left: 2px solid #007acc; }
+
+/* Log Yazıları */
+.log-line { margin: 2px 0; }
+.log-info { color: #d4d4d4; }
+.log-success { color: #4ec9b0; }
+.log-error { color: #f44336; }
+.log-warning { color: #ce9178; }
+
+/* React Flow Highlighting */
+.react-flow__edge.selected .react-flow__edge-path {
+  stroke: #007acc !important;
+  stroke-width: 3 !important;
+  filter: drop-shadow(0 0 4px rgba(0, 122, 204, 0.6));
+}
+.react-flow__edge-path {
+  transition: all 0.2s ease;
+}

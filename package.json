@@ -1,0 +1,43 @@
+{
+  "name": "plceditor",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "tauri dev",
+    "web": "vite",
+    "build:linux": "tauri build",
+    "build:windows": "tauri build --target x86_64-pc-windows-gnu",
+    "build": "npm run build:linux && npm run build:windows",
+    "build:web": "vite build",
+    "postbuild": "node scripts/move-releases.js",
+    "lint": "eslint . --ext ts,tsx --report-unused-disable-directives --max-warnings 0",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@monaco-editor/react": "^4.7.0",
+    "@tauri-apps/api": "~2.2.0",
+    "@tauri-apps/plugin-dialog": "^2.6.0",
+    "@tauri-apps/plugin-fs": "^2.4.5",
+    "i18next": "^25.8.0",
+    "i18next-browser-languagedetector": "^8.2.0",
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0",
+    "react-i18next": "^16.5.4",
+    "reactflow": "^11.11.4"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "~2.2.0",
+    "@types/react": "^18.2.64",
+    "@types/react-dom": "^18.2.21",
+    "@typescript-eslint/eslint-plugin": "^7.1.1",
+    "@typescript-eslint/parser": "^7.1.1",
+    "@vitejs/plugin-react": "^4.2.1",
+    "eslint": "^8.57.0",
+    "eslint-plugin-react-hooks": "^4.6.0",
+    "eslint-plugin-react-refresh": "^0.4.5",
+    "typescript": "^5.2.2",
+    "vite": "^5.1.6"
+  },
+  "main": "dist-electron/main.js"
+}

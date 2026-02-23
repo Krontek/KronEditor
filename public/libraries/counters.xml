@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Library>
+  <Category name="COUNTERS">
+    <Block type="CTU" description="Count Up" class="FunctionBlock">
+      <Inputs>
+        <Variable name="CU" type="BOOL" default="FALSE" />
+        <Variable name="R" type="BOOL" default="FALSE" />
+        <Variable name="PV" type="INT" default="0" />
+      </Inputs>
+      <Outputs>
+        <Variable name="Q" type="BOOL" />
+        <Variable name="CV" type="INT" />
+      </Outputs>
+    </Block>
+     <Block type="CTD" description="Count Down" class="FunctionBlock">
+      <Inputs>
+        <Variable name="CD" type="BOOL" default="FALSE" />
+        <Variable name="LD" type="BOOL" default="FALSE" />
+        <Variable name="PV" type="INT" default="0" />
+      </Inputs>
+      <Outputs>
+        <Variable name="Q" type="BOOL" />
+        <Variable name="CV" type="INT" />
+      </Outputs>
+    </Block>
+  </Category>
+</Library>
