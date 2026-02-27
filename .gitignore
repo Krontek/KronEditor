@@ -30,3 +30,5 @@ Releases/*
 
 # Backend Artifacts
 bin/
+build/plc.h
+build/plc.c
