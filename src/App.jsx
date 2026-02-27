@@ -103,6 +103,23 @@ function App() {
   const [isSimulationMode, setIsSimulationMode] = useState(false);
   const [isRunning, setIsRunning] = useState(false);
 
+  // LIVE VARIABLE TRACKER
+  const [liveVariables, setLiveVariables] = useState({});
+
+  useEffect(() => {
+    import('@tauri-apps/api/event').then(({ listen }) => {
+      const unlisten = listen('simulation-output', (event) => {
+        try {
+          const newVars = JSON.parse(event.payload);
+          setLiveVariables(newVars);
+        } catch (e) {
+          console.error("Failed to parse live vars:", e);
+        }
+      });
+      return () => unlisten.then(fn => fn());
+    });
+  }, []);
+
   // Persist settings
   useEffect(() => {
     localStorage.setItem('appTheme', theme);
@@ -257,8 +274,6 @@ function App() {
     }
 
     const nextMode = !isSimulationMode;
-    setIsSimulationMode(nextMode);
-    addLog('info', `Simulation Mode ${nextMode ? 'Enabled' : 'Disabled'}.`);
 
     if (nextMode) {
       addLog('info', 'Compiling Project for Simulation (C Transpilation)...');
@@ -270,9 +285,20 @@ function App() {
           source: cCode.source
         });
         addLog('success', `Transpiled C header and source successfully saved to ${outPath}`);
+
+        addLog('info', 'Compiling simulation executable with tcc...');
+        const exePath = await invoke('compile_simulation');
+        addLog('success', `Simulation executable compiled: ${exePath}`);
+
+        setIsSimulationMode(true);
+        addLog('info', 'Simulation Mode Enabled. Variables are now in Live Mode.');
+
       } catch (error) {
         addLog('error', `Simulation Compilation Failed: ${error}`);
       }
+    } else {
+      setIsSimulationMode(false);
+      addLog('info', 'Simulation Mode Disabled.');
     }
   };
 
@@ -285,15 +311,31 @@ function App() {
     if (isSimulationMode) {
       setIsRunning(true);
       addLog('success', t('messages.plcRunMode') || 'Running Simulation Execution...');
+      try {
+        await invoke('run_simulation');
+      } catch (err) {
+        addLog('error', `Failed to start simulation: ${err}`);
+        setIsRunning(false);
+      }
     } else if (isPlcConnected) {
       setIsRunning(true);
       addLog('success', 'PLC Execution Started.');
     }
   };
 
-  const handleStopExecution = () => {
+  const handleStopExecution = async () => {
     if (isRunning) {
       setIsRunning(false);
+
+      if (isSimulationMode) {
+        try {
+          await invoke('stop_simulation');
+          setLiveVariables({}); // Clear old variables
+        } catch (err) {
+          addLog('error', `Failed to stop simulation: ${err}`);
+        }
+      }
+
       addLog('error', t('messages.plcStopped') || 'Execution Stopped.');
     }
   };
@@ -848,6 +890,8 @@ function App() {
                           projectStructure={projectStructure}
                           currentId={activeItem.id}
                           libraryData={libraryData} // Pass Library Data
+                          liveVariables={isSimulationMode ? liveVariables : null}
+                          parentName={activeItem.name}
                         />
                       )}
                     </div>

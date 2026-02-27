@@ -295,8 +295,10 @@ const RungEditorNew = ({ variables, setVariables, rungs, setRungs, availableBloc
 
   // Rung'dan blok silme
   const deleteBlockFromRung = useCallback((rungId, blockId) => {
+    let blockToDelete = null;
     const newRungs = rungs.map(rung => {
       if (rung.id === rungId) {
+        blockToDelete = rung.blocks.find(b => b.id === blockId);
         return {
           ...rung,
           blocks: rung.blocks.filter(b => b.id !== blockId),
@@ -307,8 +309,19 @@ const RungEditorNew = ({ variables, setVariables, rungs, setRungs, availableBloc
     });
     setRungs(newRungs);
     saveHistory(newRungs);
-    setVariables(prev => prev.filter(v => v.id !== blockId));
-  }, [rungs, saveHistory]);
+
+    // Remove the associated variable if it's no longer used by any block
+    if (blockToDelete && blockToDelete.data && blockToDelete.data.instanceName) {
+      const instanceName = blockToDelete.data.instanceName;
+      const isUsedElsewhere = newRungs.some(r =>
+        r.blocks.some(b => b.data && b.data.instanceName === instanceName)
+      );
+
+      if (!isUsedElsewhere) {
+        setVariables(prev => prev.filter(v => v.name !== instanceName));
+      }
+    }
+  }, [rungs, saveHistory, setVariables]);
 
   // Rung'a bağlantı ekleme
   const addConnectionToRung = useCallback((rungId, connection) => {

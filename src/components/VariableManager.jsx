@@ -62,7 +62,7 @@ const EditableCell = ({ value, onCommit, placeholder = '' }) => {
   );
 };
 
-const VariableManager = ({ variables = [], onDelete, onUpdate, onAdd, allowedClasses = ALL_CLASSES, globalVars = [], derivedTypes = [], userDefinedTypes = [] }) => {
+const VariableManager = ({ variables = [], onDelete, onUpdate, onAdd, allowedClasses = ALL_CLASSES, globalVars = [], derivedTypes = [], userDefinedTypes = [], liveVariables = null, parentName = "" }) => {
   const { t } = useTranslation();
   const [selectedId, setSelectedId] = useState(null);
 
@@ -120,6 +120,15 @@ const VariableManager = ({ variables = [], onDelete, onUpdate, onAdd, allowedCla
     if (onUpdate) onUpdate(id, 'name', trimmed);
   };
 
+  // Helper to extract live value if available
+  const getLiveValue = (varName) => {
+    if (!liveVariables) return null;
+    const safeProgName = (parentName || "").replace(/\s+/g, '_');
+    const safeVarName = (varName || "").replace(/\s+/g, '_');
+    const key = `prog_${safeProgName}_${safeVarName}`;
+    return liveVariables[key] !== undefined ? liveVariables[key] : null;
+  };
+
   return (
     <div style={{
       height: '100%',
@@ -141,14 +150,15 @@ const VariableManager = ({ variables = [], onDelete, onUpdate, onAdd, allowedCla
         <div style={{ display: 'flex', gap: '5px' }}>
           <button
             onClick={handleAddClick}
-            style={{ background: '#388E3C', border: 'none', color: 'white', padding: '2px 8px', fontSize: '11px', cursor: 'pointer', borderRadius: '3px' }}
+            disabled={liveVariables !== null}
+            style={{ background: '#388E3C', border: 'none', color: 'white', padding: '2px 8px', fontSize: '11px', cursor: liveVariables ? 'not-allowed' : 'pointer', borderRadius: '3px', opacity: liveVariables ? 0.5 : 1 }}
           >
             + {t('common.add')}
           </button>
           <button
             onClick={handleRemoveClick}
-            disabled={!selectedId}
-            style={{ background: !selectedId ? '#555' : '#D32F2F', border: 'none', color: !selectedId ? '#aaa' : 'white', padding: '2px 8px', fontSize: '11px', cursor: !selectedId ? 'default' : 'pointer', borderRadius: '3px' }}
+            disabled={!selectedId || liveVariables !== null}
+            style={{ background: (!selectedId || liveVariables) ? '#555' : '#D32F2F', border: 'none', color: (!selectedId || liveVariables) ? '#aaa' : 'white', padding: '2px 8px', fontSize: '11px', cursor: (!selectedId || liveVariables) ? 'default' : 'pointer', borderRadius: '3px' }}
           >
             - {t('common.delete')}
           </button>
@@ -165,57 +175,70 @@ const VariableManager = ({ variables = [], onDelete, onUpdate, onAdd, allowedCla
               <th style={{ padding: '5px', borderBottom: '1px solid #444', minWidth: '120px' }}>{t('tables.type')}</th>
               <th style={{ padding: '5px', borderBottom: '1px solid #444' }}>{t('tables.initialValue')}</th>
               <th style={{ padding: '5px', borderBottom: '1px solid #444' }}>{t('tables.description')}</th>
+              {liveVariables !== null && (
+                <th style={{ padding: '5px', borderBottom: '1px solid #444', color: '#00ff00' }}>Live Value</th>
+              )}
             </tr>
           </thead>
           <tbody>
-            {variables.map((v) => (
-              <tr
-                key={v.id}
-                onClick={() => setSelectedId(v.id)}
-                style={{
-                  borderBottom: '1px solid #333',
-                  background: selectedId === v.id ? '#0d47a1' : 'transparent',
-                  cursor: 'pointer'
-                }}
-              >
-                <td style={{ padding: '5px' }}>
-                  <EditableCell
-                    value={v.name}
-                    onCommit={(val) => validateAndSaveName(v.id, val)}
-                  />
-                </td>
-                <td style={{ padding: '5px' }}>
-                  <ModernSelect
-                    value={v.class}
-                    options={allowedClasses}
-                    onChange={(val) => onUpdate && onUpdate(v.id, 'class', val)}
-                  />
-                </td>
-                <td style={{ padding: '5px' }}>
-                  <DataTypeSelector
-                    value={v.type}
-                    onChange={(newType) => onUpdate && onUpdate(v.id, 'type', newType)}
-                    derivedTypes={derivedTypes}
-                    userDefinedTypes={userDefinedTypes}
-                  />
-                </td>
-                <td style={{ padding: '5px' }}>
-                  <EditableCell
-                    value={v.initialValue}
-                    onCommit={(val) => onUpdate && onUpdate(v.id, 'initialValue', val)}
-                  />
-                </td>
-                <td style={{ padding: '5px' }}>
-                  <EditableCell
-                    value={v.description}
-                    onCommit={(val) => onUpdate && onUpdate(v.id, 'description', val)}
-                  />
-                </td>
-              </tr>
-            ))}
+            {variables.map((v) => {
+              const liveVal = getLiveValue(v.name);
+              const isLive = liveVal !== null;
+
+              return (
+                <tr
+                  key={v.id}
+                  onClick={() => setSelectedId(v.id)}
+                  style={{
+                    borderBottom: '1px solid #333',
+                    background: selectedId === v.id ? '#0d47a1' : 'transparent',
+                    cursor: 'pointer'
+                  }}
+                >
+                  <td style={{ padding: '5px' }}>
+                    <EditableCell
+                      value={v.name}
+                      onCommit={(val) => !liveVariables && validateAndSaveName(v.id, val)}
+                    />
+                  </td>
+                  <td style={{ padding: '5px' }}>
+                    <ModernSelect
+                      value={v.class}
+                      options={allowedClasses}
+                      onChange={(val) => !liveVariables && onUpdate && onUpdate(v.id, 'class', val)}
+                    />
+                  </td>
+                  <td style={{ padding: '5px' }}>
+                    <DataTypeSelector
+                      value={v.type}
+                      onChange={(newType) => !liveVariables && onUpdate && onUpdate(v.id, 'type', newType)}
+                      derivedTypes={derivedTypes}
+                      userDefinedTypes={userDefinedTypes}
+                    />
+                  </td>
+                  <td style={{ padding: '5px' }}>
+                    <EditableCell
+                      value={v.initialValue}
+                      onCommit={(val) => !liveVariables && onUpdate && onUpdate(v.id, 'initialValue', val)}
+                    />
+                  </td>
+                  <td style={{ padding: '5px' }}>
+                    <EditableCell
+                      value={v.description}
+                      onCommit={(val) => !liveVariables && onUpdate && onUpdate(v.id, 'description', val)}
+                    />
+                  </td>
+                  {liveVariables !== null && (
+                    <td style={{ padding: '5px', color: isLive ? '#00ff00' : '#888', fontWeight: 'bold' }}>
+                      {isLive ? String(liveVal) : 'N/A'}
+                    </td>
+                  )}
+                </tr>
+              )
+            })}
             {variables.length === 0 && (
               <tr>
-                <td colSpan="5" style={{ padding: '20px', textAlign: 'center', color: '#666' }}>
+                <td colSpan={liveVariables ? "6" : "5"} style={{ padding: '20px', textAlign: 'center', color: '#666' }}>
                   {t('messages.empty')}
                 </td>
               </tr>
