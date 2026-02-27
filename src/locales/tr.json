@@ -34,7 +34,9 @@
         "shortcuts": "Kısayollar",
         "newProject": "Yeni Proje",
         "openProject": "Proje Aç",
-        "close": "Kapat"
+        "close": "Kapat",
+        "project": "Proje",
+        "plc": "PLC"
     },
     "tables": {
         "name": "İsim",
@@ -49,19 +51,31 @@
         "triggering": "Tetikleme",
         "interval": "Aralık",
         "priority": "Öncelik",
-        "structMembers": "Yapı Üyeleri"
+        "structMembers": "Yapı Üyeleri",
+        "identifier": "Tanımlayıcı",
+        "valueOptional": "Değer (İsteğe Bağlı)",
+        "min": "Min (Tamsayı)",
+        "max": "Max (Tamsayı)",
+        "baseType": "Temel Tip",
+        "dimensions": "Boyutlar"
     },
     "actions": {
         "addTask": "Görev Ekle",
         "addInstance": "Örnek Ekle",
         "addVariable": "Değişken Ekle",
+        "addMember": "Üye Ekle",
+        "addValue": "Değer Ekle",
+        "addDimension": "Boyut Ekle",
         "addNew": "Yeni Ekle",
         "compile": "Derle",
         "start": "Başlat",
         "stop": "Durdur",
         "simulate": "Simüle Et",
         "sendToPlc": "PLC'ye Gönder",
-        "closeProject": "Projeyi Kapat"
+        "closeProject": "Projeyi Kapat",
+        "editCycleTime": "Döngü Süresini Düzenle",
+        "selectTarget": "Hedef Seç",
+        "build": "Derle"
     },
     "options": {
         "cyclic": "Döngüsel",
@@ -79,7 +93,16 @@
         "plcCompileStarted": "Derleme başlatıldı",
         "plcRunMode": "PLC Run Modu.",
         "plcStopped": "PLC Durduruldu.",
-        "startScreenDesc": "Modern, web tabanlı bir PLC programlama ortamı"
+        "startScreenDesc": "Modern, web tabanlı bir PLC programlama ortamı",
+        "duplicateName": "Bu isimde bir öğe zaten mevcut.",
+        "arrayDef": "Dizi Tanımı",
+        "arrayDesc": "Dizinizin boyutlarını ve temel tipini tanımlayın.",
+        "structDef": "Yapı Tanımı",
+        "structDesc": "Yapınızın üyelerini tanımlayın.",
+        "enumDef": "Sıralı Tanımı",
+        "enumDesc": "Sıralı değerleri tanımlayın.",
+        "noMembers": "Üye tanımlanmadı. Başlamak için \"Üye Ekle\"ye tıklayın.",
+        "structTip": "İpucu: Yeni bir satır eklemek için son Başlangıç Değeri alanında Enter'a basın."
     },
     "resources": {
         "globalVariables": "Global Değişkenler",
@@ -95,12 +118,19 @@
     },
     "modals": {
         "create": "Yeni Oluştur",
+        "createDataType": "Veri Tipi Oluştur",
         "enterName": "İsim Girin:",
+        "enterCycleTime": "Döngü Süresi Girin:",
         "returnType": "Dönüş Tipi:",
         "confirm": "Onayla",
         "contactSettings": "Kontak Ayarları",
         "coilSettings": "Bobin Ayarları",
         "blockSettings": "Blok Ayarları"
+    },
+    "errors": {
+        "nameRequired": "İsim zorunludur",
+        "nameExists": "İsim zaten mevcut",
+        "invalidIdentifier": "Geçersiz Tanımlayıcı: \"{name}\". Bir harf veya alt çizgi ile başlamalı ve yalnızca alfasayısal karakterler içermelidir."
     },
     "settingsPage": {
         "general": "Genel",

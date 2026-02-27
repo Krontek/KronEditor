@@ -80,7 +80,6 @@ const VariableManager = ({ variables = [], onDelete, onUpdate, onAdd, allowedCla
       name: newName,
       class: allowedClasses[0] || 'Local',
       type: 'BOOL',
-      location: '',
       initialValue: '',
       description: ''
     };
@@ -164,7 +163,6 @@ const VariableManager = ({ variables = [], onDelete, onUpdate, onAdd, allowedCla
               <th style={{ padding: '5px', borderBottom: '1px solid #444' }}>{t('tables.name')}</th>
               <th style={{ padding: '5px', borderBottom: '1px solid #444', minWidth: '80px' }}>{t('tables.class')}</th>
               <th style={{ padding: '5px', borderBottom: '1px solid #444', minWidth: '120px' }}>{t('tables.type')}</th>
-              <th style={{ padding: '5px', borderBottom: '1px solid #444' }}>{t('tables.location')}</th>
               <th style={{ padding: '5px', borderBottom: '1px solid #444' }}>{t('tables.initialValue')}</th>
               <th style={{ padding: '5px', borderBottom: '1px solid #444' }}>{t('tables.description')}</th>
             </tr>
@@ -203,12 +201,6 @@ const VariableManager = ({ variables = [], onDelete, onUpdate, onAdd, allowedCla
                 </td>
                 <td style={{ padding: '5px' }}>
                   <EditableCell
-                    value={v.location}
-                    onCommit={(val) => onUpdate && onUpdate(v.id, 'location', val)}
-                  />
-                </td>
-                <td style={{ padding: '5px' }}>
-                  <EditableCell
                     value={v.initialValue}
                     onCommit={(val) => onUpdate && onUpdate(v.id, 'initialValue', val)}
                   />
@@ -223,7 +215,7 @@ const VariableManager = ({ variables = [], onDelete, onUpdate, onAdd, allowedCla
             ))}
             {variables.length === 0 && (
               <tr>
-                <td colSpan="6" style={{ padding: '20px', textAlign: 'center', color: '#666' }}>
+                <td colSpan="5" style={{ padding: '20px', textAlign: 'center', color: '#666' }}>
                   {t('messages.empty')}
                 </td>
               </tr>

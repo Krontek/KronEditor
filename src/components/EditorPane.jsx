@@ -13,7 +13,8 @@ const EditorPane = ({
   allowedClasses = [],
   globalVars = [],
   availableBlocks = [],
-  availablePrograms = []
+  availablePrograms = [],
+  projectStructure = null
 }) => {
   // --- STATE MANAGEMENT ---
   // We use separate state checks to ensure safety
@@ -346,6 +347,8 @@ const EditorPane = ({
             onUpdate={handleUpdateVar}
             allowedClasses={allowedClasses}
             globalVars={globalVars}
+            derivedTypes={projectStructure?.dataTypes?.map(d => d.name) || []}
+            userDefinedTypes={availableBlocks?.map(b => b.name) || []}
           />
         </div>
       )}
@@ -400,6 +403,8 @@ const EditorPane = ({
               setInstances(newContent.instances || []);
             }}
             availablePrograms={availablePrograms}
+            derivedTypes={projectStructure?.dataTypes?.map(d => d.name) || []}
+            userDefinedTypes={availableBlocks?.map(b => b.name) || []}
           />
         ) : (
           <div style={{ padding: 20, color: '#aaa', textAlign: 'center' }}>

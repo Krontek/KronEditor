@@ -1,35 +1,41 @@
 import React, { useState, useEffect } from 'react';
 import { DataTypeSelector } from './common/Selectors';
 
-const CreateItemModal = ({ isOpen, onClose, onConfirm, category, defaultName, availableTasks = [] }) => {
+const CreateItemModal = ({ isOpen, onClose, onConfirm, category, defaultName, isEdit, initialData }) => {
     const [name, setName] = useState('');
     const [language, setLanguage] = useState('LD');
     const [returnType, setReturnType] = useState('BOOL');
-    const [selectedTask, setSelectedTask] = useState('task0');
+    const [cycleTime, setCycleTime] = useState('1ms');
 
     useEffect(() => {
         if (isOpen) {
-            setName(defaultName || '');
-            setLanguage(category === 'dataTypes' ? 'UDT' : 'LD');
-            setReturnType('BOOL');
-            setSelectedTask('task0');
+            setName(isEdit ? initialData?.name || '' : defaultName || '');
+            setLanguage(isEdit ? initialData?.language || 'LD' : category === 'dataTypes' ? 'UDT' : 'LD');
+            setReturnType(isEdit ? initialData?.returnType || 'BOOL' : 'BOOL');
+            setCycleTime(isEdit ? initialData?.cycleTime || '1ms' : '1ms');
         }
-    }, [isOpen, defaultName, category]);
+    }, [isOpen, defaultName, category, isEdit, initialData]);
 
     if (!isOpen) return null;
 
     const isDataType = category === 'dataTypes';
     const isFunction = category === 'functions';
     const isProgram = category === 'programs';
-    const title = category === 'dataTypes' ? 'Create Data Type' :
-        category === 'programs' ? 'Create Program' :
-            category === 'functionBlocks' ? 'Create Function Block' :
-                'Create Function';
+    const title = isEdit ? 'Edit Properties' :
+        category === 'dataTypes' ? 'Create Data Type' :
+            category === 'programs' ? 'Create Program' :
+                category === 'functionBlocks' ? 'Create Function Block' :
+                    'Create Function';
 
     const handleConfirm = () => {
         if (!name.trim()) return;
-        onConfirm(name, language, returnType, isProgram ? selectedTask.trim() || 'task0' : undefined);
-        onClose();
+        const success = onConfirm(name, language, returnType, isProgram ? cycleTime.trim() || '1ms' : undefined);
+        if (success === false) {
+            // Reset name to initial/default on duplicate
+            setName(isEdit ? initialData?.name || '' : defaultName || '');
+        } else {
+            onClose();
+        }
     };
 
     return (
@@ -86,17 +92,17 @@ const CreateItemModal = ({ isOpen, onClose, onConfirm, category, defaultName, av
                     />
                 </div>
 
-                {/* Task Selection (Only for Programs) */}
+                {/* Cycle Time Selection (Only for Programs) */}
                 {isProgram && (
                     <div style={{ marginBottom: '20px' }}>
                         <label style={{ display: 'block', marginBottom: '8px', fontSize: '12px', color: '#ccc' }}>
-                            Assign to Task
+                            Cycle Time
                         </label>
                         <input
-                            list="available-tasks"
-                            value={selectedTask}
-                            onChange={(e) => setSelectedTask(e.target.value)}
-                            placeholder="Enter task name (e.g. task0)"
+                            type="text"
+                            value={cycleTime}
+                            onChange={(e) => setCycleTime(e.target.value)}
+                            placeholder="Enter cycle time (e.g. 1ms)"
                             style={{
                                 width: '100%',
                                 padding: '10px',
@@ -109,11 +115,6 @@ const CreateItemModal = ({ isOpen, onClose, onConfirm, category, defaultName, av
                                 boxSizing: 'border-box'
                             }}
                         />
-                        <datalist id="available-tasks">
-                            {availableTasks.map(task => (
-                                <option key={task} value={task} />
-                            ))}
-                        </datalist>
                     </div>
                 )}
 
@@ -138,27 +139,29 @@ const CreateItemModal = ({ isOpen, onClose, onConfirm, category, defaultName, av
                             Language
                         </label>
                         <div style={{ display: 'flex', gap: '20px' }}>
-                            <label style={{ display: 'flex', alignItems: 'center', gap: '8px', cursor: 'pointer' }}>
+                            <label style={{ display: 'flex', alignItems: 'center', gap: '8px', cursor: isEdit ? 'not-allowed' : 'pointer' }}>
                                 <input
                                     type="radio"
                                     name="language"
                                     value="LD"
                                     checked={language === 'LD'}
                                     onChange={(e) => setLanguage(e.target.value)}
-                                    style={{ accentColor: '#007acc' }}
+                                    disabled={isEdit}
+                                    style={{ accentColor: '#007acc', cursor: isEdit ? 'not-allowed' : 'pointer' }}
                                 />
-                                <span>Ladder Logic (LD)</span>
+                                <span style={{ opacity: isEdit ? 0.6 : 1 }}>Ladder Logic (LD)</span>
                             </label>
-                            <label style={{ display: 'flex', alignItems: 'center', gap: '8px', cursor: 'pointer' }}>
+                            <label style={{ display: 'flex', alignItems: 'center', gap: '8px', cursor: isEdit ? 'not-allowed' : 'pointer' }}>
                                 <input
                                     type="radio"
                                     name="language"
                                     value="ST"
                                     checked={language === 'ST'}
                                     onChange={(e) => setLanguage(e.target.value)}
-                                    style={{ accentColor: '#007acc' }}
+                                    disabled={isEdit}
+                                    style={{ accentColor: '#007acc', cursor: isEdit ? 'not-allowed' : 'pointer' }}
                                 />
-                                <span>Structured Text (ST)</span>
+                                <span style={{ opacity: isEdit ? 0.6 : 1 }}>Structured Text (ST)</span>
                             </label>
                         </div>
                     </div>
@@ -193,7 +196,7 @@ const CreateItemModal = ({ isOpen, onClose, onConfirm, category, defaultName, av
                             opacity: !name.trim() ? 0.5 : 1
                         }}
                     >
-                        Create
+                        {isEdit ? 'Save' : 'Create'}
                     </button>
                 </div>
             </div>

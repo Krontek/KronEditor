@@ -1,8 +1,9 @@
 import React, { useState } from 'react';
 import { useTranslation } from 'react-i18next';
+import { ask } from '@tauri-apps/plugin-dialog';
 import PlcIcon from '../assets/icons/plc-icon.png';
 
-const ProjectSidebar = ({ projectStructure, onSelectItem, activeId, onAddItem, onDeleteItem, onRenameItem, onSettingsClick, onShortcutsClick }) => {
+const ProjectSidebar = ({ projectStructure, onSelectItem, activeId, onAddItem, onDeleteItem, onEditItem, onSettingsClick, onShortcutsClick }) => {
     const { t } = useTranslation();
     const [expanded, setExpanded] = useState({
         dataTypes: true,
@@ -77,25 +78,23 @@ const ProjectSidebar = ({ projectStructure, onSelectItem, activeId, onAddItem, o
                                 <span>
                                     {item.type === 'ST' ? '📄' :
                                         item.type === 'LD' ? '🪜' :
-                                            item.type === 'Array' ? <span style={{ fontFamily: 'monospace', fontWeight: 'bold', fontSize: '10px' }}>[ ]</span> :
-                                                item.type === 'Enumerated' ? <span style={{ fontFamily: 'monospace', fontWeight: 'bold', fontSize: '10px' }}>(E)</span> :
-                                                    item.type === 'Structure' ? <span style={{ fontFamily: 'monospace', fontWeight: 'bold', fontSize: '10px' }}>{'{ }'}</span> :
+                                            item.type === 'Array' ? <span style={{ fontFamily: 'Consolas, monospace', fontWeight: 'bold', fontSize: '10px', background: '#0e639c', color: '#fff', padding: '2px 4px', borderRadius: '3px', border: '1px solid #1177bb' }}>[ ]</span> :
+                                                item.type === 'Enumerated' ? <span style={{ fontFamily: 'Consolas, monospace', fontWeight: 'bold', fontSize: '10px', background: '#68217a', color: '#fff', padding: '2px 4px', borderRadius: '3px', border: '1px solid #8e2fade' }}>(E)</span> :
+                                                    item.type === 'Structure' ? <span style={{ fontFamily: 'Consolas, monospace', fontWeight: 'bold', fontSize: '10px', background: '#b87333', color: '#fff', padding: '2px 4px', borderRadius: '3px', border: '1px solid #d9873c' }}>{'{ }'}</span> :
                                                         '📦'}
                                 </span>
                                 <span>{item.name}</span>
+                                {key === 'programs' && item.cycleTime && <span style={{ fontSize: '10px', color: '#888', marginLeft: '4px' }}>[{item.cycleTime}]</span>}
                                 {item.type && <span style={{ fontSize: '9px', color: '#666', border: '1px solid #444', padding: '0 2px', borderRadius: 2 }}>{item.type}</span>}
                             </div>
 
                             {/* Action Buttons */}
                             <div style={{ display: 'flex', gap: '4px' }}>
-                                {/* Rename Button */}
+                                {/* Edit Button */}
                                 <button
                                     onClick={(e) => {
                                         e.stopPropagation();
-                                        const newName = window.prompt(t('modals.enterName'), item.name);
-                                        if (newName && newName !== item.name) {
-                                            onRenameItem && onRenameItem(key, item.id, newName);
-                                        }
+                                        onEditItem && onEditItem(key, item.id);
                                     }}
                                     style={{
                                         background: 'none',
@@ -105,16 +104,20 @@ const ProjectSidebar = ({ projectStructure, onSelectItem, activeId, onAddItem, o
                                         fontSize: '12px',
                                         opacity: activeId === item.id ? 1 : 0.5
                                     }}
-                                    title={t('common.rename')}
+                                    title={t('actions.edit') || 'Edit'}
                                 >
                                     ✎
                                 </button>
 
                                 {/* Delete Button */}
                                 <button
-                                    onClick={(e) => {
+                                    onClick={async (e) => {
                                         e.stopPropagation();
-                                        if (confirm(`${t('common.delete')} ${item.name}?`)) {
+                                        const confirmed = await ask(`${t('common.delete')} ${item.name}?`, {
+                                            title: t('common.delete') || 'Delete',
+                                            type: 'warning'
+                                        });
+                                        if (confirmed) {
                                             onDeleteItem(key, item.id);
                                         }
                                     }}

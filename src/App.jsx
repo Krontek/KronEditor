@@ -8,14 +8,20 @@ import ErrorBoundary from './components/ErrorBoundary';
 import SettingsPage from './components/SettingsPage';
 import ShortcutsModal from './components/ShortcutsModal';
 import StartScreen from './components/StartScreen';
+import SelectTargetModal from './components/SelectTargetModal';
+import ArrayTypeEditor from './components/ArrayTypeEditor';
+import StructureTypeEditor from './components/StructureTypeEditor';
+import EnumTypeEditor from './components/EnumTypeEditor';
 import { useTranslation } from 'react-i18next';
 import { exportProjectToXml, importProjectFromXml } from './services/XmlService';
 import { libraryService } from './services/LibraryService'; // Import Service
 import { open, save, ask } from '@tauri-apps/plugin-dialog';
 import { readTextFile, writeTextFile } from '@tauri-apps/plugin-fs';
-import { invoke } from '@tauri-apps/api/core';
 import { getCurrentWindow } from '@tauri-apps/api/window';
+import { invoke } from '@tauri-apps/api/core';
 import { compileProjectToST } from './services/CompilerService';
+import { transpileToC } from './services/CTranspilerService';
+import { mkdir, exists, BaseDirectory } from '@tauri-apps/plugin-fs';
 import PlcIcon from './assets/icons/plc-icon.png';
 import './App.css';
 
@@ -62,7 +68,10 @@ function App() {
   const [createModal, setCreateModal] = useState({
     isOpen: false,
     category: '',
-    defaultName: ''
+    defaultName: '',
+    isEdit: false,
+    editId: null,
+    initialData: {}
   });
 
   const [dataTypeModal, setDataTypeModal] = useState({
@@ -74,13 +83,25 @@ function App() {
 
   const [currentFilePath, setCurrentFilePath] = useState(null);
 
-  // App Settings State
+  // Dropdown States
+  const [isProjectDropdownOpen, setIsProjectDropdownOpen] = useState(false);
+  const [isPlcDropdownOpen, setIsPlcDropdownOpen] = useState(false);
+
+  // PLC Targets State
+  const [isTargetModalOpen, setIsTargetModalOpen] = useState(false);
+  const [plcTarget, setPlcTarget] = useState('imx8m');
+
   // App Settings State - Persisted to LocalStorage
   const [theme, setTheme] = useState(() => localStorage.getItem('appTheme') || 'dark');
   const [editorSettings, setEditorSettings] = useState(() => {
     const saved = localStorage.getItem('editorSettings');
     return saved ? JSON.parse(saved) : { fontSize: 14, minimap: true, wordWrap: false };
   });
+
+  // PLC & Simulation Execution State
+  const [isPlcConnected, setIsPlcConnected] = useState(false); // Mock for future
+  const [isSimulationMode, setIsSimulationMode] = useState(false);
+  const [isRunning, setIsRunning] = useState(false);
 
   // Persist settings
   useEffect(() => {
@@ -108,7 +129,7 @@ function App() {
 
   const addLog = useCallback((type, msg) => {
     const time = new Date().toLocaleTimeString();
-    setLogs(prev => [...prev, { type, msg: `[${time}] ${msg}` }]);
+    setLogs(prev => [...prev, { type, msg: `[${time}] ${msg} ` }]);
   }, []);
 
   // --- File Operations ---
@@ -122,9 +143,9 @@ function App() {
     try {
       const xmlContent = exportProjectToXml(projectStructure);
       await writeTextFile(currentFilePath, xmlContent);
-      addLog('success', `Project saved to ${currentFilePath}`);
+      addLog('success', `Project saved to ${currentFilePath} `);
     } catch (error) {
-      addLog('error', `Save Error: ${error}`);
+      addLog('error', `Save Error: ${error} `);
     }
   }, [currentFilePath, projectStructure, addLog]);
 
@@ -146,9 +167,9 @@ function App() {
       await writeTextFile(filePath, xmlContent);
 
       setCurrentFilePath(filePath);
-      addLog('success', `Project saved to ${filePath}`);
+      addLog('success', `Project saved to ${filePath} `);
     } catch (error) {
-      addLog('error', `Save As Error: ${error}`);
+      addLog('error', `Save As Error: ${error} `);
     }
   }, [projectStructure, addLog]);
 
@@ -214,38 +235,81 @@ function App() {
         setCurrentFilePath(filePath);
         setActiveId(null);
         setIsProjectOpen(true);
-        addLog('success', `Project loaded from ${filePath}`);
+        addLog('success', `Project loaded from ${filePath} `);
       } else {
         addLog('error', 'Failed to parse project file (Invalid Format).');
       }
     } catch (error) {
       console.error(error);
-      addLog('error', `Open Error: ${error}`);
+      addLog('error', `Open Error: ${error} `);
     }
   };
 
-  const handleSimulate = async () => {
-    addLog('info', 'Compiling Project...');
+  const handleToggleSimulation = async () => {
+    if (isPlcConnected) {
+      addLog('error', 'Cannot enable Simulation Mode while PLC is connected.');
+      return;
+    }
 
-    try {
-      const fullST = compileProjectToST(projectStructure);
+    if (isRunning) {
+      addLog('warning', 'Please stop execution before toggling simulation mode.');
+      return;
+    }
 
-      if (!fullST || !fullST.trim()) {
-        addLog('warning', 'Project is empty. Nothing to simulate.');
-        return;
+    const nextMode = !isSimulationMode;
+    setIsSimulationMode(nextMode);
+    addLog('info', `Simulation Mode ${nextMode ? 'Enabled' : 'Disabled'}.`);
+
+    if (nextMode) {
+      addLog('info', 'Compiling Project for Simulation (C Transpilation)...');
+      try {
+        const standardHeaders = await invoke('get_standard_headers').catch(() => []);
+        const cCode = transpileToC(projectStructure, standardHeaders);
+        const outPath = await invoke('write_plc_files', {
+          header: cCode.header,
+          source: cCode.source
+        });
+        addLog('success', `Transpiled C header and source successfully saved to ${outPath}`);
+      } catch (error) {
+        addLog('error', `Simulation Compilation Failed: ${error}`);
       }
+    }
+  };
 
-      // 1. Call Rust Backend
-      const result = await invoke('simulate_st', { code: fullST });
-      addLog('success', result);
+  const handleStartExecution = async () => {
+    if (!isSimulationMode && !isPlcConnected) {
+      addLog('warning', 'Cannot start. Please enable Simulation Mode or connect to a PLC.');
+      return;
+    }
 
-    } catch (error) {
-      addLog('error', `Simulation Failed: ${error}`);
+    if (isSimulationMode) {
+      setIsRunning(true);
+      addLog('success', t('messages.plcRunMode') || 'Running Simulation Execution...');
+    } else if (isPlcConnected) {
+      setIsRunning(true);
+      addLog('success', 'PLC Execution Started.');
+    }
+  };
+
+  const handleStopExecution = () => {
+    if (isRunning) {
+      setIsRunning(false);
+      addLog('error', t('messages.plcStopped') || 'Execution Stopped.');
+    }
+  };
+
+  const handleBuild = () => {
+    addLog('info', `Build started for target: ${plcTarget}...`);
+    try {
+      const stCode = compileProjectToST(projectStructure);
+      addLog('success', 'Project built successfully.');
+    } catch (err) {
+      addLog('error', `Build failed: ${err.message}`);
     }
   };
 
   const handleSendToPlc = async () => {
-    addLog('info', 'Compiling for target Hardware...');
+    addLog('info', `Send to PLC triggered for target: ${plcTarget} `);
     // Future: Invoke specific Rust command for cross-compilation
     setTimeout(() => {
       addLog('success', 'Binary sent to PLC (Simulated Action)');
@@ -267,13 +331,13 @@ function App() {
         // Compile: Ctrl + B
         if (e.key.toLowerCase() === 'b') {
           e.preventDefault();
-          addLog('warning', `${t('messages.plcCompileStarted') || 'Derleme başlatıldı'}...`);
+          handleBuild();
         }
 
-        // Simulation: Ctrl + X
+        // Run/Start: Ctrl + X
         if (e.key.toLowerCase() === 'x') {
           e.preventDefault();
-          addLog('success', t('messages.plcRunMode') || 'PLC Run Mode Active');
+          handleStartExecution();
         }
       }
     };
@@ -292,10 +356,10 @@ function App() {
 
     const existingNames = projectStructure[category].map(item => item.name);
     let counter = 0;
-    while (existingNames.includes(`${prefix}${counter}`)) {
+    while (existingNames.includes(`${prefix}${counter} `)) {
       counter++;
     }
-    const defaultName = `${prefix}${counter}`;
+    const defaultName = `${prefix}${counter} `;
 
     if (category === 'dataTypes') {
       setDataTypeModal({ isOpen: true, existingNames });
@@ -305,7 +369,10 @@ function App() {
     setCreateModal({
       isOpen: true,
       category,
-      defaultName
+      defaultName,
+      isEdit: false,
+      editId: null,
+      initialData: {}
     });
   };
 
@@ -336,13 +403,88 @@ function App() {
     setDataTypeModal({ isOpen: false, existingNames: [] });
   };
 
-  const handleCreateConfirm = (name, type, returnType, taskName) => {
+  const handleCreateConfirm = (name, type, returnType, cycleTime) => {
     const category = createModal.category;
+
+    // Check if name already exists in this category
+    const isDuplicate = projectStructure[category].some(item =>
+      item.name.toLowerCase() === name.toLowerCase() &&
+      (!createModal.isEdit || item.id !== createModal.editId)
+    );
+
+    if (isDuplicate) {
+      alert(t('messages.duplicateName') || 'An item with this name already exists.');
+      return false;
+    }
+
+    if (createModal.isEdit) {
+      setProjectStructure(prev => {
+        const nextStruct = { ...prev };
+        let oldProgramName = null;
+
+        nextStruct[category] = nextStruct[category].map(item => {
+          if (item.id === createModal.editId) {
+            oldProgramName = item.name;
+            return {
+              ...item,
+              name,
+              returnType: category === 'functions' ? returnType : item.returnType,
+              cycleTime: category === 'programs' ? (cycleTime || '1ms') : item.cycleTime
+            };
+          }
+          return item;
+        });
+
+        if (category === 'programs' && oldProgramName && oldProgramName !== name) {
+          // Update the associated task interval and instance program name in res_config
+          nextStruct.resources = nextStruct.resources.map(r => {
+            if (r.id === 'res_config') {
+              const tasks = [...(r.content.tasks || [])];
+              const instances = [...(r.content.instances || [])];
+
+              const taskIndex = tasks.findIndex(t => t.name === `task_${oldProgramName}`);
+              if (taskIndex !== -1) {
+                const formattedInterval = cycleTime.startsWith('T#') ? cycleTime : `T#${cycleTime}`;
+                tasks[taskIndex] = { ...tasks[taskIndex], name: `task_${name}`, interval: formattedInterval };
+              }
+
+              const instIndex = instances.findIndex(inst => inst.program === oldProgramName);
+              if (instIndex !== -1) {
+                instances[instIndex] = { ...instances[instIndex], program: name, task: `task_${name}` };
+              }
+
+              return { ...r, content: { ...r.content, tasks, instances } };
+            }
+            return r;
+          });
+        } else if (category === 'programs' && oldProgramName === name) {
+          // Just updated cycle time
+          nextStruct.resources = nextStruct.resources.map(r => {
+            if (r.id === 'res_config') {
+              const tasks = [...(r.content.tasks || [])];
+              const taskIndex = tasks.findIndex(t => t.name === `task_${name}`);
+              if (taskIndex !== -1) {
+                const formattedInterval = cycleTime.startsWith('T#') ? cycleTime : `T#${cycleTime}`;
+                tasks[taskIndex] = { ...tasks[taskIndex], interval: formattedInterval };
+              }
+              return { ...r, content: { ...r.content, tasks } };
+            }
+            return r;
+          });
+        }
+        return nextStruct;
+      });
+      addLog('info', `Updated properties for ${name}`);
+      setCreateModal({ isOpen: false, category: '', defaultName: '', isEdit: false, editId: null, initialData: {} });
+      return true;
+    }
+
     const newItem = {
       id: `${category}_${Date.now()}`,
       name: name,
       type,
       returnType: category === 'functions' ? returnType : undefined,
+      cycleTime: category === 'programs' ? (cycleTime || '1ms') : undefined,
       content:
         type === 'LD' ? { rungs: [], variables: [] } :
           type === 'UDT' ? { members: [] } :
@@ -356,24 +498,22 @@ function App() {
         [category]: [...prev[category], newItem]
       };
 
-      if (category === 'programs' && taskName) {
-        // Automatically assign the program to the task
+      if (category === 'programs' && cycleTime) {
+        // Automatically create a task and instance for the program
         const configResource = nextStruct.resources.find(r => r.id === 'res_config');
         if (configResource) {
           const tasks = configResource.content.tasks || [];
           const instances = configResource.content.instances || [];
 
-          let taskExists = tasks.some(t => t.name === taskName);
+          const taskName = `task_${name}`;
           let newTasks = [...tasks];
-          if (!taskExists) {
-            newTasks.push({
-              id: `task_${Date.now()}`,
-              name: taskName,
-              triggering: 'Cyclic',
-              interval: 'T#20ms',
-              priority: 1
-            });
-          }
+          newTasks.push({
+            id: `task_${Date.now()}`,
+            name: taskName,
+            triggering: 'Cyclic',
+            interval: cycleTime.startsWith('T#') ? cycleTime : `T#${cycleTime}`,
+            priority: 1
+          });
 
           let i = 0;
           const instNames = instances.map(inst => inst.name);
@@ -405,7 +545,8 @@ function App() {
     setActiveId(newItem.id);
     addLog('info', `Added ${name} (${type}) to ${category}`);
     // Close modal handled by createModal state update below
-    setCreateModal({ isOpen: false, category: '', defaultName: '' });
+    setCreateModal({ isOpen: false, category: '', defaultName: '', isEdit: false, editId: null, initialData: {} });
+    return true;
   };
 
   const handleDeleteItem = (category, id) => {
@@ -417,14 +558,43 @@ function App() {
     addLog('warning', `Deleted item ${id}`);
   };
 
-  const handleRenameItem = (category, id, newName) => {
-    setProjectStructure(prev => ({
-      ...prev,
-      [category]: prev[category].map(item =>
-        item.id === id ? { ...item, name: newName } : item
-      )
-    }));
-    addLog('info', `Renamed item to ${newName}`);
+  const handleEditItemDetails = (category, id) => {
+    const item = projectStructure[category].find(i => i.id === id);
+    if (!item) return;
+
+    if (category === 'dataTypes') {
+      const newName = window.prompt(t('modals.enterName') || 'Enter Name:', item.name);
+      if (newName && newName !== item.name) {
+        // Check for duplicates
+        if (projectStructure[category].some(it => it.name.toLowerCase() === newName.toLowerCase() && it.id !== id)) {
+          alert(t('messages.duplicateName') || 'An item with this name already exists.');
+          return;
+        }
+
+        setProjectStructure(prev => ({
+          ...prev,
+          [category]: prev[category].map(it =>
+            it.id === id ? { ...it, name: newName } : it
+          )
+        }));
+        addLog('info', `Renamed item to ${newName}`);
+      }
+      return;
+    }
+
+    setCreateModal({
+      isOpen: true,
+      category,
+      defaultName: item.name,
+      isEdit: true,
+      editId: id,
+      initialData: {
+        name: item.name,
+        language: item.type,
+        returnType: item.returnType,
+        cycleTime: item.cycleTime
+      }
+    });
   };
 
   const handleSelectItem = (category, id) => {
@@ -492,6 +662,12 @@ function App() {
 
   const startResizing = (direction) => setIsResizing(direction);
 
+  const getAvailableDataTypes = () => {
+    if (!activeItem || activeItem.category !== 'dataTypes') return projectStructure.dataTypes.map(d => d.name);
+    const idx = projectStructure.dataTypes.findIndex(d => d.id === activeItem.id);
+    return idx >= 0 ? projectStructure.dataTypes.slice(0, idx).map(d => d.name) : projectStructure.dataTypes.map(d => d.name);
+  };
+
   return (
     <div style={{ display: 'flex', flexDirection: 'column', height: '100vh', width: '100vw', background: '#1e1e1e', overflow: 'hidden' }}>
 
@@ -512,16 +688,91 @@ function App() {
       <div className="header" style={{ height: '50px', flexShrink: 0, display: 'flex', alignItems: 'center', padding: '0 15px', background: '#2d2d2d', borderBottom: '1px solid #3e3e42' }}>
         {isProjectOpen && (
           <>
-            <button className="toolbar-btn" onClick={handleOpen}>📂 {t('common.open') || 'Open'}</button>
-            <button className="toolbar-btn" onClick={handleSave}>💾 {t('common.save')}</button>
-            <button className="toolbar-btn" onClick={handleSaveAs}>💾 {t('common.saveAs') || 'Save As'}</button>
-            <div style={{ width: 20 }}></div>
-            <button className="toolbar-btn" onClick={handleCloseProject} style={{ color: '#ff9800' }}>✖ {t('actions.closeProject') || 'Close Project'}</button>
-            <div style={{ width: 20 }}></div>
-            <button className="toolbar-btn" onClick={handleSimulate}>🚀 {t('actions.simulate')}</button>
-            <button className="toolbar-btn" onClick={handleSendToPlc}>⚡ {t('actions.sendToPlc')}</button>
-            <button className="toolbar-btn run" onClick={() => addLog('success', t('messages.plcRunMode') || 'Running')}>▶ {t('actions.start')}</button>
-            <button className="toolbar-btn stop" onClick={() => addLog('error', t('messages.plcStopped') || 'Stopped')}>⏹ {t('actions.stop')}</button>
+            {/* Project Dropdown */}
+            <div className="dropdown" style={{ marginRight: '10px' }}>
+              <button
+                className="toolbar-btn"
+                onClick={() => setIsProjectDropdownOpen(!isProjectDropdownOpen)}
+                onBlur={() => setTimeout(() => setIsProjectDropdownOpen(false), 200)}
+              >
+                📁 {t('common.project') || 'Project'} ▼
+              </button>
+              {isProjectDropdownOpen && (
+                <div className="dropdown-content">
+                  <div className="dropdown-item" onClick={handleOpen}>
+                    📂 {t('common.open') || 'Open'}
+                  </div>
+                  <div className="dropdown-item" onClick={handleSave}>
+                    💾 {t('common.save')}
+                  </div>
+                  <div className="dropdown-item" onClick={handleSaveAs}>
+                    💾 {t('common.saveAs') || 'Save As'}
+                  </div>
+                  <div style={{ height: '1px', background: '#3e3e42', margin: '4px 0' }}></div>
+                  <div className="dropdown-item" onClick={handleCloseProject} style={{ color: '#ff9800' }}>
+                    ✖ {t('actions.closeProject') || 'Close Project'}
+                  </div>
+                </div>
+              )}
+            </div>
+
+            {/* PLC Dropdown */}
+            <div className="dropdown" style={{ marginRight: '10px' }}>
+              <button
+                className="toolbar-btn"
+                onClick={() => setIsPlcDropdownOpen(!isPlcDropdownOpen)}
+                onBlur={() => setTimeout(() => setIsPlcDropdownOpen(false), 200)}
+              >
+                ⚙️ {t('common.plc') || 'PLC'} ▼
+              </button>
+              {isPlcDropdownOpen && (
+                <div className="dropdown-content">
+                  <div className="dropdown-item" onClick={() => setIsTargetModalOpen(true)}>
+                    🎯 {t('actions.selectTarget') || 'Select Target'}
+                  </div>
+                  <div className="dropdown-item" onClick={handleBuild}>
+                    🔨 {t('actions.build') || 'Build'}
+                  </div>
+                  <div className="dropdown-item" onClick={handleSendToPlc}>
+                    ⚡ {t('actions.sendToPlc') || 'Send to PLC'}
+                  </div>
+                </div>
+              )}
+            </div>
+
+            <div style={{ width: 10 }}></div>
+
+            {/* Simulation Toggle */}
+            <button
+              className={`toolbar-btn ${isSimulationMode ? 'simulation-active' : ''}`}
+              onClick={handleToggleSimulation}
+              disabled={isPlcConnected || isRunning}
+              style={{
+                background: isSimulationMode ? '#007acc' : 'transparent',
+                border: isSimulationMode ? '1px solid #0098ff' : '1px solid transparent',
+              }}
+            >
+              🚀 {isSimulationMode ? 'Simulation ON' : 'Simulation OFF'}
+            </button>
+
+            {/* Execution Controls */}
+            <button
+              className="toolbar-btn run"
+              onClick={handleStartExecution}
+              disabled={isRunning || (!isSimulationMode && !isPlcConnected)}
+              style={{ opacity: (isRunning || (!isSimulationMode && !isPlcConnected)) ? 0.5 : 1 }}
+            >
+              ▶ {t('actions.start')}
+            </button>
+
+            <button
+              className="toolbar-btn stop"
+              onClick={handleStopExecution}
+              disabled={!isRunning}
+              style={{ opacity: !isRunning ? 0.5 : 1 }}
+            >
+              ⏹ {t('actions.stop')}
+            </button>
           </>
         )}
       </div>
@@ -543,7 +794,7 @@ function App() {
                 onSelectItem={handleSelectItem}
                 onAddItem={handleAddItem}
                 onDeleteItem={handleDeleteItem}
-                onRenameItem={handleRenameItem}
+                onEditItem={handleEditItemDetails}
                 onSettingsClick={() => setActiveId('SETTINGS')}
                 onShortcutsClick={() => setShortcutsModalOpen(true)}
               />
@@ -572,25 +823,33 @@ function App() {
                 ) : activeItem ? (
                   <ErrorBoundary>
                     <div style={{ flex: 1, position: 'relative', overflow: 'hidden' }}>
-                      <EditorPane
-                        key={activeItem.id}
-                        fileType={activeItem.type}
-                        initialContent={activeItem.content}
-                        onContentChange={handleContentChange}
-                        allowedClasses={
-                          activeItem.category === 'programs'
-                            ? ['Local', 'Temp']
-                            : ['Input', 'Output', 'InOut', 'Local', 'Temp']
-                        }
-                        context={activeItem.category}
-                        availableBlocks={[...projectStructure.functionBlocks, ...projectStructure.functions]}
-                        availablePrograms={projectStructure.programs.map(p => p.name)}
-                        availableTasks={projectStructure.resources.find(r => r.type === 'RESOURCE_EDITOR')?.content.tasks?.map(t => t.name) || []}
-                        globalVars={projectStructure.resources.find(r => r.type === 'RESOURCE_EDITOR')?.content.globalVars || []}
-                        projectStructure={projectStructure}
-                        currentId={activeItem.id}
-                        libraryData={libraryData} // Pass Library Data
-                      />
+                      {activeItem.category === 'dataTypes' ? (
+                        <>
+                          {activeItem.type === 'Array' && <ArrayTypeEditor content={activeItem.content} onContentChange={handleContentChange} projectStructure={projectStructure} currentId={activeItem.id} derivedTypes={getAvailableDataTypes()} />}
+                          {activeItem.type === 'Structure' && <StructureTypeEditor content={activeItem.content} onContentChange={handleContentChange} projectStructure={projectStructure} currentId={activeItem.id} derivedTypes={getAvailableDataTypes()} />}
+                          {activeItem.type === 'Enumerated' && <EnumTypeEditor content={activeItem.content} onContentChange={handleContentChange} />}
+                        </>
+                      ) : (
+                        <EditorPane
+                          key={activeItem.id}
+                          fileType={activeItem.type}
+                          initialContent={activeItem.content}
+                          onContentChange={handleContentChange}
+                          allowedClasses={
+                            activeItem.category === 'programs'
+                              ? ['Local', 'Temp']
+                              : ['Input', 'Output', 'InOut', 'Local', 'Temp']
+                          }
+                          context={activeItem.category}
+                          availableBlocks={[...projectStructure.functionBlocks, ...projectStructure.functions]}
+                          availablePrograms={projectStructure.programs.map(p => p.name)}
+                          availableTasks={projectStructure.resources.find(r => r.type === 'RESOURCE_EDITOR')?.content.tasks?.map(t => t.name) || []}
+                          globalVars={projectStructure.resources.find(r => r.type === 'RESOURCE_EDITOR')?.content.globalVars || []}
+                          projectStructure={projectStructure}
+                          currentId={activeItem.id}
+                          libraryData={libraryData} // Pass Library Data
+                        />
+                      )}
                     </div>
                   </ErrorBoundary>
                 ) : (
@@ -613,7 +872,7 @@ function App() {
                 </div>
                 <div style={{ flex: 1, overflowY: 'auto', padding: '5px', fontFamily: 'Consolas, monospace', fontSize: '12px' }}>
                   {logs.map((log, index) => (
-                    <div key={index} className={`log-line log-${log.type}`}>
+                    <div key={index} className={`log - line log - ${log.type} `}>
                       {log.msg}
                     </div>
                   ))}
@@ -657,7 +916,8 @@ function App() {
         onConfirm={handleCreateConfirm}
         category={createModal.category}
         defaultName={createModal.defaultName}
-        availableTasks={projectStructure.resources.find(r => r.id === 'res_config')?.content.tasks?.map(t => t.name) || []}
+        isEdit={createModal.isEdit}
+        initialData={createModal.initialData}
       />
 
       <DataTypeCreationModal
@@ -670,6 +930,16 @@ function App() {
       <ShortcutsModal
         isOpen={shortcutsModalOpen}
         onClose={() => setShortcutsModalOpen(false)}
+      />
+
+      <SelectTargetModal
+        isOpen={isTargetModalOpen}
+        onClose={() => setIsTargetModalOpen(false)}
+        currentTarget={plcTarget}
+        onSelect={(target) => {
+          setPlcTarget(target);
+          addLog('info', `PLC target changed to: ${target} `);
+        }}
       />
 
     </div>

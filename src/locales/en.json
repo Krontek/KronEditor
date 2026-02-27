@@ -21,7 +21,13 @@
         "triggering": "Triggering",
         "interval": "Interval",
         "priority": "Priority",
-        "structMembers": "Struct Members"
+        "structMembers": "Struct Members",
+        "identifier": "Identifier",
+        "valueOptional": "Value (Optional)",
+        "min": "Min (Integer)",
+        "max": "Max (Integer)",
+        "baseType": "Base Type",
+        "dimensions": "Dimensions"
     },
     "common": {
         "add": "Add",
@@ -50,19 +56,27 @@
         "shortcuts": "Shortcuts",
         "newProject": "New Project",
         "openProject": "Open Project",
-        "close": "Close"
+        "close": "Close",
+        "project": "Project",
+        "plc": "PLC"
     },
     "actions": {
         "addTask": "Add Task",
         "addInstance": "Add Instance",
         "addVariable": "Add Variable",
+        "addMember": "Add Member",
+        "addValue": "Add Value",
+        "addDimension": "Add Dimension",
         "addNew": "Add New",
         "compile": "Compile",
         "start": "Start",
         "stop": "Stop",
         "simulate": "Simulate",
         "sendToPlc": "Send to PLC",
-        "closeProject": "Close Project"
+        "closeProject": "Close Project",
+        "editCycleTime": "Edit Cycle Time",
+        "selectTarget": "Select Target",
+        "build": "Build"
     },
     "options": {
         "cyclic": "Cyclic",
@@ -80,19 +94,35 @@
         "plcCompileStarted": "Compilation started",
         "plcRunMode": "PLC Run Mode.",
         "plcStopped": "PLC Stopped.",
-        "startScreenDesc": "A modern web-based PLC programming environment"
+        "startScreenDesc": "A modern web-based PLC programming environment",
+        "duplicateName": "An item with this name already exists.",
+        "arrayDef": "Array Definition",
+        "arrayDesc": "Define the dimensions and base type of your array.",
+        "structDef": "Structure Definition",
+        "structDesc": "Define the members of your structure.",
+        "enumDef": "Enumerated Definition",
+        "enumDesc": "Define the enumerated values.",
+        "noMembers": "No members defined. Click \"Add Member\" to start.",
+        "structTip": "Tip: Press Enter in the last Initial Value field to add a new row."
     },
     "resources": {
         "globalVariables": "Global Variables"
     },
     "modals": {
         "create": "Create New",
+        "createDataType": "Create Data Type",
         "enterName": "Enter Name:",
+        "enterCycleTime": "Enter Cycle Time:",
         "returnType": "Return Type:",
         "confirm": "Confirm",
         "contactSettings": "Contact Settings",
         "coilSettings": "Coil Settings",
         "blockSettings": "Block Settings"
+    },
+    "errors": {
+        "nameRequired": "Name is required",
+        "nameExists": "Name already exists",
+        "invalidIdentifier": "Invalid Identifier: \"{name}\". Must start with a letter/underscore and contain only alphanumeric characters."
     },
     "settingsPage": {
         "general": "General",

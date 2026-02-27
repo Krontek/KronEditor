@@ -2,7 +2,7 @@ import React from 'react';
 import VariableManager from './VariableManager';
 import { useTranslation } from 'react-i18next';
 
-const ResourceEditor = ({ content, onContentChange }) => {
+const ResourceEditor = ({ content, onContentChange, availablePrograms = [], derivedTypes = [], userDefinedTypes = [] }) => {
     const { t } = useTranslation();
 
     const handleDeleteVar = (id) => {
@@ -21,7 +21,6 @@ const ResourceEditor = ({ content, onContentChange }) => {
             name: 'NewVar',
             class: 'Var',
             type: 'BOOL',
-            location: '',
             initialValue: '',
             desc: ''
         };
@@ -49,6 +48,8 @@ const ResourceEditor = ({ content, onContentChange }) => {
                         onUpdate={handleUpdateVar}
                         onAdd={handleAddVar}
                         allowedClasses={['Var', 'Constant', 'Retain']}
+                        derivedTypes={derivedTypes}
+                        userDefinedTypes={userDefinedTypes}
                     />
                 </div>
             </div>
