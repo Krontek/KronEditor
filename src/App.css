@@ -1,5 +1,12 @@
 /* src/App.css */
-body { margin: 0; padding: 0; background: #1e1e1e; color: #d4d4d4; font-family: 'Segoe UI', sans-serif; overflow: hidden; }
+body {
+  margin: 0;
+  padding: 0;
+  background: #1e1e1e;
+  color: #d4d4d4;
+  font-family: 'Segoe UI', sans-serif;
+  overflow: hidden;
+}
 
 /* ANA IZGARA YAPISI */
 .app-layout {
@@ -18,7 +25,7 @@ body { margin: 0; padding: 0; background: #1e1e1e; color: #d4d4d4; font-family: 
      Sağ: 250px
   */
   grid-template-columns: 250px 1fr 250px;
-  
+
   /* Alan İsimlendirmeleri */
   grid-template-areas:
     "header header header"
@@ -27,19 +34,79 @@ body { margin: 0; padding: 0; background: #1e1e1e; color: #d4d4d4; font-family: 
 }
 
 /* BÖLGELERİN STİLLERİ */
-.header { grid-area: header; background: #2d2d2d; border-bottom: 1px solid #3e3e42; display: flex; align-items: center; padding: 0 15px; }
-.sidebar-left { grid-area: sidebar-left; background: #252526; border-right: 1px solid #3e3e42; overflow-y: auto; }
-.main { grid-area: main; background: #1e1e1e; position: relative; overflow: hidden; }
-.sidebar-right { grid-area: sidebar-right; background: #252526; border-left: 1px solid #3e3e42; overflow-y: auto; }
-.footer { grid-area: footer; background: #007acc; /* Konsol rengi genellikle mavidir ama değiştirebiliriz */ background: #1e1e1e; border-top: 1px solid #3e3e42; padding: 10px; font-family: 'Consolas', monospace; font-size: 12px; overflow-y: auto; }
+.header {
+  grid-area: header;
+  background: #2d2d2d;
+  border-bottom: 1px solid #3e3e42;
+  display: flex;
+  align-items: center;
+  padding: 0 15px;
+}
+
+.sidebar-left {
+  grid-area: sidebar-left;
+  background: #252526;
+  border-right: 1px solid #3e3e42;
+  overflow-y: auto;
+}
+
+.main {
+  grid-area: main;
+  background: #1e1e1e;
+  position: relative;
+  overflow: hidden;
+}
+
+.sidebar-right {
+  grid-area: sidebar-right;
+  background: #252526;
+  border-left: 1px solid #3e3e42;
+  overflow-y: auto;
+}
+
+.footer {
+  grid-area: footer;
+  background: #007acc;
+  /* Konsol rengi genellikle mavidir ama değiştirebiliriz */
+  background: #1e1e1e;
+  border-top: 1px solid #3e3e42;
+  padding: 10px;
+  font-family: 'Consolas', monospace;
+  font-size: 12px;
+  overflow-y: auto;
+}
 
 /* Header Butonları */
 .toolbar-btn {
-  background: #3e3e42; border: 1px solid #555; color: white; padding: 5px 15px; margin-right: 10px; cursor: pointer; border-radius: 3px; font-size: 13px; display: flex; align-items: center; gap: 5px;
+  background: #3e3e42;
+  border: 1px solid #555;
+  color: white;
+  padding: 5px 15px;
+  margin-right: 10px;
+  cursor: pointer;
+  border-radius: 3px;
+  font-size: 13px;
+  display: flex;
+  align-items: center;
+  gap: 5px;
 }
-.toolbar-btn:hover { background: #505050; }
-.toolbar-btn.run { background: #1b5e20; border-color: #2e7d32; } /* Yeşil Run butonu */
-.toolbar-btn.stop { background: #b71c1c; border-color: #d32f2f; } /* Kırmızı Stop butonu */
+
+.toolbar-btn:hover {
+  background: #505050;
+}
+
+.toolbar-btn.run {
+  background: #1b5e20;
+  border-color: #2e7d32;
+}
+
+/* Yeşil Run butonu */
+.toolbar-btn.stop {
+  background: #b71c1c;
+  border-color: #d32f2f;
+}
+
+/* Kırmızı Stop butonu */
 
 /* Header Dropdowns */
 .dropdown {
@@ -53,7 +120,7 @@ body { margin: 0; padding: 0; background: #1e1e1e; color: #d4d4d4; font-family: 
   left: 0;
   background-color: #2d2d2d;
   min-width: 160px;
-  box-shadow: 0px 8px 16px 0px rgba(0,0,0,0.4);
+  box-shadow: 0px 8px 16px 0px rgba(0, 0, 0, 0.4);
   z-index: 1000;
   border: 1px solid #3e3e42;
   border-radius: 4px;
@@ -77,16 +144,47 @@ body { margin: 0; padding: 0; background: #1e1e1e; color: #d4d4d4; font-family: 
 }
 
 /* Proje Ağacı Stilleri */
-.project-tree-item { padding: 8px 15px; cursor: pointer; display: flex; align-items: center; gap: 8px; font-size: 13px; color: #ccc; }
-.project-tree-item:hover { background: #2a2d2e; color: white; }
-.project-tree-item.active { background: #37373d; color: white; border-left: 2px solid #007acc; }
+.project-tree-item {
+  padding: 8px 15px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  color: #ccc;
+}
+
+.project-tree-item:hover {
+  background: #2a2d2e;
+  color: white;
+}
+
+.project-tree-item.active {
+  background: #37373d;
+  color: white;
+  border-left: 2px solid #007acc;
+}
 
 /* Log Yazıları */
-.log-line { margin: 2px 0; }
-.log-info { color: #d4d4d4; }
-.log-success { color: #4ec9b0; }
-.log-error { color: #f44336; }
-.log-warning { color: #ce9178; }
+.log-line {
+  margin: 2px 0;
+}
+
+.log-info {
+  color: #d4d4d4;
+}
+
+.log-success {
+  color: #4ec9b0;
+}
+
+.log-error {
+  color: #f44336;
+}
+
+.log-warning {
+  color: #ce9178;
+}
 
 /* React Flow Highlighting */
 .react-flow__edge.selected .react-flow__edge-path {
@@ -94,6 +192,7 @@ body { margin: 0; padding: 0; background: #1e1e1e; color: #d4d4d4; font-family: 
   stroke-width: 3 !important;
   filter: drop-shadow(0 0 4px rgba(0, 122, 204, 0.6));
 }
+
 .react-flow__edge-path {
   transition: all 0.2s ease;
 }
@@ -109,6 +208,7 @@ body { margin: 0; padding: 0; background: #1e1e1e; color: #d4d4d4; font-family: 
   flex-shrink: 0;
   border-bottom: 1px solid #3e3e42;
 }
+
 .titlebar-title {
   display: flex;
   align-items: center;
@@ -118,10 +218,12 @@ body { margin: 0; padding: 0; background: #1e1e1e; color: #d4d4d4; font-family: 
   color: #ccc;
   pointer-events: none;
 }
+
 .titlebar-controls {
   display: flex;
   height: 100%;
 }
+
 .titlebar-button {
   display: inline-flex;
   justify-content: center;
@@ -133,10 +235,21 @@ body { margin: 0; padding: 0; background: #1e1e1e; color: #d4d4d4; font-family: 
   cursor: pointer;
   transition: background 0.1s;
 }
+
 .titlebar-button:hover {
   background: #333;
 }
+
 .titlebar-close:hover {
   background: #e81123 !important;
   color: white !important;
+}
+
+/* ST EDITOR ONLINE MODE DECORATIONS */
+.inline-live-var {
+  background-color: rgba(255, 255, 255, 0.1);
+  border-radius: 4px;
+  padding: 0 4px;
+  font-weight: bold;
+  opacity: 0.9;
 }

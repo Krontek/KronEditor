@@ -1,4 +1,4 @@
-import React, { useState, useCallback, useRef, useEffect } from 'react';
+import { useState, useCallback, useRef, useEffect } from 'react';
 import RungContainer, { blockConfig } from './RungContainer';
 import ErrorBoundary from './ErrorBoundary';
 import BlockSettingsModal from './BlockSettingsModal';
@@ -11,46 +11,54 @@ import DraggableBlock from './DraggableBlock';
  * - Rung hareket ederken, içindeki her şey beraber hareket ediyor
  */
 
-const RungEditorNew = ({ variables, setVariables, rungs, setRungs, availableBlocks, globalVars = [] }) => {
-  // Rungs listesi artık prop olarak geliyor: { id, blocks: [...], connections: [...], label }
+const RungEditorNew = ({ variables, setVariables, rungs, setRungs, availableBlocks, globalVars = [], liveVariables = null, parentName = "", readOnly = false }) => {
 
-  // Undo/Redo history
-  const [history, setHistory] = useState([[]]);
-  const [historyIndex, setHistoryIndex] = useState(0);
+  // Undo/Redo history - her snapshot { rungs, variables } çiftini saklıyor
+  const historyRef = useRef([{
+    rungs: JSON.parse(JSON.stringify(rungs)),
+    variables: JSON.parse(JSON.stringify(variables))
+  }]);
+  const historyIndexRef = useRef(0);
 
   // Settings modal state
-  const [editingBlock, setEditingBlock] = useState(null); // { rungId, blockId, data }
+  const [editingBlock, setEditingBlock] = useState(null);
 
-  // History yönetimi
-  const saveHistory = useCallback((newRungs) => {
-    const newHistory = history.slice(0, historyIndex + 1);
-    newHistory.push(JSON.parse(JSON.stringify(newRungs))); // Deep copy
-    setHistory(newHistory);
-    setHistoryIndex(newHistory.length - 1);
-  }, [history, historyIndex]);
+  // History kaydet - hem rungs hem variables birlikte
+  const saveHistory = useCallback((newRungs, newVariables) => {
+    const sliced = historyRef.current.slice(0, historyIndexRef.current + 1);
+    sliced.push({
+      rungs: JSON.parse(JSON.stringify(newRungs)),
+      variables: JSON.parse(JSON.stringify(newVariables))
+    });
+    if (sliced.length > 50) sliced.shift();
+    historyRef.current = sliced;
+    historyIndexRef.current = sliced.length - 1;
+  }, []);
 
   const undo = useCallback(() => {
-    if (historyIndex > 0) {
-      setHistoryIndex(historyIndex - 1);
-      setRungs(JSON.parse(JSON.stringify(history[historyIndex - 1])));
+    if (historyIndexRef.current > 0) {
+      historyIndexRef.current--;
+      const state = historyRef.current[historyIndexRef.current];
+      setRungs(JSON.parse(JSON.stringify(state.rungs)));
+      setVariables(JSON.parse(JSON.stringify(state.variables)));
     }
-  }, [historyIndex, history]);
+  }, [setRungs, setVariables]);
 
   const redo = useCallback(() => {
-    if (historyIndex < history.length - 1) {
-      setHistoryIndex(historyIndex + 1);
-      setRungs(JSON.parse(JSON.stringify(history[historyIndex + 1])));
+    if (historyIndexRef.current < historyRef.current.length - 1) {
+      historyIndexRef.current++;
+      const state = historyRef.current[historyIndexRef.current];
+      setRungs(JSON.parse(JSON.stringify(state.rungs)));
+      setVariables(JSON.parse(JSON.stringify(state.variables)));
     }
-  }, [historyIndex, history]);
+  }, [setRungs, setVariables]);
 
   // Keyboard Shortcuts for Undo/Redo
   useEffect(() => {
     const handleKeyDown = (e) => {
-      // CMD/CTRL + Z
       if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'z') {
         e.preventDefault();
         e.stopPropagation();
-
         if (e.shiftKey) {
           redo();
         } else {
@@ -58,79 +66,73 @@ const RungEditorNew = ({ variables, setVariables, rungs, setRungs, availableBloc
         }
       }
     };
-
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
   }, [undo, redo]);
 
   // Blok verisini güncelleme
   const updateBlockData = useCallback((rungId, blockId, newData) => {
-    // 1. Rungs State güncellemesi
-    setRungs(prevRungs => prevRungs.map(rung => {
-      if (rung.id === rungId) {
-        return {
-          ...rung,
-          blocks: rung.blocks.map(b => {
-            if (b.id === blockId) {
-              return {
-                ...b,
-                data: { ...b.data, ...newData }
-              };
-            }
-            return b;
-          })
-        };
-      }
-      return rung;
-    }));
+    if (readOnly) return;
 
-    // 2. Variables State güncellemesi (Eğer instanceName değiştiyse)
+    // instanceName değiştiyse variables'ı da güncelle
+    let newVariables = variables;
     if (newData.instanceName) {
-      setVariables(prevVars => prevVars.map(v =>
-        v.id === blockId ? { ...v, name: newData.instanceName } : v
-      ));
+      newVariables = variables.map(v => v.id === blockId ? { ...v, name: newData.instanceName } : v);
+      setVariables(newVariables);
     }
-  }, []);
 
-  // Blok pozisyonunu güncelleme
+    setRungs(prevRungs => {
+      const newRungs = prevRungs.map(rung => {
+        if (rung.id === rungId) {
+          return {
+            ...rung,
+            blocks: rung.blocks.map(b =>
+              b.id === blockId ? { ...b, data: { ...b.data, ...newData } } : b
+            )
+          };
+        }
+        return rung;
+      });
+      saveHistory(newRungs, newVariables);
+      return newRungs;
+    });
+  }, [readOnly, variables, saveHistory, setVariables]);
+
+  // Blok pozisyonunu güncelleme (history'e kaydedilmez - performans için)
   const updateBlockPosition = useCallback((rungId, blockId, position) => {
+    if (readOnly) return;
     setRungs(prevRungs => prevRungs.map(rung => {
       if (rung.id === rungId) {
         return {
           ...rung,
-          blocks: rung.blocks.map(b => {
-            if (b.id === blockId) {
-              return { ...b, position };
-            }
-            return b;
-          })
+          blocks: rung.blocks.map(b => b.id === blockId ? { ...b, position } : b)
         };
       }
       return rung;
     }));
-  }, []);
+  }, [readOnly]);
 
   // Blok çift tıklandığında ayarları aç
-  const handleNodeDoubleClick = useCallback((event, node, rungId) => {
-    // Sadece bloklara çift tıklanınca (terminal değil)
+  const handleNodeDoubleClick = useCallback((_event, node, rungId) => {
+    if (readOnly) return;
     setEditingBlock({
       rungId,
       id: node.id,
       type: node.data.type,
       ...node.data
     });
-  }, []);
+  }, [readOnly]);
 
   // Ayarları kaydet
   const handleSaveSettings = useCallback((blockId, newSettings) => {
     if (!editingBlock) return;
-
     updateBlockData(editingBlock.rungId, blockId, newSettings);
     setEditingBlock(null);
   }, [editingBlock, updateBlockData]);
 
   // Rung ekleme
   const addRung = useCallback(() => {
+    if (readOnly) return;
     const newRung = {
       id: `rung_${Date.now()}_${Math.random()}`,
       label: String(rungs.length).padStart(3, '0'),
@@ -139,18 +141,20 @@ const RungEditorNew = ({ variables, setVariables, rungs, setRungs, availableBloc
     };
     const newRungs = [...rungs, newRung];
     setRungs(newRungs);
-    saveHistory(newRungs);
-  }, [rungs, saveHistory]);
+    saveHistory(newRungs, variables);
+  }, [readOnly, rungs, variables, saveHistory]);
 
   // Rung silme
   const deleteRung = useCallback((rungId) => {
+    if (readOnly) return;
     const newRungs = rungs.filter(r => r.id !== rungId);
     setRungs(newRungs);
-    saveHistory(newRungs);
-  }, [rungs, saveHistory]);
+    saveHistory(newRungs, variables);
+  }, [readOnly, rungs, variables, saveHistory]);
 
   // Rung'lar arasında taşıma (yukarı/aşağı)
   const moveRung = useCallback((rungId, direction) => {
+    if (readOnly) return;
     const idx = rungs.findIndex(r => r.id === rungId);
     if (direction === 'up' && idx <= 0) return;
     if (direction === 'down' && idx >= rungs.length - 1) return;
@@ -159,13 +163,12 @@ const RungEditorNew = ({ variables, setVariables, rungs, setRungs, availableBloc
     const swapIdx = direction === 'up' ? idx - 1 : idx + 1;
     [newRungs[idx], newRungs[swapIdx]] = [newRungs[swapIdx], newRungs[idx]];
     setRungs(newRungs);
-    saveHistory(newRungs);
-  }, [rungs, saveHistory]);
+    saveHistory(newRungs, variables);
+  }, [readOnly, rungs, variables, saveHistory]);
 
-  // HELPER: Safely Insert Block into Rung (Pure logic)
-  const insertBlock = useCallback((rungId, blockType, position, instanceName, customData) => {
+  // HELPER: Blok ekle + history'ye hem rungs hem variables kaydet
+  const insertBlock = useCallback((rungId, blockType, position, instanceName, customData, newVariables) => {
     const blockId = `block_${Date.now()}_${Math.random()}`;
-
     const newBlock = {
       id: blockId,
       type: blockType,
@@ -184,16 +187,16 @@ const RungEditorNew = ({ variables, setVariables, rungs, setRungs, availableBloc
         }
         return rung;
       });
-      saveHistory(newRungs);
+      saveHistory(newRungs, newVariables);
       return newRungs;
     });
   }, [setRungs, saveHistory]);
 
   // Main Add Block Handler
   const addBlockToRung = useCallback((rungId, blockType, position, customData = null) => {
-    if (!position) return;
+    if (!position || readOnly) return;
 
-    // 1. CONTACT / COIL LOGIC (Smart Selection via Inline UI)
+    // 1. CONTACT / COIL LOGIC
     if (blockType === 'Contact' || blockType === 'Coil') {
       const allVars = [
         ...variables.map(v => ({ ...v, scope: 'Local' })),
@@ -201,23 +204,21 @@ const RungEditorNew = ({ variables, setVariables, rungs, setRungs, availableBloc
       ];
       const boolVars = allVars.filter(v => v.type === 'BOOL');
 
-      // Case A: No BOOL variables exist -> Auto-create Var0 and Assign
+      // Case A: BOOL değişken yok -> otomatik oluştur
       if (boolVars.length === 0) {
         let index = 0;
         let newName = '';
         while (true) {
           const candidate = `Var${index}`;
-          const exists = allVars.some(v => v.name === candidate);
-          if (!exists) {
+          if (!allVars.some(v => v.name === candidate)) {
             newName = candidate;
             break;
           }
           index++;
-          if (index > 1000) { console.error("Loop safety break"); break; } // Safety
+          if (index > 1000) { console.error("Loop safety break"); break; }
         }
 
-        const varClass = blockType === 'Contact' ? 'Input' : 'Output';
-        setVariables(prev => [...prev, {
+        const newVar = {
           id: `created_var_${Date.now()}`,
           name: newName,
           class: 'Local',
@@ -225,38 +226,40 @@ const RungEditorNew = ({ variables, setVariables, rungs, setRungs, availableBloc
           location: '',
           initialValue: '',
           description: ''
-        }]);
-
-        insertBlock(rungId, blockType, position, newName, customData);
+        };
+        const newVariables = [...variables, newVar];
+        setVariables(newVariables);
+        insertBlock(rungId, blockType, position, newName, customData, newVariables);
       }
-      // Case B: BOOL variables exist -> Insert blank/placeholder for inline selection
+      // Case B: BOOL değişken var -> boş placeholder
       else {
-        // We pass empty string as instanceName. The Block UI will show '??' and inputs.
-        insertBlock(rungId, blockType, position, '', customData);
+        insertBlock(rungId, blockType, position, '', customData, variables);
       }
       return;
     }
 
-    // 2. OTHER BLOCKS (Standard / UserDefined) - Auto Naming
+    // 2. DİĞER BLOKLAR (Standard / UserDefined)
     let instanceName;
+    let newVariables = variables;
+
     if (customData) {
       if (customData.type === 'functions') {
         instanceName = customData.name;
+        // Function blok instance oluşturmaz, variables değişmez
       } else {
         // Function Block Instance
         let index = 0;
         while (true) {
           const candidateName = `${customData.name}_${index}`;
-          const exists = variables.some(v => v.name === candidateName) || (globalVars || []).some(v => v.name === candidateName);
-          if (!exists) {
+          if (!variables.some(v => v.name === candidateName) && !(globalVars || []).some(v => v.name === candidateName)) {
             instanceName = candidateName;
             break;
           }
           index++;
-          if (index > 1000) { console.error("Loop safety break"); break; } // Safety
+          if (index > 1000) { console.error("Loop safety break"); break; }
         }
 
-        setVariables(prev => [...prev, {
+        const newVar = {
           id: `fb_inst_${Date.now()}`,
           name: instanceName,
           class: 'Local',
@@ -264,22 +267,24 @@ const RungEditorNew = ({ variables, setVariables, rungs, setRungs, availableBloc
           location: '',
           initialValue: '',
           description: 'FB Instance'
-        }]);
+        };
+        newVariables = [...variables, newVar];
+        setVariables(newVariables);
       }
     } else {
       // Standard Blocks (TON, CTU, etc.)
       let index = 0;
       while (true) {
         const candidate = `${blockType}${index}`;
-        const exists = variables.some(v => v.name === candidate) || (globalVars || []).some(v => v.name === candidate);
-        if (!exists) {
+        if (!variables.some(v => v.name === candidate) && !(globalVars || []).some(v => v.name === candidate)) {
           instanceName = candidate;
           break;
         }
         index++;
-        if (index > 1000) { console.error("Loop safety break"); break; } // Safety
+        if (index > 1000) { console.error("Loop safety break"); break; }
       }
-      setVariables(prev => [...prev, {
+
+      const newVar = {
         id: `std_inst_${Date.now()}`,
         name: instanceName,
         class: 'Local',
@@ -287,14 +292,17 @@ const RungEditorNew = ({ variables, setVariables, rungs, setRungs, availableBloc
         location: '',
         initialValue: '',
         description: ''
-      }]);
+      };
+      newVariables = [...variables, newVar];
+      setVariables(newVariables);
     }
 
-    insertBlock(rungId, blockType, position, instanceName, customData);
-  }, [variables, globalVars, insertBlock, setVariables]);
+    insertBlock(rungId, blockType, position, instanceName, customData, newVariables);
+  }, [readOnly, variables, globalVars, insertBlock, setVariables]);
 
-  // Rung'dan blok silme
+  // Rung'dan blok silme - variable da siliniyorsa history'ye yeni hali kaydet
   const deleteBlockFromRung = useCallback((rungId, blockId) => {
+    if (readOnly) return;
     let blockToDelete = null;
     const newRungs = rungs.map(rung => {
       if (rung.id === rungId) {
@@ -308,23 +316,27 @@ const RungEditorNew = ({ variables, setVariables, rungs, setRungs, availableBloc
       return rung;
     });
     setRungs(newRungs);
-    saveHistory(newRungs);
 
-    // Remove the associated variable if it's no longer used by any block
-    if (blockToDelete && blockToDelete.data && blockToDelete.data.instanceName) {
+    // Silinen bloğun variable'ını da kaldır - yeni variables'ı senkron hesapla
+    let newVariables = variables;
+    if (blockToDelete?.data?.instanceName) {
       const instanceName = blockToDelete.data.instanceName;
       const isUsedElsewhere = newRungs.some(r =>
-        r.blocks.some(b => b.data && b.data.instanceName === instanceName)
+        r.blocks.some(b => b.data?.instanceName === instanceName)
       );
-
       if (!isUsedElsewhere) {
-        setVariables(prev => prev.filter(v => v.name !== instanceName));
+        newVariables = variables.filter(v => v.name !== instanceName);
+        setVariables(newVariables);
       }
     }
-  }, [rungs, saveHistory, setVariables]);
+
+    // Her iki yeni state'i birlikte history'ye kaydet
+    saveHistory(newRungs, newVariables);
+  }, [readOnly, rungs, variables, saveHistory, setVariables]);
 
   // Rung'a bağlantı ekleme
   const addConnectionToRung = useCallback((rungId, connection) => {
+    if (readOnly) return;
     const newRungs = rungs.map(rung => {
       if (rung.id === rungId) {
         return {
@@ -338,11 +350,12 @@ const RungEditorNew = ({ variables, setVariables, rungs, setRungs, availableBloc
       return rung;
     });
     setRungs(newRungs);
-    saveHistory(newRungs);
-  }, [rungs, saveHistory]);
+    saveHistory(newRungs, variables);
+  }, [readOnly, rungs, variables, saveHistory]);
 
   // Rung'dan bağlantı silme
   const deleteConnectionFromRung = useCallback((rungId, connectionId) => {
+    if (readOnly) return;
     const newRungs = rungs.map(rung => {
       if (rung.id === rungId) {
         return {
@@ -353,10 +366,8 @@ const RungEditorNew = ({ variables, setVariables, rungs, setRungs, availableBloc
       return rung;
     });
     setRungs(newRungs);
-    saveHistory(newRungs);
-  }, [rungs, saveHistory]);
-
-
+    saveHistory(newRungs, variables);
+  }, [readOnly, rungs, variables, saveHistory]);
 
   // Helpers to Group Variables by Type
   const processVars = (vars, scope) => vars.map(v => ({ name: v.name, type: v.type, scope }));
@@ -398,25 +409,28 @@ const RungEditorNew = ({ variables, setVariables, rungs, setRungs, availableBloc
       </datalist>
 
       {/* TOOLBAR */}
-      <div style={{ background: '#252526', borderBottom: '1px solid #333', padding: '10px', display: 'flex', gap: '10px', alignItems: 'center' }}>
+      <div style={{ background: readOnly ? '#1a1a1a' : '#252526', borderBottom: '1px solid #333', padding: '6px 10px', display: 'flex', gap: '8px', alignItems: 'center' }}>
         <button
           onClick={addRung}
+          disabled={readOnly}
           style={{
-            background: '#2e7d32',
-            color: 'white',
+            background: readOnly ? '#444' : '#2e7d32',
+            color: readOnly ? '#888' : 'white',
             border: 'none',
-            padding: '8px 16px',
+            padding: '4px 8px',
+            fontSize: '12px',
             borderRadius: 4,
-            cursor: 'pointer',
+            cursor: readOnly ? 'default' : 'pointer',
             fontWeight: 'bold',
-            marginRight: '20px'
+            marginRight: '10px',
+            opacity: readOnly ? 0.5 : 1
           }}
         >
-          + Rung Ekle
+          + Rung
         </button>
 
         {/* Draggable Blocks */}
-        <div style={{ display: 'flex', gap: '10px', paddingLeft: '10px', borderLeft: '1px solid #444' }}>
+        <div style={{ display: 'flex', gap: '10px', paddingLeft: '10px', borderLeft: '1px solid #444', opacity: readOnly ? 0.4 : 1, pointerEvents: readOnly ? 'none' : 'auto' }}>
           <DraggableBlock
             type="Contact"
             label="Contact"
@@ -434,14 +448,13 @@ const RungEditorNew = ({ variables, setVariables, rungs, setRungs, availableBloc
             label="Coil"
             icon={
               <svg width="24" height="24" viewBox="0 0 40 40" stroke="currentColor" strokeWidth="2" fill="none">
-                <line x1="0" y1="20" x2="5" y2="20" />
-                <path d="M5,5 Q15,5 15,20 Q15,35 5,35" />
-                <path d="M35,5 Q25,5 25,20 Q25,35 35,35" />
-                <line x1="35" y1="20" x2="40" y2="20" />
+                <line x1="0" y1="20" x2="10" y2="20" />
+                <path d="M10,5 Q-5,20 10,35" />
+                <path d="M30,5 Q45,20 30,35" />
+                <line x1="30" y1="20" x2="40" y2="20" />
               </svg>
             }
           />
-
         </div>
 
         <div style={{ color: '#888', fontSize: 12, display: 'flex', alignItems: 'center', marginLeft: 'auto' }}>
@@ -471,6 +484,8 @@ const RungEditorNew = ({ variables, setVariables, rungs, setRungs, availableBloc
                 availableBlocks={availableBlocks}
                 variables={variables}
                 globalVars={globalVars}
+                liveVariables={liveVariables}
+                parentName={parentName}
               />
             </ErrorBoundary>
           ))}

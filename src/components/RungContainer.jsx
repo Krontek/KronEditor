@@ -199,50 +199,50 @@ const getSymbolPath = (type, subType) => {
       case 'Negated':
         return (
           <g stroke="currentColor" strokeWidth="2" fill="none">
-            <line x1="0" y1="20" x2="5" y2="20" />
-            <path d="M5,5 Q15,5 15,20 Q15,35 5,35" />
-            <path d="M35,5 Q25,5 25,20 Q25,35 35,35" />
-            <line x1="35" y1="20" x2="40" y2="20" />
+            <line x1="0" y1="20" x2="10" y2="20" />
+            <path d="M10,5 Q-5,20 10,35" />
+            <path d="M30,5 Q45,20 30,35" />
+            <line x1="30" y1="20" x2="40" y2="20" />
             <line x1="10" y1="30" x2="30" y2="10" />
           </g>
         );
       case 'Set':
         return (
           <g stroke="currentColor" strokeWidth="2" fill="none">
-            <line x1="0" y1="20" x2="5" y2="20" />
-            <path d="M5,5 Q15,5 15,20 Q15,35 5,35" />
-            <path d="M35,5 Q25,5 25,20 Q25,35 35,35" />
-            <line x1="35" y1="20" x2="40" y2="20" />
+            <line x1="0" y1="20" x2="10" y2="20" />
+            <path d="M10,5 Q-5,20 10,35" />
+            <path d="M30,5 Q45,20 30,35" />
+            <line x1="30" y1="20" x2="40" y2="20" />
             <text x="20" y="25" textAnchor="middle" fontSize="12" stroke="none" fill="currentColor">S</text>
           </g>
         );
       case 'Reset':
         return (
           <g stroke="currentColor" strokeWidth="2" fill="none">
-            <line x1="0" y1="20" x2="5" y2="20" />
-            <path d="M5,5 Q15,5 15,20 Q15,35 5,35" />
-            <path d="M35,5 Q25,5 25,20 Q25,35 35,35" />
-            <line x1="35" y1="20" x2="40" y2="20" />
+            <line x1="0" y1="20" x2="10" y2="20" />
+            <path d="M10,5 Q-5,20 10,35" />
+            <path d="M30,5 Q45,20 30,35" />
+            <line x1="30" y1="20" x2="40" y2="20" />
             <text x="20" y="25" textAnchor="middle" fontSize="12" stroke="none" fill="currentColor">R</text>
           </g>
         );
       case 'Rising':
         return (
           <g stroke="currentColor" strokeWidth="2" fill="none">
-            <line x1="0" y1="20" x2="5" y2="20" />
-            <path d="M5,5 Q15,5 15,20 Q15,35 5,35" />
-            <path d="M35,5 Q25,5 25,20 Q25,35 35,35" />
-            <line x1="35" y1="20" x2="40" y2="20" />
+            <line x1="0" y1="20" x2="10" y2="20" />
+            <path d="M10,5 Q-5,20 10,35" />
+            <path d="M30,5 Q45,20 30,35" />
+            <line x1="30" y1="20" x2="40" y2="20" />
             <text x="20" y="25" textAnchor="middle" fontSize="12" stroke="none" fill="currentColor">P</text>
           </g>
         );
       case 'Falling':
         return (
           <g stroke="currentColor" strokeWidth="2" fill="none">
-            <line x1="0" y1="20" x2="5" y2="20" />
-            <path d="M5,5 Q15,5 15,20 Q15,35 5,35" />
-            <path d="M35,5 Q25,5 25,20 Q25,35 35,35" />
-            <line x1="35" y1="20" x2="40" y2="20" />
+            <line x1="0" y1="20" x2="10" y2="20" />
+            <path d="M10,5 Q-5,20 10,35" />
+            <path d="M30,5 Q45,20 30,35" />
+            <line x1="30" y1="20" x2="40" y2="20" />
             <text x="20" y="25" textAnchor="middle" fontSize="12" stroke="none" fill="currentColor">N</text>
           </g>
         );
@@ -250,10 +250,10 @@ const getSymbolPath = (type, subType) => {
       default:
         return (
           <g stroke="currentColor" strokeWidth="2" fill="none">
-            <line x1="0" y1="20" x2="5" y2="20" />
-            <path d="M5,5 Q15,5 15,20 Q15,35 5,35" />
-            <path d="M35,5 Q25,5 25,20 Q25,35 35,35" />
-            <line x1="35" y1="20" x2="40" y2="20" />
+            <line x1="0" y1="20" x2="10" y2="20" />
+            <path d="M10,5 Q-5,20 10,35" />
+            <path d="M30,5 Q45,20 30,35" />
+            <line x1="30" y1="20" x2="40" y2="20" />
           </g>
         );
     }
@@ -265,7 +265,7 @@ const getSymbolPath = (type, subType) => {
 const BlockNode = ({ id, data, isConnectable, selected }) => {
   const { setNodes } = useReactFlow();
   const edges = useEdges();
-  const { variables = [], globalVars = [] } = data; // Receive vars from data context
+  const { variables = [], globalVars = [], liveVariables = null } = data; // Receive vars from data context
 
 
   // SAFE MODE GHOST RENDERING
@@ -391,11 +391,16 @@ const BlockNode = ({ id, data, isConnectable, selected }) => {
     }));
   }, [id, setNodes, data]);
 
-  // Contact ve Coil için Özel Render
   if (data.type === 'Contact' || data.type === 'Coil') {
     const subType = data.subType || (data.type === 'Contact' ? 'NO' : 'Normal');
     const symbol = getSymbolPath(data.type, subType);
     const instanceName = data.instanceName || (data.type === 'Contact' ? (data.values?.var || '') : (data.values?.coil || '')); // Default to empty string for placeholder
+
+    // LIVE VARIABLE CHECK
+    const liveVariables = data.liveVariables;
+    const safeProgName = (data.parentName || "").trim().replace(/\s+/g, '_');
+    const lookupKey = instanceName ? `prog_${safeProgName}_${instanceName.trim()}` : null;
+    const isLiveActive = liveVariables && lookupKey && liveVariables[lookupKey] !== undefined;
 
     const cycleType = (e) => {
       e.preventDefault();
@@ -429,6 +434,27 @@ const BlockNode = ({ id, data, isConnectable, selected }) => {
         ),
         borderRadius: 4
       }}>
+        {/* Live Variable Overlay for Online Mode */}
+        {isLiveActive && (
+          <div style={{
+            position: 'absolute',
+            top: -50,
+            left: '50%',
+            transform: 'translateX(-50%)',
+            background: liveVariables[lookupKey] ? '#00e676' : '#252526',
+            color: liveVariables[lookupKey] ? '#000' : '#888',
+            border: `1px solid ${liveVariables[lookupKey] ? '#00e676' : '#888'}`,
+            padding: '2px 6px',
+            borderRadius: 4,
+            fontSize: 10,
+            fontWeight: 'bold',
+            zIndex: 20,
+            pointerEvents: 'none',
+            whiteSpace: 'nowrap'
+          }}>
+            {liveVariables[lookupKey] ? 'TRUE' : 'FALSE'}
+          </div>
+        )}
         {/* Interactive Controls (Top) */}
         <div style={{
           position: 'absolute',
@@ -786,7 +812,9 @@ const RungContainer = ({
   onNodeDoubleClick,
   availableBlocks = [],
   variables = [],
-  globalVars = []
+  globalVars = [],
+  liveVariables = null,
+  parentName = ""
 }) => {
   const containerRef = useRef(null);
   const [containerWidth, setContainerWidth] = React.useState(800);
@@ -887,14 +915,16 @@ const RungContainer = ({
           values: block.data.values || {},
           onUpdate: (id, val) => onUpdateBlockRef.current(id, val),
           variables: variables, // Pass to node data
-          globalVars: globalVars // Pass to node data
+          globalVars: globalVars, // Pass to node data
+          liveVariables: liveVariables, // Pass online mode data mapping
+          parentName: parentName
         },
         draggable: true,
         selected: !!selectedMap[block.id],
         extent: [[bounds.minX, 0], [bounds.maxX, RUNG_HEIGHT]] // Fully relaxed Y constraint
       };
     });
-  }, [getBlockHeight, variables, globalVars]); // Added variables dependencies
+  }, [getBlockHeight, variables, globalVars, liveVariables, parentName]); // Added variables dependencies
 
   const [nodes, setNodes, onNodesChange] = useNodesState([
     ...createTerminalNodes(containerWidth),

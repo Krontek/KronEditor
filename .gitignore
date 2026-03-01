@@ -32,3 +32,4 @@ Releases/*
 bin/
 build/plc.h
 build/plc.c
+build/simulation

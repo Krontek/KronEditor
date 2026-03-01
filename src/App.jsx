@@ -103,23 +103,6 @@ function App() {
   const [isSimulationMode, setIsSimulationMode] = useState(false);
   const [isRunning, setIsRunning] = useState(false);
 
-  // LIVE VARIABLE TRACKER
-  const [liveVariables, setLiveVariables] = useState({});
-
-  useEffect(() => {
-    import('@tauri-apps/api/event').then(({ listen }) => {
-      const unlisten = listen('simulation-output', (event) => {
-        try {
-          const newVars = JSON.parse(event.payload);
-          setLiveVariables(newVars);
-        } catch (e) {
-          console.error("Failed to parse live vars:", e);
-        }
-      });
-      return () => unlisten.then(fn => fn());
-    });
-  }, []);
-
   // Persist settings
   useEffect(() => {
     localStorage.setItem('appTheme', theme);
@@ -138,15 +121,54 @@ function App() {
   });
   const [isResizing, setIsResizing] = useState(null); // 'left', 'right', 'console'
 
+  // Console Scroll Ref
+  const consoleEndRef = React.useRef(null);
+
   // Sahte Konsol Logları
   const [logs, setLogs] = useState([
-    { type: 'info', msg: 'PLC Editörü başlatıldı v2.1' },
-    { type: 'success', msg: 'Hazır.' }
+    { type: 'info', msg: 'System initialized.' },
+    { type: 'info', msg: 'Ready to map PLC project...' }
   ]);
+
+  // Auto-scroll Console
+  useEffect(() => {
+    if (consoleEndRef.current) {
+      consoleEndRef.current.scrollIntoView({ behavior: 'smooth' });
+    }
+  }, [logs]);
 
   const addLog = useCallback((type, msg) => {
     const time = new Date().toLocaleTimeString();
     setLogs(prev => [...prev, { type, msg: `[${time}] ${msg} ` }]);
+  }, []);
+
+  // --- Live Variable Listener ---
+  const [liveVariables, setLiveVariables] = useState({});
+
+  useEffect(() => {
+    let unlisten = null;
+    import('@tauri-apps/api/event').then(({ listen }) => {
+      listen('simulation-output', (event) => {
+        try {
+          const parsed = typeof event.payload === 'string' ? JSON.parse(event.payload) : event.payload;
+          if (parsed.vars) {
+            // Normal variable update from LLDB monitor
+            setLiveVariables(parsed.vars);
+          } else if (parsed.status === 'exited' || parsed.status === 'crashed') {
+            // Simulation process ended on its own
+            setIsRunning(false);
+            setLiveVariables({});
+            addLog('warning', `Simulation ${parsed.status}.`);
+          } else if (parsed.error) {
+            addLog('error', `Simulation: ${parsed.error}`);
+          }
+          // {"status": "started", "pid": N} is informational, no action needed
+        } catch (e) {
+          console.error("Failed to parse simulation output:", e, "Raw Payload:", event.payload);
+        }
+      }).then(f => unlisten = f);
+    });
+    return () => { if (unlisten) unlisten(); };
   }, []);
 
   // --- File Operations ---
@@ -282,15 +304,17 @@ function App() {
         const cCode = transpileToC(projectStructure, standardHeaders);
         const outPath = await invoke('write_plc_files', {
           header: cCode.header,
-          source: cCode.source
+          source: cCode.source,
+          variableTable: JSON.stringify(cCode.variableTable, null, 2)
         });
         addLog('success', `Transpiled C header and source successfully saved to ${outPath}`);
 
-        addLog('info', 'Compiling simulation executable with tcc...');
+        addLog('info', 'Compiling simulation executable with gcc (debug symbols)...');
         const exePath = await invoke('compile_simulation');
         addLog('success', `Simulation executable compiled: ${exePath}`);
 
         setIsSimulationMode(true);
+        setLiveVariables({}); // Initialize an empty object so the 'Live Value' column appears immediately
         addLog('info', 'Simulation Mode Enabled. Variables are now in Live Mode.');
 
       } catch (error) {
@@ -839,6 +863,7 @@ function App() {
                 onEditItem={handleEditItemDetails}
                 onSettingsClick={() => setActiveId('SETTINGS')}
                 onShortcutsClick={() => setShortcutsModalOpen(true)}
+                isRunning={isRunning}
               />
             </div>
 
@@ -889,9 +914,10 @@ function App() {
                           globalVars={projectStructure.resources.find(r => r.type === 'RESOURCE_EDITOR')?.content.globalVars || []}
                           projectStructure={projectStructure}
                           currentId={activeItem.id}
-                          libraryData={libraryData} // Pass Library Data
-                          liveVariables={isSimulationMode ? liveVariables : null}
+                          libraryData={libraryData}
+                          liveVariables={isSimulationMode ? (liveVariables || {}) : null}
                           parentName={activeItem.name}
+                          isRunning={isRunning}
                         />
                       )}
                     </div>
@@ -916,10 +942,11 @@ function App() {
                 </div>
                 <div style={{ flex: 1, overflowY: 'auto', padding: '5px', fontFamily: 'Consolas, monospace', fontSize: '12px' }}>
                   {logs.map((log, index) => (
-                    <div key={index} className={`log - line log - ${log.type} `}>
+                    <div key={index} className={`log-line log-${log.type}`}>
                       {log.msg}
                     </div>
                   ))}
+                  <div ref={consoleEndRef} />
                 </div>
               </div>
 

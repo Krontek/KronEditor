@@ -14,7 +14,10 @@ const EditorPane = ({
   globalVars = [],
   availableBlocks = [],
   availablePrograms = [],
-  projectStructure = null
+  projectStructure = null,
+  liveVariables = null,
+  parentName = "",
+  isRunning = false
 }) => {
   // --- STATE MANAGEMENT ---
   // We use separate state checks to ensure safety
@@ -151,12 +154,52 @@ const EditorPane = ({
         }
       });
       monacoInstance.editor.setModelMarkers(model, 'owner', markers);
+
+      // ONLINE MODE DECORATIONS (Codesys-style inline values)
+      if (liveVariables && window.stEditor) {
+        let decs = [];
+        const safeProgName = (parentName || "").trim().replace(/\s+/g, '_');
+
+        lines.forEach((line, i) => {
+          const regex = /\b[a-zA-Z_][a-zA-Z0-9_]*\b/g;
+          let match;
+          while ((match = regex.exec(line)) !== null) {
+            const word = match[0];
+            if (allVarNames.has(word)) {
+              // Try to find live value
+              const key = `prog_${safeProgName}_${word}`;
+              if (liveVariables[key] !== undefined) {
+                const val = liveVariables[key];
+                const displayStr = typeof val === 'boolean' ? (val ? 'TRUE' : 'FALSE') : String(val);
+
+                // Add inline decoration right after the variable
+                decs.push({
+                  range: new monacoInstance.Range(i + 1, match.index + 1 + word.length, i + 1, match.index + 1 + word.length),
+                  options: {
+                    after: {
+                      content: ` = ${displayStr}`,
+                      inlineClassName: `inline-live-var`,
+                      margin: '0 0 0 4px',
+                    }
+                  }
+                });
+              }
+            }
+          }
+        });
+
+        // Use standard deltaDecorations for standard monaco instance (store on editor to overwrite)
+        window.stEditor._liveDecs = window.stEditor.deltaDecorations(window.stEditor._liveDecs || [], decs);
+      } else if (window.stEditor && window.stEditor._liveDecs) {
+        // Clear if not in simulation
+        window.stEditor._liveDecs = window.stEditor.deltaDecorations(window.stEditor._liveDecs, []);
+      }
     };
 
     validate();
     const disposable = model.onDidChangeContent(validate);
     return () => disposable.dispose();
-  }, [variables, globalVars, code, fileType, monacoInstance]);
+  }, [variables, globalVars, code, fileType, monacoInstance, liveVariables, parentName]);
 
   // --- AUTOCOMPLETE PROVIDER ---
   useEffect(() => {
@@ -349,6 +392,8 @@ const EditorPane = ({
             globalVars={globalVars}
             derivedTypes={projectStructure?.dataTypes?.map(d => d.name) || []}
             userDefinedTypes={availableBlocks?.map(b => b.name) || []}
+            liveVariables={liveVariables}
+            disabled={isRunning}
           />
         </div>
       )}
@@ -362,6 +407,9 @@ const EditorPane = ({
             setRungs={setRungs}
             availableBlocks={availableBlocks}
             globalVars={globalVars}
+            liveVariables={liveVariables}
+            parentName={parentName}
+            readOnly={isRunning}
           />
         ) : fileType === 'ST' ? (
           <div
@@ -388,8 +436,8 @@ const EditorPane = ({
                 lineNumbers: 'on',
                 scrollBeyondLastLine: false,
                 automaticLayout: true,
-                readOnly: readOnly,
-                dnd: true
+                readOnly: readOnly || isRunning,
+                dnd: !isRunning
               }}
               onMount={handleEditorDidMount}
             />
@@ -405,6 +453,8 @@ const EditorPane = ({
             availablePrograms={availablePrograms}
             derivedTypes={projectStructure?.dataTypes?.map(d => d.name) || []}
             userDefinedTypes={availableBlocks?.map(b => b.name) || []}
+            liveVariables={liveVariables}
+            isRunning={isRunning}
           />
         ) : (
           <div style={{ padding: 20, color: '#aaa', textAlign: 'center' }}>

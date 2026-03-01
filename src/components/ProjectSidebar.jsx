@@ -3,7 +3,7 @@ import { useTranslation } from 'react-i18next';
 import { ask } from '@tauri-apps/plugin-dialog';
 import PlcIcon from '../assets/icons/plc-icon.png';
 
-const ProjectSidebar = ({ projectStructure, onSelectItem, activeId, onAddItem, onDeleteItem, onEditItem, onSettingsClick, onShortcutsClick }) => {
+const ProjectSidebar = ({ projectStructure, onSelectItem, activeId, onAddItem, onDeleteItem, onEditItem, onSettingsClick, onShortcutsClick, isRunning = false }) => {
     const { t } = useTranslation();
     const [expanded, setExpanded] = useState({
         dataTypes: true,
@@ -38,17 +38,19 @@ const ProjectSidebar = ({ projectStructure, onSelectItem, activeId, onAddItem, o
                     <button
                         onClick={(e) => {
                             e.stopPropagation();
-                            onAddItem(key);
+                            if (!isRunning) onAddItem(key);
                         }}
+                        disabled={isRunning}
                         style={{
                             background: 'none',
                             border: 'none',
-                            color: '#fff',
-                            cursor: 'pointer',
+                            color: isRunning ? '#666' : '#fff',
+                            cursor: isRunning ? 'not-allowed' : 'pointer',
                             fontSize: '14px',
-                            padding: '0 4px'
+                            padding: '0 4px',
+                            opacity: isRunning ? 0.4 : 1
                         }}
-                        title={t('actions.addNew')}
+                        title={isRunning ? 'Simülasyon çalışırken düzenleme yapılamaz' : t('actions.addNew')}
                     >
                         +
                     </button>
@@ -94,17 +96,18 @@ const ProjectSidebar = ({ projectStructure, onSelectItem, activeId, onAddItem, o
                                 <button
                                     onClick={(e) => {
                                         e.stopPropagation();
-                                        onEditItem && onEditItem(key, item.id);
+                                        if (!isRunning) onEditItem && onEditItem(key, item.id);
                                     }}
+                                    disabled={isRunning}
                                     style={{
                                         background: 'none',
                                         border: 'none',
                                         color: '#666',
-                                        cursor: 'pointer',
+                                        cursor: isRunning ? 'not-allowed' : 'pointer',
                                         fontSize: '12px',
-                                        opacity: activeId === item.id ? 1 : 0.5
+                                        opacity: isRunning ? 0.2 : activeId === item.id ? 1 : 0.5
                                     }}
-                                    title={t('actions.edit') || 'Edit'}
+                                    title={isRunning ? 'Simülasyon çalışırken düzenleme yapılamaz' : (t('actions.edit') || 'Edit')}
                                 >
                                     ✎
                                 </button>
@@ -113,6 +116,7 @@ const ProjectSidebar = ({ projectStructure, onSelectItem, activeId, onAddItem, o
                                 <button
                                     onClick={async (e) => {
                                         e.stopPropagation();
+                                        if (isRunning) return;
                                         const confirmed = await ask(`${t('common.delete')} ${item.name}?`, {
                                             title: t('common.delete') || 'Delete',
                                             type: 'warning'
@@ -121,15 +125,16 @@ const ProjectSidebar = ({ projectStructure, onSelectItem, activeId, onAddItem, o
                                             onDeleteItem(key, item.id);
                                         }
                                     }}
+                                    disabled={isRunning}
                                     style={{
                                         background: 'none',
                                         border: 'none',
                                         color: '#666',
-                                        cursor: 'pointer',
+                                        cursor: isRunning ? 'not-allowed' : 'pointer',
                                         fontSize: '12px',
-                                        opacity: activeId === item.id ? 1 : 0.5
+                                        opacity: isRunning ? 0.2 : activeId === item.id ? 1 : 0.5
                                     }}
-                                    title={t('common.delete')}
+                                    title={isRunning ? 'Simülasyon çalışırken düzenleme yapılamaz' : t('common.delete')}
                                 >
                                     🗑️
                                 </button>

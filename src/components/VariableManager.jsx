@@ -62,7 +62,20 @@ const EditableCell = ({ value, onCommit, placeholder = '' }) => {
   );
 };
 
-const VariableManager = ({ variables = [], onDelete, onUpdate, onAdd, allowedClasses = ALL_CLASSES, globalVars = [], derivedTypes = [], userDefinedTypes = [], liveVariables = null, parentName = "" }) => {
+const VariableManager = ({ variables = [], onDelete, onUpdate, onAdd, allowedClasses = ALL_CLASSES, globalVars = [], derivedTypes = [], userDefinedTypes = [], liveVariables = null, parentName = "", disabled = false }) => {
+  // Format a live value for display (handles booleans, objects, numbers)
+  const formatLiveValue = (val) => {
+    if (val === null || val === undefined) return '---';
+    if (typeof val === 'boolean') return val ? 'TRUE' : 'FALSE';
+    if (typeof val === 'object') {
+      // TON/TOF: show Q and ET
+      if ('Q' in val && 'ET' in val) return `Q=${val.Q ? 'T' : 'F'} ET=${val.ET}ms`;
+      // CTU: show Q and CV
+      if ('Q' in val && 'CV' in val) return `Q=${val.Q ? 'T' : 'F'} CV=${val.CV}`;
+      return JSON.stringify(val);
+    }
+    return String(val);
+  };
   const { t } = useTranslation();
   const [selectedId, setSelectedId] = useState(null);
 
@@ -123,8 +136,8 @@ const VariableManager = ({ variables = [], onDelete, onUpdate, onAdd, allowedCla
   // Helper to extract live value if available
   const getLiveValue = (varName) => {
     if (!liveVariables) return null;
-    const safeProgName = (parentName || "").replace(/\s+/g, '_');
-    const safeVarName = (varName || "").replace(/\s+/g, '_');
+    const safeProgName = (parentName || "").trim().replace(/\s+/g, '_');
+    const safeVarName = (varName || "").trim().replace(/\s+/g, '_');
     const key = `prog_${safeProgName}_${safeVarName}`;
     return liveVariables[key] !== undefined ? liveVariables[key] : null;
   };
@@ -150,15 +163,15 @@ const VariableManager = ({ variables = [], onDelete, onUpdate, onAdd, allowedCla
         <div style={{ display: 'flex', gap: '5px' }}>
           <button
             onClick={handleAddClick}
-            disabled={liveVariables !== null}
-            style={{ background: '#388E3C', border: 'none', color: 'white', padding: '2px 8px', fontSize: '11px', cursor: liveVariables ? 'not-allowed' : 'pointer', borderRadius: '3px', opacity: liveVariables ? 0.5 : 1 }}
+            disabled={disabled || liveVariables !== null}
+            style={{ background: '#388E3C', border: 'none', color: 'white', padding: '2px 8px', fontSize: '11px', cursor: (disabled || liveVariables) ? 'not-allowed' : 'pointer', borderRadius: '3px', opacity: (disabled || liveVariables) ? 0.5 : 1 }}
           >
             + {t('common.add')}
           </button>
           <button
             onClick={handleRemoveClick}
-            disabled={!selectedId || liveVariables !== null}
-            style={{ background: (!selectedId || liveVariables) ? '#555' : '#D32F2F', border: 'none', color: (!selectedId || liveVariables) ? '#aaa' : 'white', padding: '2px 8px', fontSize: '11px', cursor: (!selectedId || liveVariables) ? 'default' : 'pointer', borderRadius: '3px' }}
+            disabled={!selectedId || disabled || liveVariables !== null}
+            style={{ background: (!selectedId || disabled || liveVariables) ? '#555' : '#D32F2F', border: 'none', color: (!selectedId || disabled || liveVariables) ? '#aaa' : 'white', padding: '2px 8px', fontSize: '11px', cursor: (!selectedId || disabled || liveVariables) ? 'default' : 'pointer', borderRadius: '3px' }}
           >
             - {t('common.delete')}
           </button>
@@ -174,10 +187,8 @@ const VariableManager = ({ variables = [], onDelete, onUpdate, onAdd, allowedCla
               <th style={{ padding: '5px', borderBottom: '1px solid #444', minWidth: '80px' }}>{t('tables.class')}</th>
               <th style={{ padding: '5px', borderBottom: '1px solid #444', minWidth: '120px' }}>{t('tables.type')}</th>
               <th style={{ padding: '5px', borderBottom: '1px solid #444' }}>{t('tables.initialValue')}</th>
+              {liveVariables && <th style={{ padding: '5px', borderBottom: '1px solid #444', color: '#00e676' }}>Live Value</th>}
               <th style={{ padding: '5px', borderBottom: '1px solid #444' }}>{t('tables.description')}</th>
-              {liveVariables !== null && (
-                <th style={{ padding: '5px', borderBottom: '1px solid #444', color: '#00ff00' }}>Live Value</th>
-              )}
             </tr>
           </thead>
           <tbody>
@@ -198,20 +209,20 @@ const VariableManager = ({ variables = [], onDelete, onUpdate, onAdd, allowedCla
                   <td style={{ padding: '5px' }}>
                     <EditableCell
                       value={v.name}
-                      onCommit={(val) => !liveVariables && validateAndSaveName(v.id, val)}
+                      onCommit={(val) => !liveVariables && !disabled && validateAndSaveName(v.id, val)}
                     />
                   </td>
                   <td style={{ padding: '5px' }}>
                     <ModernSelect
                       value={v.class}
                       options={allowedClasses}
-                      onChange={(val) => !liveVariables && onUpdate && onUpdate(v.id, 'class', val)}
+                      onChange={(val) => !liveVariables && !disabled && onUpdate && onUpdate(v.id, 'class', val)}
                     />
                   </td>
                   <td style={{ padding: '5px' }}>
                     <DataTypeSelector
                       value={v.type}
-                      onChange={(newType) => !liveVariables && onUpdate && onUpdate(v.id, 'type', newType)}
+                      onChange={(newType) => !liveVariables && !disabled && onUpdate && onUpdate(v.id, 'type', newType)}
                       derivedTypes={derivedTypes}
                       userDefinedTypes={userDefinedTypes}
                     />
@@ -219,26 +230,26 @@ const VariableManager = ({ variables = [], onDelete, onUpdate, onAdd, allowedCla
                   <td style={{ padding: '5px' }}>
                     <EditableCell
                       value={v.initialValue}
-                      onCommit={(val) => !liveVariables && onUpdate && onUpdate(v.id, 'initialValue', val)}
+                      onCommit={(val) => !liveVariables && !disabled && onUpdate && onUpdate(v.id, 'initialValue', val)}
                     />
                   </td>
+                  {liveVariables && (
+                    <td style={{ padding: '5px', fontWeight: 'bold', color: isLive ? '#00e676' : '#888' }}>
+                      {isLive ? (typeof liveVal === 'boolean' ? (liveVal ? 'TRUE' : 'FALSE') : liveVal) : '---'}
+                    </td>
+                  )}
                   <td style={{ padding: '5px' }}>
                     <EditableCell
                       value={v.description}
-                      onCommit={(val) => !liveVariables && onUpdate && onUpdate(v.id, 'description', val)}
+                      onCommit={(val) => !liveVariables && !disabled && onUpdate && onUpdate(v.id, 'description', val)}
                     />
                   </td>
-                  {liveVariables !== null && (
-                    <td style={{ padding: '5px', color: isLive ? '#00ff00' : '#888', fontWeight: 'bold' }}>
-                      {isLive ? String(liveVal) : 'N/A'}
-                    </td>
-                  )}
                 </tr>
               )
             })}
             {variables.length === 0 && (
               <tr>
-                <td colSpan={liveVariables ? "6" : "5"} style={{ padding: '20px', textAlign: 'center', color: '#666' }}>
+                <td colSpan={liveVariables ? 6 : 5} style={{ padding: '20px', textAlign: 'center', color: '#666' }}>
                   {t('messages.empty')}
                 </td>
               </tr>
