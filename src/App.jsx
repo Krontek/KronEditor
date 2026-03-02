@@ -157,7 +157,6 @@ function App() {
           } else if (parsed.status === 'exited' || parsed.status === 'crashed') {
             // Simulation process ended on its own
             setIsRunning(false);
-            setLiveVariables({});
             addLog('warning', `Simulation ${parsed.status}.`);
           } else if (parsed.error) {
             addLog('error', `Simulation: ${parsed.error}`);
@@ -314,15 +313,33 @@ function App() {
         addLog('success', `Simulation executable compiled: ${exePath}`);
 
         setIsSimulationMode(true);
-        setLiveVariables({}); // Initialize an empty object so the 'Live Value' column appears immediately
-        addLog('info', 'Simulation Mode Enabled. Variables are now in Live Mode.');
 
+        // Load Default Initial Values
+        let initialLiveVars = {};
+        if (cCode.variableTable && cCode.variableTable.programs) {
+          Object.values(cCode.variableTable.programs).forEach(prog => {
+            if (prog.variables) {
+              Object.values(prog.variables).forEach(v => {
+                initialLiveVars[v.c_symbol] = v.initialValue;
+              });
+            }
+          });
+        }
+        if (cCode.variableTable && cCode.variableTable.globalVars) {
+          Object.entries(cCode.variableTable.globalVars).forEach(([name, v]) => {
+            initialLiveVars[name] = v.initialValue;
+          });
+        }
+
+        setLiveVariables(initialLiveVars);
+        addLog('info', 'Simulation Mode Enabled. Variables populated with default values.');
       } catch (error) {
         addLog('error', `Simulation Compilation Failed: ${error}`);
       }
     } else {
       setIsSimulationMode(false);
       addLog('info', 'Simulation Mode Disabled.');
+      setLiveVariables({});
     }
   };
 
@@ -354,7 +371,6 @@ function App() {
       if (isSimulationMode) {
         try {
           await invoke('stop_simulation');
-          setLiveVariables({}); // Clear old variables
         } catch (err) {
           addLog('error', `Failed to stop simulation: ${err}`);
         }
@@ -363,6 +379,15 @@ function App() {
       addLog('error', t('messages.plcStopped') || 'Execution Stopped.');
     }
   };
+
+  const handleForceWrite = useCallback(async (key, value) => {
+    if (!isRunning) return;
+    try {
+      await invoke('write_variable', { name: key, value: String(value) });
+    } catch (err) {
+      addLog('error', `Force write failed for '${key}': ${err}`);
+    }
+  }, [isRunning, addLog]);
 
   const handleBuild = () => {
     addLog('info', `Build started for target: ${plcTarget}...`);
@@ -863,7 +888,7 @@ function App() {
                 onEditItem={handleEditItemDetails}
                 onSettingsClick={() => setActiveId('SETTINGS')}
                 onShortcutsClick={() => setShortcutsModalOpen(true)}
-                isRunning={isRunning}
+                isRunning={isRunning || isSimulationMode}
               />
             </div>
 
@@ -891,11 +916,15 @@ function App() {
                   <ErrorBoundary>
                     <div style={{ flex: 1, position: 'relative', overflow: 'hidden' }}>
                       {activeItem.category === 'dataTypes' ? (
-                        <>
+                        <div style={{
+                          height: '100%',
+                          pointerEvents: (isRunning || isSimulationMode) ? 'none' : 'auto',
+                          opacity: (isRunning || isSimulationMode) ? 0.55 : 1
+                        }}>
                           {activeItem.type === 'Array' && <ArrayTypeEditor content={activeItem.content} onContentChange={handleContentChange} projectStructure={projectStructure} currentId={activeItem.id} derivedTypes={getAvailableDataTypes()} />}
                           {activeItem.type === 'Structure' && <StructureTypeEditor content={activeItem.content} onContentChange={handleContentChange} projectStructure={projectStructure} currentId={activeItem.id} derivedTypes={getAvailableDataTypes()} />}
                           {activeItem.type === 'Enumerated' && <EnumTypeEditor content={activeItem.content} onContentChange={handleContentChange} />}
-                        </>
+                        </div>
                       ) : (
                         <EditorPane
                           key={activeItem.id}
@@ -918,6 +947,8 @@ function App() {
                           liveVariables={isSimulationMode ? (liveVariables || {}) : null}
                           parentName={activeItem.name}
                           isRunning={isRunning}
+                          isSimulationMode={isSimulationMode}
+                          onForceWrite={isRunning ? handleForceWrite : null}
                         />
                       )}
                     </div>

@@ -1,5 +1,6 @@
 import React, { useState } from 'react';
 import { DataTypeSelector, ModernSelect } from './common/Selectors';
+import ForceWriteModal from './common/ForceWriteModal';
 import { useTranslation } from 'react-i18next';
 
 const ALL_CLASSES = ['Local', 'Global', 'Input', 'Output', 'InOut', 'Temp'];
@@ -9,43 +10,29 @@ const EditableCell = ({ value, onCommit, placeholder = '' }) => {
   const [localValue, setLocalValue] = useState(value);
   const [isEditing, setIsEditing] = useState(false);
 
-  // Sync local state when prop changes (if not editing to avoid overwriting typing)
   React.useEffect(() => {
-    if (!isEditing) {
-      setLocalValue(value);
-    }
+    if (!isEditing) setLocalValue(value);
   }, [value, isEditing]);
 
   const handleKeyDown = (e) => {
     if (e.key === 'Enter') {
       onCommit(localValue);
       setIsEditing(false);
-      e.target.blur(); // Remove focus
+      e.target.blur();
     } else if (e.key === 'Escape') {
-      setLocalValue(value); // Revert
+      setLocalValue(value);
       setIsEditing(false);
       e.target.blur();
     }
-  };
-
-  const handleBlur = () => {
-    // If Enter wasn't pressed, we revert to original value
-    setLocalValue(value);
-    setIsEditing(false);
-  };
-
-  const handleChange = (e) => {
-    setLocalValue(e.target.value);
-    setIsEditing(true);
   };
 
   return (
     <input
       type="text"
       value={localValue}
-      onChange={handleChange}
+      onChange={(e) => { setLocalValue(e.target.value); setIsEditing(true); }}
       onKeyDown={handleKeyDown}
-      onBlur={handleBlur}
+      onBlur={() => { if (isEditing) onCommit(localValue); setIsEditing(false); }}
       placeholder={placeholder}
       style={{
         background: 'transparent',
@@ -62,123 +49,111 @@ const EditableCell = ({ value, onCommit, placeholder = '' }) => {
   );
 };
 
-const VariableManager = ({ variables = [], onDelete, onUpdate, onAdd, allowedClasses = ALL_CLASSES, globalVars = [], derivedTypes = [], userDefinedTypes = [], liveVariables = null, parentName = "", disabled = false }) => {
-  // Format a live value for display (handles booleans, objects, numbers)
-  const formatLiveValue = (val) => {
+const VariableManager = ({
+  variables = [],
+  onDelete,
+  onUpdate,
+  onAdd,
+  allowedClasses = ALL_CLASSES,
+  globalVars = [],
+  derivedTypes = [],
+  userDefinedTypes = [],
+  liveVariables = null,
+  parentName = "",
+  disabled = false,
+  isSimulationMode = false,
+  onForceWrite = null
+}) => {
+  const { t } = useTranslation();
+  const [selectedId, setSelectedId] = useState(null);
+  const [forceModal, setForceModal] = useState(null); // { varName, varType, liveKey, liveVal }
+
+  // ── Handlers ──────────────────────────────────────────────────────────────
+
+  const handleAddClick = () => {
+    const existingNames = [...variables, ...globalVars].map(v => v.name);
+    let counter = 0;
+    while (existingNames.includes(`Var${counter}`)) counter++;
+    if (onAdd) onAdd({
+      id: Date.now(),
+      name: `Var${counter}`,
+      class: allowedClasses[0] || 'Local',
+      type: 'BOOL',
+      initialValue: '',
+      description: ''
+    });
+  };
+
+  const handleRemoveClick = () => {
+    if (selectedId && onDelete) { onDelete(selectedId); setSelectedId(null); }
+  };
+
+  const validateAndSaveName = (id, newName) => {
+    const trimmed = newName.trim();
+    if (!trimmed) return;
+    const currentVar = variables.find(v => v.id === id);
+    if (!currentVar || currentVar.name === trimmed) return;
+    if (variables.some(v => v.id !== id && v.name === trimmed) || globalVars.some(v => v.name === trimmed)) {
+      alert(`Variable name '${trimmed}' already exists in this scope!`);
+      return;
+    }
+    if (onUpdate) onUpdate(id, 'name', trimmed);
+  };
+
+  // ── Live value lookup ─────────────────────────────────────────────────────
+
+  /** Returns the correct liveVariables key for a variable name. */
+  const getLiveKey = (varName) => {
+    if (!liveVariables) return null;
+    const safeName    = (varName    || '').trim().replace(/\s+/g, '_');
+    const safeProgName = (parentName || '').trim().replace(/\s+/g, '_');
+    const progKey    = `prog_${safeProgName}_${safeName}`;
+    if (liveVariables[progKey] !== undefined) return progKey;
+    const globalKey  = `prog__${safeName}`;
+    if (liveVariables[globalKey] !== undefined) return globalKey;
+    return progKey; // default even if not found (shows ---)
+  };
+
+  const getLiveValue = (varName) => {
+    if (!liveVariables) return null;
+    const key = getLiveKey(varName);
+    return (key && liveVariables[key] !== undefined) ? liveVariables[key] : null;
+  };
+
+  const formatLiveDisplay = (val) => {
     if (val === null || val === undefined) return '---';
     if (typeof val === 'boolean') return val ? 'TRUE' : 'FALSE';
     if (typeof val === 'object') {
-      // TON/TOF: show Q and ET
       if ('Q' in val && 'ET' in val) return `Q=${val.Q ? 'T' : 'F'} ET=${val.ET}ms`;
-      // CTU: show Q and CV
       if ('Q' in val && 'CV' in val) return `Q=${val.Q ? 'T' : 'F'} CV=${val.CV}`;
       return JSON.stringify(val);
     }
     return String(val);
   };
-  const { t } = useTranslation();
-  const [selectedId, setSelectedId] = useState(null);
 
-  // ... (handlers same as before)
-  const handleAddClick = () => {
-    const existingNames = [...variables, ...globalVars].map(v => v.name);
-    let counter = 0;
-    while (existingNames.includes(`Var${counter}`)) {
-      counter++;
-    }
-    const newName = `Var${counter}`;
-
-    const newVar = {
-      id: Date.now(),
-      name: newName,
-      class: allowedClasses[0] || 'Local',
-      type: 'BOOL',
-      initialValue: '',
-      description: ''
-    };
-    if (onAdd) onAdd(newVar);
-  };
-
-  const handleRemoveClick = () => {
-    if (selectedId && onDelete) {
-      onDelete(selectedId);
-      setSelectedId(null);
-    }
-  };
-
-  const validateAndSaveName = (id, newName) => {
-    const trimmed = newName.trim();
-    if (!trimmed) {
-      // Revert if empty
-      return;
-    }
-
-    const currentVar = variables.find(v => v.id === id);
-    if (!currentVar) return; // Should not happen
-    if (currentVar.name === trimmed) return; // No change
-
-    // Check Local (exclude self)
-    const existsLocal = variables.some(v => v.id !== id && v.name === trimmed);
-    // Check Global
-    const existsGlobal = globalVars.some(v => v.name === trimmed);
-
-    if (existsLocal || existsGlobal) {
-      // Alert user
-      alert(`Variable name '${trimmed}' already exists in this scope!`);
-      // function ends, onUpdate is NOT called.
-      // EditableCell will exit edit mode, triggering useEffect to reset localValue to original 'value' prop.
-      return;
-    }
-
-    if (onUpdate) onUpdate(id, 'name', trimmed);
-  };
-
-  // Helper to extract live value if available
-  const getLiveValue = (varName) => {
-    if (!liveVariables) return null;
-    const safeProgName = (parentName || "").trim().replace(/\s+/g, '_');
-    const safeVarName = (varName || "").trim().replace(/\s+/g, '_');
-    const key = `prog_${safeProgName}_${safeVarName}`;
-    return liveVariables[key] !== undefined ? liveVariables[key] : null;
-  };
+  // ── Render ────────────────────────────────────────────────────────────────
 
   return (
-    <div style={{
-      height: '100%',
-      display: 'flex',
-      flexDirection: 'column',
-      background: '#252526',
-      borderBottom: '2px solid #007acc'
-    }}>
-      {/* ... (Header same as before) */}
-      <div style={{
-        padding: '5px 10px',
-        background: '#333',
-        display: 'flex',
-        justifyContent: 'space-between',
-        alignItems: 'center',
-        borderBottom: '1px solid #444'
-      }}>
+    <div style={{ height: '100%', display: 'flex', flexDirection: 'column', background: '#252526', borderBottom: '2px solid #007acc' }}>
+
+      {/* Header */}
+      <div style={{ padding: '5px 10px', background: '#333', display: 'flex', justifyContent: 'space-between', alignItems: 'center', borderBottom: '1px solid #444' }}>
         <span style={{ fontWeight: 'bold', color: '#fff', fontSize: '13px' }}>Variable Table</span>
         <div style={{ display: 'flex', gap: '5px' }}>
           <button
             onClick={handleAddClick}
-            disabled={disabled || liveVariables !== null}
-            style={{ background: '#388E3C', border: 'none', color: 'white', padding: '2px 8px', fontSize: '11px', cursor: (disabled || liveVariables) ? 'not-allowed' : 'pointer', borderRadius: '3px', opacity: (disabled || liveVariables) ? 0.5 : 1 }}
-          >
-            + {t('common.add')}
-          </button>
+            disabled={disabled || isSimulationMode}
+            style={{ background: '#388E3C', border: 'none', color: 'white', padding: '2px 8px', fontSize: '11px', cursor: (disabled || isSimulationMode) ? 'not-allowed' : 'pointer', borderRadius: '3px', opacity: (disabled || isSimulationMode) ? 0.5 : 1 }}
+          >+ {t('common.add')}</button>
           <button
             onClick={handleRemoveClick}
-            disabled={!selectedId || disabled || liveVariables !== null}
-            style={{ background: (!selectedId || disabled || liveVariables) ? '#555' : '#D32F2F', border: 'none', color: (!selectedId || disabled || liveVariables) ? '#aaa' : 'white', padding: '2px 8px', fontSize: '11px', cursor: (!selectedId || disabled || liveVariables) ? 'default' : 'pointer', borderRadius: '3px' }}
-          >
-            - {t('common.delete')}
-          </button>
+            disabled={!selectedId || disabled || isSimulationMode}
+            style={{ background: (!selectedId || disabled || isSimulationMode) ? '#555' : '#D32F2F', border: 'none', color: (!selectedId || disabled || isSimulationMode) ? '#aaa' : 'white', padding: '2px 8px', fontSize: '11px', cursor: (!selectedId || disabled || isSimulationMode) ? 'default' : 'pointer', borderRadius: '3px' }}
+          >- {t('common.delete')}</button>
         </div>
       </div>
 
-      {/* TABLO */}
+      {/* Table */}
       <div style={{ flex: 1, overflow: 'auto' }}>
         <table style={{ width: '100%', borderCollapse: 'collapse', color: '#ccc', fontSize: '11px', textAlign: 'left' }}>
           <thead style={{ background: '#1e1e1e', position: 'sticky', top: 0, zIndex: 10 }}>
@@ -187,65 +162,76 @@ const VariableManager = ({ variables = [], onDelete, onUpdate, onAdd, allowedCla
               <th style={{ padding: '5px', borderBottom: '1px solid #444', minWidth: '80px' }}>{t('tables.class')}</th>
               <th style={{ padding: '5px', borderBottom: '1px solid #444', minWidth: '120px' }}>{t('tables.type')}</th>
               <th style={{ padding: '5px', borderBottom: '1px solid #444' }}>{t('tables.initialValue')}</th>
-              {liveVariables && <th style={{ padding: '5px', borderBottom: '1px solid #444', color: '#00e676' }}>Live Value</th>}
+              {liveVariables && (
+                <th style={{ padding: '5px', borderBottom: '1px solid #444', color: '#00e676' }}>
+                  Live Value {onForceWrite && <span style={{ color: '#888', fontSize: 10, fontWeight: 'normal' }}>(click to set)</span>}
+                </th>
+              )}
               <th style={{ padding: '5px', borderBottom: '1px solid #444' }}>{t('tables.description')}</th>
             </tr>
           </thead>
           <tbody>
             {variables.map((v) => {
               const liveVal = getLiveValue(v.name);
-              const isLive = liveVal !== null;
+              const liveKey = getLiveKey(v.name);
+              const hasValue = liveVal !== null && liveVal !== undefined;
+              const canForce = !!onForceWrite && liveVariables;
 
               return (
                 <tr
                   key={v.id}
                   onClick={() => setSelectedId(v.id)}
-                  style={{
-                    borderBottom: '1px solid #333',
-                    background: selectedId === v.id ? '#0d47a1' : 'transparent',
-                    cursor: 'pointer'
-                  }}
+                  style={{ borderBottom: '1px solid #333', background: selectedId === v.id ? '#0d47a1' : 'transparent', cursor: 'pointer' }}
                 >
                   <td style={{ padding: '5px' }}>
-                    <EditableCell
-                      value={v.name}
-                      onCommit={(val) => !liveVariables && !disabled && validateAndSaveName(v.id, val)}
-                    />
+                    <EditableCell value={v.name} onCommit={(val) => !isSimulationMode && !disabled && validateAndSaveName(v.id, val)} />
                   </td>
                   <td style={{ padding: '5px' }}>
                     <ModernSelect
                       value={v.class}
                       options={allowedClasses}
-                      onChange={(val) => !liveVariables && !disabled && onUpdate && onUpdate(v.id, 'class', val)}
+                      onChange={(val) => !isSimulationMode && !disabled && onUpdate && onUpdate(v.id, 'class', val)}
                     />
                   </td>
                   <td style={{ padding: '5px' }}>
                     <DataTypeSelector
                       value={v.type}
-                      onChange={(newType) => !liveVariables && !disabled && onUpdate && onUpdate(v.id, 'type', newType)}
+                      onChange={(newType) => !isSimulationMode && !disabled && onUpdate && onUpdate(v.id, 'type', newType)}
                       derivedTypes={derivedTypes}
                       userDefinedTypes={userDefinedTypes}
                     />
                   </td>
                   <td style={{ padding: '5px' }}>
-                    <EditableCell
-                      value={v.initialValue}
-                      onCommit={(val) => !liveVariables && !disabled && onUpdate && onUpdate(v.id, 'initialValue', val)}
-                    />
+                    <EditableCell value={v.initialValue} onCommit={(val) => !disabled && onUpdate && onUpdate(v.id, 'initialValue', val)} />
                   </td>
                   {liveVariables && (
-                    <td style={{ padding: '5px', fontWeight: 'bold', color: isLive ? '#00e676' : '#888' }}>
-                      {isLive ? (typeof liveVal === 'boolean' ? (liveVal ? 'TRUE' : 'FALSE') : liveVal) : '---'}
+                    <td
+                      style={{ padding: '5px', cursor: canForce ? 'pointer' : 'default' }}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        if (canForce) setForceModal({ varName: v.name, varType: v.type, liveKey, liveVal });
+                      }}
+                      title={canForce ? 'Click to force-write value' : ''}
+                    >
+                      <span style={{
+                        color: hasValue ? '#00e676' : '#555',
+                        fontWeight: 'bold',
+                        fontFamily: 'Consolas, monospace',
+                        padding: '1px 6px',
+                        borderRadius: 3,
+                        background: canForce && hasValue ? 'rgba(0,230,118,0.08)' : 'transparent',
+                        border: canForce ? `1px solid ${hasValue ? 'rgba(0,230,118,0.25)' : '#333'}` : 'none',
+                        display: 'inline-block'
+                      }}>
+                        {formatLiveDisplay(liveVal)}
+                      </span>
                     </td>
                   )}
                   <td style={{ padding: '5px' }}>
-                    <EditableCell
-                      value={v.description}
-                      onCommit={(val) => !liveVariables && !disabled && onUpdate && onUpdate(v.id, 'description', val)}
-                    />
+                    <EditableCell value={v.description} onCommit={(val) => !disabled && onUpdate && onUpdate(v.id, 'description', val)} />
                   </td>
                 </tr>
-              )
+              );
             })}
             {variables.length === 0 && (
               <tr>
@@ -257,6 +243,19 @@ const VariableManager = ({ variables = [], onDelete, onUpdate, onAdd, allowedCla
           </tbody>
         </table>
       </div>
+
+      {/* Force Write Modal */}
+      {forceModal && (
+        <ForceWriteModal
+          isOpen={true}
+          onClose={() => setForceModal(null)}
+          varName={forceModal.varName}
+          varType={forceModal.varType}
+          currentValue={forceModal.liveVal}
+          liveKey={forceModal.liveKey}
+          onConfirm={(key, val) => { onForceWrite && onForceWrite(key, val); }}
+        />
+      )}
     </div>
   );
 };

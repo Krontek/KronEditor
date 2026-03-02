@@ -5,6 +5,24 @@ const DraggableBlock = ({ type, label, icon }) => {
         event.dataTransfer.setData('application/reactflow', nodeType);
         event.dataTransfer.setData('blockType', nodeType);
         event.dataTransfer.effectAllowed = 'move';
+
+        // Add a smaller, proportionally accurate drag ghost
+        const ghostContainer = document.createElement("div");
+        ghostContainer.style.width = "18px";
+        ghostContainer.style.height = "18px";
+        ghostContainer.style.border = "2px solid #007acc";
+        ghostContainer.style.background = "rgba(255, 255, 255, 0.1)";
+        ghostContainer.style.position = "absolute";
+        ghostContainer.style.top = "-1000px";
+        document.body.appendChild(ghostContainer);
+        event.dataTransfer.setDragImage(ghostContainer, 9, 9);
+
+        // Cleanup function for ghost element after a slight delay
+        setTimeout(() => {
+            if (document.body.contains(ghostContainer)) {
+                document.body.removeChild(ghostContainer);
+            }
+        }, 100);
     };
 
     return (

@@ -1,4 +1,5 @@
 import React, { useState, useCallback, useRef, useEffect } from 'react';
+import ForceWriteModal from './common/ForceWriteModal';
 import ReactFlow, {
   ReactFlowProvider,
   addEdge,
@@ -267,6 +268,24 @@ const BlockNode = ({ id, data, isConnectable, selected }) => {
   const edges = useEdges();
   const { variables = [], globalVars = [], liveVariables = null } = data; // Receive vars from data context
 
+  // LOCAL STATE to prevent cursor jumping due to async prop updates
+  const [localInstanceName, setLocalInstanceName] = useState(
+    data.instanceName || (data.type === 'Contact' ? (data.values?.var || '') : (data.values?.coil || ''))
+  );
+
+  React.useEffect(() => {
+    setLocalInstanceName(
+      data.instanceName || (data.type === 'Contact' ? (data.values?.var || '') : (data.values?.coil || ''))
+    );
+  }, [data.instanceName, data.type, data.values?.var, data.values?.coil]);
+
+  const [localPinValues, setLocalPinValues] = useState(data.values || {});
+  const [forceModal, setForceModal] = useState(false);
+
+  React.useEffect(() => {
+    setLocalPinValues(data.values || {});
+  }, [data.values]);
+
 
   // SAFE MODE GHOST RENDERING
   // Renders a pure visual copy without inputs/handles to prevent logic errors during drag
@@ -280,7 +299,7 @@ const BlockNode = ({ id, data, isConnectable, selected }) => {
       // Visual Clone of Contact/Coil
       return (
         <div style={{
-          position: 'relative', width: 24, height: 24, minWidth: 24, minHeight: 24,
+          position: 'relative', width: 18, height: 18, minWidth: 18, minHeight: 18,
           display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center',
           background: 'rgba(255, 255, 255, 0.05)', // Match real block
           border: '1px solid transparent', // Match real block when not selected
@@ -299,7 +318,7 @@ const BlockNode = ({ id, data, isConnectable, selected }) => {
               {instanceName || '??'}
             </div>
           </div>
-          <svg width="24" height="24" viewBox="0 0 40 40" style={{ color: '#fff', overflow: 'visible' }}>{symbol}</svg>
+          <svg width="18" height="18" viewBox="0 0 40 40" style={{ color: '#fff', overflow: 'visible' }}>{symbol}</svg>
         </div>
       );
     }
@@ -399,12 +418,26 @@ const BlockNode = ({ id, data, isConnectable, selected }) => {
     // LIVE VARIABLE CHECK
     const liveVariables = data.liveVariables;
     const safeProgName = (data.parentName || "").trim().replace(/\s+/g, '_');
-    const lookupKey = instanceName ? `prog_${safeProgName}_${instanceName.trim()}` : null;
+    const safeName = instanceName ? instanceName.trim() : '';
+    let lookupKey = null;
+    if (liveVariables && safeName) {
+      const progKey = `prog_${safeProgName}_${safeName}`;
+      if (liveVariables[progKey] !== undefined) {
+        lookupKey = progKey;
+      } else {
+        const globalKey = `prog__${safeName}`;
+        lookupKey = liveVariables[globalKey] !== undefined ? globalKey : progKey;
+      }
+    }
     const isLiveActive = liveVariables && lookupKey && liveVariables[lookupKey] !== undefined;
+    const canForce = !!data.onForceWrite && isLiveActive;
+    const varDef = [...variables, ...globalVars].find(v => v.name === instanceName);
+    const varType = varDef?.type || 'BOOL';
 
     const cycleType = (e) => {
       e.preventDefault();
       e.stopPropagation();
+      if (data.readOnly) return;
       const contactTypes = ['NO', 'NC', 'Rising', 'Falling'];
       const coilTypes = ['Normal', 'Negated', 'Set', 'Reset', 'Rising', 'Falling'];
       const types = data.type === 'Contact' ? contactTypes : coilTypes;
@@ -416,10 +449,10 @@ const BlockNode = ({ id, data, isConnectable, selected }) => {
     return (
       <div style={{
         position: 'relative',
-        width: 24,
-        height: 24,
-        minWidth: 24, // Explicit min width
-        minHeight: 24, // Explicit min height
+        width: 18,
+        height: 18,
+        minWidth: 18, // Explicit min width
+        minHeight: 18, // Explicit min height
         display: 'flex',
         flexDirection: 'column',
         alignItems: 'center',
@@ -436,22 +469,27 @@ const BlockNode = ({ id, data, isConnectable, selected }) => {
       }}>
         {/* Live Variable Overlay for Online Mode */}
         {isLiveActive && (
-          <div style={{
-            position: 'absolute',
-            top: -50,
-            left: '50%',
-            transform: 'translateX(-50%)',
-            background: liveVariables[lookupKey] ? '#00e676' : '#252526',
-            color: liveVariables[lookupKey] ? '#000' : '#888',
-            border: `1px solid ${liveVariables[lookupKey] ? '#00e676' : '#888'}`,
-            padding: '2px 6px',
-            borderRadius: 4,
-            fontSize: 10,
-            fontWeight: 'bold',
-            zIndex: 20,
-            pointerEvents: 'none',
-            whiteSpace: 'nowrap'
-          }}>
+          <div
+            className="nodrag"
+            onClick={(e) => { e.stopPropagation(); if (canForce) setForceModal(true); }}
+            title={canForce ? 'Click to force-write value' : ''}
+            style={{
+              position: 'absolute',
+              top: -50,
+              left: '50%',
+              transform: 'translateX(-50%)',
+              background: liveVariables[lookupKey] ? '#00e676' : '#252526',
+              color: liveVariables[lookupKey] ? '#000' : '#888',
+              border: `1px solid ${liveVariables[lookupKey] ? '#00e676' : '#888'}`,
+              padding: '2px 6px',
+              borderRadius: 4,
+              fontSize: 10,
+              fontWeight: 'bold',
+              zIndex: 20,
+              cursor: canForce ? 'pointer' : 'default',
+              whiteSpace: 'nowrap'
+            }}
+          >
             {liveVariables[lookupKey] ? 'TRUE' : 'FALSE'}
           </div>
         )}
@@ -469,12 +507,16 @@ const BlockNode = ({ id, data, isConnectable, selected }) => {
           {/* Variable Input */}
           <input
             className="nodrag"
-            value={instanceName}
+            value={localInstanceName}
+            readOnly={!!data.readOnly}
             onChange={(e) => {
-              const val = e.target.value.replace(/[🌍🏠]/g, '').trim();
+              if (data.readOnly) return;
+              const rawValue = e.target.value;
+              setLocalInstanceName(rawValue);
+              const val = rawValue.replace(/[🌍🏠]/g, '').trim();
               handleUpdate({ instanceName: val });
             }}
-            list="ladder-vars-BOOL"
+            list={data.readOnly ? undefined : "ladder-vars-BOOL"}
             placeholder="??"
             style={{
               width: 80,
@@ -505,7 +547,7 @@ const BlockNode = ({ id, data, isConnectable, selected }) => {
               display: 'flex',
               alignItems: 'center',
               justifyContent: 'center',
-              minWidth: 24,
+              minWidth: 18,
               userSelect: 'none'
             }}
             title={`Current Type: ${subType}. Click to change.`}
@@ -515,7 +557,7 @@ const BlockNode = ({ id, data, isConnectable, selected }) => {
         </div>
 
         {/* SVG Symbol */}
-        <svg width="24" height="24" viewBox="0 0 40 40" style={{ color: selected ? '#007acc' : '#fff', overflow: 'visible' }}>
+        <svg width="18" height="18" viewBox="0 0 40 40" style={{ color: selected ? '#007acc' : '#fff', overflow: 'visible' }}>
           {symbol}
         </svg>
 
@@ -554,6 +596,17 @@ const BlockNode = ({ id, data, isConnectable, selected }) => {
             zIndex: 5
           }}
         />
+        {forceModal && (
+          <ForceWriteModal
+            isOpen={true}
+            onClose={() => setForceModal(false)}
+            varName={instanceName}
+            varType={varType}
+            currentValue={liveVariables?.[lookupKey]}
+            liveKey={lookupKey}
+            onConfirm={(key, val) => { data.onForceWrite && data.onForceWrite(key, val); }}
+          />
+        )}
       </div>
     );
   }
@@ -697,12 +750,16 @@ const BlockNode = ({ id, data, isConnectable, selected }) => {
                   <input
                     type="text"
                     className="nodrag"
-                    value={val}
-                    list={pin.type === 'ANY' ? "ladder-vars-ANY" : `ladder-vars-${pin.type}`}
+                    value={localPinValues[pin.name] !== undefined ? localPinValues[pin.name] : (val || '')}
+                    list={data.readOnly ? undefined : (pin.type === 'ANY' ? "ladder-vars-ANY" : `ladder-vars-${pin.type}`)}
+                    readOnly={!!data.readOnly}
                     onDoubleClick={(e) => e.stopPropagation()}
                     onChange={(e) => {
-                      // Strip emojis coming from autocomplete suggestions (globally and trim)
+                      if (data.readOnly) return;
                       const rawValue = e.target.value;
+                      setLocalPinValues(prev => ({ ...prev, [pin.name]: rawValue }));
+
+                      // Strip emojis coming from autocomplete suggestions (globally and trim)
                       const newValue = rawValue.replace(/[🌍🏠]/g, '').trim();
 
                       if (isTime && !TIME_CHAR_REGEX.test(newValue)) return;
@@ -814,7 +871,9 @@ const RungContainer = ({
   variables = [],
   globalVars = [],
   liveVariables = null,
-  parentName = ""
+  parentName = "",
+  readOnly = false,
+  onForceWrite = null
 }) => {
   const containerRef = useRef(null);
   const [containerWidth, setContainerWidth] = React.useState(800);
@@ -852,7 +911,7 @@ const RungContainer = ({
 
   // Helper to calculate block height
   const getBlockHeight = useCallback((type) => {
-    if (type === 'Contact' || type === 'Coil') return 24;
+    if (type === 'Contact' || type === 'Coil') return 18;
     const config = blockConfig[type];
     if (!config) return 100;
     const rows = Math.max(config.inputs.length, config.outputs.length);
@@ -914,17 +973,19 @@ const RungContainer = ({
           type: block.data.label || block.type,
           values: block.data.values || {},
           onUpdate: (id, val) => onUpdateBlockRef.current(id, val),
+          onForceWrite: (key, val) => onForceWriteRef.current?.(key, val),
           variables: variables, // Pass to node data
           globalVars: globalVars, // Pass to node data
           liveVariables: liveVariables, // Pass online mode data mapping
-          parentName: parentName
+          parentName: parentName,
+          readOnly: readOnly
         },
-        draggable: true,
+        draggable: !readOnly,
         selected: !!selectedMap[block.id],
         extent: [[bounds.minX, 0], [bounds.maxX, RUNG_HEIGHT]] // Fully relaxed Y constraint
       };
     });
-  }, [getBlockHeight, variables, globalVars, liveVariables, parentName]); // Added variables dependencies
+  }, [getBlockHeight, variables, globalVars, liveVariables, parentName, readOnly]); // Added variables dependencies
 
   const [nodes, setNodes, onNodesChange] = useNodesState([
     ...createTerminalNodes(containerWidth),
@@ -963,6 +1024,11 @@ const RungContainer = ({
   React.useEffect(() => {
     onUpdateBlockRef.current = onUpdateBlock;
   }, [onUpdateBlock]);
+
+  const onForceWriteRef = useRef(onForceWrite);
+  React.useEffect(() => {
+    onForceWriteRef.current = onForceWrite;
+  }, [onForceWrite]);
 
   // Rung.blocks değişince nodes'u güncelle
   React.useEffect(() => {
@@ -1140,6 +1206,8 @@ const RungContainer = ({
 
   const onDrop = useCallback((event) => {
     event.preventDefault();
+
+    if (readOnly) { DragDropManager.clear(); return; }
 
     // Use DragDropManager instead of dataTransfer.getData
     const dragData = DragDropManager.getDragData();
@@ -1486,10 +1554,10 @@ const RungContainer = ({
           edgesUpdatable={true}
           edgesFocusable={true}
           edgesSelectable={true}
-          nodesDraggable={true}
-          nodesConnectable={true}
+          nodesDraggable={!readOnly}
+          nodesConnectable={!readOnly}
           nodesSelectable={true}
-          deleteKeyCode={['Backspace', 'Delete']}
+          deleteKeyCode={readOnly ? null : ['Backspace', 'Delete']}
           multiSelectionKeyCode={['Meta', 'Ctrl']}
           defaultViewport={{ x: 0, y: 0, zoom: 1 }}
         />

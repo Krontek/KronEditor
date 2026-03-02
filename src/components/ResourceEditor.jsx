@@ -2,7 +2,7 @@ import React from 'react';
 import VariableManager from './VariableManager';
 import { useTranslation } from 'react-i18next';
 
-const ResourceEditor = ({ content, onContentChange, availablePrograms = [], derivedTypes = [], userDefinedTypes = [], liveVariables = null, isRunning = false }) => {
+const ResourceEditor = ({ content, onContentChange, availablePrograms = [], derivedTypes = [], userDefinedTypes = [], liveVariables = null, isRunning = false, isSimulationMode = false, onForceWrite = null }) => {
     const { t } = useTranslation();
 
     const handleDeleteVar = (id) => {
@@ -52,6 +52,8 @@ const ResourceEditor = ({ content, onContentChange, availablePrograms = [], deri
                         userDefinedTypes={userDefinedTypes}
                         liveVariables={liveVariables}
                         disabled={isRunning}
+                        isSimulationMode={isSimulationMode}
+                        onForceWrite={onForceWrite}
                     />
                 </div>
             </div>

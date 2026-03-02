@@ -11,7 +11,7 @@ import DraggableBlock from './DraggableBlock';
  * - Rung hareket ederken, içindeki her şey beraber hareket ediyor
  */
 
-const RungEditorNew = ({ variables, setVariables, rungs, setRungs, availableBlocks, globalVars = [], liveVariables = null, parentName = "", readOnly = false }) => {
+const RungEditorNew = ({ variables, setVariables, rungs, setRungs, availableBlocks, globalVars = [], liveVariables = null, parentName = "", readOnly = false, onForceWrite = null }) => {
 
   // Undo/Redo history - her snapshot { rungs, variables } çiftini saklıyor
   const historyRef = useRef([{
@@ -435,7 +435,7 @@ const RungEditorNew = ({ variables, setVariables, rungs, setRungs, availableBloc
             type="Contact"
             label="Contact"
             icon={
-              <svg width="24" height="24" viewBox="0 0 40 40" stroke="currentColor" strokeWidth="2" fill="none">
+              <svg width="15" height="15" viewBox="0 0 40 40" stroke="currentColor" strokeWidth="2" fill="none">
                 <line x1="0" y1="20" x2="10" y2="20" />
                 <line x1="10" y1="5" x2="10" y2="35" />
                 <line x1="30" y1="5" x2="30" y2="35" />
@@ -447,10 +447,10 @@ const RungEditorNew = ({ variables, setVariables, rungs, setRungs, availableBloc
             type="Coil"
             label="Coil"
             icon={
-              <svg width="24" height="24" viewBox="0 0 40 40" stroke="currentColor" strokeWidth="2" fill="none">
+              <svg width="15" height="15" viewBox="0 0 40 40" stroke="currentColor" strokeWidth="2" fill="none">
                 <line x1="0" y1="20" x2="10" y2="20" />
-                <path d="M10,5 Q-5,20 10,35" />
-                <path d="M30,5 Q45,20 30,35" />
+                <path d="M10,5 Q2,20 10,35" />
+                <path d="M30,5 Q38,20 30,35" />
                 <line x1="30" y1="20" x2="40" y2="20" />
               </svg>
             }
@@ -486,6 +486,8 @@ const RungEditorNew = ({ variables, setVariables, rungs, setRungs, availableBloc
                 globalVars={globalVars}
                 liveVariables={liveVariables}
                 parentName={parentName}
+                readOnly={readOnly}
+                onForceWrite={onForceWrite}
               />
             </ErrorBoundary>
           ))}
