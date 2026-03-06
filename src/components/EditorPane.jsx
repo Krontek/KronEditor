@@ -574,9 +574,51 @@ const EditorPane = ({
     if (window.stHandleDropClean) window.stHandleDropClean();
 
     const dragData = DragDropManager.getDragData();
-    const snippet = dragData ? dragData.stSnippet : e.dataTransfer.getData('stSnippet');
+    let snippet = dragData ? dragData.stSnippet : e.dataTransfer.getData('stSnippet');
 
     if (snippet && window.stEditor) {
+      if (dragData && dragData.type === 'blockNode' && dragData.instanceNamePattern) {
+        // Variables are only required for Function Blocks, not standard Functions (which have return types)
+        const isFunction = dragData.customData && (dragData.customData.returnType || dragData.customData.type === 'functions' || dragData.customData.class === 'Function');
+        const isContactOrCoil = dragData.blockType === 'Contact' || dragData.blockType === 'Coil';
+
+        if (!isFunction && !isContactOrCoil) {
+          const rawBaseName = dragData.instanceNamePattern.replace(/[0-9]+$/, '');
+          const baseName = rawBaseName.trim().replace(/\s+/g, '_');
+          let index = 0;
+          let newName = '';
+          const allVars = [...variablesRef.current, ...globalVarsRef.current];
+
+          while (true) {
+            const candidate = `${baseName}${index}`;
+            if (!allVars.some(v => v.name === candidate)) {
+              newName = candidate;
+              break;
+            }
+            index++;
+            if (index > 1000) break;
+          }
+
+          // Replace the hardcoded instance name in the snippet with the safe newName
+          const hardcodedName = `${rawBaseName}0`;
+          if (snippet.startsWith(hardcodedName)) {
+            snippet = newName + snippet.substring(hardcodedName.length);
+          }
+
+          // Add the matched variable to local variables
+          const newVar = {
+            id: `st_fb_inst_${Date.now()}`,
+            name: newName,
+            class: 'Local',
+            type: dragData.customData?.name || dragData.blockType,
+            location: '',
+            initialValue: '',
+            description: 'FB Instance'
+          };
+          handleAddVar(newVar);
+        }
+      }
+
       const editor = window.stEditor;
       const position = editor.getTargetAtClientPoint(e.clientX, e.clientY)?.position;
 
@@ -634,7 +676,7 @@ const EditorPane = ({
             onUpdate={handleUpdateVar}
             allowedClasses={allowedClasses}
             globalVars={globalVars}
-            derivedTypes={projectStructure?.dataTypes?.map(d => d.name) || []}
+            derivedTypes={projectStructure?.dataTypes || []}
             userDefinedTypes={availableBlocks || []}
             liveVariables={liveVariables}
             parentName={parentName}
@@ -718,7 +760,7 @@ const EditorPane = ({
               setInstances(newContent.instances || []);
             }}
             availablePrograms={availablePrograms}
-            derivedTypes={projectStructure?.dataTypes?.map(d => d.name) || []}
+            derivedTypes={projectStructure?.dataTypes || []}
             userDefinedTypes={availableBlocks || []}
             liveVariables={liveVariables}
             isRunning={isRunning}

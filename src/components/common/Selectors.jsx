@@ -9,17 +9,58 @@ export const ELEMENTARY_TYPES = [
 ];
 
 export const STD_BLOCK_TYPES = [
-    { name: 'TON', category: 'Standard / Timers' },
-    { name: 'TOF', category: 'Standard / Timers' },
-    { name: 'TP', category: 'Standard / Timers' },
-    { name: 'TONR', category: 'Standard / Timers' },
-    { name: 'R_TRIG', category: 'Standard / Triggers' },
-    { name: 'F_TRIG', category: 'Standard / Triggers' },
-    { name: 'CTU', category: 'Standard / Counters' },
-    { name: 'CTD', category: 'Standard / Counters' },
-    { name: 'CTUD', category: 'Standard / Counters' },
-    { name: 'SR', category: 'Standard / Bistables' },
-    { name: 'RS', category: 'Standard / Bistables' }
+    // Standard Function Blocks
+    { name: 'TON', category: 'Standard Function Blocks / Timers' },
+    { name: 'TOF', category: 'Standard Function Blocks / Timers' },
+    { name: 'TP', category: 'Standard Function Blocks / Timers' },
+    { name: 'TONR', category: 'Standard Function Blocks / Timers' },
+    { name: 'CTU', category: 'Standard Function Blocks / Counters' },
+    { name: 'CTD', category: 'Standard Function Blocks / Counters' },
+    { name: 'CTUD', category: 'Standard Function Blocks / Counters' },
+
+    // Bit Logic Operations
+    { name: 'R_TRIG', category: 'Bit Logic Operations / Edge Detectors' },
+    { name: 'F_TRIG', category: 'Bit Logic Operations / Edge Detectors' },
+    { name: 'SR', category: 'Bit Logic Operations / Bistables' },
+    { name: 'RS', category: 'Bit Logic Operations / Bistables' },
+    { name: 'BAND', category: 'Bit Logic Operations / Bitwise Operations' },
+    { name: 'BOR', category: 'Bit Logic Operations / Bitwise Operations' },
+    { name: 'BXOR', category: 'Bit Logic Operations / Bitwise Operations' },
+    { name: 'BNOT', category: 'Bit Logic Operations / Bitwise Operations' },
+    { name: 'SHL', category: 'Bit Logic Operations / Bitwise Operations' },
+    { name: 'SHR', category: 'Bit Logic Operations / Bitwise Operations' },
+    { name: 'ROL', category: 'Bit Logic Operations / Bitwise Operations' },
+    { name: 'ROR', category: 'Bit Logic Operations / Bitwise Operations' },
+
+    // Mathematical Functions
+    { name: 'ADD', category: 'Mathematical Functions / Basic Math' },
+    { name: 'SUB', category: 'Mathematical Functions / Basic Math' },
+    { name: 'MUL', category: 'Mathematical Functions / Basic Math' },
+    { name: 'DIV', category: 'Mathematical Functions / Basic Math' },
+    { name: 'MOD', category: 'Mathematical Functions / Basic Math' },
+    { name: 'MOVE', category: 'Mathematical Functions / Basic Math' },
+    { name: 'ABS', category: 'Mathematical Functions / Floating Point' },
+    { name: 'SQRT', category: 'Mathematical Functions / Floating Point' },
+    { name: 'EXPT', category: 'Mathematical Functions / Floating Point' },
+    { name: 'SIN', category: 'Mathematical Functions / Trigonometry' },
+    { name: 'COS', category: 'Mathematical Functions / Trigonometry' },
+    { name: 'TAN', category: 'Mathematical Functions / Trigonometry' },
+    { name: 'ASIN', category: 'Mathematical Functions / Trigonometry' },
+    { name: 'ACOS', category: 'Mathematical Functions / Trigonometry' },
+    { name: 'ATAN', category: 'Mathematical Functions / Trigonometry' },
+
+    // Comparison & Selection
+    { name: 'GT', category: 'Comparison & Selection / Comparison' },
+    { name: 'GE', category: 'Comparison & Selection / Comparison' },
+    { name: 'EQ', category: 'Comparison & Selection / Comparison' },
+    { name: 'NE', category: 'Comparison & Selection / Comparison' },
+    { name: 'LE', category: 'Comparison & Selection / Comparison' },
+    { name: 'LT', category: 'Comparison & Selection / Comparison' },
+    { name: 'SEL', category: 'Comparison & Selection / Selection' },
+    { name: 'MUX', category: 'Comparison & Selection / Selection' },
+    { name: 'LIMIT', category: 'Comparison & Selection / Selection' },
+    { name: 'MAX', category: 'Comparison & Selection / Selection' },
+    { name: 'MIN', category: 'Comparison & Selection / Selection' }
 ];
 
 export const DataTypeSelector = ({ value, onChange, derivedTypes = [], userDefinedTypes = [] }) => {
@@ -30,6 +71,8 @@ export const DataTypeSelector = ({ value, onChange, derivedTypes = [], userDefin
         derived: false,
         user: false
     });
+    const [expandedUserMain, setExpandedUserMain] = useState({});
+    const [expandedUserSub, setExpandedUserSub] = useState({});
     const [coords, setCoords] = useState({ top: 0, left: 0, width: 0 });
     const containerRef = useRef(null);
     const searchInputRef = useRef(null);
@@ -74,6 +117,8 @@ export const DataTypeSelector = ({ value, onChange, derivedTypes = [], userDefin
                 derived: false,
                 user: false
             });
+            setExpandedUserMain({});
+            setExpandedUserSub({});
             setIsOpen(true);
         } else {
             setIsOpen(false);
@@ -92,6 +137,20 @@ export const DataTypeSelector = ({ value, onChange, derivedTypes = [], userDefin
         }));
     };
 
+    const toggleUserMain = (cat) => {
+        setExpandedUserMain(prev => ({
+            ...prev,
+            [cat]: !prev[cat]
+        }));
+    };
+
+    const toggleUserSub = (subCat) => {
+        setExpandedUserSub(prev => ({
+            ...prev,
+            [subCat]: !prev[subCat]
+        }));
+    };
+
     // Filter Logic
     const term = searchTerm.toLowerCase();
     const isSearching = term.length > 0;
@@ -101,27 +160,83 @@ export const DataTypeSelector = ({ value, onChange, derivedTypes = [], userDefin
     // Let's keep categories structure but expand them if they have matches and search term exists.
 
     const filteredElementary = ELEMENTARY_TYPES.filter(t => t.toLowerCase().includes(term));
-    const filteredDerived = derivedTypes.filter(t => t.toLowerCase().includes(term));
 
-    // Normalize user defined types to always have a name and category
-    // Also include standard FB types like TON, TOF...
-    const normalizedUserTypes = [...STD_BLOCK_TYPES, ...userDefinedTypes].map(b => {
-        if (typeof b === 'string') return { name: b, category: 'Project Defined' };
-        return { name: b.name, category: b.category || 'Project Defined' };
+    // Explicitly separate Standard Library vs User Defined
+    const standardBlocksMap = new Map();
+    STD_BLOCK_TYPES.forEach(b => {
+        standardBlocksMap.set(b.name, { name: b.name, category: b.category, type: 'FunctionBlocks', isStandard: true });
     });
 
-    const filteredUserObjs = normalizedUserTypes.filter(t => t.name.toLowerCase().includes(term));
-    const filteredUserNames = filteredUserObjs.map(t => t.name); // Keep names for quick access
-
-    // Grouping
-    const groupedUserTypes = filteredUserObjs.reduce((acc, curr) => {
-        if (!acc[curr.category]) acc[curr.category] = [];
-        // Prevent duplicates
-        if (!acc[curr.category].includes(curr.name)) {
-            acc[curr.category].push(curr.name);
+    const userBlocks = [];
+    userDefinedTypes.forEach(b => {
+        if (typeof b === 'string') {
+            userBlocks.push({ name: b, category: 'FunctionBlocks', type: 'FunctionBlocks', isStandard: false });
+            return;
         }
-        return acc;
-    }, {});
+
+        // If it has an 'id', it was created by the user in this project
+        if (b.id) {
+            userBlocks.push({ name: b.name, category: b.category || 'FunctionBlocks', type: b.type || 'FunctionBlocks', isStandard: false });
+        } else {
+            // It comes from the dynamically loaded standard library
+            if (!standardBlocksMap.has(b.name)) {
+                standardBlocksMap.set(b.name, { name: b.name, category: b.category || 'Standard FBs', type: 'FunctionBlocks', isStandard: true });
+            }
+        }
+    });
+
+    const standardBlocks = Array.from(standardBlocksMap.values());
+
+    const projectDefined = {
+        Arrays: [],
+        Enums: [],
+        Structs: [],
+        Functions: [],
+        FunctionBlocks: []
+    };
+
+    const allDerivedTypes = derivedTypes.map(d => typeof d === 'string' ? { name: d, type: 'Unknown' } : d);
+
+    allDerivedTypes.forEach(d => {
+        if (d.type === 'Array') projectDefined.Arrays.push(d.name);
+        else if (d.type === 'Enumerated') projectDefined.Enums.push(d.name);
+        else if (d.type === 'Structure') projectDefined.Structs.push(d.name);
+        else projectDefined.Arrays.push(d.name); // Fallback if VariableManager still passes strings
+    });
+
+    // Only user blocks go to Derived -> Functions/FunctionBlocks
+    userBlocks.forEach(u => {
+        if (u.type === 'functions' || u.type === 'Function') projectDefined.Functions.push(u.name);
+        else projectDefined.FunctionBlocks.push(u.name);
+    });
+
+    const filteredProjectDefined = {};
+    Object.entries(projectDefined).forEach(([k, v]) => {
+        const matching = v.filter(name => name.toLowerCase().includes(term));
+        if (matching.length > 0) filteredProjectDefined[k] = matching;
+    });
+
+    // Only standard blocks go to structuredUserTypes (FunctionBlock section)
+    const structuredUserTypes = {};
+    standardBlocks.forEach(curr => {
+        if (!curr.name.toLowerCase().includes(term)) return;
+        const parts = curr.category ? curr.category.split(' / ') : ['FunctionBlocks'];
+        const mainCat = parts[0];
+        const subCat = parts.length > 1 ? parts[1] : null;
+
+        if (!structuredUserTypes[mainCat]) structuredUserTypes[mainCat] = { items: [], subCats: {} };
+
+        if (subCat) {
+            if (!structuredUserTypes[mainCat].subCats[subCat]) structuredUserTypes[mainCat].subCats[subCat] = [];
+            if (!structuredUserTypes[mainCat].subCats[subCat].includes(curr.name)) {
+                structuredUserTypes[mainCat].subCats[subCat].push(curr.name);
+            }
+        } else {
+            if (!structuredUserTypes[mainCat].items.includes(curr.name)) {
+                structuredUserTypes[mainCat].items.push(curr.name);
+            }
+        }
+    });
 
     // Auto-expand if searching
     const showElementary = isSearching || expandedCategories.elementary;
@@ -169,8 +284,16 @@ export const DataTypeSelector = ({ value, onChange, derivedTypes = [], userDefin
                     onKeyDown={(e) => {
                         if (e.key === 'Enter') {
                             if (filteredElementary.length > 0) { handleSelect(filteredElementary[0]); return; }
-                            if (filteredDerived.length > 0) { handleSelect(filteredDerived[0]); return; }
-                            if (filteredUserNames.length > 0) { handleSelect(filteredUserNames[0]); return; }
+                            // First project defined item
+                            const projKeys = Object.keys(filteredProjectDefined);
+                            if (projKeys.length > 0 && filteredProjectDefined[projKeys[0]].length > 0) {
+                                handleSelect(filteredProjectDefined[projKeys[0]][0]); return;
+                            }
+                            // First standard item
+                            const stdKeys = Object.keys(structuredUserTypes);
+                            if (stdKeys.length > 0 && structuredUserTypes[stdKeys[0]].items.length > 0) {
+                                handleSelect(structuredUserTypes[stdKeys[0]].items[0]); return;
+                            }
                         }
                     }}
                 />
@@ -220,51 +343,81 @@ export const DataTypeSelector = ({ value, onChange, derivedTypes = [], userDefin
                     </div>
                 )}
 
-                {/* 2. DERIVED TYPES (UDTs) */}
-                <div
-                    onClick={() => !isSearching && toggleCategory('derived')}
-                    style={{
-                        padding: '6px 10px',
-                        background: '#333',
-                        borderBottom: '1px solid #2d2d2d',
-                        borderTop: '1px solid #2d2d2d',
-                        color: '#eee',
-                        fontSize: '11px',
-                        fontWeight: 'bold',
-                        cursor: isSearching ? 'default' : 'pointer',
-                        display: 'flex',
-                        justifyContent: 'space-between',
-                        alignItems: 'center'
-                    }}
-                >
-                    <span>Derived</span>
-                    {!isSearching && <span>{expandedCategories.derived ? '▼' : '►'}</span>}
-                </div>
-                {showDerived && (
-                    <div style={{ padding: '4px 0', background: '#1e1e1e' }}>
-                        {filteredDerived.length === 0 && <div style={{ padding: '5px 20px', color: '#666', fontSize: '11px' }}>No derived types</div>}
-                        {filteredDerived.map(t => (
-                            <div
-                                key={t}
-                                onClick={() => handleSelect(t)}
-                                style={{
-                                    padding: '6px 20px',
-                                    cursor: 'pointer',
-                                    fontSize: '13px',
-                                    color: value === t ? '#4ec9b0' : '#ccc',
-                                    background: value === t ? '#2d2d2d' : 'transparent',
-                                    fontFamily: 'Consolas, monospace'
-                                }}
-                                onMouseEnter={(e) => e.target.style.background = '#2d2d2d'}
-                                onMouseLeave={(e) => e.target.style.background = value === t ? '#2d2d2d' : 'transparent'}
-                            >
-                                {t}
-                            </div>
-                        ))}
+                {/* 2. PROJECT DEFINED TYPES */}
+                <>
+                    <div
+                        onClick={() => !isSearching && toggleCategory('derived')}
+                        style={{
+                            padding: '6px 10px',
+                            background: '#333',
+                            borderBottom: '1px solid #2d2d2d',
+                            borderTop: '1px solid #2d2d2d',
+                            color: '#eee',
+                            fontSize: '11px',
+                            fontWeight: 'bold',
+                            cursor: isSearching ? 'default' : 'pointer',
+                            display: 'flex',
+                            justifyContent: 'space-between',
+                            alignItems: 'center'
+                        }}
+                    >
+                        <span>Derived</span>
+                        {!isSearching && <span>{showDerived ? '▼' : '►'}</span>}
                     </div>
-                )}
+                    {showDerived && (
+                        <div style={{ padding: '0', background: '#1e1e1e' }}>
+                            {Object.keys(filteredProjectDefined).length === 0 && <div style={{ padding: '5px 20px', color: '#666', fontSize: '11px' }}>No project types</div>}
 
-                {/* 3. USER DEFINED TYPES (FBs) */}
+                            {Object.entries(filteredProjectDefined).map(([subCat, blocks]) => {
+                                const isSubExpanded = isSearching || expandedUserSub[`proj-${subCat}`];
+                                return (
+                                    <div key={subCat}>
+                                        <div
+                                            onClick={() => !isSearching && toggleUserSub(`proj-${subCat}`)}
+                                            style={{
+                                                padding: '4px 15px',
+                                                color: '#888',
+                                                fontSize: '11px',
+                                                fontWeight: 'bold',
+                                                textTransform: 'uppercase',
+                                                background: '#252526',
+                                                borderBottom: '1px solid #333',
+                                                cursor: isSearching ? 'default' : 'pointer',
+                                                display: 'flex',
+                                                justifyContent: 'space-between',
+                                                alignItems: 'center'
+                                            }}
+                                        >
+                                            <span>{subCat}</span>
+                                            {!isSearching && <span>{isSubExpanded ? '▼' : '►'}</span>}
+                                        </div>
+
+                                        {isSubExpanded && blocks.map(t => (
+                                            <div
+                                                key={t}
+                                                onClick={() => handleSelect(t)}
+                                                style={{
+                                                    padding: '6px 20px',
+                                                    cursor: 'pointer',
+                                                    fontSize: '13px',
+                                                    color: value === t ? '#4ec9b0' : '#ccc',
+                                                    background: value === t ? '#2d2d2d' : 'transparent',
+                                                    fontFamily: 'Consolas, monospace'
+                                                }}
+                                                onMouseEnter={(e) => e.target.style.background = '#2d2d2d'}
+                                                onMouseLeave={(e) => e.target.style.background = value === t ? '#2d2d2d' : 'transparent'}
+                                            >
+                                                {t}
+                                            </div>
+                                        ))}
+                                    </div>
+                                );
+                            })}
+                        </div>
+                    )}
+                </>
+
+                {/* 3. FUNCTION BLOCKS (STANDARD) */}
                 <>
                     <div
                         onClick={() => !isSearching && toggleCategory('user')}
@@ -283,36 +436,100 @@ export const DataTypeSelector = ({ value, onChange, derivedTypes = [], userDefin
                         }}
                     >
                         <span>FunctionBlock</span>
-                        {!isSearching && <span>{expandedCategories.user ? '▼' : '►'}</span>}
+                        {!isSearching && <span>{showUser ? '▼' : '►'}</span>}
                     </div>
                     {showUser && (
                         <div style={{ padding: '0', background: '#1e1e1e' }}>
-                            {filteredUserNames.length === 0 && <div style={{ padding: '5px 20px', color: '#666', fontSize: '11px' }}>No function blocks</div>}
-                            {Object.entries(groupedUserTypes).map(([catName, blocks]) => (
-                                <div key={catName}>
-                                    <div style={{ padding: '4px 15px', color: '#888', fontSize: '10px', textTransform: 'uppercase', background: '#252526', borderBottom: '1px solid #333' }}>
-                                        {catName}
-                                    </div>
-                                    {blocks.map(t => (
+                            {Object.keys(structuredUserTypes).length === 0 && <div style={{ padding: '5px 20px', color: '#666', fontSize: '11px' }}>No standard function blocks</div>}
+                            {Object.entries(structuredUserTypes).map(([mainCat, data]) => {
+                                const isMainExpanded = isSearching || expandedUserMain[mainCat];
+                                return (
+                                    <div key={mainCat}>
                                         <div
-                                            key={t}
-                                            onClick={() => handleSelect(t)}
+                                            onClick={() => !isSearching && toggleUserMain(mainCat)}
                                             style={{
-                                                padding: '6px 20px',
-                                                cursor: 'pointer',
-                                                fontSize: '13px',
-                                                color: value === t ? '#4ec9b0' : '#ccc',
-                                                background: value === t ? '#2d2d2d' : 'transparent',
-                                                fontFamily: 'Consolas, monospace'
+                                                padding: '4px 15px',
+                                                color: '#888',
+                                                fontSize: '11px',
+                                                fontWeight: 'bold',
+                                                textTransform: 'uppercase',
+                                                background: '#252526',
+                                                borderBottom: '1px solid #333',
+                                                cursor: isSearching ? 'default' : 'pointer',
+                                                display: 'flex',
+                                                justifyContent: 'space-between',
+                                                alignItems: 'center'
                                             }}
-                                            onMouseEnter={(e) => e.target.style.background = '#2d2d2d'}
-                                            onMouseLeave={(e) => e.target.style.background = value === t ? '#2d2d2d' : 'transparent'}
                                         >
-                                            {t}
+                                            <span>{mainCat}</span>
+                                            {!isSearching && <span>{isMainExpanded ? '▼' : '►'}</span>}
                                         </div>
-                                    ))}
-                                </div>
-                            ))}
+
+                                        {isMainExpanded && data.items.map(t => (
+                                            <div
+                                                key={t}
+                                                onClick={() => handleSelect(t)}
+                                                style={{
+                                                    padding: '6px 20px',
+                                                    cursor: 'pointer',
+                                                    fontSize: '13px',
+                                                    color: value === t ? '#4ec9b0' : '#ccc',
+                                                    background: value === t ? '#2d2d2d' : 'transparent',
+                                                    fontFamily: 'Consolas, monospace'
+                                                }}
+                                                onMouseEnter={(e) => e.target.style.background = '#2d2d2d'}
+                                                onMouseLeave={(e) => e.target.style.background = value === t ? '#2d2d2d' : 'transparent'}
+                                            >
+                                                {t}
+                                            </div>
+                                        ))}
+
+                                        {isMainExpanded && Object.entries(data.subCats).map(([subCat, blocks]) => {
+                                            const subCatKey = `${mainCat}-${subCat}`;
+                                            const isSubExpanded = isSearching || expandedUserSub[subCatKey];
+                                            return (
+                                                <div key={subCatKey}>
+                                                    <div
+                                                        onClick={() => !isSearching && toggleUserSub(subCatKey)}
+                                                        style={{
+                                                            padding: '4px 25px',
+                                                            color: '#aaa',
+                                                            fontSize: '10px',
+                                                            background: '#2a2a2a',
+                                                            borderBottom: '1px solid #333',
+                                                            cursor: isSearching ? 'default' : 'pointer',
+                                                            display: 'flex',
+                                                            justifyContent: 'space-between',
+                                                            alignItems: 'center'
+                                                        }}
+                                                    >
+                                                        <span>{subCat}</span>
+                                                        {!isSearching && <span>{isSubExpanded ? '▼' : '►'}</span>}
+                                                    </div>
+                                                    {isSubExpanded && blocks.map(t => (
+                                                        <div
+                                                            key={t}
+                                                            onClick={() => handleSelect(t)}
+                                                            style={{
+                                                                padding: '6px 35px',
+                                                                cursor: 'pointer',
+                                                                fontSize: '13px',
+                                                                color: value === t ? '#4ec9b0' : '#ccc',
+                                                                background: value === t ? '#2d2d2d' : 'transparent',
+                                                                fontFamily: 'Consolas, monospace'
+                                                            }}
+                                                            onMouseEnter={(e) => e.target.style.background = '#2d2d2d'}
+                                                            onMouseLeave={(e) => e.target.style.background = value === t ? '#2d2d2d' : 'transparent'}
+                                                        >
+                                                            {t}
+                                                        </div>
+                                                    ))}
+                                                </div>
+                                            );
+                                        })}
+                                    </div>
+                                );
+                            })}
                         </div>
                     )}
                 </>

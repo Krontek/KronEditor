@@ -258,23 +258,53 @@ function App() {
   }, [defaultProjectStructure]);
 
   const handleOpen = async () => {
+    // Determine if we are running in Tauri
+    const isTauri = window.__TAURI_INTERNALS__ !== undefined;
+
+    if (isTauri) {
+      try {
+        const selected = await open({
+          multiple: false,
+          filters: [{
+            name: 'PLC Project Files',
+            extensions: ['xml']
+          }, {
+            name: 'All Files',
+            extensions: ['*']
+          }]
+        });
+
+        if (!selected) return;
+
+        const filePath = Array.isArray(selected) ? selected[0] : selected;
+        const content = await readTextFile(filePath);
+        processFileContent(content, filePath);
+      } catch (error) {
+        console.error(error);
+        addLog('error', t('logs.openError', { error: error }) || `Open Error: ${error} `);
+      }
+    } else {
+      // Web Fallback: Use standard HTML file input
+      const input = document.createElement('input');
+      input.type = 'file';
+      input.accept = '.xml';
+      input.onchange = e => {
+        const file = e.target.files[0];
+        if (!file) return;
+
+        const reader = new FileReader();
+        reader.onload = async (event) => {
+          const content = event.target.result;
+          processFileContent(content, file.name);
+        };
+        reader.readAsText(file);
+      };
+      input.click();
+    }
+  };
+
+  const processFileContent = (content, filePath) => {
     try {
-      const selected = await open({
-        multiple: false,
-        filters: [{
-          name: 'PLC Project Files',
-          extensions: ['xml']
-        }, {
-          name: 'All Files',
-          extensions: ['*']
-        }]
-      });
-
-      if (!selected) return;
-
-      const filePath = Array.isArray(selected) ? selected[0] : selected;
-      const content = await readTextFile(filePath);
-
       const newStructure = importProjectFromXml(content);
       if (newStructure) {
         // Ensure Configuration Resource Exists
@@ -299,8 +329,8 @@ function App() {
         addLog('error', t('logs.invalidFormat') || 'Failed to parse project file (Invalid Format).');
       }
     } catch (error) {
-      console.error(error);
-      addLog('error', t('logs.openError', { error: error }) || `Open Error: ${error} `);
+       console.error(error);
+       addLog('error', t('logs.openError', { error: error }) || `Open Error: ${error} `);
     }
   };
 

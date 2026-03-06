@@ -125,25 +125,31 @@ const RungEditorNew = ({ variables, setVariables, rungs, setRungs, availableBloc
   const updateBlockData = useCallback((rungId, blockId, newData) => {
     if (readOnly) return;
 
-    // instanceName değiştiyse variables'ı da güncelle
-    let newVariables = variables;
-    if (newData.instanceName) {
-      newVariables = variables.map(v => v.id === blockId ? { ...v, name: newData.instanceName } : v);
-      setVariables(newVariables);
-    }
-
     setRungs(prevRungs => {
+      let oldInstanceName = null;
       const newRungs = prevRungs.map(rung => {
         if (rung.id === rungId) {
           return {
             ...rung,
-            blocks: rung.blocks.map(b =>
-              b.id === blockId ? { ...b, data: { ...b.data, ...newData } } : b
-            )
+            blocks: rung.blocks.map(b => {
+              if (b.id === blockId) {
+                oldInstanceName = b.data.instanceName;
+                return { ...b, data: { ...b.data, ...newData } };
+              }
+              return b;
+            })
           };
         }
         return rung;
       });
+
+      // instanceName değiştiyse variables'ı da güncelle
+      let newVariables = variables;
+      if (newData.instanceName && oldInstanceName && newData.instanceName !== oldInstanceName) {
+         newVariables = variables.map(v => v.name === oldInstanceName ? { ...v, name: newData.instanceName } : v);
+         setVariables(newVariables);
+      }
+
       saveHistory(newRungs, newVariables);
       return newRungs;
     });
@@ -375,13 +381,13 @@ const RungEditorNew = ({ variables, setVariables, rungs, setRungs, availableBloc
     const dragData = typeof DragDropManager !== 'undefined' ? DragDropManager.getDragData() : null;
     const namePatternBase = dragData?.instanceNamePattern ? dragData.instanceNamePattern.replace(/[0-9]+$/, '') : null;
 
-    if (customData) {
+    if (customData && customData.name) {
       if (customData.type === 'functions') {
         instanceName = customData.name;
         // Function blok instance oluşturmaz, variables değişmez
       } else {
-        // Function Block Instance
-        const baseName = namePatternBase || customData.name;
+        // User-defined Function Block Instance (has a name)
+        const baseName = (namePatternBase || customData.name).trim().replace(/\s+/g, '_');
         let index = 0;
 
         while (true) {
@@ -408,7 +414,7 @@ const RungEditorNew = ({ variables, setVariables, rungs, setRungs, availableBloc
       }
     } else {
       // Standard Blocks (TON, CTU, etc.)
-      const baseName = namePatternBase || blockType;
+      const baseName = (namePatternBase || blockType).trim().replace(/\s+/g, '_');
       let index = 0;
 
       while (true) {
@@ -516,12 +522,17 @@ const RungEditorNew = ({ variables, setVariables, rungs, setRungs, availableBloc
   ];
 
   const varsByType = {};
+  const NUMERIC_TYPES = new Set(['INT', 'UINT', 'SINT', 'USINT', 'DINT', 'UDINT', 'REAL', 'LREAL', 'BYTE', 'WORD', 'DWORD']);
   const addOption = (type, value) => {
     if (!varsByType[type]) varsByType[type] = [];
     varsByType[type].push(value);
     if (type !== 'ANY') {
       if (!varsByType['ANY']) varsByType['ANY'] = [];
       varsByType['ANY'].push(value);
+    }
+    if (NUMERIC_TYPES.has(type)) {
+      if (!varsByType['ANY_NUM']) varsByType['ANY_NUM'] = [];
+      varsByType['ANY_NUM'].push(value);
     }
   };
 

@@ -142,11 +142,13 @@ extern volatile uint64_t us_tick;
     if (projectStructure.functionBlocks && projectStructure.functionBlocks.length > 0) {
         header += `// --- FUNCTION BLOCK STATES ---\n`;
         projectStructure.functionBlocks.forEach(fb => {
+            const fbNameSafe = (fb.name || '').trim().replace(/\s+/g, '_');
             header += `typedef struct {\n`;
             fb.content.variables.forEach(v => {
+                if (isInlineMathType(v.type)) return; // Inline math — no struct member needed
                 header += `    ${mapType(v.type)} ${v.name};\n`;
             });
-            header += `} ${fb.name};\n\n`;
+            header += `} ${fbNameSafe};\n\n`;
         });
     }
 
@@ -205,26 +207,28 @@ extern volatile uint64_t us_tick;
             // Allocate static program instances of FBs if they exist
             prog.content.variables.forEach(v => {
                 let vName = (v.name || '').trim().replace(/\s+/g, '_');
-                if (isFBType(v.type, projectStructure) || stdFunctions[v.type]) {
-                    header += `${v.type} prog_${progName}_inst_${vName};\n`;
+                let vType = (v.type || '').trim();
+                if (isInlineMathType(vType)) return; // Inline math — handled inline in LD, no instance
+                if (isFBType(vType, projectStructure) || stdFunctions[vType]) {
+                    header += `${vType} prog_${progName}_inst_${vName};\n`;
                 } else {
                     // Global internal variables for simple programs
-                    header += `${mapType(v.type)} prog_${progName}_${vName};\n`;
+                    header += `${mapType(vType)} prog_${progName}_${vName};\n`;
                 }
 
-                const isFB = isFBType(v.type, projectStructure) || stdFunctions[v.type];
+                const isFB = isFBType(vType, projectStructure) || stdFunctions[vType];
                 const cSym = isFB ? `prog_${progName}_inst_${vName}` : `prog_${progName}_${vName}`;
-                const initVal = resolveInitialValue(v.initialValue, v.type);
+                const initVal = resolveInitialValue(v.initialValue, vType);
                 variableTable.programs[progName].variables[vName] = {
-                    type: v.type, c_symbol: cSym, initialValue: initVal
+                    type: vType, c_symbol: cSym, initialValue: initVal
                 };
                 // Debug: top-level entry
                 variableTable.debugDefaults[`prog_${progName}_${vName}`] = {
-                    type: v.type, c_symbol: cSym, defaultValue: initVal
+                    type: vType, c_symbol: cSym, defaultValue: initVal
                 };
                 // Debug: expand array elements and struct members
                 if (!isFB) {
-                    const dtDef = dataTypeDefs[v.type];
+                    const dtDef = dataTypeDefs[vType];
                     if (dtDef?.type === 'Array') {
                         const baseType = dtDef.content.baseType;
                         const elemSize = IEC_TYPE_SIZES[baseType.toUpperCase()] || 0;
@@ -270,6 +274,22 @@ extern volatile uint64_t us_tick;
                 };
             });
 
+            // Collect variable names already declared (program vars + shadow vars)
+            if (prog.type === 'LD') {
+                const declaredVarNames = new Set();
+                prog.content.variables.forEach(v => {
+                    const vName = (v.name || '').trim().replace(/\s+/g, '_');
+                    if (!isInlineMathType(v.type)) declaredVarNames.add(vName);
+                });
+                shadowVars.forEach(sv => {
+                    const shortKey = sv.symbol.replace(`prog_${progName}_`, '');
+                    declaredVarNames.add(shortKey);
+                });
+                // Variables referenced in pin fields but not declared in the
+                // variable table are intentionally left undeclared so that the
+                // C compiler emits an error, forcing the user to add them.
+            }
+
             header += transpilePOUSource(prog, 'program', stdFunctions, progName, globalVarNames);
         });
     }
@@ -283,7 +303,8 @@ extern volatile uint64_t us_tick;
 };
 
 const isFBType = (type, structure) => {
-    return structure.functionBlocks?.some(fb => fb.name === type);
+    const t = (type || '').trim();
+    return structure.functionBlocks?.some(fb => (fb.name || '').trim() === t);
 };
 
 const mapIECtoTimeUs = (iecTimeStr) => {
@@ -514,7 +535,8 @@ const FB_Q_OUTPUT = {
 };
 
 // Returns the IEC type of an output pin for a given block type
-const getOutputPinType = (blockType, pinName) => {
+// customData is optional — used for user-defined FB output pin types
+const getOutputPinType = (blockType, pinName, customData) => {
     if (['Q', 'Q1', 'QU', 'QD', 'ENO'].includes(pinName)) return 'BOOL';
     if (pinName === 'ET') return 'TIME';
     if (pinName === 'CV') return 'INT';
@@ -524,6 +546,11 @@ const getOutputPinType = (blockType, pinName) => {
         if (['ADD', 'SUB', 'MUL', 'DIV', 'MOD', 'MOVE', 'SEL', 'MUX'].includes(blockType)) return 'DINT';
         if (['ABS', 'SQRT', 'EXPT', 'MAX', 'MIN', 'LIMIT', 'SIN', 'COS', 'TAN', 'ASIN', 'ACOS', 'ATAN', 'NORM_X', 'SCALE_X'].includes(blockType)) return 'REAL';
         if (['BAND', 'BOR', 'BXOR', 'BNOT', 'SHL', 'SHR', 'ROL', 'ROR'].includes(blockType)) return 'DWORD';
+    }
+    // User-defined FB: look up actual type from customData variables
+    if (customData?.content?.variables) {
+        const varDef = customData.content.variables.find(v => v.name === pinName);
+        if (varDef) return varDef.type || 'BOOL';
     }
     return 'BOOL';
 };
@@ -535,9 +562,10 @@ const collectShadowVars = (rungs, progName) => {
     const vars = [];
     (rungs || []).forEach(rung => {
         (rung.blocks || []).forEach(b => {
-            const type = b.type || '';
+            const type = (b.type || '').trim();
             const data = b.data || {};
             if (type === 'Contact' || type === 'Coil') return;
+            if (isInlineMathType(type)) return; // Inline math — no shadow vars
             const instName = (data.instanceName || type).trim().replace(/\s+/g, '_');
             const outPins = [
                 ...(FB_OUTPUTS[type] || []),
@@ -551,9 +579,55 @@ const collectShadowVars = (rungs, progName) => {
                     const sym = `prog_${progName}_out_${instName}_${pinName}`;
                     if (!seen.has(sym)) {
                         seen.add(sym);
-                        vars.push({ symbol: sym, type: getOutputPinType(type, pinName) });
+                        vars.push({ symbol: sym, type: getOutputPinType(type, pinName, data.customData) });
                     }
                 }
+            });
+        });
+    });
+    return vars;
+};
+
+// Scan all blocks for variable references in pin fields that are not yet declared.
+// Returns shadow-style entries so the caller can declare them in the header.
+const collectUndeclaredPinVars = (rungs, progName, declaredVarNames, globalVarNames) => {
+    const seen = new Set();
+    const vars = [];
+    const idRegex = /^[A-Za-z_][A-Za-z0-9_]*(\[[^\]]*\]|\.[A-Za-z_][A-Za-z0-9_]*)*$/;
+    const isLiteral = (s) =>
+        /^-?[0-9]/.test(s) || /^(true|false)$/i.test(s) ||
+        s.toUpperCase().startsWith('T#') || s.toUpperCase().startsWith('TIME#');
+
+    (rungs || []).forEach(rung => {
+        (rung.blocks || []).forEach(b => {
+            const type = (b.type || '').trim();
+            const data = b.data || {};
+            const vals = data.values || {};
+
+            // Contact/Coil variable references
+            if (type === 'Contact' || type === 'Coil') {
+                const pinKey = type === 'Contact' ? 'var' : 'coil';
+                const raw = (vals[pinKey] || data.instanceName || '') + '';
+                const v = raw.replace(/[🌍🏠⊞⊡⊟]/g, '').trim();
+                if (v && idRegex.test(v) && !isLiteral(v)) {
+                    const baseName = v.split(/[\.\[]/)[0];
+                    if (!globalVarNames.includes(baseName) && !declaredVarNames.has(baseName) && !seen.has(baseName)) {
+                        seen.add(baseName);
+                        vars.push({ symbol: `prog_${progName}_${baseName}`, type: 'BOOL' });
+                    }
+                }
+                return;
+            }
+
+            // All other blocks — scan every pin value
+            Object.entries(vals).forEach(([pinName, rawVal]) => {
+                const v = rawVal ? (rawVal + '').replace(/[🌍🏠⊞⊡⊟]/g, '').trim() : '';
+                if (!v || !idRegex.test(v) || isLiteral(v)) return;
+                const baseName = v.split(/[\.\[]/)[0];
+                if (globalVarNames.includes(baseName) || declaredVarNames.has(baseName) || seen.has(baseName)) return;
+                seen.add(baseName);
+                const pinType = getOutputPinType(type, pinName);
+                vars.push({ symbol: `prog_${progName}_${baseName}`, type: pinType });
             });
         });
     });
@@ -587,6 +661,42 @@ Object.keys(FB_OUTPUTS).length; // dummy to close initializer
         if (src !== dst) FB_OUTPUTS[`${src}_TO_${dst}`] = ['ENO', 'OUT'];
     });
 });
+
+// ── Math FB blocks: use struct-based _Call from kronmath.h ──
+// All integer-only, no EN/ENO fields. Struct type names may differ from block type.
+const MATH_FB_BLOCKS = new Set([
+    'ADD', 'SUB', 'MUL', 'DIV', 'MOD', 'MOVE', 'ABS',
+    'SQRT', 'EXPT', 'NEG', 'AVG',
+    'SIN', 'COS', 'TAN', 'ASIN', 'ACOS', 'ATAN'
+]);
+// Map block type → C struct type name (only where they differ)
+const MATH_FB_STRUCT = {
+    'ABS': 'ABS_FB', 'SQRT': 'SQRT_FB', 'MIN': 'MIN_FB', 'MAX': 'MAX_FB',
+};
+// Blocks with array inputs: IN[KRON_MATH_MAX_IN] + N count
+const MATH_FB_ARRAY_INPUT = new Set(['ADD', 'MUL', 'MIN', 'MAX', 'AVG']);
+// Map editor pin names → struct member names (only where they differ)
+const MATH_FB_PIN_MAP = {
+    'EXPT': { 'IN': 'IN1', 'EXP': 'IN2' },
+};
+
+// ── Inline KRON_ functions (kroncompare.h) — still use direct function calls ──
+const KRON_FN = {
+    // Comparison (kroncompare.h)
+    'GT': 'KRON_GT', 'GE': 'KRON_GE', 'EQ': 'KRON_EQ',
+    'NE': 'KRON_NE', 'LE': 'KRON_LE', 'LT': 'KRON_LT',
+    // Selection (kroncompare.h)
+    'SEL': 'KRON_SEL', 'MUX': 'KRON_MUX',
+    // Range (kroncompare.h)
+    'MAX': 'KRON_MAX', 'MIN': 'KRON_MIN', 'LIMIT': 'KRON_LIMIT',
+};
+// Bitwise — use C operators directly
+const BITWISE_OP = {
+    'BAND': '&', 'BOR': '|', 'BXOR': '^', 'BNOT': '~',
+    'SHL': '<<', 'SHR': '>>', 'ROL': '<<', 'ROR': '>>',
+};
+// Returns true for EN-trigger stateless blocks that should be inlined
+const isInlineMathType = (type) => FB_TRIGGER_PIN[type] === 'EN';
 
 // Ordered input pin names for each standard FB type (index matches in_0, in_1, ...)
 const FB_INPUTS = {
@@ -939,7 +1049,7 @@ const transpileLDLogics = (rungs, stdFunctions = {}, parentName = '', category =
         // 3. Emit C code in topological order
         sorted.forEach((blockId, idx) => {
             const b = nodeMap[blockId];
-            const type = b.type || '';
+            const type = (b.type || '').trim();
             const data = b.data || {};
             const subType = data.subType || (type === 'Contact' ? 'NO' : 'Normal');
             const bOut = `out_r${rungIdx}_b${idx}`;
@@ -976,11 +1086,131 @@ const transpileLDLogics = (rungs, stdFunctions = {}, parentName = '', category =
                     }
                 }
 
+            } else if (isInlineMathType(type)) {
+                // ── EN-trigger stateless block ──
+                const inputPins = FB_INPUTS[type] || [];
+                const dataInputPins = inputPins.filter(p => p !== 'EN');
+
+                // Collect argument values from static pin values and wire connections
+                const argValues = {};
+                if (data.values) {
+                    Object.entries(data.values).forEach(([pinName, val]) => {
+                        if (['EN', 'ENO', 'OUT'].includes(pinName)) return;
+                        const resolved = resolveVal(val);
+                        if (resolved !== null) argValues[pinName] = resolved;
+                    });
+                }
+                (rung.connections || []).forEach(c => {
+                    if (c.target !== blockId) return;
+                    const tp = c.targetPin;
+                    if (!tp || tp === 'in_0' || tp === 'in') return;
+                    const pinIdx = parseInt(tp.split('_')[1]);
+                    if (isNaN(pinIdx)) return;
+                    const pinName = inputPins[pinIdx];
+                    if (!pinName || pinName === 'EN') return;
+                    if (c.source && c.source.startsWith('terminal_left')) {
+                        argValues[pinName] = 'true';
+                    } else if (sortedIndex[c.source] !== undefined) {
+                        argValues[pinName] = `out_r${rungIdx}_b${sortedIndex[c.source]}`;
+                    }
+                });
+
+                const args = dataInputPins.map(pin => argValues[pin] || '0');
+                const validIdPattern = /^[A-Za-z_][A-Za-z0-9_]*(\[[^\]]*\]|\.[A-Za-z_][A-Za-z0-9_]*)*$/;
+
+                if (MATH_FB_BLOCKS.has(type)) {
+                    // ── Math FB: local struct + _Call (kronmath.h) ──
+                    // New kronmath.h: no EN/ENO fields, integer-only structs
+                    const structType = MATH_FB_STRUCT[type] || type;
+                    const callFn = `${structType === type ? type : structType.replace('_FB', '')}_Call`;
+                    const localVar = `_m_r${rungIdx}_b${idx}`;
+                    const pinMap = MATH_FB_PIN_MAP[type] || {};
+
+                    out += `    ${bOut} = ${inExpr};\n`;
+                    out += `    if (${bOut}) {\n`;
+                    out += `    ${structType} ${localVar} = {0};\n`;
+
+                    if (MATH_FB_ARRAY_INPUT.has(type)) {
+                        // Array-input blocks: IN[0]=val1, IN[1]=val2, N=count
+                        dataInputPins.forEach((pin, i) => {
+                            out += `    ${localVar}.IN[${i}] = ${argValues[pin] || '0'};\n`;
+                        });
+                        out += `    ${localVar}.N = ${dataInputPins.length};\n`;
+                    } else {
+                        dataInputPins.forEach(pin => {
+                            const structPin = pinMap[pin] || pin;
+                            out += `    ${localVar}.${structPin} = ${argValues[pin] || '0'};\n`;
+                        });
+                    }
+                    out += `    ${callFn}(&${localVar});\n`;
+
+                    // OUT assignment
+                    const outRaw = data.values?.OUT;
+                    const outVar = outRaw ? (outRaw + '').replace(/[🌍🏠⊞⊡⊟]/g, '').trim() : '';
+                    if (outVar && validIdPattern.test(outVar)) {
+                        out += `    ${resolveVar(outVar)} = ${localVar}.OUT;\n`;
+                    }
+                    out += `    }\n`;
+
+                    // ENO write-back (power-flow passthrough)
+                    const enoRaw = data.values?.ENO;
+                    const enoVar = enoRaw ? (enoRaw + '').replace(/[🌍🏠⊞⊡⊟]/g, '').trim() : '';
+                    if (enoVar && validIdPattern.test(enoVar)) {
+                        out += `    ${resolveVar(enoVar)} = ${bOut};\n`;
+                    }
+
+                } else {
+                    // ── Inline comparison/selection/range/bitwise/conversion ──
+                    let resultExpr;
+                    if (KRON_FN[type]) {
+                        resultExpr = `${KRON_FN[type]}(${args.join(', ')})`;
+                    } else if (BITWISE_OP[type]) {
+                        if (args.length === 1) {
+                            resultExpr = `(${BITWISE_OP[type]}${args[0]})`;
+                        } else {
+                            resultExpr = `(${args[0]} ${BITWISE_OP[type]} ${args[1]})`;
+                        }
+                    } else if (type.match(/^[A-Z]+_TO_[A-Z]+$/)) {
+                        // Conversion — use C cast
+                        const dstType = type.split('_TO_')[1];
+                        resultExpr = `(${mapType(dstType)})(${args[0]})`;
+                    } else {
+                        resultExpr = `/* unknown inline: ${type} */ 0`;
+                    }
+
+                    const hasOutPin = (FB_OUTPUTS[type] || []).includes('OUT');
+                    const isBoolResult = !hasOutPin; // Comparison: ENO IS the result
+
+                    if (isBoolResult) {
+                        out += `    ${bOut} = ${inExpr} && ${resultExpr};\n`;
+                    } else {
+                        out += `    ${bOut} = ${inExpr};\n`;
+                        // Assign OUT to target variable
+                        const outRaw = data.values?.OUT;
+                        const outVar = outRaw ? (outRaw + '').replace(/[🌍🏠⊞⊡⊟]/g, '').trim() : '';
+                        if (outVar && validIdPattern.test(outVar)) {
+                            out += `    if (${bOut}) { ${resolveVar(outVar)} = ${resultExpr}; }\n`;
+                        }
+                    }
+
+                    // ENO write-back (if assigned to a variable)
+                    const enoRaw = data.values?.ENO;
+                    const enoVar = enoRaw ? (enoRaw + '').replace(/[🌍🏠⊞⊡⊟]/g, '').trim() : '';
+                    if (enoVar && validIdPattern.test(enoVar)) {
+                        out += `    ${resolveVar(enoVar)} = ${bOut};\n`;
+                    }
+                }
+
             } else {
                 // ── Function Block (standard or user-defined) ──────────────────
                 const instName = data.instanceName || type;
                 const callTarget = getCallTarget(instName);
-                const inputPins = FB_INPUTS[type] || (stdFunctions[type] ? stdFunctions[type].inputs : []);
+                const isUserDefinedFB = !FB_INPUTS[type] && !stdFunctions[type] && !!data.customData?.content?.variables;
+                // For user-defined FBs, build inputPins from customData Input variables
+                const userInputPins = isUserDefinedFB
+                    ? (data.customData.content.variables || []).filter(v => v.class === 'Input' || v.class === 'InOut').map(v => v.name)
+                    : [];
+                const inputPins = FB_INPUTS[type] || (stdFunctions[type] ? stdFunctions[type].inputs : userInputPins);
 
                 // Determine output pin names for this block type so we can separate
                 // write-back assignments (post-call) from input assignments (pre-call)
@@ -1027,7 +1257,10 @@ const transpileLDLogics = (rungs, stdFunctions = {}, parentName = '', category =
                 }
 
                 // Call the FB execute function
-                if (stdFunctions[type]?.hasTime) {
+                if (isUserDefinedFB) {
+                    // User-defined FBs use _Execute naming convention
+                    out += `    ${type}_Execute(&${callTarget});\n`;
+                } else if (stdFunctions[type]?.hasTime) {
                     if (stdFunctions[type]?.isFB !== false || Object.keys(FB_INPUTS).includes(type)) {
                         out += `    ${type}_Call(&${callTarget}, us_tick);\n`;
                     } else {
@@ -1047,14 +1280,20 @@ const transpileLDLogics = (rungs, stdFunctions = {}, parentName = '', category =
                 }
 
                 // Check and propagate EN -> ENO correctly for regular FBs, or use Q-output
-                const qOutput = FB_Q_OUTPUT[type] || (triggerPin === 'EN' ? 'ENO' : 'Q');
-                if (qOutput === 'ENO' && triggerPin === 'EN') {
-                    // Implicit power flow
-                    out += `    ${bOut} = ${callTarget}.EN;\n`;
-                } else if (qOutput) {
-                    out += `    ${bOut} = ${callTarget}.${qOutput};\n`;
+                if (isUserDefinedFB) {
+                    // User-defined FBs don't have a standard Q/ENO pin;
+                    // power flow passes through unconditionally after execution
+                    out += `    ${bOut} = ${inExpr};\n`;
                 } else {
-                    out += `    ${bOut} = false;\n`;
+                    const qOutput = FB_Q_OUTPUT[type] || (triggerPin === 'EN' ? 'ENO' : 'Q');
+                    if (qOutput === 'ENO' && triggerPin === 'EN') {
+                        // Implicit power flow
+                        out += `    ${bOut} = ${callTarget}.EN;\n`;
+                    } else if (qOutput) {
+                        out += `    ${bOut} = ${callTarget}.${qOutput};\n`;
+                    } else {
+                        out += `    ${bOut} = false;\n`;
+                    }
                 }
 
                 // Step 4: output pin write-back — all pins, to assigned var or shadow tracking var
@@ -1066,7 +1305,11 @@ const transpileLDLogics = (rungs, stdFunctions = {}, parentName = '', category =
                         out += `    ${resolveVar(varStr)} = ${callTarget}.${pinName};\n`;
                     } else {
                         // No assignment → shadow tracking variable (declared by collectShadowVars)
-                        out += `    prog_${parentName}_out_${safeInst}_${pinName} = ${callTarget}.${pinName};\n`;
+                        if (category === 'function_block') {
+                            // Inside FB scope: no shadow var needed, skip unassigned output pins
+                        } else {
+                            out += `    prog_${parentName}_out_${safeInst}_${pinName} = ${callTarget}.${pinName};\n`;
+                        }
                     }
                 });
             }

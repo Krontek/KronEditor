@@ -90,8 +90,8 @@ export class LibraryService {
                     label: type,
                     desc: description,
                     class: blockClass,
-                    inputs,
-                    outputs
+                    inputs: inputs.filter(p => p.name !== 'EN'),
+                    outputs: outputs.filter(p => p.name !== 'ENO')
                 });
             }
 
