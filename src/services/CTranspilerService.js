@@ -1112,10 +1112,13 @@ const transpileLDLogics = (rungs, stdFunctions = {}, parentName = '', category =
 
         // Build power-flow (inExpr) for a block:
         //   Contact / Coil use handle id "in"
-        //   FB first input uses "in_0"
+        //   FB trigger input uses "in_<triggerPinName>" (e.g. in_CU, in_IN, in_CLK)
         //   Multiple parallel paths converging are OR'd
         const getInExpr = (blockId, blockType) => {
             const isSimple = blockType === 'Contact' || blockType === 'Coil';
+            // Determine the trigger-pin handle name for this FB type
+            const trigPin = FB_TRIGGER_PIN[blockType];
+            const trigHandle = trigPin ? `in_${trigPin}` : null;
             const conds = [];
             (rung.connections || []).forEach(c => {
                 if (c.target !== blockId) return;
@@ -1123,7 +1126,7 @@ const transpileLDLogics = (rungs, stdFunctions = {}, parentName = '', category =
                 const tp = c.targetPin;
                 const isFlowPin = isSimple
                     ? (tp === 'in' || !tp)
-                    : (tp === 'in_0' || tp === 'in' || !tp);
+                    : (tp === trigHandle || tp === 'in_0' || tp === 'in' || !tp);
                 if (!isFlowPin) return;
 
                 if (c.source && c.source.startsWith('terminal_left')) {
@@ -1192,11 +1195,10 @@ const transpileLDLogics = (rungs, stdFunctions = {}, parentName = '', category =
                 (rung.connections || []).forEach(c => {
                     if (c.target !== blockId) return;
                     const tp = c.targetPin;
-                    if (!tp || tp === 'in_0' || tp === 'in') return;
-                    const pinIdx = parseInt(tp.split('_')[1]);
-                    if (isNaN(pinIdx)) return;
-                    const pinName = inputPins[pinIdx];
-                    if (!pinName || pinName === 'EN') return;
+                    if (!tp || tp === 'in_0' || tp === 'in' || tp === 'in_EN') return;
+                    // Handle is "in_<pinName>" — extract pin name
+                    const pinName = tp.startsWith('in_') ? tp.slice(3) : null;
+                    if (!pinName || !inputPins.includes(pinName) || pinName === 'EN') return;
                     if (c.source && c.source.startsWith('terminal_left')) {
                         argValues[pinName] = 'true';
                     } else if (sortedIndex[c.source] !== undefined) {
@@ -1347,11 +1349,11 @@ const transpileLDLogics = (rungs, stdFunctions = {}, parentName = '', category =
                     if (c.target !== blockId) return;
                     const tp = c.targetPin;
                     // Skip the power-flow (trigger) handle
-                    if (!tp || tp === 'in_0' || tp === 'in') return;
-                    const pinIdx = parseInt(tp.split('_')[1]);
-                    if (isNaN(pinIdx)) return;
-                    const pinName = inputPins[pinIdx];
-                    if (!pinName) return;
+                    const trigPinHandle = FB_TRIGGER_PIN[type] ? `in_${FB_TRIGGER_PIN[type]}` : null;
+                    if (!tp || tp === 'in_0' || tp === 'in' || tp === trigPinHandle) return;
+                    // Handle is "in_<pinName>" — extract pin name
+                    const pinName = tp.startsWith('in_') ? tp.slice(3) : null;
+                    if (!pinName || !inputPins.includes(pinName)) return;
                     const cPin = cStructPin(type, pinName);
                     if (c.source && c.source.startsWith('terminal_left')) {
                         out += `    ${callTarget}.${cPin} = true;\n`;

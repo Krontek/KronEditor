@@ -1402,40 +1402,88 @@ const RungContainer = ({
       sortedBlocks.forEach(b => blockIds.push(b.id));
       blockIds.push('terminal_right_middle');
 
-      // Compute output power for each block
+      // Compute output power for each block.
+      // For simple blocks (Contact, Coil, terminal): blockOutPower[id] = boolean
+      // For FB blocks: blockOutPower[id] = { _default: bool, out_Q: bool, ... }
       const blockOutPower = { terminal_left_middle: true };
+
+      // Helper to read per-pin power from a source block
+      const getSourcePower = (edge) => {
+        const p = blockOutPower[edge.source];
+        if (p === undefined) return false;
+        if (typeof p !== 'object' || p === null) return !!p;
+        if (edge.sourceHandle && p[edge.sourceHandle] !== undefined) return p[edge.sourceHandle];
+        return p._default || false;
+      };
 
       blockIds.forEach(bid => {
         if (bid === 'terminal_left_middle') return;
 
-        // Input power = OR of all incoming edge source powers
+        // Input power = OR of all incoming edge source powers (per-pin aware)
         const incoming = incomingByBlock[bid] || [];
         let inPower = false;
-        incoming.forEach(e => { if (blockOutPower[e.source]) inPower = true; });
+        incoming.forEach(e => { if (getSourcePower(e)) inPower = true; });
 
         const block = blockMap[bid];
-        let outPower = inPower;
 
-        if (block) {
-          const type = (block.data?.type || block.data?.label || '').trim();
-          const subType = block.data?.subType || 'NO';
-          const vals = block.data?.values || {};
-
-          if (type === 'Contact') {
-            const varVal = lookupVar(vals.var || block.data?.instanceName || '');
-            outPower = subType === 'NC' ? (inPower && !varVal) : (inPower && varVal);
-          }
-          // Coil & FB blocks: outPower = inPower (power passes through)
+        if (!block) {
+          // Terminal node (right rail) or unknown
+          blockOutPower[bid] = inPower;
+          return;
         }
 
-        blockOutPower[bid] = outPower;
+        const type = (block.data?.type || block.data?.label || '').trim();
+        const subType = block.data?.subType || 'NO';
+        const vals = block.data?.values || {};
+
+        if (type === 'Contact') {
+          const varVal = lookupVar(vals.var || block.data?.instanceName || '');
+          blockOutPower[bid] = subType === 'NC' ? (inPower && !varVal) : (inPower && varVal);
+        } else if (type === 'Coil') {
+          blockOutPower[bid] = inPower;
+        } else {
+          // Function Block — per-output-pin power from live simulation values
+          const instName = (block.data?.instanceName || '').trim().replace(/\s+/g, '_');
+          const pinPower = { _default: inPower };
+
+          // For each outgoing edge from this block, look up the output pin's live value
+          currentEdges.forEach(e => {
+            if (e.source !== bid || !e.sourceHandle) return;
+            if (pinPower[e.sourceHandle] !== undefined) return; // already computed
+            const pinName = e.sourceHandle.replace(/^out_/, '');
+            if (!pinName) return;
+
+            let pinVal;
+            // 1. Check if a variable is assigned to this output pin
+            const assignedVar = (vals[pinName] || '').replace(/[🌍🏠⊞⊡⊟]/g, '').trim();
+            if (assignedVar && /^[A-Za-z_]/.test(assignedVar)) {
+              const safeVar = assignedVar.replace(/\s+/g, '_');
+              const progKey = `prog_${safeProgName}_${safeVar}`;
+              pinVal = liveVariables[progKey] !== undefined ? liveVariables[progKey] : liveVariables[`prog__${safeVar}`];
+            }
+            // 2. Fallback: shadow variable for unassigned output pins
+            if (pinVal === undefined && instName) {
+              pinVal = liveVariables[`prog_${safeProgName}_out_${instName}_${pinName}`];
+            }
+
+            if (pinVal !== undefined) {
+              pinPower[e.sourceHandle] = typeof pinVal === 'boolean' ? pinVal
+                : typeof pinVal === 'number' ? pinVal !== 0
+                : !!pinVal;
+            } else {
+              pinPower[e.sourceHandle] = inPower; // no live data → fallback
+            }
+          });
+
+          blockOutPower[bid] = pinPower;
+        }
       });
 
       // Colour each edge: red = powered, blue = unpowered
       return currentEdges.map(e => ({
         ...e,
         style: {
-          stroke: blockOutPower[e.source] ? '#ff1744' : '#2979ff',
+          stroke: getSourcePower(e) ? '#ff1744' : '#2979ff',
           strokeWidth: 2,
         },
       }));
