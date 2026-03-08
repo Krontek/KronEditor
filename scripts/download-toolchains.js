@@ -21,14 +21,12 @@
 import fs   from 'fs';
 import path from 'path';
 import https from 'https';
-import http  from 'http';
 import { execSync } from 'child_process';
 import { fileURLToPath } from 'url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT      = path.resolve(__dirname, '..');
-const TC_DIR    = path.join(ROOT, 'src-tauri', 'toolchains');
-const HOST_FILE = path.join(TC_DIR, '.host');
+const TC_BASE   = path.join(ROOT, 'src-tauri', 'toolchains');
 
 // ---------------------------------------------------------------------------
 // Detect or override host OS
@@ -52,6 +50,9 @@ const ARM_BASE    = `https://developer.arm.com/-/media/Files/downloads/gnu/${ARM
 // ---------------------------------------------------------------------------
 // Toolchain definitions
 // ---------------------------------------------------------------------------
+// TC_DIR is host-specific: toolchains/linux/ or toolchains/windows/
+const TC_DIR = path.join(TC_BASE, hostOS);
+
 const TOOLCHAINS = {
     mingw: {
         description: 'MinGW (w64devkit) — cross-compile to Windows',
@@ -67,45 +68,30 @@ const TOOLCHAINS = {
     'arm-none-eabi': {
         description: 'ARM bare-metal (Cortex-M targets)',
         dir:  path.join(TC_DIR, 'arm-none-eabi'),
-        check: () => {
-            const gcc = hostOS === 'windows' ? 'arm-none-eabi-gcc.exe' : 'arm-none-eabi-gcc';
-            return fs.existsSync(path.join(TC_DIR, 'arm-none-eabi', 'bin', gcc));
-        },
+        check: () => hasGcc(TC_DIR, 'arm-none-eabi'),
         skip: false,
         download: () => downloadArmOfficial('arm-none-eabi', 'arm-none-eabi'),
     },
     'aarch64-none-linux-gnu': {
         description: 'AArch64 Linux cross-compiler (Raspberry Pi, etc.)',
         dir:  path.join(TC_DIR, 'aarch64-none-linux-gnu'),
-        check: () => {
-            const gcc = hostOS === 'windows' ? 'aarch64-none-linux-gnu-gcc.exe' : 'aarch64-none-linux-gnu-gcc';
-            return fs.existsSync(path.join(TC_DIR, 'aarch64-none-linux-gnu', 'bin', gcc));
-        },
+        check: () => hasGcc(TC_DIR, 'aarch64-none-linux-gnu'),
         skip: false,
         download: () => downloadArmOfficial('aarch64-none-linux-gnu', 'aarch64-none-linux-gnu'),
     },
 };
 
+/** Check if a toolchain's gcc binary exists (handles both .exe and bare names). */
+function hasGcc(tcDir, triplet) {
+    const binDir = path.join(tcDir, triplet, 'bin');
+    return fs.existsSync(path.join(binDir, `${triplet}-gcc`))
+        || fs.existsSync(path.join(binDir, `${triplet}-gcc.exe`));
+}
+
 // ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
 fs.mkdirSync(TC_DIR, { recursive: true });
-
-// Check if we already have the right host's toolchains
-const existingHost = fs.existsSync(HOST_FILE)
-    ? fs.readFileSync(HOST_FILE, 'utf8').trim()
-    : null;
-
-if (existingHost && existingHost !== hostOS) {
-    console.log(`[toolchains] Host changed (${existingHost} → ${hostOS}), re-downloading...`);
-    // Remove non-matching toolchains (keep directory structure)
-    for (const [name, tc] of Object.entries(TOOLCHAINS)) {
-        if (fs.existsSync(tc.dir)) {
-            fs.rmSync(tc.dir, { recursive: true, force: true });
-            console.log(`  Removed ${name}/`);
-        }
-    }
-}
 
 let allOk = true;
 for (const [name, tc] of Object.entries(TOOLCHAINS)) {
@@ -120,7 +106,17 @@ for (const [name, tc] of Object.entries(TOOLCHAINS)) {
     console.log(`[${name}] ${tc.description}`);
     try {
         await tc.download();
-        if (!tc.check()) throw new Error('gcc binary not found after extraction');
+        if (!tc.check()) {
+            // Diagnostics: list what ended up in bin/
+            const binDir = path.join(tc.dir, 'bin');
+            if (fs.existsSync(binDir)) {
+                const files = fs.readdirSync(binDir);
+                console.error(`  bin/ contains ${files.length} files: ${files.slice(0, 10).join(', ')}${files.length > 10 ? '...' : ''}`);
+            } else {
+                console.error(`  bin/ directory does not exist at ${binDir}`);
+            }
+            throw new Error('gcc binary not found after extraction');
+        }
         console.log(`[${name}] OK`);
     } catch (e) {
         console.error(`[${name}] FAILED: ${e.message}`);
@@ -128,7 +124,6 @@ for (const [name, tc] of Object.entries(TOOLCHAINS)) {
     }
 }
 
-fs.writeFileSync(HOST_FILE, hostOS);
 if (!allOk) { console.error('\nSome toolchains failed to download.'); process.exit(1); }
 console.log('[toolchains] All done.');
 
@@ -136,38 +131,21 @@ console.log('[toolchains] All done.');
 // Download helpers
 // ===========================================================================
 
-/** Follow redirects and download a file to disk. */
+/** Download a file using curl or wget (handles CDN redirects reliably). */
 function downloadFile(url, dest) {
-    return new Promise((resolve, reject) => {
-        const file = fs.createWriteStream(dest);
-        const get = url.startsWith('https') ? https.get : http.get;
-        const doGet = (u) => {
-            get(u, { headers: { 'User-Agent': 'KronEditor-build' } }, (res) => {
-                if (res.statusCode === 301 || res.statusCode === 302 || res.statusCode === 307) {
-                    file.close();
-                    fs.unlinkSync(dest);
-                    return doGet(res.headers.location);
-                }
-                if (res.statusCode !== 200) {
-                    file.close();
-                    fs.unlinkSync(dest);
-                    return reject(new Error(`HTTP ${res.statusCode} for ${u}`));
-                }
-                const total = parseInt(res.headers['content-length'] || '0', 10);
-                let downloaded = 0;
-                res.on('data', (chunk) => {
-                    downloaded += chunk.length;
-                    if (total > 0) {
-                        const pct = ((downloaded / total) * 100).toFixed(0);
-                        process.stdout.write(`\r  Downloading... ${pct}% (${(downloaded / 1048576).toFixed(1)} MB)`);
-                    }
-                });
-                res.pipe(file);
-                file.on('finish', () => { file.close(); console.log(''); resolve(); });
-            }).on('error', (e) => { file.close(); fs.unlinkSync(dest); reject(e); });
-        };
-        doGet(url);
-    });
+    // Try curl first, then wget
+    try {
+        execSync(`curl -fL --progress-bar -o "${dest}" "${url}"`, { stdio: 'inherit' });
+    } catch {
+        try {
+            execSync(`wget --show-progress -O "${dest}" "${url}"`, { stdio: 'inherit' });
+        } catch (e) {
+            if (fs.existsSync(dest)) fs.unlinkSync(dest);
+            throw new Error(`Download failed (neither curl nor wget succeeded): ${e.message}`);
+        }
+    }
+    if (!fs.existsSync(dest)) throw new Error(`Download produced no file: ${dest}`);
+    return Promise.resolve();
 }
 
 /** Fetch JSON from a URL, following redirects. */
@@ -213,7 +191,7 @@ async function downloadMingw() {
     } else if (asset.name.endsWith('.7z.exe') || asset.name.endsWith('.7z')) {
         execSync(`7z x "${tmpFile}" -o"${TC_DIR}" -y`, { stdio: 'inherit' });
     } else {
-        execSync(`unzip -q "${tmpFile}" -d "${TC_DIR}"`, { stdio: 'inherit' });
+        execSync(`unzip -ooq "${tmpFile}" -d "${TC_DIR}"`, { stdio: 'inherit' });
     }
 
     if (fs.existsSync(extracted)) {
@@ -243,42 +221,173 @@ async function downloadArmOfficial(toolchainName, triplet) {
     console.log(`  Downloading ${filename}...`);
     await downloadFile(url, tmpFile);
 
+    // Extract into a temporary directory to handle both layouts:
+    //   Linux tar.xz: single root dir (arm-gnu-toolchain-VERSION-HOST-TRIPLET/)
+    //   Windows zip:  flat layout (bin/, lib/, libexec/, <triplet>/, share/, ...)
+    const tmpExtract = path.join(TC_DIR, `_extract_${toolchainName}`);
+    if (fs.existsSync(tmpExtract)) fs.rmSync(tmpExtract, { recursive: true, force: true });
+    fs.mkdirSync(tmpExtract, { recursive: true });
+
     console.log('  Extracting (this may take a while)...');
     if (filename.endsWith('.tar.xz')) {
-        // Linux: tar.xz
-        fs.mkdirSync(destDir, { recursive: true });
-        execSync(`tar xf "${tmpFile}" -C "${TC_DIR}"`, { stdio: 'inherit' });
-        // Find extracted dir (arm-gnu-toolchain-VERSION-HOST-TRIPLET)
-        const entries = fs.readdirSync(TC_DIR).filter(e =>
-            e.startsWith(`arm-gnu-toolchain-${ARM_VERSION}`) && e.includes(triplet) &&
-            fs.statSync(path.join(TC_DIR, e)).isDirectory()
+        execSync(`tar xf "${tmpFile}" -C "${tmpExtract}"`, { stdio: 'inherit' });
+    } else if (process.platform === 'win32') {
+        execSync(
+            `powershell -NoProfile -Command "Expand-Archive -Force -Path '${tmpFile}' -DestinationPath '${tmpExtract}'"`,
+            { stdio: 'inherit' }
         );
-        if (entries.length > 0) {
-            const extractedDir = path.join(TC_DIR, entries[0]);
-            if (fs.existsSync(destDir)) fs.rmSync(destDir, { recursive: true, force: true });
-            fs.renameSync(extractedDir, destDir);
-        }
     } else {
-        // Windows: .zip
-        if (process.platform === 'win32') {
-            execSync(
-                `powershell -NoProfile -Command "Expand-Archive -Force -Path '${tmpFile}' -DestinationPath '${TC_DIR}'"`,
-                { stdio: 'inherit' }
-            );
-        } else {
-            execSync(`unzip -q "${tmpFile}" -d "${TC_DIR}"`, { stdio: 'inherit' });
+        execSync(`unzip -oq "${tmpFile}" -d "${tmpExtract}"`, { stdio: 'inherit' });
+    }
+
+    // Determine the actual toolchain root inside tmpExtract.
+    // If extraction created a single directory wrapper (tar.xz), unwrap it.
+    // If it's a flat layout (Windows zip), tmpExtract itself is the root.
+    const entries = fs.readdirSync(tmpExtract).filter(e => {
+        try { return fs.statSync(path.join(tmpExtract, e)).isDirectory(); }
+        catch { return false; }
+    });
+    let toolchainRoot = tmpExtract;
+    if (entries.length === 1 && fs.existsSync(path.join(tmpExtract, entries[0], 'bin'))) {
+        // Single wrapper directory (tar.xz layout) — unwrap
+        toolchainRoot = path.join(tmpExtract, entries[0]);
+    }
+
+    // Move to final destination
+    if (fs.existsSync(destDir)) fs.rmSync(destDir, { recursive: true, force: true });
+    fs.renameSync(toolchainRoot, destDir);
+    // Clean up temp dir (may still exist if we unwrapped a subdirectory)
+    if (fs.existsSync(tmpExtract)) fs.rmSync(tmpExtract, { recursive: true, force: true });
+
+    fs.unlinkSync(tmpFile);
+
+    // Strip to minimal compile/link toolset
+    console.log('  Pruning unnecessary files...');
+    pruneToolchain(destDir, triplet);
+}
+
+// ---------------------------------------------------------------------------
+// Prune ARM toolchain to minimal compile-and-link set
+// ---------------------------------------------------------------------------
+function pruneToolchain(tcDir, triplet) {
+    const gccVer = '14.2.1';
+
+    // --- 1. bin/: keep only what we need for C compilation and linking ---
+    // Include both bare and .exe names so pruning works regardless of host
+    const binNames = [
+        `${triplet}-gcc`, `${triplet}-gcc-${gccVer}`,
+        `${triplet}-ar`, `${triplet}-as`,
+        `${triplet}-ld`, `${triplet}-ld.bfd`,
+        `${triplet}-ranlib`, `${triplet}-objcopy`,
+        `${triplet}-size`, `${triplet}-cpp`,
+    ];
+    const keepBins = new Set();
+    for (const n of binNames) { keepBins.add(n); keepBins.add(n + '.exe'); }
+    const binDir = path.join(tcDir, 'bin');
+    if (fs.existsSync(binDir)) {
+        const before = fs.readdirSync(binDir);
+        for (const f of before) {
+            if (!keepBins.has(f)) rmPath(path.join(binDir, f));
         }
-        // Find and rename extracted directory
-        const entries = fs.readdirSync(TC_DIR).filter(e =>
-            e.startsWith(`arm-gnu-toolchain-${ARM_VERSION}`) && e.includes(triplet) &&
-            fs.statSync(path.join(TC_DIR, e)).isDirectory()
-        );
-        if (entries.length > 0) {
-            const extractedDir = path.join(TC_DIR, entries[0]);
-            if (fs.existsSync(destDir)) fs.rmSync(destDir, { recursive: true, force: true });
-            fs.renameSync(extractedDir, destDir);
+        const after = fs.readdirSync(binDir);
+        if (after.length === 0 && before.length > 0) {
+            console.error(`  WARNING: pruning removed ALL ${before.length} files from bin/`);
+            console.error(`  Actual names: ${before.slice(0, 5).join(', ')}${before.length > 5 ? '...' : ''}`);
+            console.error(`  Expected names like: ${[...keepBins].slice(0, 4).join(', ')}`);
         }
     }
 
-    fs.unlinkSync(tmpFile);
+    // --- 2. libexec/gcc/<triplet>/<ver>/: keep cc1, collect2; drop cc1plus, f951, etc. ---
+    const libexecDir = path.join(tcDir, 'libexec', 'gcc', triplet, gccVer);
+    if (fs.existsSync(libexecDir)) {
+        const leNames = ['cc1', 'collect2', 'liblto_plugin.so', 'liblto_plugin-0.dll', 'lto-wrapper', 'lto1'];
+        const keepLibexec = new Set();
+        for (const n of leNames) { keepLibexec.add(n); keepLibexec.add(n + '.exe'); }
+        for (const f of fs.readdirSync(libexecDir)) {
+            if (!keepLibexec.has(f)) rmPath(path.join(libexecDir, f));
+        }
+    }
+
+    // --- 3. Remove entire top-level dirs we never need ---
+    for (const sub of ['share', 'include', 'data']) {
+        rmPath(path.join(tcDir, sub));
+    }
+    // Remove manifest/license text files
+    for (const f of fs.readdirSync(tcDir)) {
+        if (f.endsWith('.txt')) rmPath(path.join(tcDir, f));
+    }
+
+    // --- 4. lib/gcc/<triplet>/<ver>/: prune multilib dirs (arm-none-eabi only) ---
+    const gccLibDir = path.join(tcDir, 'lib', 'gcc', triplet, gccVer);
+    if (fs.existsSync(gccLibDir)) {
+        // Remove Fortran includes, install-tools, plugin, gcov
+        for (const sub of ['finclude', 'install-tools', 'plugin']) {
+            rmPath(path.join(gccLibDir, sub));
+        }
+        rmByName(gccLibDir, 'libgcov.a');
+        rmByName(gccLibDir, 'libcaf_single.a');
+
+        if (triplet === 'arm-none-eabi') {
+            // Remove arm/ mode multilib (we only use thumb)
+            rmPath(path.join(gccLibDir, 'arm'));
+            // Keep only needed thumb variants
+            pruneMultilib(path.join(gccLibDir, 'thumb'));
+        }
+    }
+
+    // --- 5. <triplet>/lib/: prune sysroot multilib (arm-none-eabi only) ---
+    const sysLib = path.join(tcDir, triplet, 'lib');
+    if (fs.existsSync(sysLib) && triplet === 'arm-none-eabi') {
+        rmPath(path.join(sysLib, 'arm'));
+        pruneMultilib(path.join(sysLib, 'thumb'));
+        // Remove Fortran library from sysroot root
+        rmByName(sysLib, 'libgfortran.a');
+        rmByName(sysLib, 'libgfortran.spec');
+    }
+
+    // --- 6. Remove python/gdb support libraries ---
+    const pyDir = path.join(tcDir, 'lib', 'python3.8');
+    rmPath(pyDir);
+    // lib64/ (aarch64 toolchain) — contains gdb python libs
+    rmPath(path.join(tcDir, 'lib64'));
+
+    const sizeMB = getDirSizeMB(tcDir);
+    console.log(`  Pruned to ${sizeMB.toFixed(0)} MB`);
+}
+
+/** For arm-none-eabi: keep only Cortex-M multilib variants we use */
+function pruneMultilib(thumbDir) {
+    if (!fs.existsSync(thumbDir)) return;
+    // v6-m = Cortex-M0, v7e-m+fp = Cortex-M4F, v7e-m+dp = Cortex-M7F, nofp = default fallback
+    const keep = new Set(['v6-m', 'v7e-m+fp', 'v7e-m+dp', 'nofp']);
+    for (const d of fs.readdirSync(thumbDir)) {
+        if (!keep.has(d)) rmPath(path.join(thumbDir, d));
+    }
+}
+
+function rmPath(p) {
+    try {
+        const st = fs.lstatSync(p);
+        if (st.isDirectory()) fs.rmSync(p, { recursive: true, force: true });
+        else fs.unlinkSync(p);
+    } catch { /* does not exist, ignore */ }
+}
+
+function rmByName(dir, name) {
+    rmPath(path.join(dir, name));
+}
+
+function getDirSizeMB(dir) {
+    let total = 0;
+    const walk = (d) => {
+        for (const entry of fs.readdirSync(d, { withFileTypes: true })) {
+            const full = path.join(d, entry.name);
+            if (entry.isDirectory()) walk(full);
+            else if (entry.isFile() || entry.isSymbolicLink()) {
+                try { total += fs.statSync(full).size; } catch {}
+            }
+        }
+    };
+    walk(dir);
+    return total / (1024 * 1024);
 }

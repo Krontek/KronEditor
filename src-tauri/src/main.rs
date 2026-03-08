@@ -34,7 +34,7 @@ lalrpop_mod!(pub grammar);
 const SIM_BIN: &str = "simulation";
 
 #[cfg(target_os = "windows")]
-const MINGW_GCC: &str = "toolchains/mingw/bin/gcc.exe";
+const MINGW_GCC: &str = "toolchains/active/mingw/bin/gcc.exe";
 
 // ---------------------------------------------------------------------------
 // Path helpers
@@ -547,8 +547,8 @@ fn do_update_libraries(app: &tauri::AppHandle, repos: Vec<String>) -> Result<(),
     {
         let _ = app.emit("library-update-progress", "--- Building for x86_64/win32 ---".to_string());
         // Try bundled MinGW first, then system cross-compiler
-        let bundled_gcc = resource_dir.join("toolchains/mingw/bin/gcc.exe");
-        let bundled_ar  = resource_dir.join("toolchains/mingw/bin/ar.exe");
+        let bundled_gcc = resource_dir.join("toolchains/active/mingw/bin/gcc.exe");
+        let bundled_ar  = resource_dir.join("toolchains/active/mingw/bin/ar.exe");
         let (cc, ar_cmd): (String, String) = if bundled_gcc.exists() {
             (bundled_gcc.to_string_lossy().to_string(), bundled_ar.to_string_lossy().to_string())
         } else {
@@ -582,7 +582,7 @@ fn do_update_libraries(app: &tauri::AppHandle, repos: Vec<String>) -> Result<(),
     // ---- arm/linux — aarch64-none-linux-gnu-gcc (per-repo .a archives) ----
     {
         let _ = app.emit("library-update-progress", "--- Building for arm/linux ---".to_string());
-        let tc_bin = resource_dir.join("toolchains/aarch64-none-linux-gnu/bin");
+        let tc_bin = resource_dir.join("toolchains/active/aarch64-none-linux-gnu/bin");
         let gcc_name = if cfg!(target_os = "windows") { "aarch64-none-linux-gnu-gcc.exe" } else { "aarch64-none-linux-gnu-gcc" };
         let ar_name  = if cfg!(target_os = "windows") { "aarch64-none-linux-gnu-ar.exe" }  else { "aarch64-none-linux-gnu-ar" };
         let cc_path = tc_bin.join(gcc_name);
@@ -616,7 +616,7 @@ fn do_update_libraries(app: &tauri::AppHandle, repos: Vec<String>) -> Result<(),
         ("arm/CortexM/M7", 5, &["-mcpu=cortex-m7", "-mthumb", "-mfloat-abi=hard", "-mfpu=fpv5-d16", "-O2", "-ffunction-sections", "-fdata-sections"]),
     ];
 
-    let tc_arm_bin = resource_dir.join("toolchains/arm-none-eabi/bin");
+    let tc_arm_bin = resource_dir.join("toolchains/active/arm-none-eabi/bin");
     let arm_gcc_name = if cfg!(target_os = "windows") { "arm-none-eabi-gcc.exe" } else { "arm-none-eabi-gcc" };
     let arm_ar_name  = if cfg!(target_os = "windows") { "arm-none-eabi-ar.exe" }  else { "arm-none-eabi-ar" };
     let arm_gcc = tc_arm_bin.join(arm_gcc_name);

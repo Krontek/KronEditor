@@ -7,7 +7,7 @@
     "dev": "tauri dev",
     "web": "vite",
     "download-toolchains": "node scripts/download-toolchains.js",
-    "build:linux": "node scripts/download-toolchains.js --host linux && tauri build",
+    "build:linux": "node scripts/download-toolchains.js --host linux && ARCH=x86_64 tauri build",
     "build:windows": "node scripts/download-toolchains.js --host windows && tauri build --target x86_64-pc-windows-gnu",
     "build": "npm run build:linux && npm run build:windows",
     "build:web": "vite build",

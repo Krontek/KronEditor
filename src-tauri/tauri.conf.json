@@ -30,7 +30,7 @@
             "dmg"
         ],
         "resources": [
-            "toolchains/**/*",
+            "toolchains/active/**/*",
             "resources/include/*",
             "resources/x86_64/linux/*",
             "resources/x86_64/win32/*",

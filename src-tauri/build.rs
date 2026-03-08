@@ -37,8 +37,33 @@ fn main() {
 
     // Ensure toolchains directory exists so Tauri's glob doesn't fail
     // when toolchains haven't been downloaded yet.
+    // Toolchains are stored per-host: toolchains/linux/, toolchains/windows/
+    // A symlink toolchains/active → <host>/ selects the right one at build/dev time.
+    let tc_base = std::path::Path::new("toolchains");
+    let _ = std::fs::create_dir_all(tc_base);
+
+    // Determine host from cargo TARGET env: windows target → windows toolchains, else linux
+    let target = std::env::var("TARGET").unwrap_or_default();
+    let host_name = if target.contains("windows") { "windows" } else { "linux" };
+
+    // Ensure both host dirs exist
+    let _ = std::fs::create_dir_all(tc_base.join("linux"));
+    let _ = std::fs::create_dir_all(tc_base.join("windows"));
+
+    // Create/update the "active" symlink → <host_name>
+    let active_link = tc_base.join("active");
+    // Remove existing symlink or directory
+    if active_link.is_symlink() || active_link.exists() {
+        let _ = std::fs::remove_file(&active_link);
+    }
+    #[cfg(unix)]
+    let _ = std::os::unix::fs::symlink(host_name, &active_link);
+    #[cfg(windows)]
+    let _ = std::os::windows::fs::symlink_dir(host_name, &active_link);
+
+    // Ensure placeholder dirs inside active toolchains so Tauri globs don't fail
     for tc in &["mingw/bin", "arm-none-eabi/bin", "aarch64-none-linux-gnu/bin"] {
-        let d = std::path::Path::new("toolchains").join(tc);
+        let d = active_link.join(tc);
         let _ = std::fs::create_dir_all(&d);
         let placeholder = d.join("EMPTY");
         if !placeholder.exists() {
