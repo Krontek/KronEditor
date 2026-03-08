@@ -375,7 +375,7 @@ function App() {
         });
         addLog('success', t('logs.transpiledSaved', { path: outPath }) || `Transpiled C header and source successfully saved to ${outPath}`);
 
-        addLog('info', t('logs.compilingSimulationTcc') || 'Compiling simulation executable with TCC...');
+        addLog('info', t('logs.compilingSimulation') || 'Compiling simulation executable...');
         const exePath = await invoke('compile_simulation');
         addLog('success', t('logs.simulationCompiled', { path: exePath }) || `Simulation executable compiled: ${exePath}`);
 

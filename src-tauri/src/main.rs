@@ -34,7 +34,7 @@ lalrpop_mod!(pub grammar);
 const SIM_BIN: &str = "simulation";
 
 #[cfg(target_os = "windows")]
-const MINGW_GCC: &str = "mingw/windows-x64/bin/gcc.exe";
+const MINGW_GCC: &str = "toolchains/mingw/bin/gcc.exe";
 
 // ---------------------------------------------------------------------------
 // Path helpers
@@ -53,7 +53,7 @@ fn get_resource_dir(app: &tauri::AppHandle) -> Result<PathBuf, String> {
 }
 
 /// Strip the \\?\ long-path UNC prefix that Windows sometimes adds.
-/// TCC does not accept this prefix in -I/-B arguments.
+/// gcc does not accept this prefix in -I/-B arguments.
 #[cfg(target_os = "windows")]
 fn plain_path(p: &Path) -> PathBuf {
     match p.to_str() {
@@ -365,8 +365,9 @@ fn do_update_libraries(app: &tauri::AppHandle, repos: Vec<String>) -> Result<(),
     }
 
     let target_names = [
-        "Simulation/Linux", "Simulation/Windows",
-        "CortexM0", "CortexM4F", "CortexM7F",
+        "x86_64/linux", "x86_64/win32",
+        "arm/linux",
+        "arm/CortexM/M0", "arm/CortexM/M4", "arm/CortexM/M7",
     ];
 
     let mut targets: Vec<BuildTarget> = Vec::new();
@@ -394,27 +395,6 @@ fn do_update_libraries(app: &tauri::AppHandle, repos: Vec<String>) -> Result<(),
                 let _ = fs::create_dir_all(&d);
                 t.dev_dir = Some(d);
             }
-        }
-    }
-
-    // TCC for Linux simulation
-    #[cfg(not(target_os = "windows"))]
-    let tcc_dir = resource_dir.join("tcc/linux-x64");
-    #[cfg(target_os = "windows")]
-    let tcc_dir = plain_path(&resource_dir.join("tcc/windows-x64"));
-
-    #[cfg(not(target_os = "windows"))]
-    let tcc_bin = tcc_dir.join("tcc");
-    #[cfg(target_os = "windows")]
-    let tcc_bin = tcc_dir.join("tcc.exe");
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if let Ok(meta) = fs::metadata(&tcc_bin) {
-            let mut perms = meta.permissions();
-            perms.set_mode(0o755);
-            let _ = fs::set_permissions(&tcc_bin, perms);
         }
     }
 
@@ -504,7 +484,7 @@ fn do_update_libraries(app: &tauri::AppHandle, repos: Vec<String>) -> Result<(),
 
     // --- Compile for each target ---
 
-    // Helper: compile one .c → lib<lib_name>.a  (used for Linux TCC and ARM targets)
+    // Helper: compile one .c → lib<lib_name>.a  (used for Linux and ARM targets)
     let compile_one_ar = |
         target_tag: &str,
         compiler:   &str,
@@ -545,109 +525,117 @@ fn do_update_libraries(app: &tauri::AppHandle, repos: Vec<String>) -> Result<(),
         Ok(())
     };
 
-    // ---- Simulation/Linux — TCC (per-repo .a archives) ----
+    // ---- x86_64/linux — GCC (per-repo .a archives) ----
     {
-        let _ = app.emit("library-update-progress", "--- Building for Simulation/Linux ---".to_string());
+        let _ = app.emit("library-update-progress", "--- Building for x86_64/linux ---".to_string());
         let t = &targets[0];
+        let cc_args: &[&str] = &["-O2", "-ffunction-sections", "-fdata-sections"];
         for (lib_name, c_file) in &repo_sources {
-            let obj_path = temp_base.join(format!("linux_{}.o", lib_name));
-            let mut cmd = std::process::Command::new(&tcc_bin);
-            cmd.arg("-B").arg(&tcc_dir)
-               .arg("-I").arg(&include_dir)
-               .arg("-I").arg(tcc_dir.join("include"))
-               .arg("-c").arg(c_file)
-               .arg("-o").arg(&obj_path);
-            for cdir in &cloned_dirs { cmd.arg("-I").arg(cdir); }
-
-            match cmd.output() {
-                Ok(o) if o.status.success() => {
-                    let lib_path = t.dir.join(format!("lib{}.a", lib_name));
-                    let ar_args = [
-                        "-ar", "rcs",
-                        lib_path.to_str().unwrap_or(""),
-                        obj_path.to_str().unwrap_or(""),
-                    ];
-                    match std::process::Command::new(&tcc_bin).args(&ar_args).output() {
-                        Ok(ar) if ar.status.success() => {
-                            let _ = app.emit("library-update-progress", format!(
-                                "  [Simulation/Linux] lib{}.a OK", lib_name));
-                            if let Some(ref dev_dir) = t.dev_dir {
-                                let _ = fs::copy(&lib_path, dev_dir.join(format!("lib{}.a", lib_name)));
-                            }
-                        }
-                        Ok(ar) => { let _ = app.emit("library-update-progress", format!(
-                            "  [Simulation/Linux] lib{}.a archive warn: {}",
-                            lib_name, String::from_utf8_lossy(&ar.stderr).trim())); }
-                        Err(e) => { let _ = app.emit("library-update-progress", format!(
-                            "  [Simulation/Linux] lib{}.a archive error: {}", lib_name, e)); }
-                    }
-                    let _ = fs::remove_file(&obj_path);
-                }
-                Ok(o) => { let _ = app.emit("library-update-progress", format!(
-                    "  [Simulation/Linux] WARN {}: {}",
-                    lib_name, String::from_utf8_lossy(&o.stderr).trim())); }
-                Err(e) => { let _ = app.emit("library-update-progress", format!(
-                    "  [Simulation/Linux] TCC error {}: {}", lib_name, e)); }
+            match compile_one_ar(
+                "x86_64/linux", "gcc", cc_args, "ar",
+                &t.dir, &t.dev_dir, lib_name, c_file,
+            ) {
+                Ok(()) => { let _ = app.emit("library-update-progress", format!(
+                    "  [x86_64/linux] lib{}.a OK", lib_name)); }
+                Err(e) => { let _ = app.emit("library-update-progress",
+                    format!("  [x86_64/linux] {}", e)); }
             }
         }
     }
 
-    // ---- Simulation/Windows — per-lib MinGW .a archives ----
-    // Built with x86_64-w64-mingw32-gcc so the archives are Windows PE COFF format.
-    // At runtime, win_sim::compile() loads them via tcc_add_file().
+    // ---- x86_64/win32 — per-lib MinGW .a archives ----
     {
-        let _ = app.emit("library-update-progress", "--- Building for Simulation/Windows ---".to_string());
-        let cc = "x86_64-w64-mingw32-gcc";
-        let ar = "x86_64-w64-mingw32-ar";
-        let has_cc = std::process::Command::new(cc)
+        let _ = app.emit("library-update-progress", "--- Building for x86_64/win32 ---".to_string());
+        // Try bundled MinGW first, then system cross-compiler
+        let bundled_gcc = resource_dir.join("toolchains/mingw/bin/gcc.exe");
+        let bundled_ar  = resource_dir.join("toolchains/mingw/bin/ar.exe");
+        let (cc, ar_cmd): (String, String) = if bundled_gcc.exists() {
+            (bundled_gcc.to_string_lossy().to_string(), bundled_ar.to_string_lossy().to_string())
+        } else {
+            ("x86_64-w64-mingw32-gcc".to_string(), "x86_64-w64-mingw32-ar".to_string())
+        };
+        let has_cc = std::process::Command::new(&cc)
             .arg("--version")
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status().map(|s| s.success()).unwrap_or(false);
         if !has_cc {
             let _ = app.emit("library-update-progress",
-                "  [Simulation/Windows] SKIP: x86_64-w64-mingw32-gcc not found".to_string());
+                "  [x86_64/win32] SKIP: MinGW gcc not found".to_string());
         } else {
             let t = &targets[1];
             let cc_args: &[&str] = &["-O2", "-ffunction-sections", "-fdata-sections"];
             for (lib_name, c_file) in &repo_sources {
                 match compile_one_ar(
-                    "Simulation/Windows", cc, cc_args, ar,
+                    "x86_64/win32", &cc, cc_args, &ar_cmd,
                     &t.dir, &t.dev_dir, lib_name, c_file,
                 ) {
                     Ok(()) => { let _ = app.emit("library-update-progress", format!(
-                        "  [Simulation/Windows] lib{}.a OK", lib_name)); }
+                        "  [x86_64/win32] lib{}.a OK", lib_name)); }
                     Err(e) => { let _ = app.emit("library-update-progress",
-                        format!("  [Simulation/Windows] {}", e)); }
+                        format!("  [x86_64/win32] {}", e)); }
                 }
             }
         }
     }
 
-    // ---- ARM targets — arm-none-eabi-gcc (per-repo .a archives) ----
+    // ---- arm/linux — aarch64-none-linux-gnu-gcc (per-repo .a archives) ----
+    {
+        let _ = app.emit("library-update-progress", "--- Building for arm/linux ---".to_string());
+        let tc_bin = resource_dir.join("toolchains/aarch64-none-linux-gnu/bin");
+        let gcc_name = if cfg!(target_os = "windows") { "aarch64-none-linux-gnu-gcc.exe" } else { "aarch64-none-linux-gnu-gcc" };
+        let ar_name  = if cfg!(target_os = "windows") { "aarch64-none-linux-gnu-ar.exe" }  else { "aarch64-none-linux-gnu-ar" };
+        let cc_path = tc_bin.join(gcc_name);
+        let ar_path = tc_bin.join(ar_name);
+        if !cc_path.exists() {
+            let _ = app.emit("library-update-progress",
+                "  [arm/linux] SKIP: aarch64-none-linux-gnu-gcc not found (run download-toolchains)".to_string());
+        } else {
+            let t = &targets[2];
+            let cc_str = cc_path.to_string_lossy().to_string();
+            let ar_str = ar_path.to_string_lossy().to_string();
+            let cc_args: &[&str] = &["-O2", "-ffunction-sections", "-fdata-sections"];
+            for (lib_name, c_file) in &repo_sources {
+                match compile_one_ar(
+                    "arm/linux", &cc_str, cc_args, &ar_str,
+                    &t.dir, &t.dev_dir, lib_name, c_file,
+                ) {
+                    Ok(()) => { let _ = app.emit("library-update-progress", format!(
+                        "  [arm/linux] lib{}.a OK", lib_name)); }
+                    Err(e) => { let _ = app.emit("library-update-progress",
+                        format!("  [arm/linux] {}", e)); }
+                }
+            }
+        }
+    }
+
+    // ---- ARM CortexM targets — arm-none-eabi-gcc (per-repo .a archives) ----
     let arm_targets: &[(&str, usize, &[&str])] = &[
-        ("CortexM0", 2, &["-mcpu=cortex-m0", "-mthumb", "-mfloat-abi=soft", "-O2", "-ffunction-sections", "-fdata-sections"]),
-        ("CortexM4F", 3, &["-mcpu=cortex-m4", "-mthumb", "-mfloat-abi=hard", "-mfpu=fpv4-sp-d16", "-O2", "-ffunction-sections", "-fdata-sections"]),
-        ("CortexM7F", 4, &["-mcpu=cortex-m7", "-mthumb", "-mfloat-abi=hard", "-mfpu=fpv5-d16", "-O2", "-ffunction-sections", "-fdata-sections"]),
+        ("arm/CortexM/M0", 3, &["-mcpu=cortex-m0", "-mthumb", "-mfloat-abi=soft", "-O2", "-ffunction-sections", "-fdata-sections"]),
+        ("arm/CortexM/M4", 4, &["-mcpu=cortex-m4", "-mthumb", "-mfloat-abi=hard", "-mfpu=fpv4-sp-d16", "-O2", "-ffunction-sections", "-fdata-sections"]),
+        ("arm/CortexM/M7", 5, &["-mcpu=cortex-m7", "-mthumb", "-mfloat-abi=hard", "-mfpu=fpv5-d16", "-O2", "-ffunction-sections", "-fdata-sections"]),
     ];
 
-    let has_arm = std::process::Command::new("arm-none-eabi-gcc")
-        .arg("--version")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status().map(|s| s.success()).unwrap_or(false);
+    let tc_arm_bin = resource_dir.join("toolchains/arm-none-eabi/bin");
+    let arm_gcc_name = if cfg!(target_os = "windows") { "arm-none-eabi-gcc.exe" } else { "arm-none-eabi-gcc" };
+    let arm_ar_name  = if cfg!(target_os = "windows") { "arm-none-eabi-ar.exe" }  else { "arm-none-eabi-ar" };
+    let arm_gcc = tc_arm_bin.join(arm_gcc_name);
+    let arm_ar  = tc_arm_bin.join(arm_ar_name);
+    let has_arm = arm_gcc.exists();
 
     for (name, idx, cc_args) in arm_targets {
         let _ = app.emit("library-update-progress", format!("--- Building for {} ---", name));
         if !has_arm {
             let _ = app.emit("library-update-progress",
-                format!("  [{}] SKIP: arm-none-eabi-gcc not found", name));
+                format!("  [{}] SKIP: arm-none-eabi-gcc not found (run download-toolchains)", name));
             continue;
         }
         let t = &targets[*idx];
+        let cc_str = arm_gcc.to_string_lossy().to_string();
+        let ar_str = arm_ar.to_string_lossy().to_string();
         for (lib_name, c_file) in &repo_sources {
             match compile_one_ar(
-                name, "arm-none-eabi-gcc", cc_args, "arm-none-eabi-ar",
+                name, &cc_str, cc_args, &ar_str,
                 &t.dir, &t.dev_dir, lib_name, c_file,
             ) {
                 Ok(()) => { let _ = app.emit("library-update-progress", format!(
@@ -706,7 +694,7 @@ fn compile_simulation(app: tauri::AppHandle) -> Result<String, String> {
     let plc_c        = build_dir.join("plc.c");
     let plc_dll      = build_dir.join("plc.dll");
     let res_include  = resource_dir.join("resources/include");
-    let sim_win      = resource_dir.join("resources/Simulation/Windows");
+    let sim_win      = resource_dir.join("resources/x86_64/win32");
 
     let gcc_bin_dir = gcc_path.parent().unwrap_or(&gcc_path);
 
@@ -757,12 +745,13 @@ fn compile_simulation(app: tauri::AppHandle) -> Result<String, String> {
     let plc_c        = build_dir.join("plc.c");
     let out_file     = build_dir.join(SIM_BIN);
     let res_include  = resource_dir.join("resources/include");
-    let sim_lib      = resource_dir.join("resources/Simulation/Linux");
+    let sim_lib      = resource_dir.join("resources/x86_64/linux");
 
     let mut cmd = Command::new("gcc");
     cmd.arg("-I").arg(&build_dir)
         .arg("-I").arg(&res_include)
         .arg("-rdynamic")
+        .arg("-no-pie")
         .arg("-o").arg(&out_file)
         .arg(&plc_c);
 
@@ -805,7 +794,7 @@ struct SimState {
     process: Mutex<Option<Child>>,
     #[cfg(not(target_os = "windows"))]
     pid:     Mutex<Option<u32>>,
-    // Windows: in-process TCC simulation
+    // Windows: in-process DLL simulation
     #[cfg(target_os = "windows")]
     win: Mutex<Option<win_sim::WinCtx>>,
 }
@@ -1177,7 +1166,7 @@ fn write_variable(
     };
     let data = encode_value(&vtype, &value)
         .ok_or_else(|| format!("Cannot encode '{}' as {}", value, vtype))?;
-    // Direct write into in-process TCC memory
+    // Direct pointer write into in-process DLL memory
     unsafe {
         let ptr = address as *mut u8;
         std::ptr::copy_nonoverlapping(data.as_ptr(), ptr, data.len());

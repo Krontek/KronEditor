@@ -148,7 +148,7 @@
         "stopExecutionFirst": "Пожалуйста, остановите выполнение перед переключением режима симуляции.",
         "compilingSimulationTranspile": "Компиляция проекта для симуляции (C Transpilation)...",
         "transpiledSaved": "Транспилированный заголовок и исходный код C успешно сохранены в {{path}}",
-        "compilingSimulationTcc": "Компиляция исполняемого файла симуляции с TCC...",
+        "compilingSimulation": "Компиляция исполняемого файла симуляции...",
         "simulationCompiled": "Исполняемый файл симуляции скомпилирован: {{path}}",
         "simulationEnabled": "Режим симуляции включен. Переменные заполнены значениями по умолчанию.",
         "simulationCompileFailed": "Ошибка компиляции симуляции: {{error}}",

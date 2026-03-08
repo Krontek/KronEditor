@@ -274,6 +274,28 @@ extern volatile uint64_t us_tick;
                 };
             });
 
+            // Collect input shadow vars — writable placeholders for unassigned/literal FB input pins
+            const inputShadowVars = prog.type === 'LD'
+                ? collectInputShadowVars(prog.content?.rungs, progName)
+                : [];
+            inputShadowVars.forEach(sv => {
+                const initPart = sv.initStr !== '0' ? ` = ${sv.initStr}` : '';
+                header += `${mapType(sv.type)} ${sv.symbol}${initPart};\n`;
+                const shortKey = sv.symbol.replace(`prog_${progName}_`, '');
+                variableTable.programs[progName].variables[shortKey] = {
+                    type: sv.type,
+                    c_symbol: sv.symbol,
+                    initialValue: sv.initVal
+                };
+                variableTable.debugDefaults[`prog_${progName}_${shortKey}`] = {
+                    type: sv.type,
+                    c_symbol: sv.symbol,
+                    defaultValue: sv.initVal
+                };
+            });
+            const inputShadowMap = new Map();
+            inputShadowVars.forEach(sv => inputShadowMap.set(`${sv.instName}_${sv.editorPin}`, sv.symbol));
+
             // Collect variable names already declared (program vars + shadow vars)
             if (prog.type === 'LD') {
                 const declaredVarNames = new Set();
@@ -290,7 +312,7 @@ extern volatile uint64_t us_tick;
                 // C compiler emits an error, forcing the user to add them.
             }
 
-            header += transpilePOUSource(prog, 'program', stdFunctions, progName, globalVarNames);
+            header += transpilePOUSource(prog, 'program', stdFunctions, progName, globalVarNames, inputShadowMap);
         });
     }
 
@@ -410,7 +432,7 @@ const generateMainLoop = (projectStructure, config) => {
     return mainSrc;
 };
 
-const transpilePOUSource = (pou, category, stdFunctions = {}, parentName = '', globalVarNames = []) => {
+const transpilePOUSource = (pou, category, stdFunctions = {}, parentName = '', globalVarNames = [], inputShadowMap = null) => {
     let src = ``;
     let safeName = (pou.name || '').trim().replace(/\s+/g, '_');
     let sig = `static inline void ${safeName}()`;
@@ -445,7 +467,7 @@ const transpilePOUSource = (pou, category, stdFunctions = {}, parentName = '', g
         });
         src += transpileSTLogics(pou.content.code, stdFunctions, parentName, category, varMap);
     } else if (pou.type === 'LD') {
-        src += transpileLDLogics(pou.content.rungs, stdFunctions, safeName, category, globalVarNames);
+        src += transpileLDLogics(pou.content.rungs, stdFunctions, safeName, category, globalVarNames, inputShadowMap);
     }
 
     src += `}\n\n`;
@@ -582,6 +604,52 @@ const collectShadowVars = (rungs, progName) => {
                         vars.push({ symbol: sym, type: getOutputPinType(type, pinName, data.customData) });
                     }
                 }
+            });
+        });
+    });
+    return vars;
+};
+
+// Collect writable input shadow variables for unassigned/literal FB input pins.
+// Returns shadow entries with initial values so the simulator can track and write them.
+const collectInputShadowVars = (rungs, progName) => {
+    const seen = new Set();
+    const vars = [];
+    const isVarRef = (val) => {
+        if (!val) return false;
+        const v = (val + '').replace(/[🌍🏠⊞⊡⊟]/g, '').trim();
+        return v.length > 0 && /^[A-Za-z_][A-Za-z0-9_]*(\[[^\]]*\]|\.[A-Za-z_][A-Za-z0-9_]*)*$/.test(v);
+    };
+    (rungs || []).forEach(rung => {
+        (rung.blocks || []).forEach(b => {
+            const type = (b.type || '').trim();
+            if (!FB_INPUT_TYPES[type]) return;
+            const data = b.data || {};
+            const instName = (data.instanceName || type).trim().replace(/\s+/g, '_');
+            const pinTypes = FB_INPUT_TYPES[type];
+            Object.entries(pinTypes).forEach(([editorPin, iecType]) => {
+                const rawVal = data.values?.[editorPin];
+                if (isVarRef(rawVal)) return;
+                const sym = `prog_${progName}_in_${instName}_${editorPin}`;
+                if (seen.has(sym)) return;
+                seen.add(sym);
+                const cleanVal = rawVal ? (rawVal + '').replace(/[🌍🏠⊞⊡⊟]/g, '').trim() : '';
+                let initStr = '0';
+                let initVal = 0;
+                if (cleanVal) {
+                    if (iecType === 'TIME') {
+                        const us = mapIECtoTimeUs(cleanVal);
+                        initStr = String(us);
+                        initVal = us;
+                    } else if (/^-?\d+(\.\d+)?$/.test(cleanVal)) {
+                        initStr = cleanVal;
+                        initVal = parseFloat(cleanVal);
+                    } else if (/^(true|false)$/i.test(cleanVal)) {
+                        initStr = cleanVal.toLowerCase();
+                        initVal = cleanVal.toLowerCase() === 'true' ? 1 : 0;
+                    }
+                }
+                vars.push({ symbol: sym, type: iecType, instName, editorPin, initStr, initVal });
             });
         });
     });
@@ -767,6 +835,27 @@ const FB_INPUTS = {
     'SCALE_X': ['EN', 'MIN', 'MAX', 'VALUE']
 };
 
+// Maps editor-facing pin names to actual C struct member names where they differ
+const FB_C_PIN_NAME = {
+    'CTU':  { 'R': 'RESET' },
+    'CTUD': { 'R': 'RESET' },
+};
+// Returns the C struct member name for a given editor pin name and block type
+const cStructPin = (blockType, editorPin) => FB_C_PIN_NAME[blockType]?.[editorPin] ?? editorPin;
+
+// IEC type of each non-trigger input pin for standard FBs (for input shadow var generation)
+const FB_INPUT_TYPES = {
+    'TON':   { 'PT': 'TIME' },
+    'TOF':   { 'PT': 'TIME' },
+    'TP':    { 'PT': 'TIME' },
+    'TONR':  { 'PT': 'TIME', 'RESET': 'BOOL' },
+    'CTU':   { 'R': 'BOOL', 'PV': 'INT' },
+    'CTD':   { 'LD': 'BOOL', 'PV': 'INT' },
+    'CTUD':  { 'CD': 'BOOL', 'R': 'BOOL', 'LD': 'BOOL', 'PV': 'INT' },
+    'SR':    { 'R': 'BOOL' },
+    'RS':    { 'R1': 'BOOL' },
+};
+
 const transpileSTLogics = (code, stdFunctions = {}, parentName = '', category = 'program', varMap = {}) => {
     if (!code) return `    // ST Implementation Empty\n`;
 
@@ -912,7 +1001,7 @@ const transpileSTLogics = (code, stdFunctions = {}, parentName = '', category = 
     return out || `    // ST parsing placeholder\n`;
 };
 
-const transpileLDLogics = (rungs, stdFunctions = {}, parentName = '', category = 'program', globalVarNames = []) => {
+const transpileLDLogics = (rungs, stdFunctions = {}, parentName = '', category = 'program', globalVarNames = [], inputShadowMap = null) => {
     if (!rungs || rungs.length === 0) return `    // LD Implementation Empty\n`;
 
     let out = '';
@@ -1221,14 +1310,34 @@ const transpileLDLogics = (rungs, stdFunctions = {}, parentName = '', category =
                         .forEach(v => outputPinNames.add(v.name));
                 }
 
+                const safeInst = instName.trim().replace(/\s+/g, '_');
                 // Step 1: assign static pin values entered in the block's INPUT fields
                 //         Skip output pins — those are written back after the call
                 if (data.values) {
                     Object.entries(data.values).forEach(([pinName, val]) => {
                         if (outputPinNames.has(pinName)) return; // handled post-call
-                        const resolved = resolveVal(val);
-                        if (resolved !== null && resolved !== undefined) {
-                            out += `    ${callTarget}.${pinName} = ${resolved};\n`;
+                        const cPin = cStructPin(type, pinName);
+                        const shadowSym = inputShadowMap?.get(`${safeInst}_${pinName}`);
+                        if (shadowSym) {
+                            out += `    ${callTarget}.${cPin} = ${shadowSym};\n`;
+                        } else {
+                            const resolved = resolveVal(val);
+                            if (resolved !== null && resolved !== undefined) {
+                                out += `    ${callTarget}.${cPin} = ${resolved};\n`;
+                            }
+                        }
+                    });
+                }
+                // Empty input pins that have shadow tracking variables (not present in data.values)
+                if (inputShadowMap) {
+                    (inputPins || []).forEach(pinName => {
+                        if (pinName === FB_TRIGGER_PIN[type]) return;
+                        if (outputPinNames.has(pinName)) return;
+                        if (data.values?.[pinName] !== undefined && data.values[pinName] !== '') return;
+                        const shadowSym = inputShadowMap.get(`${safeInst}_${pinName}`);
+                        if (shadowSym) {
+                            const cPin = cStructPin(type, pinName);
+                            out += `    ${callTarget}.${cPin} = ${shadowSym};\n`;
                         }
                     });
                 }
@@ -1243,17 +1352,18 @@ const transpileLDLogics = (rungs, stdFunctions = {}, parentName = '', category =
                     if (isNaN(pinIdx)) return;
                     const pinName = inputPins[pinIdx];
                     if (!pinName) return;
+                    const cPin = cStructPin(type, pinName);
                     if (c.source && c.source.startsWith('terminal_left')) {
-                        out += `    ${callTarget}.${pinName} = true;\n`;
+                        out += `    ${callTarget}.${cPin} = true;\n`;
                     } else if (sortedIndex[c.source] !== undefined) {
-                        out += `    ${callTarget}.${pinName} = out_r${rungIdx}_b${sortedIndex[c.source]};\n`;
+                        out += `    ${callTarget}.${cPin} = out_r${rungIdx}_b${sortedIndex[c.source]};\n`;
                     }
                 });
 
                 // Step 3: set the trigger (power-flow) input — always from inExpr
                 const triggerPin = FB_TRIGGER_PIN[type] || (inputPins.length > 0 ? inputPins[0] : null);
                 if (triggerPin) {
-                    out += `    ${callTarget}.${triggerPin} = ${inExpr};\n`;
+                    out += `    ${callTarget}.${cStructPin(type, triggerPin)} = ${inExpr};\n`;
                 }
 
                 // Call the FB execute function
@@ -1297,7 +1407,6 @@ const transpileLDLogics = (rungs, stdFunctions = {}, parentName = '', category =
                 }
 
                 // Step 4: output pin write-back — all pins, to assigned var or shadow tracking var
-                const safeInst = instName.trim().replace(/\s+/g, '_');
                 outputPinNames.forEach(pinName => {
                     const rawVal = data.values?.[pinName];
                     const varStr = rawVal ? (rawVal + '').replace(/[🌍🏠⊞⊡⊟]/g, '').trim() : '';

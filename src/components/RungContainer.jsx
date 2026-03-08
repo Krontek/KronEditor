@@ -395,7 +395,7 @@ const BlockNode = ({ id, data, isConnectable, selected }) => {
   }, [data.instanceName, data.type, data.values?.var, data.values?.coil]);
 
   const [localPinValues, setLocalPinValues] = useState(data.values || {});
-  const [forceModal, setForceModal] = useState(false);
+  const [forceModal, setForceModal] = useState(null);
 
   React.useEffect(() => {
     setLocalPinValues(data.values || {});
@@ -483,7 +483,7 @@ const BlockNode = ({ id, data, isConnectable, selected }) => {
         {isLiveActive && (
           <div
             className="nodrag"
-            onClick={(e) => { e.stopPropagation(); if (canForce) setForceModal(true); }}
+            onClick={(e) => { e.stopPropagation(); if (canForce) setForceModal({ liveKey: lookupKey, varName: instanceName, varType, currentValue: liveVariables?.[lookupKey] }); }}
             title={canForce ? 'Click to force-write value' : ''}
             style={{
               position: 'absolute',
@@ -611,11 +611,11 @@ const BlockNode = ({ id, data, isConnectable, selected }) => {
         {forceModal && (
           <ForceWriteModal
             isOpen={true}
-            onClose={() => setForceModal(false)}
-            varName={instanceName}
-            varType={varType}
-            currentValue={liveVariables?.[lookupKey]}
-            liveKey={lookupKey}
+            onClose={() => setForceModal(null)}
+            varName={forceModal.varName}
+            varType={forceModal.varType}
+            currentValue={forceModal.currentValue}
+            liveKey={forceModal.liveKey}
             onConfirm={(key, val) => { data.onForceWrite && data.onForceWrite(key, val); }}
           />
         )}
@@ -785,7 +785,8 @@ const BlockNode = ({ id, data, isConnectable, selected }) => {
 
             const safeProgName = (data.parentName || "").trim().replace(/\s+/g, '_');
             const safeInstName = (data.instanceName || '').trim().replace(/\s+/g, '_');
-
+            const shadowKey = `prog_${safeProgName}_in_${safeInstName}_${pin.name}`;
+            const hasShadow = !!(liveVariables && liveVariables[shadowKey] !== undefined);
             // IEC 61131-3 Time Literal Regex
             // Matches T#..., TIME#... with units d, h, m, s, ms. 
             // Case insensitive.
@@ -813,31 +814,38 @@ const BlockNode = ({ id, data, isConnectable, selected }) => {
                     transition: 'transform 0.2s ease'
                   }}>
                     {/* Live value badge (simulation mode) - Positioned above the input if a variable is assigned, or in place of it if not */}
-                    {(liveVariables && (!val || valVarDef)) && (
-                      <span style={{
-                        position: 'absolute',
-                        top: val ? -15 : 0, // Move above if there is text, otherwise overlay
-                        right: 0,
-                        minWidth: 36,
-                        fontSize: 9,
-                        background: (liveVariables[`prog_${safeProgName}_${baseValName}`] !== undefined || liveVariables[`prog__${baseValName}`] !== undefined) ? 'rgba(0,230,118,0.12)' : 'transparent',
-                        border: `1px solid ${(liveVariables[`prog_${safeProgName}_${baseValName}`] !== undefined || liveVariables[`prog__${baseValName}`] !== undefined) ? 'rgba(0,230,118,0.4)' : '#444'}`,
-                        color: (liveVariables[`prog_${safeProgName}_${baseValName}`] !== undefined || liveVariables[`prog__${baseValName}`] !== undefined) ? '#00e676' : '#555',
-                        padding: '0px 3px',
-                        borderRadius: 2,
-                        fontFamily: 'Consolas, monospace',
-                        textAlign: 'center',
-                        pointerEvents: 'none',
-                        zIndex: 10,
-                        whiteSpace: 'nowrap'
-                      }}>
-                        {(liveVariables[`prog_${safeProgName}_${baseValName}`] !== undefined || liveVariables[`prog__${baseValName}`] !== undefined) ?
-                          (typeof (liveVariables[`prog_${safeProgName}_${baseValName}`] !== undefined ? liveVariables[`prog_${safeProgName}_${baseValName}`] : liveVariables[`prog__${baseValName}`]) === 'boolean'
-                            ? ((liveVariables[`prog_${safeProgName}_${baseValName}`] !== undefined ? liveVariables[`prog_${safeProgName}_${baseValName}`] : liveVariables[`prog__${baseValName}`]) ? '1' : '0')
-                            : (pin.type === 'TIME' ? formatTimeUs(liveVariables[`prog_${safeProgName}_${baseValName}`] !== undefined ? liveVariables[`prog_${safeProgName}_${baseValName}`] : liveVariables[`prog__${baseValName}`]) : String((liveVariables[`prog_${safeProgName}_${baseValName}`] !== undefined ? liveVariables[`prog_${safeProgName}_${baseValName}`] : liveVariables[`prog__${baseValName}`]))))
-                          : '---'}
-                      </span>
-                    )}
+                    {(liveVariables && (!val || valVarDef || hasShadow)) && (() => {
+                      const varLiveVal = liveVariables[`prog_${safeProgName}_${baseValName}`] !== undefined
+                        ? liveVariables[`prog_${safeProgName}_${baseValName}`]
+                        : liveVariables[`prog__${baseValName}`] !== undefined
+                          ? liveVariables[`prog__${baseValName}`]
+                          : liveVariables[shadowKey];
+                      const hasLive = varLiveVal !== undefined;
+                      const liveStr = hasLive
+                        ? (typeof varLiveVal === 'boolean' ? (varLiveVal ? '1' : '0') : (pin.type === 'TIME' ? formatTimeUs(varLiveVal) : String(varLiveVal)))
+                        : '---';
+                      return (
+                        <span style={{
+                          position: 'absolute',
+                          top: val ? -15 : 0,
+                          right: 0,
+                          minWidth: 36,
+                          fontSize: 9,
+                          background: hasLive ? 'rgba(0,230,118,0.12)' : 'transparent',
+                          border: `1px solid ${hasLive ? 'rgba(0,230,118,0.4)' : '#444'}`,
+                          color: hasLive ? '#00e676' : '#555',
+                          padding: '0px 3px',
+                          borderRadius: 2,
+                          fontFamily: 'Consolas, monospace',
+                          textAlign: 'center',
+                          pointerEvents: 'none',
+                          zIndex: 10,
+                          whiteSpace: 'nowrap'
+                        }}>
+                          {liveStr}
+                        </span>
+                      );
+                    })()}
 
                     <input
                       type="text"
@@ -846,6 +854,12 @@ const BlockNode = ({ id, data, isConnectable, selected }) => {
                       list={data.readOnly ? undefined : (pin.type === 'ANY' ? "ladder-vars-ANY" : `ladder-vars-${pin.type}`)}
                       readOnly={!!data.readOnly}
                       onDoubleClick={(e) => e.stopPropagation()}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        if (!data.readOnly || !hasShadow || !data.onForceWrite) return;
+                        const modalVarType = pin.type === 'TIME' ? 'INT' : (pin.type === 'ANY' ? 'INT' : pin.type);
+                        setForceModal({ liveKey: shadowKey, varName: `${data.instanceName || data.type}.${pin.name}`, varType: modalVarType, currentValue: liveVariables[shadowKey] });
+                      }}
                       onChange={(e) => {
                         if (data.readOnly) return;
                         const rawValue = e.target.value;
@@ -869,7 +883,7 @@ const BlockNode = ({ id, data, isConnectable, selected }) => {
                         borderRadius: 2,
                         outline: 'none',
                         textAlign: 'right',
-                        opacity: (liveVariables && !val) ? 0 : 1
+                        opacity: (liveVariables && (!val || hasShadow)) ? 0 : 1
                       }}
                       placeholder={isTime ? 'T#...' : '...'}
                     />
@@ -1032,6 +1046,17 @@ const BlockNode = ({ id, data, isConnectable, selected }) => {
           })}
         </div>
       </div>
+      {forceModal && (
+        <ForceWriteModal
+          isOpen={true}
+          onClose={() => setForceModal(null)}
+          varName={forceModal.varName}
+          varType={forceModal.varType}
+          currentValue={forceModal.currentValue}
+          liveKey={forceModal.liveKey}
+          onConfirm={(key, val) => { data.onForceWrite && data.onForceWrite(key, val); }}
+        />
+      )}
     </div >
   );
 };
@@ -1263,12 +1288,17 @@ const RungContainer = ({
   }, [onForceWrite]);
 
   const handleNodeClick = useCallback((event, node) => {
-    if (readOnly) return;
     // Don't toggle terminal nodes
     if (node.id.startsWith('terminal_')) return;
 
     const targetNode = nodes.find(n => n.id === node.id);
     const wasSelected = targetNode ? targetNode.selected : false;
+
+    if (readOnly) {
+      // Simulation mode: allow selection for spacebar BOOL toggle, skip edit callbacks
+      setNodes((nds) => nds.map((n) => (n.id === node.id ? { ...n, selected: !wasSelected } : n)));
+      return;
+    }
 
     if (wasSelected) {
       // Toggle off if already selected

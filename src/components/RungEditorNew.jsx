@@ -3,6 +3,7 @@ import { useTranslation } from 'react-i18next';
 import RungContainer, { blockConfig } from './RungContainer';
 import ErrorBoundary from './ErrorBoundary';
 import BlockSettingsModal from './BlockSettingsModal';
+import ForceWriteModal from './common/ForceWriteModal';
 import DragDropManager from '../utils/DragDropManager';
 
 const EMPTY_IMG = new Image();
@@ -70,6 +71,8 @@ const RungEditorNew = ({ variables, setVariables, rungs, setRungs, availableBloc
 
   // Settings modal state
   const [editingBlock, setEditingBlock] = useState(null);
+  // Simulation force-write modal (double-click on node during simulation)
+  const [simForceModal, setSimForceModal] = useState(null); // { varName, varType, liveKey, currentValue }
 
   // Rung selection & drag/drop
   const [focusedRungId, setFocusedRungId] = useState(null);
@@ -329,16 +332,38 @@ const RungEditorNew = ({ variables, setVariables, rungs, setRungs, availableBloc
     }));
   }, [readOnly]);
 
-  // Blok çift tıklandığında ayarları aç
+  // Blok çift tıklandığında ayarları aç (simülasyon modunda force-write modalı açar)
   const handleNodeDoubleClick = useCallback((_event, node, rungId) => {
-    if (readOnly) return;
+    if (readOnly) {
+      // Simulation mode: open force-write modal for this node's variable
+      if (!liveVariables || !onForceWrite) return;
+      const instanceName = (
+        node.data.instanceName ||
+        node.data.values?.var ||
+        node.data.values?.coil ||
+        ''
+      ).replace(/[🌍🏠⊞⊡⊟]/g, '').trim();
+      if (!instanceName) return;
+      const safeProgName = (parentName || '').trim().replace(/\s+/g, '_');
+      const progKey = `prog_${safeProgName}_${instanceName}`;
+      const globalKey = `prog__${instanceName}`;
+      const lookupKey = liveVariables[progKey] !== undefined ? progKey : globalKey;
+      const varDef = [...variables, ...globalVars].find(v => v.name === instanceName);
+      setSimForceModal({
+        varName: instanceName,
+        varType: varDef?.type || 'BOOL',
+        liveKey: lookupKey,
+        currentValue: liveVariables[lookupKey]
+      });
+      return;
+    }
     setEditingBlock({
       rungId,
       id: node.id,
       type: node.data.type,
       ...node.data
     });
-  }, [readOnly]);
+  }, [readOnly, liveVariables, onForceWrite, parentName, variables, globalVars]);
 
   // Ayarları kaydet
   const handleSaveSettings = useCallback((blockId, newSettings) => {
@@ -917,6 +942,19 @@ const RungEditorNew = ({ variables, setVariables, rungs, setRungs, availableBloc
         variables={variables}
         globalVars={globalVars}
       />
+
+      {/* SIMULATION FORCE-WRITE MODAL (double-click on node during simulation) */}
+      {simForceModal && (
+        <ForceWriteModal
+          isOpen={true}
+          onClose={() => setSimForceModal(null)}
+          varName={simForceModal.varName}
+          varType={simForceModal.varType}
+          currentValue={simForceModal.currentValue}
+          liveKey={simForceModal.liveKey}
+          onConfirm={(key, val) => { onForceWrite && onForceWrite(key, val); setSimForceModal(null); }}
+        />
+      )}
     </div>
   );
 };

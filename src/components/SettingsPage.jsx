@@ -43,7 +43,7 @@ const SettingsPage = ({ theme, setTheme, editorSettings, setEditorSettings }) =>
     const handleUpdateLibraries = async () => {
         setIsUpdating(true);
         setProgressLog('Starting library build for all targets...\n');
-        setProgressLog(prev => prev + 'Targets: Simulation/Linux (TCC), Simulation/Windows (mingw), CortexM0, CortexM4F, CortexM7F (arm-none-eabi-gcc)\n\n');
+        setProgressLog(prev => prev + 'Targets: x86_64/linux (GCC), x86_64/win32 (MinGW), arm/linux (aarch64), arm/CortexM/M0, M4, M7 (arm-none-eabi-gcc)\n\n');
 
         const unlistenProgress = await listen('library-update-progress', (event) => {
             setProgressLog(prev => prev + event.payload + '\n');
