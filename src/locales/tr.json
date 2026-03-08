@@ -172,7 +172,7 @@
         "stopExecutionFirst": "Simülasyon modunu değiştirmeden önce lütfen yürütmeyi durdurun.",
         "compilingSimulationTranspile": "Simülasyon için Proje Derleniyor (C Transpilation)...",
         "transpiledSaved": "Çevrilen C başlık ve kaynak dosyası başarıyla kaydedildi: {{path}}",
-        "compilingSimulationGcc": "Simülasyon çalıştırılabilir dosyası gcc ile derleniyor (hata ayıklama sembolleriyle)...",
+        "compilingSimulationTcc": "Simülasyon çalıştırılabilir dosya TCC ile derleniyor...",
         "simulationCompiled": "Simülasyon dosyası derlendi: {{path}}",
         "simulationEnabled": "Simülasyon Modu Etkinleştirildi. Değişkenler varsayılan değerler ile dolduruldu.",
         "simulationCompileFailed": "Simülasyon Derleme Hatası: {{error}}",

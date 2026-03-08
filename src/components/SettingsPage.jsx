@@ -42,7 +42,8 @@ const SettingsPage = ({ theme, setTheme, editorSettings, setEditorSettings }) =>
 
     const handleUpdateLibraries = async () => {
         setIsUpdating(true);
-        setProgressLog('Starting library update...\n');
+        setProgressLog('Starting library build for all targets...\n');
+        setProgressLog(prev => prev + 'Targets: Simulation/Linux (TCC), Simulation/Windows (mingw), CortexM0, CortexM4F, CortexM7F (arm-none-eabi-gcc)\n\n');
 
         const unlistenProgress = await listen('library-update-progress', (event) => {
             setProgressLog(prev => prev + event.payload + '\n');
@@ -71,7 +72,7 @@ const SettingsPage = ({ theme, setTheme, editorSettings, setEditorSettings }) =>
     const tabs = [
         { id: 'general', label: t('settingsPage.general'), icon: '⚙️' },
         { id: 'editor', label: t('settingsPage.editor'), icon: '📝' },
-        { id: 'libraries', label: 'Libraries', icon: '📦' },
+        ...(import.meta.env.DEV ? [{ id: 'libraries', label: 'Libraries', icon: '📦' }] : []),
         { id: 'about', label: t('settingsPage.about'), icon: 'ℹ️' }
     ];
 
@@ -244,7 +245,7 @@ const SettingsPage = ({ theme, setTheme, editorSettings, setEditorSettings }) =>
                                 fontSize: '14px'
                             }}
                         >
-                            {isUpdating ? 'Updating...' : 'Update Libraries'}
+                            {isUpdating ? 'Building...' : 'Build Libraries'}
                         </button>
                         {progressLog && (
                             <textarea

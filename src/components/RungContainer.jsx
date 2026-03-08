@@ -1074,6 +1074,13 @@ const RungContainer = ({
 }) => {
   const containerRef = useRef(null);
   const [containerWidth, setContainerWidth] = React.useState(800);
+
+  // ── Rubber band selection state ──
+  const [rubberBand, setRubberBand] = useState(null); // { startX, startY, currentX, currentY }
+  const [rubberBandListening, setRubberBandListening] = useState(false); // triggers effect to attach listeners
+  const rubberBandRef = useRef(null);
+  const isRubberBandingRef = useRef(false);
+
   // Container ve Rung boyutları
 
 
@@ -1678,6 +1685,190 @@ const RungContainer = ({
     onUpdateBlockPosition(node.id, node.position);
   }, [onUpdateBlockPosition]);
 
+  // ── Rubber Band Selection (Right-click drag) ──
+  // Returns the bounding box of a node using its position and calculated dimensions
+  const getNodeBounds = useCallback((node) => {
+    const type = node.data?.type || node.data?.label || node.type;
+    if (type === 'Contact' || type === 'Coil') {
+      return { x: node.position.x, y: node.position.y, width: 27, height: 27 };
+    }
+    const height = getBlockHeight(type);
+    return { x: node.position.x, y: node.position.y, width: 140, height };
+  }, [getBlockHeight]);
+
+  // Check if two rectangles intersect (touch)
+  const rectsIntersect = useCallback((r1, r2) => {
+    return !(r1.x + r1.width < r2.x || r2.x + r2.width < r1.x ||
+             r1.y + r1.height < r2.y || r2.y + r2.height < r1.y);
+  }, []);
+
+  // Check if r1 fully contains r2
+  const rectContains = useCallback((r1, r2) => {
+    return r1.x <= r2.x && r1.y <= r2.y &&
+           r1.x + r1.width >= r2.x + r2.width &&
+           r1.y + r1.height >= r2.y + r2.height;
+  }, []);
+
+  // Compute which nodes should be selected based on rubber band rect and direction
+  const computeRubberBandSelection = useCallback((band) => {
+    if (!band) return [];
+    const { startX, startY, currentX, currentY } = band;
+    const selRect = {
+      x: Math.min(startX, currentX),
+      y: Math.min(startY, currentY),
+      width: Math.abs(currentX - startX),
+      height: Math.abs(currentY - startY)
+    };
+    const isRightToLeft = currentX < startX;
+    const selectedIds = [];
+
+    nodes.forEach(node => {
+      if (node.id.startsWith('terminal_')) return;
+      const bounds = getNodeBounds(node);
+      if (isRightToLeft) {
+        // Right-to-left: select all objects the rectangle touches (intersects)
+        if (rectsIntersect(selRect, bounds)) {
+          selectedIds.push(node.id);
+        }
+      } else {
+        // Left-to-right: select only fully contained objects
+        if (rectContains(selRect, bounds)) {
+          selectedIds.push(node.id);
+        }
+      }
+    });
+    return selectedIds;
+  }, [nodes, getNodeBounds, rectsIntersect, rectContains]);
+
+  // Apply rubber band selection to nodes in real-time
+  const applyRubberBandSelection = useCallback((band) => {
+    const selectedIds = computeRubberBandSelection(band);
+    setNodes(nds => nds.map(n => {
+      if (n.id.startsWith('terminal_')) return n;
+      return { ...n, selected: selectedIds.includes(n.id) };
+    }));
+  }, [computeRubberBandSelection, setNodes]);
+
+  // Minimum pixel distance before rubber band activates (to distinguish from click)
+  const RUBBER_BAND_THRESHOLD = 5;
+  const rubberBandPendingRef = useRef(null); // stores initial mousedown point before threshold met
+
+  const handleRubberBandMouseDown = useCallback((e) => {
+    // Only left-click (button === 0)
+    if (e.button !== 0) return;
+    if (readOnly) return;
+
+    // Only activate on empty canvas, not on nodes/edges/handles
+    const target = e.target;
+    const isPane = target.classList?.contains('react-flow__pane') ||
+                   target.classList?.contains('react-flow__renderer') ||
+                   target.classList?.contains('react-flow__viewport');
+    if (!isPane) return;
+
+    const rect = containerRef.current?.getBoundingClientRect();
+    if (!rect) return;
+
+    const startX = e.clientX - rect.left;
+    const startY = e.clientY - rect.top;
+
+    // Store pending start, don't activate rubber band yet (wait for threshold)
+    rubberBandPendingRef.current = { startX, startY, clientX: e.clientX, clientY: e.clientY };
+    isRubberBandingRef.current = false;
+    setRubberBandListening(true);
+  }, [readOnly]);
+
+  const handleRubberBandMouseMove = useCallback((e) => {
+    // Check if we have a pending start but haven't crossed threshold yet
+    if (rubberBandPendingRef.current && !isRubberBandingRef.current) {
+      const dx = e.clientX - rubberBandPendingRef.current.clientX;
+      const dy = e.clientY - rubberBandPendingRef.current.clientY;
+      if (Math.abs(dx) < RUBBER_BAND_THRESHOLD && Math.abs(dy) < RUBBER_BAND_THRESHOLD) return;
+
+      // Threshold crossed - activate rubber band
+      const { startX, startY } = rubberBandPendingRef.current;
+      const band = { startX, startY, currentX: startX, currentY: startY };
+      setRubberBand(band);
+      rubberBandRef.current = band;
+      isRubberBandingRef.current = true;
+      rubberBandPendingRef.current = null;
+
+      // Clear previous selection
+      setNodes(nds => nds.map(n => ({ ...n, selected: false })));
+      if (onSelectBlock) onSelectBlock(null);
+    }
+
+    if (!isRubberBandingRef.current || !rubberBandRef.current) return;
+
+    const rect = containerRef.current?.getBoundingClientRect();
+    if (!rect) return;
+
+    const currentX = e.clientX - rect.left;
+    const currentY = e.clientY - rect.top;
+
+    const updatedBand = { ...rubberBandRef.current, currentX, currentY };
+    rubberBandRef.current = updatedBand;
+    setRubberBand(updatedBand);
+
+    // Real-time selection
+    applyRubberBandSelection(updatedBand);
+  }, [applyRubberBandSelection, setNodes, onSelectBlock]);
+
+  const handleRubberBandMouseUp = useCallback((e) => {
+    // If pending but never crossed threshold = just a click on empty space → deselect all
+    if (rubberBandPendingRef.current && !isRubberBandingRef.current) {
+      rubberBandPendingRef.current = null;
+      setRubberBandListening(false);
+      setNodes(nds => nds.map(n => ({ ...n, selected: false })));
+      if (onSelectBlock) onSelectBlock(null);
+      return;
+    }
+
+    if (!isRubberBandingRef.current) {
+      setRubberBandListening(false);
+      return;
+    }
+
+    isRubberBandingRef.current = false;
+    setRubberBandListening(false);
+
+    // Final selection is already applied in mousemove
+    // Notify parent about selected block (first selected or null)
+    const selectedIds = computeRubberBandSelection(rubberBandRef.current);
+    if (selectedIds.length === 1) {
+      const node = nodes.find(n => n.id === selectedIds[0]);
+      if (node && onSelectBlock) onSelectBlock(rung.id, node);
+    } else if (selectedIds.length === 0) {
+      if (onSelectBlock) onSelectBlock(null);
+    }
+
+    setRubberBand(null);
+    rubberBandRef.current = null;
+  }, [computeRubberBandSelection, nodes, onSelectBlock, rung.id, setNodes]);
+
+  // Attach/detach window-level mouse events for rubber band
+  useEffect(() => {
+    if (rubberBandListening) {
+      window.addEventListener('mousemove', handleRubberBandMouseMove);
+      window.addEventListener('mouseup', handleRubberBandMouseUp);
+      return () => {
+        window.removeEventListener('mousemove', handleRubberBandMouseMove);
+        window.removeEventListener('mouseup', handleRubberBandMouseUp);
+      };
+    }
+  }, [rubberBandListening, handleRubberBandMouseMove, handleRubberBandMouseUp]);
+
+  // Compute rubber band visual rect
+  const rubberBandStyle = React.useMemo(() => {
+    if (!rubberBand) return null;
+    const { startX, startY, currentX, currentY } = rubberBand;
+    const left = Math.min(startX, currentX);
+    const top = Math.min(startY, currentY);
+    const width = Math.abs(currentX - startX);
+    const height = Math.abs(currentY - startY);
+    const isRightToLeft = currentX < startX;
+    return { left, top, width, height, isRightToLeft };
+  }, [rubberBand]);
+
   return (
     <div style={{
       background: '#2a2a2a',
@@ -1786,13 +1977,15 @@ const RungContainer = ({
       {/* RUNG EDITOR CANVAS */}
       <div
         ref={containerRef}
+        onMouseDown={handleRubberBandMouseDown}
         style={{
           width: '100%',
           height: RUNG_HEIGHT,
           background: '#1e1e1e',
           position: 'relative',
           border: '1px dashed #444',
-          overflow: 'hidden'
+          overflow: 'hidden',
+          cursor: 'default'
         }}
       // Handlers moved back to ReactFlow for better integration
       >
@@ -1818,6 +2011,19 @@ const RungContainer = ({
           pointerEvents: 'none',
           zIndex: 0
         }} />
+
+        {/* Rubber Band Selection Rectangle */}
+        {rubberBandStyle && (
+          <div
+            className={`rung-selection-rect ${rubberBandStyle.isRightToLeft ? 'select-intersect' : 'select-contain'}`}
+            style={{
+              left: rubberBandStyle.left,
+              top: rubberBandStyle.top,
+              width: rubberBandStyle.width,
+              height: rubberBandStyle.height,
+            }}
+          />
+        )}
 
         <ReactFlow
           style={{ zIndex: 5 }}

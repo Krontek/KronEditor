@@ -197,6 +197,46 @@ body {
   transition: all 0.2s ease;
 }
 
+/* Override ReactFlow grab cursor - use default cursor inside rung */
+.react-flow__pane,
+.react-flow__node,
+.react-flow__renderer {
+  cursor: default !important;
+}
+
+.react-flow__node.draggable {
+  cursor: default !important;
+}
+
+.react-flow__node.dragging {
+  cursor: grabbing !important;
+}
+
+/* Rubber band selection rectangle */
+.rung-selection-rect {
+  position: absolute;
+  pointer-events: none;
+  z-index: 1000;
+  border: 1.5px dashed;
+  border-radius: 2px;
+}
+
+.rung-selection-rect.select-intersect {
+  background: rgba(144, 238, 144, 0.15);
+  border-color: rgba(144, 238, 144, 0.7);
+}
+
+.rung-selection-rect.select-contain {
+  background: rgba(135, 206, 250, 0.15);
+  border-color: rgba(135, 206, 250, 0.7);
+}
+
+/* Highlight nodes during rubber band selection */
+.react-flow__node.rubber-band-selected {
+  outline: 2px solid #4fc3f7 !important;
+  outline-offset: 2px;
+}
+
 /* Custom Titlebar */
 .custom-titlebar {
   height: 30px;

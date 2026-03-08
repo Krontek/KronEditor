@@ -164,7 +164,7 @@
         "stopExecutionFirst": "Please stop execution before toggling simulation mode.",
         "compilingSimulationTranspile": "Compiling Project for Simulation (C Transpilation)...",
         "transpiledSaved": "Transpiled C header and source successfully saved to {{path}}",
-        "compilingSimulationGcc": "Compiling simulation executable with gcc (debug symbols)...",
+        "compilingSimulationTcc": "Compiling simulation executable with TCC...",
         "simulationCompiled": "Simulation executable compiled: {{path}}",
         "simulationEnabled": "Simulation Mode Enabled. Variables populated with default values.",
         "simulationCompileFailed": "Simulation Compilation Failed: {{error}}",
