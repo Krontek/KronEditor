@@ -657,7 +657,8 @@ function App() {
         return Number.isFinite(asNumber) ? asNumber : value;
       })();
 
-      // Remote force write
+      // Remote force write — skip FB instance variables (no SHM slot)
+      if (!remoteVarKeysRef.current.includes(key)) return;
       wsRef.current.send(JSON.stringify({
         type: 'write_var',
         id: String(Date.now()),

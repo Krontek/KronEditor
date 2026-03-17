@@ -33,8 +33,41 @@ lalrpop_mod!(pub grammar);
 #[cfg(not(target_os = "windows"))]
 const SIM_BIN: &str = "simulation";
 
-#[cfg(target_os = "windows")]
-const MINGW_GCC: &str = "toolchains/active/mingw/bin/gcc.exe";
+// ---------------------------------------------------------------------------
+// Toolchain path helpers
+//
+// Layout (host-OS separated, no symlinks):
+//   toolchains/
+//     linux/
+//       aarch64-none-linux-gnu/   RPi 3/4/5/Zero2W + BB AI-64  (aarch64)
+//       arm-linux-gnueabihf/      BB Black/Green/AI              (armv7)
+//       arm-none-eabi/            RPi Pico/Pico W                (Cortex-M)
+//     windows/
+//       aarch64-none-linux-gnu/   same targets, Windows-hosted
+//       arm-linux-gnueabihf/      same
+//       arm-none-eabi/            same
+//       mingw/                    simulation on Windows (.dll)
+// ---------------------------------------------------------------------------
+
+/// Root toolchain directory for the current host OS.
+fn toolchains_dir(resource_dir: &Path) -> PathBuf {
+    if cfg!(target_os = "windows") {
+        resource_dir.join("toolchains/windows")
+    } else {
+        resource_dir.join("toolchains/linux")
+    }
+}
+
+/// Full path to a compiler binary inside a named toolchain.
+/// `toolchain` e.g. "aarch64-none-linux-gnu", binary e.g. "aarch64-none-linux-gnu-gcc"
+fn tc_bin(resource_dir: &Path, toolchain: &str, binary: &str) -> PathBuf {
+    let exe = if cfg!(target_os = "windows") {
+        format!("{}.exe", binary)
+    } else {
+        binary.to_string()
+    };
+    toolchains_dir(resource_dir).join(toolchain).join("bin").join(exe)
+}
 
 // ---------------------------------------------------------------------------
 // Path helpers
@@ -366,7 +399,7 @@ fn do_update_libraries(app: &tauri::AppHandle, repos: Vec<String>) -> Result<(),
 
     let target_names = [
         "x86_64/linux", "x86_64/win32",
-        "arm/linux",
+        "arm/aarch64", "arm/armv7",
         "arm/CortexM/M0", "arm/CortexM/M4", "arm/CortexM/M7",
     ];
 
@@ -546,9 +579,9 @@ fn do_update_libraries(app: &tauri::AppHandle, repos: Vec<String>) -> Result<(),
     // ---- x86_64/win32 — per-lib MinGW .a archives ----
     {
         let _ = app.emit("library-update-progress", "--- Building for x86_64/win32 ---".to_string());
-        // Try bundled MinGW first, then system cross-compiler
-        let bundled_gcc = resource_dir.join("toolchains/active/mingw/bin/gcc.exe");
-        let bundled_ar  = resource_dir.join("toolchains/active/mingw/bin/ar.exe");
+        // Try bundled MinGW first (windows/mingw on Windows host, system cross-compiler on Linux)
+        let bundled_gcc = tc_bin(&resource_dir, "mingw", "gcc");
+        let bundled_ar  = tc_bin(&resource_dir, "mingw", "ar");
         let (cc, ar_cmd): (String, String) = if bundled_gcc.exists() {
             (bundled_gcc.to_string_lossy().to_string(), bundled_ar.to_string_lossy().to_string())
         } else {
@@ -579,17 +612,14 @@ fn do_update_libraries(app: &tauri::AppHandle, repos: Vec<String>) -> Result<(),
         }
     }
 
-    // ---- arm/linux — aarch64-none-linux-gnu-gcc (per-repo .a archives) ----
+    // ---- arm/aarch64 — aarch64-none-linux-gnu-gcc ----
     {
-        let _ = app.emit("library-update-progress", "--- Building for arm/linux ---".to_string());
-        let tc_bin = resource_dir.join("toolchains/active/aarch64-none-linux-gnu/bin");
-        let gcc_name = if cfg!(target_os = "windows") { "aarch64-none-linux-gnu-gcc.exe" } else { "aarch64-none-linux-gnu-gcc" };
-        let ar_name  = if cfg!(target_os = "windows") { "aarch64-none-linux-gnu-ar.exe" }  else { "aarch64-none-linux-gnu-ar" };
-        let cc_path = tc_bin.join(gcc_name);
-        let ar_path = tc_bin.join(ar_name);
+        let _ = app.emit("library-update-progress", "--- Building for arm/aarch64 ---".to_string());
+        let cc_path = tc_bin(&resource_dir, "aarch64-none-linux-gnu", "aarch64-none-linux-gnu-gcc");
+        let ar_path = tc_bin(&resource_dir, "aarch64-none-linux-gnu", "aarch64-none-linux-gnu-ar");
         if !cc_path.exists() {
             let _ = app.emit("library-update-progress",
-                "  [arm/linux] SKIP: aarch64-none-linux-gnu-gcc not found (run download-toolchains)".to_string());
+                "  [arm/aarch64] SKIP: aarch64-none-linux-gnu-gcc not found".to_string());
         } else {
             let t = &targets[2];
             let cc_str = cc_path.to_string_lossy().to_string();
@@ -597,37 +627,65 @@ fn do_update_libraries(app: &tauri::AppHandle, repos: Vec<String>) -> Result<(),
             let cc_args: &[&str] = &["-O2", "-ffunction-sections", "-fdata-sections"];
             for (lib_name, c_file) in &repo_sources {
                 match compile_one_ar(
-                    "arm/linux", &cc_str, cc_args, &ar_str,
+                    "arm/aarch64", &cc_str, cc_args, &ar_str,
                     &t.dir, &t.dev_dir, lib_name, c_file,
                 ) {
                     Ok(()) => { let _ = app.emit("library-update-progress", format!(
-                        "  [arm/linux] lib{}.a OK", lib_name)); }
+                        "  [arm/aarch64] lib{}.a OK", lib_name)); }
                     Err(e) => { let _ = app.emit("library-update-progress",
-                        format!("  [arm/linux] {}", e)); }
+                        format!("  [arm/aarch64] {}", e)); }
                 }
             }
         }
     }
 
-    // ---- ARM CortexM targets — arm-none-eabi-gcc (per-repo .a archives) ----
+    // ---- arm/armv7 — arm-linux-gnueabihf-gcc (BB Black/Green/AI) ----
+    {
+        let _ = app.emit("library-update-progress", "--- Building for arm/armv7 ---".to_string());
+        let cc_path = tc_bin(&resource_dir, "arm-linux-gnueabihf", "arm-linux-gnueabihf-gcc");
+        let ar_path = tc_bin(&resource_dir, "arm-linux-gnueabihf", "arm-linux-gnueabihf-ar");
+        if !cc_path.exists() {
+            let _ = app.emit("library-update-progress",
+                "  [arm/armv7] SKIP: arm-linux-gnueabihf-gcc not found".to_string());
+        } else {
+            let t = &targets[3];
+            let cc_str = cc_path.to_string_lossy().to_string();
+            let ar_str = ar_path.to_string_lossy().to_string();
+            let cc_args: &[&str] = &["-march=armv7-a", "-mfpu=vfpv3-d16", "-mfloat-abi=hard",
+                                     "-O2", "-ffunction-sections", "-fdata-sections"];
+            for (lib_name, c_file) in &repo_sources {
+                match compile_one_ar(
+                    "arm/armv7", &cc_str, cc_args, &ar_str,
+                    &t.dir, &t.dev_dir, lib_name, c_file,
+                ) {
+                    Ok(()) => { let _ = app.emit("library-update-progress", format!(
+                        "  [arm/armv7] lib{}.a OK", lib_name)); }
+                    Err(e) => { let _ = app.emit("library-update-progress",
+                        format!("  [arm/armv7] {}", e)); }
+                }
+            }
+        }
+    }
+
+    // ---- ARM CortexM targets — arm-none-eabi-gcc ----
+    // targets indices: [0]=x86_64/linux [1]=x86_64/win32
+    //                  [2]=arm/aarch64  [3]=arm/armv7
+    //                  [4]=arm/CortexM/M0 [5]=arm/CortexM/M4 [6]=arm/CortexM/M7
     let arm_targets: &[(&str, usize, &[&str])] = &[
-        ("arm/CortexM/M0", 3, &["-mcpu=cortex-m0", "-mthumb", "-mfloat-abi=soft", "-O2", "-ffunction-sections", "-fdata-sections"]),
-        ("arm/CortexM/M4", 4, &["-mcpu=cortex-m4", "-mthumb", "-mfloat-abi=hard", "-mfpu=fpv4-sp-d16", "-O2", "-ffunction-sections", "-fdata-sections"]),
-        ("arm/CortexM/M7", 5, &["-mcpu=cortex-m7", "-mthumb", "-mfloat-abi=hard", "-mfpu=fpv5-d16", "-O2", "-ffunction-sections", "-fdata-sections"]),
+        ("arm/CortexM/M0", 4, &["-mcpu=cortex-m0", "-mthumb", "-mfloat-abi=soft", "-O2", "-ffunction-sections", "-fdata-sections"]),
+        ("arm/CortexM/M4", 5, &["-mcpu=cortex-m4", "-mthumb", "-mfloat-abi=hard", "-mfpu=fpv4-sp-d16", "-O2", "-ffunction-sections", "-fdata-sections"]),
+        ("arm/CortexM/M7", 6, &["-mcpu=cortex-m7", "-mthumb", "-mfloat-abi=hard", "-mfpu=fpv5-d16", "-O2", "-ffunction-sections", "-fdata-sections"]),
     ];
 
-    let tc_arm_bin = resource_dir.join("toolchains/active/arm-none-eabi/bin");
-    let arm_gcc_name = if cfg!(target_os = "windows") { "arm-none-eabi-gcc.exe" } else { "arm-none-eabi-gcc" };
-    let arm_ar_name  = if cfg!(target_os = "windows") { "arm-none-eabi-ar.exe" }  else { "arm-none-eabi-ar" };
-    let arm_gcc = tc_arm_bin.join(arm_gcc_name);
-    let arm_ar  = tc_arm_bin.join(arm_ar_name);
+    let arm_gcc = tc_bin(&resource_dir, "arm-none-eabi", "arm-none-eabi-gcc");
+    let arm_ar  = tc_bin(&resource_dir, "arm-none-eabi", "arm-none-eabi-ar");
     let has_arm = arm_gcc.exists();
 
     for (name, idx, cc_args) in arm_targets {
         let _ = app.emit("library-update-progress", format!("--- Building for {} ---", name));
         if !has_arm {
             let _ = app.emit("library-update-progress",
-                format!("  [{}] SKIP: arm-none-eabi-gcc not found (run download-toolchains)", name));
+                format!("  [{}] SKIP: arm-none-eabi-gcc not found", name));
             continue;
         }
         let t = &targets[*idx];
@@ -818,18 +876,26 @@ fn compile_for_target(
     let plc_c = build_dir.join("plc.c");
     let out_file = build_dir.join("runtime.bin");
     let res_include = resource_dir.join("resources/include");
-    let lib_dir = resource_dir.join("resources/arm/linux");
 
-    // Select cross-compiler based on board
-    let compiler = if board_id.starts_with("rpi_pico") {
+    // Select cross-compiler and library directory based on board
+    let (compiler, lib_dir) = if board_id.starts_with("rpi_pico") {
         return Err("Pico (Cortex-M) targets are not supported for remote deployment".into());
+    } else if board_id.starts_with("bb_") && !board_id.starts_with("bb_ai64") {
+        // BeagleBone Black / Green / AI → armv7 (Cortex-A8/A15)
+        (
+            tc_bin(&resource_dir, "arm-linux-gnueabihf", "arm-linux-gnueabihf-gcc"),
+            resource_dir.join("resources/arm/armv7"),
+        )
     } else {
-        // All RPi full-size and BeagleBone boards -> aarch64 Linux
-        resource_dir.join("toolchains/active/aarch64-none-linux-gnu/bin/aarch64-none-linux-gnu-gcc")
+        // RPi 3/4/5/Zero2W + BeagleBone AI-64 → aarch64
+        (
+            tc_bin(&resource_dir, "aarch64-none-linux-gnu", "aarch64-none-linux-gnu-gcc"),
+            resource_dir.join("resources/arm/aarch64"),
+        )
     };
 
     if !compiler.exists() {
-        return Err(format!("Cross-compiler not found: {}\nPlease install the aarch64 toolchain.", compiler.display()));
+        return Err(format!("Cross-compiler not found: {}", compiler.display()));
     }
 
     let mut cmd = Command::new(&compiler);
@@ -837,8 +903,20 @@ fn compile_for_target(
         .arg("-static")
         .arg("-ffunction-sections")
         .arg("-fdata-sections")
-        .arg("-Wl,--gc-sections")
-        .arg("-I").arg(&build_dir)
+        .arg("-Wl,--gc-sections");
+
+    // Architecture-specific flags
+    if board_id.starts_with("bb_") && !board_id.starts_with("bb_ai64") {
+        cmd.arg("-march=armv7-a").arg("-mfpu=vfpv3-d16").arg("-mfloat-abi=hard");
+    }
+
+    // Board-specific preprocessor defines
+    if board_id == "rpi_5" {
+        // RPi 5 uses /dev/gpiochip4 (RP1 chip) instead of the default gpiochip0
+        cmd.arg(r#"-DKRON_GPIO_CHIP="/dev/gpiochip4""#);
+    }
+
+    cmd.arg("-I").arg(&build_dir)
         .arg("-I").arg(&res_include)
         .arg("-o").arg(&out_file)
         .arg(&plc_c);
@@ -977,16 +1055,21 @@ fn deploy_to_server(app: tauri::AppHandle, server_addr: String) -> Result<String
 // check_server_status -- GET /status from KronServer
 // ---------------------------------------------------------------------------
 
-#[tauri::command]
-fn check_server_status(server_addr: String) -> Result<String, String> {
+fn check_server_status_sync(server_addr: &str) -> Result<String, String> {
     let url = format!("http://{}/status", server_addr);
     let resp = ureq::get(&url)
         .timeout(std::time::Duration::from_secs(3))
         .call()
         .map_err(|e| format!("Connection failed: {}", e))?;
-
     resp.into_string()
         .map_err(|e| format!("Failed to read response: {}", e))
+}
+
+#[tauri::command]
+async fn check_server_status(server_addr: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || check_server_status_sync(&server_addr))
+        .await
+        .map_err(|e| format!("Task error: {}", e))?
 }
 
 // ---------------------------------------------------------------------------
@@ -1008,10 +1091,12 @@ fn deploy_server_to_target(
     // Select the right binary based on board
     let binary_name = if board_id.starts_with("rpi_pico") {
         return Err("Pico targets do not support remote server deployment".into());
-    } else if board_id.starts_with("rpi_") {
+    } else if board_id.starts_with("rpi_") || board_id == "bb_ai64" {
+        // aarch64: all RPi Linux boards + BeagleBone AI-64
         "plc-agent_linux_arm64"
     } else if board_id.starts_with("bb_") {
-        "plc-agent_linux_arm64"
+        // armv7: BeagleBone Black / Green / AI
+        "plc-agent_linux_armv7"
     } else {
         "plc-agent_linux_amd64"
     };
@@ -1148,7 +1233,7 @@ fn deploy_server_to_target(
 
     // Verify
     let check_addr = format!("{}:7070", host);
-    match check_server_status(check_addr) {
+    match check_server_status_sync(&check_addr) {
         Ok(_) => {
             let _ = app.emit("server-deploy-progress", "plc-agent deployed and running!");
             Ok("Server deployed successfully".into())
@@ -1167,7 +1252,7 @@ fn deploy_server_to_target(
 fn compile_simulation(app: tauri::AppHandle) -> Result<String, String> {
     let resource_dir = get_resource_dir(&app)?;
     let build_dir    = plain_path(&get_build_dir(&app)?);
-    let gcc_path     = resource_dir.join(MINGW_GCC);
+    let gcc_path     = tc_bin(&resource_dir, "mingw", "gcc");
     let plc_c        = build_dir.join("plc.c");
     let plc_dll      = build_dir.join("plc.dll");
     let res_include  = resource_dir.join("resources/include");

@@ -30,12 +30,20 @@
             "dmg"
         ],
         "resources": [
-            "toolchains/active/**/*",
+            "toolchains/linux/**/*",
+            "toolchains/windows/aarch64-none-linux-gnu/**/*",
+            "toolchains/windows/arm-linux-gnueabihf/**/*",
+            "toolchains/windows/arm-none-eabi/**/*",
+            "toolchains/windows/mingw/bin/**/*",
+            "toolchains/windows/mingw/lib/**/*",
+            "toolchains/windows/mingw/libexec/**/*",
+            "toolchains/windows/mingw/include/**/*",
             "resources/include/*",
             "resources/x86_64/linux/*",
             "resources/x86_64/win32/*",
             "resources/x86_64/MacOS/*",
-            "resources/arm/linux/*",
+            "resources/arm/aarch64/*",
+            "resources/arm/armv7/*",
             "resources/arm/CortexM/M0/*",
             "resources/arm/CortexM/M4/*",
             "resources/arm/CortexM/M7/*"

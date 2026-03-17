@@ -442,8 +442,10 @@ const BlockNode = ({ id, data, isConnectable, selected }) => {
     }
     const isLiveActive = liveVariables && lookupKey && liveVariables[lookupKey] !== undefined;
     const canForce = !!data.onForceWrite && isLiveActive;
-    const varDef = [...variables, ...globalVars].find(v => v.name === instanceName);
+    const allVars = [...variables, ...globalVars];
+    const varDef = allVars.find(v => v.name === instanceName);
     const varType = varDef?.type || 'BOOL';
+    const isTypeMismatch = !!(varDef && varDef.type !== 'BOOL');
 
     const cycleType = (e) => {
       e.preventDefault();
@@ -471,10 +473,11 @@ const BlockNode = ({ id, data, isConnectable, selected }) => {
         cursor: 'pointer',
         pointerEvents: 'auto', // Explicitly allow clicks here
         background: selected ? 'rgba(0, 122, 204, 0.2)' : 'rgba(255, 255, 255, 0.05)',
-        border: selected ? '2px solid #007acc' : (
-          ((data.type === 'Contact' || data.type === 'Coil') && instanceName !== '' &&
-            ![...variables, ...globalVars].some(v => v.name === instanceName.replace(/[🌍🏠⊞⊡⊟]/g, '').trim().split(/[\[.]/)[0]))
-            ? '2px solid #f44336' // RED ERROR BORDER
+        border: selected ? '2px solid #a78bfa' : (
+          isTypeMismatch ? '2px solid #ff9800' // ORANGE: variable exists but not BOOL
+          : ((data.type === 'Contact' || data.type === 'Coil') && instanceName !== '' &&
+              !allVars.some(v => v.name === instanceName.replace(/[🌍🏠⊞⊡⊟]/g, '').trim().split(/[\[.]/)[0]))
+            ? '2px solid #f44336' // RED: variable not found
             : '1px solid transparent'
         ),
         borderRadius: 4
@@ -526,6 +529,9 @@ const BlockNode = ({ id, data, isConnectable, selected }) => {
               const rawValue = e.target.value;
               setLocalInstanceName(rawValue);
               const val = rawValue.replace(/[🌍🏠⊞⊡⊟]/g, '').trim();
+              // Block assignment if variable exists but is not BOOL type
+              const typedVarDef = allVars.find(v => v.name === val.split(/[\[.]/)[0]);
+              if (typedVarDef && typedVarDef.type !== 'BOOL') return;
               handleUpdate({ instanceName: val });
             }}
             list={data.readOnly ? undefined : "ladder-vars-BOOL"}
@@ -534,7 +540,7 @@ const BlockNode = ({ id, data, isConnectable, selected }) => {
               width: 65,
               height: 16,
               fontSize: 9,
-              border: selected ? '1px solid #007acc' : '1px solid #333',
+              border: selected ? '1px solid #a78bfa' : '1px solid #333',
               background: '#252526',
               color: 'white',
               borderRadius: 2,
@@ -550,7 +556,7 @@ const BlockNode = ({ id, data, isConnectable, selected }) => {
             style={{
               height: 16,
               padding: '0 6px',
-              background: '#007acc',
+              background: '#a78bfa',
               color: 'white',
               fontSize: 8,
               fontWeight: 'bold',
@@ -569,7 +575,12 @@ const BlockNode = ({ id, data, isConnectable, selected }) => {
         </div>
 
         {/* SVG Symbol */}
-        <svg width="27" height="27" viewBox="0 0 40 40" style={{ color: selected ? '#007acc' : '#fff', overflow: 'visible', pointerEvents: 'none' }}>
+        <svg width="27" height="27" viewBox="0 0 40 40" style={{
+          color: selected ? '#a78bfa'
+            : (data.type === 'Contact' && isLiveActive && lookupKey && liveVariables?.[lookupKey]) ? '#ff1744'
+            : '#fff',
+          overflow: 'visible', pointerEvents: 'none'
+        }}>
           {symbol}
         </svg>
 
@@ -763,7 +774,7 @@ const BlockNode = ({ id, data, isConnectable, selected }) => {
   return (
     <div style={{
       backgroundColor: selected ? '#3c3c3c' : '#252526',
-      border: selected ? '2px solid #007acc' : '1px solid #666',
+      border: selected ? '2px solid #a78bfa' : '1px solid #666',
       borderRadius: 4,
       minWidth: 140,
       color: '#fff',
@@ -1318,6 +1329,8 @@ const RungContainer = ({
 
 
 
+  const [selectedEdgeId, setSelectedEdgeId] = useState(null);
+
   const [edges, setEdges, onEdgesChange] = useEdgesState(
     rung.connections.map(conn => ({
       id: conn.id,
@@ -1342,17 +1355,37 @@ const RungContainer = ({
     onForceWriteRef.current = onForceWrite;
   }, [onForceWrite]);
 
+  const handleEdgeClick = useCallback((event, edge) => {
+    if (readOnly) return;
+    event.stopPropagation();
+    setSelectedEdgeId(prev => {
+      const newId = prev === edge.id ? null : edge.id;
+      return newId;
+    });
+    // Deselect all nodes when an edge is clicked
+    setNodes(nds => nds.map(n => ({ ...n, selected: false })));
+    if (onSelectBlock) onSelectBlock(null, null);
+  }, [readOnly, setNodes, onSelectBlock]);
+
   const handleNodeClick = useCallback((event, node) => {
     // Don't toggle terminal nodes
     if (node.id.startsWith('terminal_')) return;
+
+    // Clear edge selection when a node is clicked
+    setSelectedEdgeId(null);
 
     const targetNode = nodes.find(n => n.id === node.id);
     const wasSelected = targetNode ? targetNode.selected : false;
 
     if (readOnly) {
       // Simulation mode: allow selection for spacebar BOOL toggle, skip edit callbacks
-      // Only one node selected at a time
-      setNodes((nds) => nds.map((n) => (n.id === node.id ? { ...n, selected: !wasSelected } : { ...n, selected: false })));
+      // Only one node selected at a time — propagate through global ID so other rungs also deselect
+      const newSelected = !wasSelected;
+      setNodes((nds) => nds.map((n) => (n.id === node.id ? { ...n, selected: newSelected } : { ...n, selected: false })));
+      if (onSelectBlock) {
+        if (newSelected) onSelectBlock(rung.id, node);
+        else onSelectBlock(null, null);
+      }
       return;
     }
 
@@ -1419,19 +1452,24 @@ const RungContainer = ({
         sourceHandle: conn.sourcePin,
         targetHandle: conn.targetPin,
         type: 'smoothstep',
-        style: { stroke: '#fff', strokeWidth: 2 },
+        selected: conn.id === selectedEdgeId,
+        style: conn.id === selectedEdgeId
+          ? { stroke: '#a78bfa', strokeWidth: 3 }
+          : { stroke: '#fff', strokeWidth: 2 },
         animated: false,
       }))
     );
-  }, [rung.connections, setEdges]);
+  }, [rung.connections, setEdges, selectedEdgeId]);
 
   // ── Live power-flow edge colouring (simulation mode) ──
   React.useEffect(() => {
     if (!liveVariables) {
-      // Simulation stopped → reset edges to default white
+      // Simulation stopped → reset edges to default white (keep selection highlight)
       setEdges(eds => eds.map(e => ({
         ...e,
-        style: { stroke: '#fff', strokeWidth: 2 },
+        style: e.id === selectedEdgeId
+          ? { stroke: '#a78bfa', strokeWidth: 3 }
+          : { stroke: '#fff', strokeWidth: 2 },
         animated: false,
       })));
       return;
@@ -1507,7 +1545,7 @@ const RungContainer = ({
           const varVal = lookupVar(vals.var || block.data?.instanceName || '');
           blockOutPower[bid] = subType === 'NC' ? (inPower && !varVal) : (inPower && varVal);
         } else if (type === 'Coil') {
-          blockOutPower[bid] = inPower;
+          blockOutPower[bid] = false; // Coil is a sink — does not pass power forward
         } else {
           // Function Block — per-output-pin power from live simulation values
           const instName = (block.data?.instanceName || '').trim().replace(/\s+/g, '_');
@@ -1546,16 +1584,15 @@ const RungContainer = ({
         }
       });
 
-      // Colour each edge: red = powered, blue = unpowered
+      // Colour each edge: red = powered, blue = unpowered (purple = selected)
       return currentEdges.map(e => ({
         ...e,
-        style: {
-          stroke: getSourcePower(e) ? '#ff1744' : '#2979ff',
-          strokeWidth: 2,
-        },
+        style: e.id === selectedEdgeId
+          ? { stroke: '#a78bfa', strokeWidth: 3 }
+          : { stroke: getSourcePower(e) ? '#ff1744' : '#2979ff', strokeWidth: 2 },
       }));
     });
-  }, [liveVariables, rung.blocks, parentName, setEdges]);
+  }, [liveVariables, rung.blocks, parentName, setEdges, selectedEdgeId]);
 
   const { screenToFlowPosition, getNode, setViewport } = useReactFlow();
   const connectionEndPositionRef = useRef(null);
@@ -1691,6 +1728,7 @@ const RungContainer = ({
     deletedEdges.forEach(edge => {
       onDeleteConnection(edge.id);
     });
+    setSelectedEdgeId(null);
   }, [onDeleteConnection]);
 
   const onDrop = useCallback((event) => {
@@ -2179,6 +2217,7 @@ const RungContainer = ({
           onNodesChange={handleNodesChange}
           onEdgesChange={onEdgesChange}
           onNodeClick={handleNodeClick}
+          onEdgeClick={handleEdgeClick}
           onConnect={onConnect}
           onConnectStart={onConnectStart}
           onConnectEnd={onConnectEnd}
@@ -2227,10 +2266,10 @@ const RungContainer = ({
 };
 
 // Wrapper with ReactFlowProvider
-const RungContainerWrapper = React.memo((props) => (
+const RungContainerWrapper = (props) => (
   <ReactFlowProvider>
     <RungContainer {...props} />
   </ReactFlowProvider>
-));
+);
 
 export default RungContainerWrapper;

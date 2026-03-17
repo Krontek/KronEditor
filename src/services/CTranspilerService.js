@@ -188,20 +188,24 @@ extern volatile uint64_t us_tick;
                 const elemSize = IEC_TYPE_SIZES[baseType.toUpperCase()] || 0;
                 dtDef.content.dimensions.forEach(dim => {
                     for (let i = parseInt(dim.min); i <= parseInt(dim.max); i++) {
+                        const elemCSym = `${v.name}[${i}]`;
+                        const elemShmSlot = tryAssignShm(baseType, elemCSym);
                         variableTable.debugDefaults[`prog__${v.name}[${i}]`] = {
-                            type: baseType, c_symbol: `${v.name}[${i}]`,
+                            type: baseType, c_symbol: elemCSym,
                             base_symbol: v.name, byte_offset: i * elemSize,
-                            defaultValue: 0
+                            defaultValue: 0, ...elemShmSlot
                         };
                     }
                 });
             } else if (dtDef?.type === 'Structure') {
                 let memberOffset = 0;
                 (dtDef.content.members || []).forEach(member => {
+                    const memCSym = `${v.name}.${member.name}`;
+                    const memShmSlot = tryAssignShm(member.type, memCSym);
                     variableTable.debugDefaults[`prog__${v.name}.${member.name}`] = {
-                        type: member.type, c_symbol: `${v.name}.${member.name}`,
+                        type: member.type, c_symbol: memCSym,
                         base_symbol: v.name, byte_offset: memberOffset,
-                        defaultValue: 0
+                        defaultValue: 0, ...memShmSlot
                     };
                     memberOffset += IEC_TYPE_SIZES[member.type.toUpperCase()] || 0;
                 });
@@ -307,20 +311,24 @@ extern volatile uint64_t us_tick;
                         const elemSize = IEC_TYPE_SIZES[baseType.toUpperCase()] || 0;
                         dtDef.content.dimensions.forEach(dim => {
                             for (let i = parseInt(dim.min); i <= parseInt(dim.max); i++) {
+                                const elemCSym = `${cSym}[${i}]`;
+                                const elemShmSlot = tryAssignShm(baseType, elemCSym);
                                 variableTable.debugDefaults[`prog_${progName}_${vName}[${i}]`] = {
-                                    type: baseType, c_symbol: `${cSym}[${i}]`,
+                                    type: baseType, c_symbol: elemCSym,
                                     base_symbol: cSym, byte_offset: i * elemSize,
-                                    defaultValue: 0
+                                    defaultValue: 0, ...elemShmSlot
                                 };
                             }
                         });
                     } else if (dtDef?.type === 'Structure') {
                         let memberOffset = 0;
                         (dtDef.content.members || []).forEach(member => {
+                            const memCSym = `${cSym}.${member.name}`;
+                            const memShmSlot = tryAssignShm(member.type, memCSym);
                             variableTable.debugDefaults[`prog_${progName}_${vName}.${member.name}`] = {
-                                type: member.type, c_symbol: `${cSym}.${member.name}`,
+                                type: member.type, c_symbol: memCSym,
                                 base_symbol: cSym, byte_offset: memberOffset,
-                                defaultValue: 0
+                                defaultValue: 0, ...memShmSlot
                             };
                             memberOffset += IEC_TYPE_SIZES[member.type.toUpperCase()] || 0;
                         });
@@ -415,8 +423,11 @@ extern volatile uint64_t us_tick;
         source += `#define PLC_FORCE_FLAGS_BASE ${FORCE_FLAGS_BASE}\n`;
         source += `static void plc_shm_pull(void) {\n`;
         source += `    if (!__plc_shm) return;\n`;
-        shmEntries.forEach(({ c_symbol, offset, size }) => {
-            source += `    memcpy(&(${c_symbol}), __plc_shm + ${offset}, ${size});\n`;
+        shmEntries.forEach(({ c_symbol, offset, size, flagOffset }) => {
+            // Only pull variables that KronServer has explicitly force-written (flag != 0).
+            // PLC-computed and literal-initialized variables keep their C values;
+            // they are never overwritten by a zeroed or stale SHM region.
+            source += `    if (__plc_shm[${flagOffset}] != 0) { memcpy(&(${c_symbol}), __plc_shm + ${offset}, ${size}); }\n`;
         });
         source += `}\n`;
         source += `static void plc_shm_sync(void) {\n`;
@@ -1518,10 +1529,11 @@ const transpileLDLogics = (rungs, stdFunctions = {}, parentName = '', category =
                 }
 
                 // Step 2: assign non-trigger inputs that arrive via wire connections
-                // Skip entirely for blocks without a trigger pin (e.g. SR/RS) — their inputs
+                // Skip for built-in blocks without a trigger pin (e.g. SR/RS) — their inputs
                 // come exclusively from data.values / shadow vars, not from wire power flow.
+                // User-defined FBs always need this step since their inputs are wired.
                 const hasTriggerPin = !!FB_TRIGGER_PIN[type];
-                if (hasTriggerPin) {
+                if (hasTriggerPin || isUserDefinedFB) {
                 (rung.connections || []).forEach(c => {
                     if (c.target !== blockId) return;
                     const tp = c.targetPin;
@@ -1545,7 +1557,10 @@ const transpileLDLogics = (rungs, stdFunctions = {}, parentName = '', category =
                 if (triggerPin) {
                     out += `    ${callTarget}.${cStructPin(type, triggerPin)} = ${inExpr};\n`;
                 }
-                if (!hasTriggerPin) {
+                // User-defined FBs always execute every scan (they have no implicit EN/ENO);
+                // power flow only controls downstream energization. Standard FBs without a
+                // trigger pin (SR/RS) are still guarded by inExpr.
+                if (!hasTriggerPin && !isUserDefinedFB) {
                     out += `    if (${inExpr}) {\n`;
                 }
                 if (isUserDefinedFB) {
@@ -1559,17 +1574,17 @@ const transpileLDLogics = (rungs, stdFunctions = {}, parentName = '', category =
                     }
                 } else {
                     if (stdFunctions[type]?.isFB !== false || Object.keys(FB_INPUTS).includes(type)) { // Standard blocks or FBs
-                        out += `    ${hasTriggerPin ? '' : '  '}${type}_Call(&${callTarget}); // FBs handle their own execution\n`;
+                        out += `    ${(hasTriggerPin || isUserDefinedFB) ? '' : '  '}${type}_Call(&${callTarget}); // FBs handle their own execution\n`;
                     } else {
                         // Regular function call transpilation fallback
                         const funcArgs = [inExpr];
                         for (let i = 1; i < inputPins.length; i++) {
                             funcArgs.push(`${callTarget}.${inputPins[i]}`);
                         }
-                        out += `    ${hasTriggerPin ? '' : '  '}${bOut} = ${type}_Call(${funcArgs.join(', ')});\n`;
+                        out += `    ${(hasTriggerPin || isUserDefinedFB) ? '' : '  '}${bOut} = ${type}_Call(${funcArgs.join(', ')});\n`;
                     }
                 }
-                if (!hasTriggerPin) {
+                if (!hasTriggerPin && !isUserDefinedFB) {
                     out += `    }\n`;
                 }
 

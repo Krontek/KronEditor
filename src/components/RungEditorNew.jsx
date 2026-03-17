@@ -1,4 +1,4 @@
-import { useState, useCallback, useRef, useEffect, memo } from 'react';
+import { useState, useCallback, useRef, useEffect } from 'react';
 import { useTranslation } from 'react-i18next';
 import RungContainer, { blockConfig } from './RungContainer';
 import ErrorBoundary from './ErrorBoundary';
@@ -985,4 +985,4 @@ const RungEditorNew = ({ variables, setVariables, rungs, setRungs, availableBloc
   );
 };
 
-export default memo(RungEditorNew);
+export default RungEditorNew;

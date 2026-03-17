@@ -488,4 +488,4 @@ const VariableManager = ({
   );
 };
 
-export default React.memo(VariableManager);
+export default VariableManager;

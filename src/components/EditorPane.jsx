@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { Editor } from '@monaco-editor/react';
 import VariableManager from './VariableManager';
 import RungEditorNew from './RungEditorNew';
@@ -907,4 +907,4 @@ const EditorPane = ({
   );
 };
 
-export default React.memo(EditorPane);
+export default EditorPane;
