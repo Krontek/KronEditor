@@ -22,6 +22,7 @@ import { readTextFile, writeTextFile } from '@tauri-apps/plugin-fs';
 import { getCurrentWindow } from '@tauri-apps/api/window';
 import { invoke } from '@tauri-apps/api/core';
 import { transpileToC } from './services/CTranspilerService';
+import { PLCClient } from './services/PLCClient';
 import { mkdir, exists, BaseDirectory } from '@tauri-apps/plugin-fs';
 import PlcIcon from './assets/icons/plc-icon.png';
 import './App.css';
@@ -131,8 +132,8 @@ function App() {
   const [sshPort, setSshPort] = useState(() => localStorage.getItem('sshPort') || '22');
   const [isDeployed, setIsDeployed] = useState(false);
   const [isDirty, setIsDirty] = useState(false);
-  const wsRef = React.useRef(null);
-  const wsTimerRef = React.useRef(null);
+  const plcClientRef = React.useRef(null);   // PLCClient instance
+  const stopStreamRef = React.useRef(null);  // cancel fn returned by streamVars()
   const remoteVarKeysRef = React.useRef([]);
 
   // Persist settings
@@ -170,8 +171,8 @@ function App() {
       invoke('check_server_status', { serverAddr: plcAddress })
         .then(() => setIsPlcConnected(true))
         .catch(() => {
-          // Don't mark disconnected if we have an active WebSocket (server is clearly alive)
-          if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) {
+          // Don't mark disconnected while a stream is active (server is clearly alive)
+          if (!plcClientRef.current?.isStreaming) {
             setIsPlcConnected(false);
           }
         });
@@ -357,13 +358,13 @@ function App() {
       setIsRunning(false);
       setLiveVariables({});
       liveVarsRef.current = {};
-      if (wsRef.current) {
-        wsRef.current.close();
-        wsRef.current = null;
+      if (stopStreamRef.current) {
+        stopStreamRef.current();
+        stopStreamRef.current = null;
       }
-      if (wsTimerRef.current) {
-        clearInterval(wsTimerRef.current);
-        wsTimerRef.current = null;
+      if (plcClientRef.current) {
+        plcClientRef.current.close();
+        plcClientRef.current = null;
       }
     }
   }, [defaultProjectStructure]);
@@ -528,87 +529,34 @@ function App() {
         setIsRunning(false);
       }
     } else if (isDeployed && !isDirty && isPlcConnected) {
-      // Remote execution via WebSocket (keep connection persistent across run/stop)
+      // Remote execution via ConnectRPC (server streaming — no polling)
       try {
-        // Reuse existing socket if it is already open.
-        if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-          if (wsTimerRef.current) {
-            clearInterval(wsTimerRef.current);
-            wsTimerRef.current = null;
-          }
-          wsRef.current.send(JSON.stringify({ type: 'start', id: 'cmd_start' }));
-          setIsRunning(true);
-
-          if (remoteVarKeysRef.current.length > 0) {
-            wsTimerRef.current = setInterval(() => {
-              if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-                wsRef.current.send(JSON.stringify({ type: 'read_all', id: 'poll' }));
-              }
-            }, 500);
-          }
-          return;
+        // Reuse existing client if already connected.
+        if (!plcClientRef.current) {
+          plcClientRef.current = new PLCClient(plcAddress);
         }
+        const client = plcClientRef.current;
 
-        const wsUrl = `ws://${plcAddress}/ws`;
-        const ws = new WebSocket(wsUrl);
-        wsRef.current = ws;
+        addLog('success', 'Connecting to PLC...');
+        await client.start();
+        addLog('success', 'PLC runtime started.');
+        setIsRunning(true);
 
-        ws.onopen = () => {
-          addLog('success', 'Connected to PLC. Starting runtime...');
-          ws.send(JSON.stringify({ type: 'start', id: 'cmd_start' }));
-          setIsRunning(true);
-
-          // Poll all SHM-backed variables with a single read_all every 500ms
-          if (remoteVarKeysRef.current.length > 0) {
-            wsTimerRef.current = setInterval(() => {
-              if (ws.readyState === WebSocket.OPEN) {
-                ws.send(JSON.stringify({ type: 'read_all', id: 'poll' }));
-              }
-            }, 500);
-          }
-        };
-
-        ws.onmessage = (event) => {
-          try {
-            const msg = JSON.parse(event.data);
-            if (msg.type !== 'response') return;
-
-            if (!msg.success && msg.error) {
-              // Only log command errors, not variable polling errors
-              if (msg.id && !msg.id.startsWith('poll')) {
-                addLog('error', `PLC: ${msg.error}`);
-              }
-              return;
-            }
-
-            // read_all response: write to ref (throttled sync pushes to state)
-            if (msg.id === 'poll' && msg.value && typeof msg.value === 'object') {
-              Object.assign(liveVarsRef.current, msg.value);
+        // Start server-streaming subscription (server pushes every 50 ms).
+        if (remoteVarKeysRef.current.length > 0) {
+          stopStreamRef.current = client.streamVars(
+            (vars) => {
+              // vars is a plain JS object: { varName: value, ... }
+              Object.assign(liveVarsRef.current, vars);
               liveVarsDirtyRef.current = true;
-            }
-            // Single read_var response (kept for compatibility)
-            else if (msg.name && msg.value !== undefined) {
-              liveVarsRef.current[msg.name] = msg.value;
-              liveVarsDirtyRef.current = true;
-            }
-          } catch (e) {
-            console.error('WS parse error:', e);
-          }
-        };
-
-        ws.onerror = () => {
-          addLog('error', 'WebSocket connection error.');
-          setIsRunning(false);
-        };
-
-        ws.onclose = () => {
-          if (wsTimerRef.current) {
-            clearInterval(wsTimerRef.current);
-            wsTimerRef.current = null;
-          }
-        };
+            },
+            (err) => {
+              addLog('error', `Stream error: ${err.message}`);
+            },
+          );
+        }
       } catch (err) {
-        addLog('error', `Failed to connect: ${err}`);
+        addLog('error', `Failed to start PLC: ${err.message || err}`);
         setIsRunning(false);
       }
     }
@@ -624,16 +572,16 @@ function App() {
         } catch (err) {
           addLog('error', `Failed to stop simulation: ${err}`);
         }
-      } else if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-        // Remote stop only (do not close the socket, so run->stop->run keeps session alive)
-        wsRef.current.send(JSON.stringify({ type: 'stop', id: String(Date.now()) }));
-        // Clear all force flags so the PLC resumes normal variable sync on next run.
-        wsRef.current.send(JSON.stringify({ type: 'clear_all_forces', id: 'clear_forces' }));
-        if (wsTimerRef.current) {
-          clearInterval(wsTimerRef.current);
-          wsTimerRef.current = null;
+      } else if (plcClientRef.current) {
+        // Stop the variable stream first.
+        if (stopStreamRef.current) {
+          stopStreamRef.current();
+          stopStreamRef.current = null;
         }
-        // Re-check server status immediately so connection indicator stays green
+        // Send stop + clear forces (fire-and-forget; errors just logged).
+        plcClientRef.current.stop().catch((e) => addLog('error', `Stop failed: ${e.message}`));
+        plcClientRef.current.clearAllForces().catch(() => {});
+        // Re-check server status immediately so connection indicator stays green.
         if (plcAddress && connectionEnabled) {
           invoke('check_server_status', { serverAddr: plcAddress })
             .then(() => setIsPlcConnected(true))
@@ -647,7 +595,7 @@ function App() {
 
   const handleForceWrite = useCallback(async (key, value) => {
     if (!isRunning) return;
-    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN && !isSimulationMode) {
+    if (plcClientRef.current && !isSimulationMode) {
       const normalizedValue = (() => {
         if (typeof value !== 'string') return value;
         const trimmed = value.trim();
@@ -659,12 +607,9 @@ function App() {
 
       // Remote force write — skip FB instance variables (no SHM slot)
       if (!remoteVarKeysRef.current.includes(key)) return;
-      wsRef.current.send(JSON.stringify({
-        type: 'write_var',
-        id: String(Date.now()),
-        name: key,
-        value: normalizedValue,
-      }));
+      plcClientRef.current.writeVar(key, normalizedValue).catch((e) => {
+        addLog('error', `Force write failed for '${key}': ${e.message}`);
+      });
     } else {
       try {
         await invoke('write_variable', { name: key, value: String(value) });
