@@ -97,12 +97,29 @@ const BoardSelectionModal = ({ isOpen, onClose, onSelect, currentBoard }) => {
                           <span style={{ fontSize: '11px', color: isSelected ? '#ddd' : '#888' }}>
                             {board.cpu.split('(')[0].trim()}
                           </span>
-                          <span style={{ fontSize: '11px', color: isSelected ? '#ddd' : '#666' }}>
-                            RAM: {board.ram.split('/')[0].trim()}
-                          </span>
-                          <span style={{ fontSize: '11px', color: isSelected ? '#ddd' : '#666' }}>
-                            GPIO: {board.gpio}
-                          </span>
+                          {board.pinLayout === 'edatec_ipc' ? (() => {
+                            const p = board.pinout;
+                            const rs485 = p.serialPorts.filter(s => s.type === 'RS485').length;
+                            const rs232 = p.serialPorts.filter(s => s.type === 'RS232').length;
+                            return (
+                              <>
+                                {rs485 > 0 && <span style={{ fontSize: '11px', color: isSelected ? '#ddd' : '#666' }}>RS485: {rs485}</span>}
+                                {rs232 > 0 && <span style={{ fontSize: '11px', color: isSelected ? '#ddd' : '#666' }}>RS232: {rs232}</span>}
+                                {p.canCount > 0 && <span style={{ fontSize: '11px', color: isSelected ? '#ddd' : '#666' }}>CAN: {p.canCount}</span>}
+                                {p.diCount > 0 && <span style={{ fontSize: '11px', color: isSelected ? '#ddd' : '#666' }}>DI: {p.diCount}</span>}
+                                {p.doCount > 0 && <span style={{ fontSize: '11px', color: isSelected ? '#ddd' : '#666' }}>DO: {p.doCount}</span>}
+                              </>
+                            );
+                          })() : (
+                            <>
+                              <span style={{ fontSize: '11px', color: isSelected ? '#ddd' : '#666' }}>
+                                RAM: {board.ram.split('/')[0].trim()}
+                              </span>
+                              <span style={{ fontSize: '11px', color: isSelected ? '#ddd' : '#666' }}>
+                                GPIO: {board.gpio}
+                              </span>
+                            </>
+                          )}
                         </div>
                       </div>
                     );

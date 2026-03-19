@@ -11,6 +11,13 @@
  *   1. Struct / typedef definitions  (needed by board-specific headers)
  *   2. Conditional implementation include  (pulls in static inline _Call fns)
  *   3. Channel dispatcher wrappers  (call the base _Call functions)
+ *
+ * ERR_ID convention (int8_t, applies to all HAL blocks):
+ *   0  = OK / no error
+ *   1  = Invalid / unsupported pin or channel index
+ *   2  = Hardware init failed (e.g. I2C open error)
+ *   3  = Hardware I/O error (e.g. I2C read/write failed)
+ *   Additional board-specific codes may be defined per block in the future.
  */
 #ifndef KRONHAL_H
 #define KRONHAL_H
@@ -26,6 +33,7 @@ typedef struct {
     bool    EN;
     bool    VALUE;
     bool    ENO;
+    int8_t  ERR_ID;
 } GPIO_Read;
 
 typedef struct {
@@ -34,6 +42,7 @@ typedef struct {
     bool    EN;
     bool    OK;
     bool    ENO;
+    int8_t  ERR_ID;
 } GPIO_Write;
 
 typedef struct {
@@ -42,17 +51,19 @@ typedef struct {
     bool    EN;
     bool    OK;
     bool    ENO;
+    int8_t  ERR_ID;
 } GPIO_SetMode;
 
 /* ===================================================================
  * PWM  (channel-based, max 8)
  * =================================================================*/
 typedef struct {
-    float DUTY;
-    float FREQ;
-    bool  EN;
-    bool  ACTIVE;
-    bool  ENO;
+    float  DUTY;
+    float  FREQ;
+    bool   EN;
+    bool   ACTIVE;
+    bool   ENO;
+    int8_t ERR_ID;
 } HAL_PWM;
 
 typedef HAL_PWM PWM0;
@@ -75,6 +86,7 @@ typedef struct {
     uint8_t RX_DATA;
     bool    DONE;
     bool    ENO;
+    int8_t  ERR_ID;
 } HAL_SPI;
 
 typedef HAL_SPI SPI0_Transfer;
@@ -93,6 +105,7 @@ typedef struct {
     uint8_t DATA;
     bool    OK;
     bool    ENO;
+    int8_t  ERR_ID;
 } HAL_I2C_Read;
 
 typedef HAL_I2C_Read I2C0_Read;
@@ -110,6 +123,7 @@ typedef struct {
     bool    EN;
     bool    OK;
     bool    ENO;
+    int8_t  ERR_ID;
 } HAL_I2C_Write;
 
 typedef HAL_I2C_Write I2C0_Write;
@@ -126,6 +140,7 @@ typedef struct {
     bool    EN;
     bool    DONE;
     bool    ENO;
+    int8_t  ERR_ID;
 } HAL_UART_Send;
 
 typedef HAL_UART_Send UART0_Send;
@@ -145,6 +160,7 @@ typedef struct {
     uint8_t DATA;
     bool    READY;
     bool    ENO;
+    int8_t  ERR_ID;
 } HAL_UART_Receive;
 
 typedef HAL_UART_Receive UART0_Receive;
@@ -163,6 +179,7 @@ typedef struct {
     int16_t VALUE;
     float   VOLTAGE;
     bool    ENO;
+    int8_t  ERR_ID;
 } HAL_ADC_Read;
 
 typedef HAL_ADC_Read ADC0_Read;
@@ -183,6 +200,7 @@ typedef struct {
     bool    EN;
     bool    DONE;
     bool    ENO;
+    int8_t  ERR_ID;
 } HAL_CAN_Send;
 
 typedef HAL_CAN_Send CAN0_Send;
@@ -198,6 +216,7 @@ typedef struct {
     uint8_t DATA;
     bool    READY;
     bool    ENO;
+    int8_t  ERR_ID;
 } HAL_CAN_Receive;
 
 typedef HAL_CAN_Receive CAN0_Receive;
@@ -213,6 +232,7 @@ typedef struct {
     int32_t RESULT;
     bool    DONE;
     bool    ENO;
+    int8_t  ERR_ID;
 } HAL_PRU_Execute;
 
 typedef HAL_PRU_Execute PRU0_Execute;
@@ -229,6 +249,7 @@ typedef struct {
     bool    EN;
     bool    OK;
     bool    ENO;
+    int8_t  ERR_ID;
 } PCM_Output;
 
 typedef struct {
@@ -237,6 +258,7 @@ typedef struct {
     int16_t DATA;
     bool    READY;
     bool    ENO;
+    int8_t  ERR_ID;
 } PCM_Input;
 
 /* ===================================================================
@@ -247,6 +269,7 @@ typedef struct {
     bool    EN;
     bool    VALUE;
     bool    ENO;
+    int8_t  ERR_ID;
 } Grove_DigitalRead;
 
 typedef struct {
@@ -255,6 +278,7 @@ typedef struct {
     bool    EN;
     bool    OK;
     bool    ENO;
+    int8_t  ERR_ID;
 } Grove_DigitalWrite;
 
 typedef struct {
@@ -263,7 +287,49 @@ typedef struct {
     int16_t VALUE;
     float   VOLTAGE;
     bool    ENO;
+    int8_t  ERR_ID;
 } Grove_AnalogRead;
+
+/* ===================================================================
+ * DI – Isolated Digital Input  (channel-based, max 8)
+ * =================================================================*/
+typedef struct {
+    int16_t CHANNEL;
+    bool    EN;
+    bool    VALUE;
+    bool    ENO;
+    int8_t  ERR_ID;
+} HAL_DI_Read;
+
+typedef HAL_DI_Read DI0_Read;
+typedef HAL_DI_Read DI1_Read;
+typedef HAL_DI_Read DI2_Read;
+typedef HAL_DI_Read DI3_Read;
+typedef HAL_DI_Read DI4_Read;
+typedef HAL_DI_Read DI5_Read;
+typedef HAL_DI_Read DI6_Read;
+typedef HAL_DI_Read DI7_Read;
+
+/* ===================================================================
+ * DO – Isolated Digital Output  (channel-based, max 8)
+ * =================================================================*/
+typedef struct {
+    int16_t CHANNEL;
+    bool    VALUE;
+    bool    EN;
+    bool    OK;
+    bool    ENO;
+    int8_t  ERR_ID;
+} HAL_DO_Write;
+
+typedef HAL_DO_Write DO0_Write;
+typedef HAL_DO_Write DO1_Write;
+typedef HAL_DO_Write DO2_Write;
+typedef HAL_DO_Write DO3_Write;
+typedef HAL_DO_Write DO4_Write;
+typedef HAL_DO_Write DO5_Write;
+typedef HAL_DO_Write DO6_Write;
+typedef HAL_DO_Write DO7_Write;
 
 /* ===================================================================
  * Conditional implementation include
@@ -277,6 +343,8 @@ typedef struct {
 #include "kronhal_pico.h"
 #elif defined(HAL_BOARD_FAMILY_BB)
 #include "kronhal_bb.h"
+#elif defined(HAL_BOARD_FAMILY_EDATEC)
+#include "kronhal_edatec.h"
 #else
 #include "kronhal_sim.h"
 #endif
@@ -350,5 +418,25 @@ static inline void PRU0_Execute_Call(HAL_PRU_Execute *i) { HAL_PRU_Execute_Call(
 static inline void PRU1_Execute_Call(HAL_PRU_Execute *i) { HAL_PRU_Execute_Call(i, 1); }
 static inline void PRU2_Execute_Call(HAL_PRU_Execute *i) { HAL_PRU_Execute_Call(i, 2); }
 static inline void PRU3_Execute_Call(HAL_PRU_Execute *i) { HAL_PRU_Execute_Call(i, 3); }
+
+/* DI – Isolated Digital Input */
+static inline void DI0_Read_Call(HAL_DI_Read *i) { HAL_DI_Read_Call(i, 0); }
+static inline void DI1_Read_Call(HAL_DI_Read *i) { HAL_DI_Read_Call(i, 1); }
+static inline void DI2_Read_Call(HAL_DI_Read *i) { HAL_DI_Read_Call(i, 2); }
+static inline void DI3_Read_Call(HAL_DI_Read *i) { HAL_DI_Read_Call(i, 3); }
+static inline void DI4_Read_Call(HAL_DI_Read *i) { HAL_DI_Read_Call(i, 4); }
+static inline void DI5_Read_Call(HAL_DI_Read *i) { HAL_DI_Read_Call(i, 5); }
+static inline void DI6_Read_Call(HAL_DI_Read *i) { HAL_DI_Read_Call(i, 6); }
+static inline void DI7_Read_Call(HAL_DI_Read *i) { HAL_DI_Read_Call(i, 7); }
+
+/* DO – Isolated Digital Output */
+static inline void DO0_Write_Call(HAL_DO_Write *i) { HAL_DO_Write_Call(i, 0); }
+static inline void DO1_Write_Call(HAL_DO_Write *i) { HAL_DO_Write_Call(i, 1); }
+static inline void DO2_Write_Call(HAL_DO_Write *i) { HAL_DO_Write_Call(i, 2); }
+static inline void DO3_Write_Call(HAL_DO_Write *i) { HAL_DO_Write_Call(i, 3); }
+static inline void DO4_Write_Call(HAL_DO_Write *i) { HAL_DO_Write_Call(i, 4); }
+static inline void DO5_Write_Call(HAL_DO_Write *i) { HAL_DO_Write_Call(i, 5); }
+static inline void DO6_Write_Call(HAL_DO_Write *i) { HAL_DO_Write_Call(i, 6); }
+static inline void DO7_Write_Call(HAL_DO_Write *i) { HAL_DO_Write_Call(i, 7); }
 
 #endif /* KRONHAL_H */

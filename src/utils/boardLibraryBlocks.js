@@ -27,6 +27,44 @@ const BOARD_CHANNELS = {
   bb_green_wireless: { PWM: 3, SPI: 2, I2C: 3, UART: 5, ADC: 7, CAN: 2, PRU: 2 },
   bb_ai:             { PWM: 4, SPI: 4, I2C: 4, UART: 6, ADC: 7, CAN: 2, PRU: 4 },
   bb_ai64:           { PWM: 4, SPI: 4, I2C: 4, UART: 6, ADC: 7, CAN: 2, PRU: 4 },
+  // Edatec IPC — CM4/CM5/Pi5 based industrial computers
+  // ED-IPC2000: CM4 Basic
+  edatec_ipc2010:    { SPI: 2, I2C: 2, UART: 2 },
+  edatec_ipc2020:    { SPI: 2, I2C: 2, UART: 2 },
+  // ED-IPC2100: CM4 + 4x isolated serial
+  edatec_ipc2110:    { SPI: 2, I2C: 2, UART: 4 },
+  edatec_ipc2120:    { SPI: 2, I2C: 2, UART: 4 },
+  edatec_ipc2130:    { SPI: 2, I2C: 2, UART: 4 },
+  edatec_ipc2140:    { SPI: 2, I2C: 2, UART: 4 },
+  // ED-IPC2200: CM4 Multi-GigE
+  edatec_ipc2200:    { SPI: 2, I2C: 2, UART: 2 },
+  // ED-IPC2400: CM4 + 3x mixed serial
+  edatec_ipc2410:    { SPI: 2, I2C: 2, UART: 3 },
+  edatec_ipc2420:    { SPI: 2, I2C: 2, UART: 3 },
+  edatec_ipc2430:    { SPI: 2, I2C: 2, UART: 3 },
+  // ED-IPC2610: CM4 + 8DI + 8DO + 4x serial
+  edatec_ipc2612:    { SPI: 2, I2C: 2, UART: 4, DI: 8, DO: 8 },
+  edatec_ipc2613:    { SPI: 2, I2C: 2, UART: 4, DI: 8, DO: 8 },
+  edatec_ipc2614:    { SPI: 2, I2C: 2, UART: 4, DI: 8, DO: 8 },
+  // ED-IPC2620: CM4 + 4DI + 4DO + 1CAN + 4x serial
+  edatec_ipc2622:    { SPI: 2, I2C: 2, UART: 4, DI: 4, DO: 4, CAN: 1 },
+  edatec_ipc2623:    { SPI: 2, I2C: 2, UART: 4, DI: 4, DO: 4, CAN: 1 },
+  edatec_ipc2624:    { SPI: 2, I2C: 2, UART: 4, DI: 4, DO: 4, CAN: 1 },
+  // ED-IPC2630: CM4 + 8DI + 8DO + 2CAN + 4x serial
+  edatec_ipc2632:    { SPI: 2, I2C: 2, UART: 4, DI: 8, DO: 8, CAN: 2 },
+  edatec_ipc2633:    { SPI: 2, I2C: 2, UART: 4, DI: 8, DO: 8, CAN: 2 },
+  edatec_ipc2634:    { SPI: 2, I2C: 2, UART: 4, DI: 8, DO: 8, CAN: 2 },
+  // ED-IPC3020: Pi5 + 2x serial
+  edatec_ipc3020:    { SPI: 2, I2C: 2, UART: 2 },
+  // ED-IPC3100: CM5 + 4x isolated serial
+  edatec_ipc3110:    { SPI: 2, I2C: 2, UART: 4 },
+  edatec_ipc3120:    { SPI: 2, I2C: 2, UART: 4 },
+  edatec_ipc3130:    { SPI: 2, I2C: 2, UART: 4 },
+  edatec_ipc3140:    { SPI: 2, I2C: 2, UART: 4 },
+  // ED-IPC3630: CM5 + 8DI + 8DO + 2CAN + 4x serial
+  edatec_ipc3632:    { SPI: 2, I2C: 2, UART: 4, DI: 8, DO: 8, CAN: 2 },
+  edatec_ipc3633:    { SPI: 2, I2C: 2, UART: 4, DI: 8, DO: 8, CAN: 2 },
+  edatec_ipc3634:    { SPI: 2, I2C: 2, UART: 4, DI: 8, DO: 8, CAN: 2 },
 };
 
 // ─── Block templates per interface ──────────────────────────────────────────
@@ -351,6 +389,53 @@ const INTERFACE_BLOCKS = {
         class: 'FunctionBlock',
       },
     ],
+  },
+
+  DI: {
+    title: 'Digital Input',
+    channelBlocks: (count) => {
+      const blocks = [];
+      for (let i = 0; i < count; i++) {
+        blocks.push({
+          blockType: `DI${i}_Read`,
+          label: `DI${i}_Read`,
+          desc: `Digital Input Channel ${i} – Read isolated digital input`,
+          inputs: [
+            { name: 'EN', type: 'BOOL', default: 'TRUE' },
+          ],
+          outputs: [
+            { name: 'ENO', type: 'BOOL' },
+            { name: 'VALUE', type: 'BOOL' },
+          ],
+          class: 'FunctionBlock',
+        });
+      }
+      return blocks;
+    },
+  },
+
+  DO: {
+    title: 'Digital Output',
+    channelBlocks: (count) => {
+      const blocks = [];
+      for (let i = 0; i < count; i++) {
+        blocks.push({
+          blockType: `DO${i}_Write`,
+          label: `DO${i}_Write`,
+          desc: `Digital Output Channel ${i} – Write isolated digital output`,
+          inputs: [
+            { name: 'VALUE', type: 'BOOL', default: 'FALSE' },
+            { name: 'EN', type: 'BOOL', default: 'TRUE' },
+          ],
+          outputs: [
+            { name: 'ENO', type: 'BOOL' },
+            { name: 'OK', type: 'BOOL' },
+          ],
+          class: 'FunctionBlock',
+        });
+      }
+      return blocks;
+    },
   },
 
   Grove: {

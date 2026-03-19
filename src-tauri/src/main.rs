@@ -864,6 +864,8 @@ fn compile_for_target(
     source: String,
     variable_table: String,
     board_id: String,
+    di_count: Option<u8>,
+    do_count: Option<u8>,
 ) -> Result<String, String> {
     let resource_dir = get_resource_dir(&app)?;
     let build_dir = plain_path(&get_build_dir(&app)?);
@@ -914,6 +916,12 @@ fn compile_for_target(
     if board_id == "rpi_5" {
         // RPi 5 uses /dev/gpiochip4 (RP1 chip) instead of the default gpiochip0
         cmd.arg(r#"-DKRON_GPIO_CHIP="/dev/gpiochip4""#);
+    }
+    if board_id.starts_with("edatec_") {
+        let di = di_count.unwrap_or(8);
+        let do_ = do_count.unwrap_or(8);
+        cmd.arg(format!("-DKRON_DI_COUNT={}", di));
+        cmd.arg(format!("-DKRON_DO_COUNT={}", do_));
     }
 
     cmd.arg("-I").arg(&build_dir)
@@ -1091,8 +1099,8 @@ fn deploy_server_to_target(
     // Select the right binary based on board
     let binary_name = if board_id.starts_with("rpi_pico") {
         return Err("Pico targets do not support remote server deployment".into());
-    } else if board_id.starts_with("rpi_") || board_id == "bb_ai64" {
-        // aarch64: all RPi Linux boards + BeagleBone AI-64
+    } else if board_id.starts_with("rpi_") || board_id.starts_with("edatec_") || board_id == "bb_ai64" {
+        // aarch64: all RPi Linux boards + Edatec IPC + BeagleBone AI-64
         "plc-agent_linux_arm64"
     } else if board_id.starts_with("bb_") {
         // armv7: BeagleBone Black / Green / AI
@@ -1143,11 +1151,18 @@ fn deploy_server_to_target(
 
     let _ = app.emit("server-deploy-progress", format!("Preparing target directory: {}", remote_dir));
 
+    // sudo prefix: root user or empty password → no sudo needed
+    let sudo_prefix = if username == "root" || password.is_empty() {
+        String::new()
+    } else {
+        format!("echo '{}' | sudo -S ", password.replace('\'', "'\\''"))
+    };
+
     // Stop any running agent (systemd first, then fallback to pkill)
     let _ = app.emit("server-deploy-progress", "Stopping existing plc-agent...");
     let stop_cmd = format!(
-        "echo '{}' | sudo -S systemctl stop plc-agent 2>/dev/null; pkill -f plc-agent 2>/dev/null; rm -f {}; sleep 1; true",
-        password.replace('\'', "'\\''"), remote_bin
+        "{0}systemctl stop plc-agent 2>/dev/null; pkill -f plc-agent 2>/dev/null; rm -f {1}; sleep 1; true",
+        sudo_prefix, remote_bin
     );
     let mut channel = sess.channel_session()
         .map_err(|e| format!("SSH channel error: {}", e))?;
@@ -1197,11 +1212,9 @@ fn deploy_server_to_target(
         remote_bin, remote_dir, remote_dir
     );
     let install_cmd = format!(
-        "cat > /tmp/plc-agent.service << 'UNIT'\n{}UNIT\necho '{}' | sudo -S cp /tmp/plc-agent.service /etc/systemd/system/plc-agent.service && echo '{}' | sudo -S systemctl daemon-reload && echo '{}' | sudo -S systemctl enable plc-agent",
-        unit_content,
-        password.replace('\'', "'\\''"),
-        password.replace('\'', "'\\''"),
-        password.replace('\'', "'\\''")
+        "cat > /tmp/plc-agent.service << 'UNIT'\n{unit}UNIT\n{sudo}cp /tmp/plc-agent.service /etc/systemd/system/plc-agent.service && {sudo}systemctl daemon-reload && {sudo}systemctl enable plc-agent",
+        unit = unit_content,
+        sudo = sudo_prefix
     );
     let mut channel = sess.channel_session()
         .map_err(|e| format!("SSH channel error: {}", e))?;
@@ -1213,10 +1226,12 @@ fn deploy_server_to_target(
 
     let _ = app.emit("server-deploy-progress", "Starting plc-agent service...");
 
-    // Start the agent via systemd
+    // Start the agent: try systemd first, fall back to direct nohup launch (for Yocto/no-systemd)
     let start_cmd = format!(
-        "echo '{}' | sudo -S systemctl start plc-agent",
-        password.replace('\'', "'\\''")
+        "{sudo}systemctl start plc-agent 2>/dev/null || (pkill -f plc-agent 2>/dev/null; nohup {bin} -addr :7070 -deploy-dir {dir} -shm-name plc_runtime -shm-size 65536 > {dir}/plc-agent.log 2>&1 & sleep 1)",
+        sudo = sudo_prefix,
+        bin = remote_bin,
+        dir = remote_dir
     );
     let mut channel = sess.channel_session()
         .map_err(|e| format!("SSH channel error: {}", e))?;

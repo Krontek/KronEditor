@@ -6,6 +6,7 @@ const getBoardFamilyDefine = (boardId) => {
     if (boardId.startsWith('rpi_pico')) return 'HAL_BOARD_FAMILY_PICO';
     if (boardId.startsWith('rpi_')) return 'HAL_BOARD_FAMILY_RPI';
     if (boardId.startsWith('bb_')) return 'HAL_BOARD_FAMILY_BB';
+    if (boardId.startsWith('edatec_')) return 'HAL_BOARD_FAMILY_EDATEC';
     return null;
 };
 
@@ -1381,7 +1382,15 @@ const transpileLDLogics = (rungs, stdFunctions = {}, parentName = '', category =
                     if (c.source && c.source.startsWith('terminal_left')) {
                         argValues[pinName] = 'true';
                     } else if (sortedIndex[c.source] !== undefined) {
-                        argValues[pinName] = `out_r${rungIdx}_b${sortedIndex[c.source]}`;
+                        const sp = c.sourcePin || '';
+                        if (sp.startsWith('out_') && !/^out_\d+$/.test(sp)) {
+                            // Named data output pin (e.g. "out_VALUE", "out_Q") — read from source struct directly
+                            const srcBlock = nodeMap[c.source];
+                            const srcInstName = (srcBlock?.data?.instanceName || srcBlock?.type || '');
+                            argValues[pinName] = `${getCallTarget(srcInstName)}.${sp.slice(4)}`;
+                        } else {
+                            argValues[pinName] = `out_r${rungIdx}_b${sortedIndex[c.source]}`;
+                        }
                     }
                 });
 
@@ -1551,7 +1560,15 @@ const transpileLDLogics = (rungs, stdFunctions = {}, parentName = '', category =
                     if (c.source && c.source.startsWith('terminal_left')) {
                         out += `    ${callTarget}.${cPin} = true;\n`;
                     } else if (sortedIndex[c.source] !== undefined) {
-                        out += `    ${callTarget}.${cPin} = out_r${rungIdx}_b${sortedIndex[c.source]};\n`;
+                        const sp = c.sourcePin || '';
+                        if (sp.startsWith('out_') && !/^out_\d+$/.test(sp)) {
+                            // Named data output pin (e.g. "out_VALUE", "out_Q") — read from source struct directly
+                            const srcBlock = nodeMap[c.source];
+                            const srcInstName = (srcBlock?.data?.instanceName || srcBlock?.type || '');
+                            out += `    ${callTarget}.${cPin} = ${getCallTarget(srcInstName)}.${sp.slice(4)};\n`;
+                        } else {
+                            out += `    ${callTarget}.${cPin} = out_r${rungIdx}_b${sortedIndex[c.source]};\n`;
+                        }
                     }
                 });
                 }

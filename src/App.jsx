@@ -667,6 +667,8 @@ function App() {
         source: cCode.source,
         variableTable: JSON.stringify(cCode.variableTable, null, 2),
         boardId: selectedBoard,
+        diCount: boardInfo?.pinout?.diCount ?? null,
+        doCount: boardInfo?.pinout?.doCount ?? null,
       });
       addLog('success', 'Cross-compilation successful.');
 

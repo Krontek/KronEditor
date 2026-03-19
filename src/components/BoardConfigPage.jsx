@@ -324,6 +324,69 @@ const InterfacesCard = ({ board }) => (
   </div>
 );
 
+// ===== EDATEC IPC I/O PANEL =====
+const EdatecIOPanel = ({ pinout }) => {
+  const { serialPorts = [], diCount = 0, doCount = 0, canCount = 0 } = pinout || {};
+  const rs485 = serialPorts.filter(p => p.type === 'RS485');
+  const rs232 = serialPorts.filter(p => p.type === 'RS232');
+
+  const Section = ({ title, color, items }) => (
+    <div style={{ marginBottom: 16 }}>
+      <div style={{ fontSize: '11px', fontWeight: 'bold', color, marginBottom: 8, textTransform: 'uppercase', letterSpacing: 1 }}>
+        {title}
+      </div>
+      <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+        {items.map((label, i) => (
+          <div key={i} style={{
+            padding: '6px 12px', borderRadius: 4,
+            background: '#1e1e1e', border: `1px solid ${color}44`,
+            fontSize: '11px', color, fontFamily: 'monospace',
+          }}>
+            {label}
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+
+  return (
+    <div style={{ padding: 16 }}>
+      {rs485.length > 0 && (
+        <Section title="RS485 Ports" color="#4caf50"
+          items={rs485.map(p => `${p.label}  /dev/ttyS${p.index}`)} />
+      )}
+      {rs232.length > 0 && (
+        <Section title="RS232 Ports" color="#9c27b0"
+          items={rs232.map(p => `${p.label}  /dev/ttyS${p.index}`)} />
+      )}
+      {canCount > 0 && (
+        <Section title="CAN Bus" color="#ff9800"
+          items={Array.from({ length: canCount }, (_, i) => `CAN${i}  can${i}`)} />
+      )}
+      {diCount > 0 && (
+        <Section title={`Digital Inputs (${diCount}x Isolated)`} color="#4a90d9"
+          items={Array.from({ length: diCount }, (_, i) => `DI${i}`)} />
+      )}
+      {doCount > 0 && (
+        <Section title={`Digital Outputs (${doCount}x Isolated)`} color="#e91e63"
+          items={Array.from({ length: doCount }, (_, i) => `DO${i}`)} />
+      )}
+      {rs485.length === 0 && rs232.length === 0 && canCount === 0 && diCount === 0 && doCount === 0 && (
+        <div style={{ color: '#666', fontSize: '12px', textAlign: 'center', paddingTop: 24 }}>
+          Standard CM4/CM5/Pi5 interfaces (GPIO, I2C, SPI, UART)
+        </div>
+      )}
+    </div>
+  );
+};
+
+// ===== BOARD ICON HELPER =====
+const boardIcon = (family) => {
+  if (family === 'Raspberry Pi') return { icon: '🍓', bg: 'linear-gradient(135deg, #c51a4a, #8b1a3a)' };
+  if (family === 'Edatec IPC')   return { icon: '🏭', bg: 'linear-gradient(135deg, #1565c0, #0d47a1)' };
+  return { icon: '🦴', bg: 'linear-gradient(135deg, #2e7d32, #1b5e20)' };
+};
+
 // ===== MAIN BOARD CONFIG PAGE =====
 const BoardConfigPage = ({ boardId }) => {
   const { t } = useTranslation();
@@ -342,6 +405,9 @@ const BoardConfigPage = ({ boardId }) => {
     setSelectedPin(prev => prev?.pin === pin.pin && prev?.header === pin.header ? null : pin);
   };
 
+  const { icon, bg } = boardIcon(board.family);
+  const isEdatec = board.pinLayout === 'edatec_ipc';
+
   return (
     <div style={{ height: '100%', overflow: 'auto', padding: '16px', background: '#1e1e1e' }}>
       {/* Board Title */}
@@ -350,12 +416,11 @@ const BoardConfigPage = ({ boardId }) => {
         padding: '14px 18px', background: '#252526', borderRadius: 8, border: '1px solid #333'
       }}>
         <div style={{
-          width: 48, height: 48, borderRadius: 8,
-          background: board.family === 'Raspberry Pi' ? 'linear-gradient(135deg, #c51a4a, #8b1a3a)' : 'linear-gradient(135deg, #2e7d32, #1b5e20)',
+          width: 48, height: 48, borderRadius: 8, background: bg,
           display: 'flex', alignItems: 'center', justifyContent: 'center',
           fontSize: '24px'
         }}>
-          {board.family === 'Raspberry Pi' ? '🍓' : '🦴'}
+          {icon}
         </div>
         <div>
           <h2 style={{ margin: 0, color: '#fff', fontSize: '18px' }}>{board.name}</h2>
@@ -363,9 +428,9 @@ const BoardConfigPage = ({ boardId }) => {
         </div>
       </div>
 
-      {/* Main Layout: Left (Pinout) + Right (Details) */}
+      {/* Main Layout: Left (Pinout / I/O) + Right (Details) */}
       <div style={{ display: 'flex', gap: 16, minHeight: 400 }}>
-        {/* LEFT: Pinout Diagram */}
+        {/* LEFT: Pinout Diagram or Edatec I/O panel */}
         <div style={{
           flex: 1, background: '#252526', borderRadius: 8, border: '1px solid #333',
           overflow: 'auto', minWidth: 0
@@ -375,23 +440,32 @@ const BoardConfigPage = ({ boardId }) => {
             fontWeight: 'bold', fontSize: '12px', color: '#ccc',
             display: 'flex', alignItems: 'center', justifyContent: 'space-between'
           }}>
-            <span>{t('board.pinoutDiagram')}</span>
-            <span style={{ fontSize: '10px', color: '#666', fontWeight: 'normal' }}>
-              {board.gpio} GPIO
-            </span>
-          </div>
-          <PinLegend />
-          <div style={{ display: 'flex', justifyContent: 'center', padding: '0 8px 8px' }}>
-            {board.pinLayout === 'rpi40' && (
-              <Rpi40PinHeader pinout={board.pinout} onPinClick={handlePinClick} selectedPin={selectedPin} />
-            )}
-            {board.pinLayout === 'pico' && (
-              <PicoPinHeader pinout={board.pinout} onPinClick={handlePinClick} selectedPin={selectedPin} />
-            )}
-            {board.pinLayout === 'beaglebone' && (
-              <BeagleBoneHeaders pinout={board.pinout} onPinClick={handlePinClick} selectedPin={selectedPin} />
+            <span>{isEdatec ? 'I/O Connectors' : t('board.pinoutDiagram')}</span>
+            {!isEdatec && (
+              <span style={{ fontSize: '10px', color: '#666', fontWeight: 'normal' }}>
+                {board.gpio} GPIO
+              </span>
             )}
           </div>
+
+          {isEdatec ? (
+            <EdatecIOPanel pinout={board.pinout} />
+          ) : (
+            <>
+              <PinLegend />
+              <div style={{ display: 'flex', justifyContent: 'center', padding: '0 8px 8px' }}>
+                {board.pinLayout === 'rpi40' && (
+                  <Rpi40PinHeader pinout={board.pinout} onPinClick={handlePinClick} selectedPin={selectedPin} />
+                )}
+                {board.pinLayout === 'pico' && (
+                  <PicoPinHeader pinout={board.pinout} onPinClick={handlePinClick} selectedPin={selectedPin} />
+                )}
+                {board.pinLayout === 'beaglebone' && (
+                  <BeagleBoneHeaders pinout={board.pinout} onPinClick={handlePinClick} selectedPin={selectedPin} />
+                )}
+              </div>
+            </>
+          )}
         </div>
 
         {/* RIGHT: Specs + Pin Detail */}
@@ -399,18 +473,19 @@ const BoardConfigPage = ({ boardId }) => {
           <BoardSpecsCard board={board} />
           <InterfacesCard board={board} />
 
-          {/* Pin Detail */}
-          <div style={{
-            background: '#252526', borderRadius: 6, border: '1px solid #333', flex: 1
-          }}>
+          {!isEdatec && (
             <div style={{
-              padding: '8px 14px', borderBottom: '1px solid #333',
-              fontWeight: 'bold', fontSize: '12px', color: '#ccc'
+              background: '#252526', borderRadius: 6, border: '1px solid #333', flex: 1
             }}>
-              {t('board.pinDetails')}
+              <div style={{
+                padding: '8px 14px', borderBottom: '1px solid #333',
+                fontWeight: 'bold', fontSize: '12px', color: '#ccc'
+              }}>
+                {t('board.pinDetails')}
+              </div>
+              <PinDetailPanel pin={selectedPin} boardLayout={board.pinLayout} />
             </div>
-            <PinDetailPanel pin={selectedPin} boardLayout={board.pinLayout} />
-          </div>
+          )}
         </div>
       </div>
     </div>
