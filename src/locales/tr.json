@@ -19,6 +19,7 @@
         "language": "Dil",
         "english": "İngilizce",
         "turkish": "Türkçe",
+        "russian": "Rusça",
         "name": "İsim",
         "type": "Tip",
         "action": "İşlem",
@@ -36,7 +37,8 @@
         "openProject": "Proje Aç",
         "close": "Kapat",
         "project": "Proje",
-        "plc": "PLC"
+        "plc": "PLC",
+        "rightClick": "Sağ tık"
     },
     "tables": {
         "name": "İsim",
@@ -47,6 +49,7 @@
         "description": "Açıklama",
         "actions": "İşlem",
         "program": "Program",
+        "rightClick": "Sau011f tu0131k",
         "task": "Görev",
         "triggering": "Tetikleme",
         "interval": "Aralık",
@@ -60,6 +63,7 @@
         "dimensions": "Boyutlar"
     },
     "actions": {
+        "add": "Ekle",
         "addTask": "Görev Ekle",
         "addInstance": "Örnek Ekle",
         "addVariable": "Değişken Ekle",
@@ -128,7 +132,10 @@
         "confirm": "Onayla",
         "contactSettings": "Kontak Ayarları",
         "coilSettings": "Bobin Ayarları",
-        "blockSettings": "Blok Ayarları"
+        "blockSettings": "Blok Ayarları",
+        "addMember": "Üye Ekle",
+        "addValue": "Değer Ekle",
+        "addDimension": "Boyut Ekle"
     },
     "errors": {
         "nameRequired": "İsim zorunludur",

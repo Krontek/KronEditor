@@ -355,7 +355,7 @@ const VariableManager = ({
                       onChange={(newType) => {
                         if (isSimulationMode || disabled) return;
 
-                        // User request: eger secilen type ile ayni tipte ayni isimde baska bir degisken varsa, global dahil, degisikligi yapamasin.
+                        // User request: if the selected type is the same type and same name as another variable, including global, don't allow the change.
                         const isDuplicate = variables.some(other => other.id !== v.id && other.name === v.name && other.type === newType) ||
                           globalVars.some(other => other.name === v.name && other.type === newType);
 

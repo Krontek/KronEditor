@@ -9,7 +9,7 @@ import DragDropManager from '../utils/DragDropManager';
 const EMPTY_IMG = new Image();
 EMPTY_IMG.src = 'data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7';
 
-// Hover'da beliren "araya ekle" çizgisi
+// Dashed line appearing on hover "insert here"
 const InsertZone = ({ onInsert, onPaste, canPaste, disabled }) => {
   const [hovered, setHovered] = useState(false);
   if (disabled) return <div style={{ height: 6 }} />;
@@ -35,7 +35,7 @@ const InsertZone = ({ onInsert, onPaste, canPaste, disabled }) => {
           <div
             onClick={onInsert}
             style={{ position: 'relative', zIndex: 1, width: 18, height: 18, background: '#007acc', borderRadius: '50%', display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#fff', fontSize: 14, fontWeight: 'bold', lineHeight: 1 }}
-            title="Yeni ekle"
+            title={t('actions.addNew')}
           >+</div>
           {canPaste && (
             <div
@@ -429,9 +429,9 @@ const RungEditorNew = ({ variables, setVariables, rungs, setRungs, availableBloc
     saveHistory(newRungs, variables);
   }, [readOnly, rungs, variables, saveHistory, setRungs, setVariables]);
 
-  // Rung ekleme
-  // targetId: hangi rung'un yanına eklenecek (null = sona ekle)
-  // before: true ise önce, false ise sonra ekle
+  // Add Rung
+  // targetId: which rung to insert beside (null = add to end)
+  // before: if true add before, if false add after
   const addRung = useCallback((targetId = null, before = false) => {
     if (readOnly) return;
     const newRung = {
@@ -463,7 +463,7 @@ const RungEditorNew = ({ variables, setVariables, rungs, setRungs, availableBloc
     saveHistory(newRungs, variables);
   }, [readOnly, rungs, variables, focusedRungId, saveHistory]);
 
-  // Rung silme
+  // Delete Rung
   const deleteRung = useCallback((rungId) => {
     if (readOnly) return;
     const newRungs = rungs.filter(r => r.id !== rungId);
@@ -536,7 +536,7 @@ const RungEditorNew = ({ variables, setVariables, rungs, setRungs, availableBloc
     setDragOverRungIndex(null);
   };
 
-  // HELPER: Blok ekle + history'ye hem rungs hem variables kaydet
+  // HELPER: Add block + save both rungs and variables to history
   const insertBlock = useCallback((rungId, blockType, position, instanceName, customData, newVariables) => {
     const blockId = `block_${Date.now()}_${Math.random()}`;
     // For Contact/Coil, propagate subType from customData directly onto data

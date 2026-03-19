@@ -16,13 +16,13 @@ import DragDropManager from '../utils/DragDropManager';
 
 
 /**
- * Her rung'un kendi mini ladder editörü
- * - Sol: Terminal - Kırmızı çizgi (fixed, canvas dışında)
- * - Orta: Bloklar (sürüklenebilir, React Flow içinde)
- * - Sağ: Terminal - Mavi çizgi (fixed, canvas dışında)
+ * Each rung has its own mini ladder editor
+ * - Left: Terminal - Red line (fixed, outside canvas)
+ * - Middle: Blocks (draggable, inside React Flow)
+ * - Right: Terminal - Blue line (fixed, outside canvas)
  */
 
-// Terminal connection point - 24V ve 0V bağlantı noktaları
+// Terminal connection point - 24V and 0V connection points
 const TerminalConnectionPoint = ({ data, isConnectable }) => {
   const isLeft = data.position === 'left';
   const label = isLeft ? '24V' : '0V';
@@ -73,7 +73,7 @@ const TerminalConnectionPoint = ({ data, isConnectable }) => {
   );
 };
 
-// Blok Yapılandırması ve Tip Tanımları
+// Block Configuration and Type Definitions
 export const blockConfig = {
   TON: {
     label: 'TON', descriptionKey: 'blockInfo.TON',
@@ -734,9 +734,9 @@ const BlockNode = ({ id, data, isConnectable, selected }) => {
   // Instance Name (Header)
   const instanceName = data.instanceName || `${data.type}_1`;
 
-  // Input değeri değiştiğinde
+  // When input value changes
   const handleInputChange = (pinLabel, value) => {
-    // 1. React Flow state'ini güncelle (Hızlı UI tepkisi için)
+    // 1. Update React Flow state (for quick UI response)
     setNodes((nodes) =>
       nodes.map((node) => {
         if (node.id === id) {
@@ -748,7 +748,7 @@ const BlockNode = ({ id, data, isConnectable, selected }) => {
             }
           };
 
-          // 2. Ana state'i güncelle (Veri kalıcılığı için)
+          // 2. Update main state (for data persistence)
           if (data.onUpdate) {
             data.onUpdate(id, { values: newData.values });
           }
@@ -832,7 +832,7 @@ const BlockNode = ({ id, data, isConnectable, selected }) => {
 
             return (
               <div key={handleId} style={{ position: 'relative', display: 'flex', alignItems: 'center', height: 20 }}>
-                {/* External Input Field (Blok dışında, solda) */}
+                {/* External Input Field (outside block, on left) */}
                 {!connected && (
                   <div style={{
                     position: 'absolute',
@@ -969,7 +969,7 @@ const BlockNode = ({ id, data, isConnectable, selected }) => {
                   }}
                 />
 
-                {/* Label (Blok içinde - Tip kaldırıldı) */}
+                {/* Label (inside block - type removed) */}
                 <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-start', lineHeight: 1, marginLeft: 6 }}>
                   <span style={{ fontSize: 10, fontWeight: 'bold' }}>{pin.name}</span>
                 </div>
@@ -1317,7 +1317,7 @@ const RungContainer = ({
     return () => window.removeEventListener('keydown', handleKeyDown);
   }, [nodes, liveVariables, parentName, onForceWrite]);
 
-  // onNodesChange'i sarmalayarak pozisyon kontrolü ekle
+  // Wrap onNodesChange to add position control
   const handleNodesChange = useCallback((changes) => {
     const constrainedChanges = changes.map(change => {
       // Terminal node'ları değiştirme
@@ -1631,7 +1631,7 @@ const RungContainer = ({
         }
         return finalConnection;
       }
-      // Sağ çizgiye yakın mı kontrol et
+      // Check if close to right wire
       else if (Math.abs(x - RIGHT_LINE_X_CALC) < SNAP_THRESHOLD &&
         Math.abs(y - MIDDLE_Y) < SNAP_THRESHOLD) {
         if (connection.target) {
@@ -2154,7 +2154,7 @@ const RungContainer = ({
               fontWeight: 'bold'
             }}
           >
-            🗑 Sil
+            🗑 {t('common.delete')}
           </button>
         </div>
       </div>

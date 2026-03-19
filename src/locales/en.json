@@ -46,6 +46,7 @@
         "action": "Action",
         "moveUp": "Move Up",
         "moveDown": "Move Down",
+        "rightClick": "Right-click",
         "pin": "Pin",
         "networkTitle": "Network Title",
         "variableName": "Variable Name",
@@ -58,9 +59,11 @@
         "openProject": "Open Project",
         "close": "Close",
         "project": "Project",
-        "plc": "PLC"
+        "plc": "PLC",
+        "rightClick": "Right-click"
     },
     "actions": {
+        "add": "Add",
         "addTask": "Add Task",
         "addInstance": "Add Instance",
         "addVariable": "Add Variable",

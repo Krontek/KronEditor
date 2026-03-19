@@ -84,6 +84,7 @@ function App() {
 
   // Global Project State
   const [projectStructure, setProjectStructure] = useState(defaultProjectStructure);
+  const [buses, setBuses] = useState([]);
 
   const [activeId, setActiveId] = useState(null);
   const [createModal, setCreateModal] = useState({
@@ -132,6 +133,7 @@ function App() {
   const [sshPort, setSshPort] = useState(() => localStorage.getItem('sshPort') || '22');
   const [isDeployed, setIsDeployed] = useState(false);
   const [isDirty, setIsDirty] = useState(false);
+  const isDirtyRef = React.useRef(false);
   const plcClientRef = React.useRef(null);   // PLCClient instance
   const stopStreamRef = React.useRef(null);  // cancel fn returned by streamVars()
   const remoteVarKeysRef = React.useRef([]);
@@ -185,12 +187,51 @@ function App() {
   // --- isDirty: mark dirty when project changes after deployment ---
   const projectStructureRef = React.useRef(projectStructure);
   useEffect(() => {
-    // Skip the initial render and only trigger when projectStructure actually changes
     if (projectStructureRef.current !== projectStructure && isDeployed) {
       setIsDirty(true);
     }
     projectStructureRef.current = projectStructure;
   }, [projectStructure, isDeployed]);
+
+  // Keep isDirtyRef in sync so the window close handler can read it without stale closure
+  useEffect(() => { isDirtyRef.current = isDirty; }, [isDirty]);
+
+  // Keep a ref to handleSave so the close handler can call it without stale closure
+  const handleSaveRef = React.useRef(null);
+
+  // --- Window close: ask to save if project is open ---
+  useEffect(() => {
+    const win = getCurrentWindow();
+    let unlisten;
+    win.onCloseRequested(async (event) => {
+      if (!isProjectOpen) return;
+      event.preventDefault();
+      const save = await ask(
+        'Proje açık. Kapatmadan önce kaydetmek ister misiniz?',
+        { title: 'KronEditor', type: 'warning', okLabel: 'Kaydet', cancelLabel: 'Kaydetme' }
+      ).catch(() => false);
+      if (save && handleSaveRef.current) {
+        await handleSaveRef.current().catch(() => {});
+      }
+      win.destroy();
+    }).then(fn => { unlisten = fn; });
+    return () => { unlisten?.(); };
+  }, [isProjectOpen]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // --- Bus handlers ---
+  const handleAddBus = useCallback((type) => {
+    setBuses(prev => {
+      if (prev.some(b => b.type === type)) return prev;
+      return [...prev, { id: `bus_${type}_${Date.now()}`, type }];
+    });
+  }, []);
+
+  const handleDeleteBus = useCallback(async (busId) => {
+    const confirmed = await ask('Bu fieldbus bağlantısını kaldırmak istiyor musunuz?', {
+      title: 'Fieldbus Kaldır', type: 'warning'
+    });
+    if (confirmed) setBuses(prev => prev.filter(b => b.id !== busId));
+  }, []);
 
   // --- Layout & Resizing State ---
   const [layout, setLayout] = useState({
@@ -278,21 +319,6 @@ function App() {
 
   // --- File Operations ---
 
-  const handleSave = useCallback(async () => {
-    if (!currentFilePath) {
-      handleSaveAs();
-      return;
-    }
-
-    try {
-      const xmlContent = exportProjectToXml(projectStructure, selectedBoard, { plcAddress, sshUser, sshPort });
-      await writeTextFile(currentFilePath, xmlContent);
-      addLog('success', t('logs.projectSaved', { path: currentFilePath }) || `Project saved to ${currentFilePath} `);
-    } catch (error) {
-      addLog('error', t('logs.saveError', { error: error }) || `Save Error: ${error} `);
-    }
-  }, [currentFilePath, projectStructure, selectedBoard, plcAddress, sshUser, sshPort, addLog]);
-
   const handleSaveAs = useCallback(async () => {
     try {
       let filePath = await save({
@@ -314,6 +340,24 @@ function App() {
     }
   }, [projectStructure, selectedBoard, plcAddress, sshUser, sshPort, addLog]);
 
+  const handleSave = useCallback(async () => {
+    if (!currentFilePath) {
+      await handleSaveAs();
+      return;
+    }
+
+    try {
+      const xmlContent = exportProjectToXml(projectStructure, selectedBoard, { plcAddress, sshUser, sshPort });
+      await writeTextFile(currentFilePath, xmlContent);
+      addLog('success', t('logs.projectSaved', { path: currentFilePath }) || `Project saved to ${currentFilePath} `);
+    } catch (error) {
+      addLog('error', t('logs.saveError', { error: error }) || `Save Error: ${error} `);
+    }
+  }, [currentFilePath, handleSaveAs, projectStructure, selectedBoard, plcAddress, sshUser, sshPort, addLog]);
+
+  // Keep ref up-to-date so onCloseRequested handler can call it without stale closure
+  useEffect(() => { handleSaveRef.current = handleSave; }, [handleSave]);
+
   const handleNewProject = useCallback(() => {
     // Show board selection first, then create project
     setPendingNewProject(true);
@@ -325,6 +369,7 @@ function App() {
     if (pendingNewProject) {
       // Creating a new project with selected board
       setProjectStructure(defaultProjectStructure);
+      setBuses([]);
       setCurrentFilePath(null);
       setActiveId(null);
       const boardInfo = getBoardById(boardId);
@@ -349,6 +394,7 @@ function App() {
     if (confirmation) {
       setIsProjectOpen(false);
       setProjectStructure(defaultProjectStructure);
+      setBuses([]);
       setCurrentFilePath(null);
       setActiveId(null);
       setSelectedBoard(null);
@@ -1301,6 +1347,9 @@ function App() {
                 onBoardClick={() => setActiveId('BOARD_CONFIG')}
                 selectedBoard={selectedBoard}
                 isRunning={isRunning || isSimulationMode}
+                buses={buses}
+                onAddBus={handleAddBus}
+                onDeleteBus={handleDeleteBus}
               />
             </div>
 

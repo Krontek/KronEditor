@@ -48,11 +48,13 @@
         "pinInformation": "Информация о пине",
         "create": "Создать",
         "shortcuts": "Ярлыки",
+        "rightClick": "u041fu0440u0430u0432u044bu0439 u043au043bu0438u043a",
         "newProject": "Новый проект",
         "openProject": "Открыть проект",
         "close": "Закрыть"
     },
     "actions": {
+"add": "Добавить",
         "addTask": "Добавить задачу",
         "addInstance": "Добавить экземпляр",
         "addVariable": "Добавить переменную",
