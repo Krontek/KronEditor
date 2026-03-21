@@ -80,7 +80,7 @@ const InsertZone = ({ onInsert, onPaste, canPaste, disabled }) => {
                     <div
                         onClick={(e) => { e.stopPropagation(); onInsert(); }}
                         style={{ position: 'relative', zIndex: 1, width: 16, height: 16, background: '#007acc', borderRadius: '50%', display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#fff', fontSize: 13, fontWeight: 'bold' }}
-                        title={t('actions.addNew')}
+                        title="Add new"
                     >+</div>
                     {canPaste && (
                         <div
@@ -160,7 +160,7 @@ const ProjectSidebar = ({
     projectStructure, onSelectItem, activeId,
     onAddItem, onDeleteItem, onEditItem, onReorderItem, onPasteItem,
     onBoardClick, selectedBoard, isRunning = false,
-    buses = [], onAddBus, onDeleteBus,
+    buses = [], onAddBus, onDeleteBus, onSelectBus,
 }) => {
     const { t } = useTranslation();
 
@@ -507,7 +507,8 @@ const ProjectSidebar = ({
                             icon={meta.icon}
                             label={meta.label}
                             isOpen={false}
-                            onToggle={() => {}} // future: bus sub-nodes
+                            active={activeId === bus.id}
+                            onClick={() => onSelectBus?.(bus.id)}
                             onContextMenu={(e) => openCtx(e, [
                                 {
                                     icon: '🗑', label: 'Kaldır', danger: true,
@@ -515,7 +516,6 @@ const ProjectSidebar = ({
                                     action: () => !isRunning && onDeleteBus?.(bus.id),
                                 }
                             ])}
-                            dimmed
                         />
                     );
                 })}

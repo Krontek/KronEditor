@@ -1,14 +1,16 @@
-import React, { useState, useEffect, useRef } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { useTranslation } from 'react-i18next';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
+import { open } from '@tauri-apps/plugin-dialog';
+import { readTextFile } from '@tauri-apps/plugin-fs';
 
 const KRON_REPOS = [
     'KronStandard', 'KronControl', 'KronCompare', 'KronConverter',
     'KronMathematic', 'KronCommunication', 'KronLogic', 'KronMotion',
 ];
 
-const SettingsPage = ({ theme, setTheme, editorSettings, setEditorSettings, selectedBoard, plcAddress, setPlcAddress, sshUser: sshUserProp, setSshUser: setSshUserProp, sshPort: sshPortProp, setSshPort: setSshPortProp, isPlcConnected, setConnectionEnabled }) => {
+const SettingsPage = ({ theme, setTheme, editorSettings, setEditorSettings, selectedBoard, plcAddress, setPlcAddress, sshUser: sshUserProp, setSshUser: setSshUserProp, sshPort: sshPortProp, setSshPort: setSshPortProp, isPlcConnected, setConnectionEnabled, esiLibrary = [], onLoadEsiFile }) => {
     const { t, i18n } = useTranslation();
     const [activeTab, setActiveTab] = useState('general');
     const [isUpdating, setIsUpdating] = useState(false);
@@ -112,6 +114,34 @@ const SettingsPage = ({ theme, setTheme, editorSettings, setEditorSettings, sele
         });
     };
 
+    const handleBuildSoem = async () => {
+        setIsUpdating(true);
+        setProgressLog('Starting SOEM build (cloning + compiling for all toolchains)...\n');
+
+        const unlistenProgress = await listen('library-update-progress', (event) => {
+            setProgressLog(prev => prev + event.payload + '\n');
+        });
+
+        const unlistenDone = await listen('library-update-done', (event) => {
+            const { success, message } = event.payload;
+            setProgressLog(prev => prev + (success ? '✓ ' : '✗ ') + message + '\n');
+            setIsUpdating(false);
+            unlistenProgress();
+            unlistenDone();
+            unlistenRef.current = null;
+        });
+
+        unlistenRef.current = { progress: unlistenProgress, done: unlistenDone };
+
+        invoke('build_soem').catch(err => {
+            setProgressLog(prev => prev + 'Error: ' + err + '\n');
+            setIsUpdating(false);
+            unlistenProgress();
+            unlistenDone();
+            unlistenRef.current = null;
+        });
+    };
+
     const handleUpdateServer = async () => {
         setIsUpdating(true);
         setProgressLog('Starting KronServer build...\n');
@@ -200,10 +230,32 @@ const SettingsPage = ({ theme, setTheme, editorSettings, setEditorSettings, sele
         }
     };
 
+    const [esiLoadError, setEsiLoadError] = useState(null);
+    const [esiLoadLog, setEsiLoadLog] = useState('');
+
+    const handleLoadEsiFileClick = async () => {
+        setEsiLoadError(null);
+        setEsiLoadLog('');
+        try {
+            const selected = await open({
+                filters: [{ name: 'ESI XML', extensions: ['xml', 'XML'] }],
+                multiple: false,
+            });
+            if (!selected) return;
+            const content = await readTextFile(selected);
+            const filename = selected.split('/').pop().split('\\').pop();
+            await onLoadEsiFile?.(filename, content);
+            setEsiLoadLog(`Loaded: ${filename}`);
+        } catch (e) {
+            setEsiLoadError('Error: ' + e.message);
+        }
+    };
+
     const tabs = [
         { id: 'general', label: t('settingsPage.general'), icon: '⚙️' },
         { id: 'editor', label: t('settingsPage.editor'), icon: '📝' },
         { id: 'connection', label: t('settingsPage.connection', 'Connection'), icon: '🔌' },
+        { id: 'fieldbus', label: 'Fieldbus', icon: '⬡' },
         ...(import.meta.env.DEV ? [{ id: 'libraries', label: 'Libraries', icon: '📦' }] : []),
         { id: 'about', label: t('settingsPage.about'), icon: 'ℹ️' }
     ];
@@ -577,6 +629,23 @@ const SettingsPage = ({ theme, setTheme, editorSettings, setEditorSettings, sele
                         >
                             {isUpdating ? 'Building...' : 'Build Server'}
                         </button>
+                        <button
+                            onClick={handleBuildSoem}
+                            disabled={isUpdating}
+                            style={{
+                                padding: '10px 20px',
+                                backgroundColor: isUpdating ? '#444' : '#1b5e20',
+                                color: '#fff',
+                                border: 'none',
+                                borderRadius: '4px',
+                                cursor: isUpdating ? 'not-allowed' : 'pointer',
+                                marginBottom: '16px',
+                                width: '100%',
+                                fontSize: '14px'
+                            }}
+                        >
+                            Build SOEM
+                        </button>
                         {progressLog && (
                             <textarea
                                 ref={logRef}
@@ -597,6 +666,57 @@ const SettingsPage = ({ theme, setTheme, editorSettings, setEditorSettings, sele
                                 }}
                             />
                         )}
+                    </div>
+                );
+            case 'fieldbus':
+                return (
+                    <div style={{ maxWidth: '600px' }}>
+                        <h3 style={{ borderBottom: '1px solid #444', paddingBottom: '10px', marginTop: 0 }}>
+                            ESI Device Library
+                        </h3>
+                        <p style={{ color: '#888', fontSize: '12px', marginBottom: '16px' }}>
+                            ESI files are stored in <code style={{ color: '#9cdcfe' }}>~/kroneditor/esi/</code> and loaded automatically on startup.
+                            Devices become available in the EtherCAT Master editor.
+                        </p>
+                        <button
+                            onClick={handleLoadEsiFileClick}
+                            style={{
+                                padding: '8px 18px', backgroundColor: '#0d47a1', color: '#fff',
+                                border: 'none', borderRadius: '4px', cursor: 'pointer',
+                                fontSize: '13px', marginBottom: '16px'
+                            }}
+                        >
+                            + Load ESI File
+                        </button>
+                        {esiLoadLog && (
+                            <div style={{ color: '#4caf50', fontSize: '12px', marginBottom: '10px' }}>{esiLoadLog}</div>
+                        )}
+                        {esiLoadError && (
+                            <div style={{ color: '#f44747', fontSize: '12px', marginBottom: '10px' }}>{esiLoadError}</div>
+                        )}
+                        <div style={{ background: '#252526', border: '1px solid #333', borderRadius: '4px', padding: '8px 12px' }}>
+                            <div style={{ color: '#888', fontSize: '11px', marginBottom: '8px', textTransform: 'uppercase', letterSpacing: '0.5px' }}>
+                                Loaded Devices ({esiLibrary.length})
+                            </div>
+                            {esiLibrary.length === 0 ? (
+                                <div style={{ color: '#555', fontSize: '12px', padding: '8px 0' }}>No ESI files loaded yet.</div>
+                            ) : (
+                                esiLibrary.map((dev, i) => (
+                                    <div key={i} style={{
+                                        padding: '6px 0',
+                                        borderBottom: i < esiLibrary.length - 1 ? '1px solid #2a2a2a' : 'none',
+                                        display: 'flex', flexDirection: 'column', gap: 2
+                                    }}>
+                                        <span style={{ color: '#9cdcfe', fontSize: '12px', fontWeight: 'bold' }}>{dev.name}</span>
+                                        <span style={{ color: '#555', fontSize: '11px' }}>
+                                            {dev.vendorName} · VID:0x{(dev.vendorId ?? 0).toString(16).toUpperCase().padStart(4,'0')}
+                                            · PC:0x{(dev.productCode ?? 0).toString(16).toUpperCase().padStart(4,'0')}
+                                            {dev._esiFile && <> · <span style={{ color: '#444' }}>{dev._esiFile}</span></>}
+                                        </span>
+                                    </div>
+                                ))
+                            )}
+                        </div>
                     </div>
                 );
             case 'about':

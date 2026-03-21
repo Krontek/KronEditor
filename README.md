@@ -25,6 +25,26 @@
 
 ---
 
+<h2 align="center">🔌 EtherCAT Master Support — Now Available</h2>
+
+<p align="center">
+  KronEditor now ships with a built-in <strong>EtherCAT master</strong> powered by <a href="https://github.com/OpenEtherCATsociety/SOEM">SOEM v2.0.0</a>.<br>
+  Configure slaves, map PDO entries, and run real-time fieldbus communication directly from your PLC project.
+</p>
+
+<p align="center">
+  <img src="images/config_ec.png" alt="EtherCAT Configuration" width="800">
+</p>
+
+<p align="center">
+  <strong>Supported targets:</strong> x86_64 Linux · AArch64 Linux (Raspberry Pi 3/4/5) · ARMv7 Linux (BeagleBone) · Cortex-M4/M7 bare-metal<br>
+  <code>libsoem.a</code> is built automatically from source via <em>Settings → Libraries → Build SOEM</em>.
+</p>
+
+> **CANopen** — coming soon. 🚧
+
+---
+
 ## About
 
 KronEditor is a desktop PLC IDE built with **Tauri v2** (Rust backend) and **React** (frontend). It lets you build IEC 61131-3 Ladder Diagram programs visually, compile them to native C for multiple hardware targets, and simulate them with live variable monitoring — all from a single application.
@@ -41,6 +61,7 @@ The editor is in active development. If you're interested in industrial automati
 - **Force-Write Variables** — Click any variable during simulation to override its value in real time
 - **Standard Library** — TON/TOF/TP/TONR timers, CTU/CTD/CTUD counters, R_TRIG/F_TRIG edge detectors, arithmetic, comparison, bitwise, trig, type conversion, PID, motion control blocks
 - **Project Save/Load** — XML-based project files
+- **EtherCAT Master** — Built-in SOEM v2.0.0 integration; configure slaves, PDO mapping, SDO init commands, and distributed clocks from a dedicated fieldbus editor. `libsoem.a` compiled automatically for all targets
 - **Internationalization** — English, Turkish, Russian
 
 ---

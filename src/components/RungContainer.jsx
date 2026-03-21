@@ -2154,7 +2154,7 @@ const RungContainer = ({
               fontWeight: 'bold'
             }}
           >
-            🗑 {t('common.delete')}
+            🗑 Delete
           </button>
         </div>
       </div>

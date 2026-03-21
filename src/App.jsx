@@ -1,4 +1,6 @@
 import React, { useState, useEffect, useCallback } from 'react';
+import { lazy, Suspense } from 'react';
+const EtherCATEditor = lazy(() => import('./components/EtherCATEditor'));
 import EditorPane from './components/EditorPane';
 import Toolbox from './components/Toolbox';
 import ProjectSidebar from './components/ProjectSidebar';
@@ -10,6 +12,7 @@ import ShortcutsModal from './components/ShortcutsModal';
 import StartScreen from './components/StartScreen';
 import BoardSelectionModal from './components/BoardSelectionModal';
 import BoardConfigPage from './components/BoardConfigPage';
+import SaveConfirmDialog from './components/SaveConfirmDialog';
 import { getBoardById } from './utils/boardDefinitions';
 import ArrayTypeEditor from './components/ArrayTypeEditor';
 import StructureTypeEditor from './components/StructureTypeEditor';
@@ -17,13 +20,13 @@ import EnumTypeEditor from './components/EnumTypeEditor';
 import { useTranslation } from 'react-i18next';
 import { exportProjectToXml, importProjectFromXml } from './services/XmlService';
 import { libraryService } from './services/LibraryService'; // Import Service
+import { loadAllEsiDevices, saveEsiFile } from './services/EsiLibraryService';
 import { open, save, ask } from '@tauri-apps/plugin-dialog';
 import { readTextFile, writeTextFile } from '@tauri-apps/plugin-fs';
 import { getCurrentWindow } from '@tauri-apps/api/window';
 import { invoke } from '@tauri-apps/api/core';
 import { transpileToC } from './services/CTranspilerService';
 import { PLCClient } from './services/PLCClient';
-import { mkdir, exists, BaseDirectory } from '@tauri-apps/plugin-fs';
 import PlcIcon from './assets/icons/plc-icon.png';
 import './App.css';
 
@@ -37,6 +40,11 @@ function App() {
   const [parsedBlocks, setParsedBlocks] = useState([]);
 
   // Load Library on Mount
+  // Load ESI device library from ~/kroneditor/esi/ on startup
+  useEffect(() => {
+    loadAllEsiDevices().then(setEsiLibrary).catch(() => {});
+  }, []);
+
   useEffect(() => {
     libraryService.loadLibrary().then(data => {
       console.log("Library Loaded:", data);
@@ -82,9 +90,13 @@ function App() {
     ]
   };
 
+  // ESI Device Library (loaded from ~/kroneditor/esi/ on startup)
+  const [esiLibrary, setEsiLibrary] = useState([]); // flat EsiDevice[]
+
   // Global Project State
   const [projectStructure, setProjectStructure] = useState(defaultProjectStructure);
   const [buses, setBuses] = useState([]);
+  const [busConfigs, setBusConfigs] = useState({}); // busId → config object
 
   const [activeId, setActiveId] = useState(null);
   const [createModal, setCreateModal] = useState({
@@ -134,6 +146,18 @@ function App() {
   const [isDeployed, setIsDeployed] = useState(false);
   const [isDirty, setIsDirty] = useState(false);
   const isDirtyRef = React.useRef(false);
+
+  // Save-confirm dialog state
+  const [saveConfirmOpen, setSaveConfirmOpen] = useState(false);
+  const saveConfirmResolveRef = React.useRef(null); // resolves with 'save' | 'discard' | 'cancel'
+
+  const showSaveConfirm = () => new Promise((resolve) => {
+    saveConfirmResolveRef.current = resolve;
+    setSaveConfirmOpen(true);
+  });
+  const handleSaveConfirmSave    = () => { setSaveConfirmOpen(false); saveConfirmResolveRef.current?.('save'); };
+  const handleSaveConfirmDiscard = () => { setSaveConfirmOpen(false); saveConfirmResolveRef.current?.('discard'); };
+  const handleSaveConfirmCancel  = () => { setSaveConfirmOpen(false); saveConfirmResolveRef.current?.('cancel'); };
   const plcClientRef = React.useRef(null);   // PLCClient instance
   const stopStreamRef = React.useRef(null);  // cancel fn returned by streamVars()
   const remoteVarKeysRef = React.useRef([]);
@@ -196,41 +220,103 @@ function App() {
   // Keep isDirtyRef in sync so the window close handler can read it without stale closure
   useEffect(() => { isDirtyRef.current = isDirty; }, [isDirty]);
 
+  // hasUnsaved: true whenever project content changes since last save/load
+  const hasUnsavedRef = React.useRef(false);
+  const isLoadingProjectRef = React.useRef(false); // suppresses change tracking during load
+  useEffect(() => {
+    if (isLoadingProjectRef.current) return;
+    if (isProjectOpen) hasUnsavedRef.current = true;
+  }, [projectStructure, buses, busConfigs]); // eslint-disable-line react-hooks/exhaustive-deps
+
   // Keep a ref to handleSave so the close handler can call it without stale closure
   const handleSaveRef = React.useRef(null);
 
+  // Keep isProjectOpen in a ref so the close handler (registered once) always sees fresh value
+  const isProjectOpenRef = React.useRef(isProjectOpen);
+  useEffect(() => { isProjectOpenRef.current = isProjectOpen; }, [isProjectOpen]);
+
   // --- Window close: ask to save if project is open ---
+  // Registered ONCE so multiple isProjectOpen changes don't stack listeners.
   useEffect(() => {
     const win = getCurrentWindow();
-    let unlisten;
-    win.onCloseRequested(async (event) => {
-      if (!isProjectOpen) return;
+    let isHandlingClose = false;
+    const unlistenPromise = win.onCloseRequested(async (event) => {
+      if (isHandlingClose) return;
+      if (!isProjectOpenRef.current) return;
+      if (!hasUnsavedRef.current) return; // no changes since last save → close directly
       event.preventDefault();
-      const save = await ask(
-        'Proje açık. Kapatmadan önce kaydetmek ister misiniz?',
-        { title: 'KronEditor', type: 'warning', okLabel: 'Kaydet', cancelLabel: 'Kaydetme' }
-      ).catch(() => false);
-      if (save && handleSaveRef.current) {
-        await handleSaveRef.current().catch(() => {});
+      isHandlingClose = true;
+      try {
+        const choice = await showSaveConfirm();
+        if (choice === 'cancel') { isHandlingClose = false; return; }
+        if (choice === 'save' && handleSaveRef.current) {
+          await handleSaveRef.current().catch(() => {});
+        }
+      } catch {
+        isHandlingClose = false;
+        return;
       }
-      win.destroy();
-    }).then(fn => { unlisten = fn; });
-    return () => { unlisten?.(); };
-  }, [isProjectOpen]); // eslint-disable-line react-hooks/exhaustive-deps
+      isHandlingClose = false;
+      await win.destroy().catch(() => win.close().catch(() => {}));
+    });
+    return () => { unlistenPromise.then(fn => fn()).catch(() => {}); };
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   // --- Bus handlers ---
   const handleAddBus = useCallback((type) => {
-    setBuses(prev => {
-      if (prev.some(b => b.type === type)) return prev;
-      return [...prev, { id: `bus_${type}_${Date.now()}`, type }];
-    });
-  }, []);
+    const existing = buses.find(b => b.type === type);
+    if (existing) {
+      setActiveId(existing.id);
+      return;
+    }
+    const newId = `bus_${type}_${Date.now()}`;
+    setBuses(prev => [...prev, { id: newId, type }]);
+    setActiveId(newId);
+  }, [buses]);
 
   const handleDeleteBus = useCallback(async (busId) => {
     const confirmed = await ask('Bu fieldbus bağlantısını kaldırmak istiyor musunuz?', {
       title: 'Fieldbus Kaldır', type: 'warning'
     });
-    if (confirmed) setBuses(prev => prev.filter(b => b.id !== busId));
+    if (confirmed) {
+      setBuses(prev => prev.filter(b => b.id !== busId));
+      setBusConfigs(prev => { const n = { ...prev }; delete n[busId]; return n; });
+      if (activeId === busId) setActiveId(null);
+    }
+  }, [activeId]);
+
+  const handleSelectBus = useCallback((busId) => {
+    setActiveId(busId);
+  }, []);
+
+  const handleBusConfigChange = useCallback((busId, newConfig) => {
+    setBusConfigs(prev => ({ ...prev, [busId]: newConfig }));
+  }, []);
+
+  const handleAddGlobalVarsFromBus = useCallback((vars) => {
+    const configResource = projectStructure.resources.find(r => r.type === 'RESOURCE_EDITOR');
+    if (!configResource) return;
+    const existing = configResource.content.globalVars || [];
+    const existingNames = new Set(existing.map(v => v.name));
+    const toAdd = vars
+      .filter(v => !existingNames.has(v.name))
+      .map(v => ({ id: `gv_ec_${Date.now()}_${Math.random().toString(36).slice(2)}`, name: v.name, type: v.type, initialValue: '', comment: v.comment || '' }));
+    if (!toAdd.length) return;
+    setProjectStructure(prev => ({
+      ...prev,
+      resources: prev.resources.map(r =>
+        r.type === 'RESOURCE_EDITOR'
+          ? { ...r, content: { ...r.content, globalVars: [...(r.content.globalVars || []), ...toAdd] } }
+          : r
+      ),
+    }));
+  }, [projectStructure]);
+
+  // Called from SettingsPage: save ESI file to library and reload device list
+  const handleLoadEsiFile = useCallback(async (filename, content) => {
+    await saveEsiFile(filename, content);
+    const devices = await loadAllEsiDevices();
+    setEsiLibrary(devices);
   }, []);
 
   // --- Layout & Resizing State ---
@@ -330,15 +416,16 @@ function App() {
         filePath += '.xml';
       }
 
-      const xmlContent = exportProjectToXml(projectStructure, selectedBoard, { plcAddress, sshUser, sshPort });
+      const xmlContent = exportProjectToXml(projectStructure, selectedBoard, { plcAddress, sshUser, sshPort }, buses, busConfigs);
       await writeTextFile(filePath, xmlContent);
 
+      hasUnsavedRef.current = false;
       setCurrentFilePath(filePath);
       addLog('success', t('logs.projectSaved', { path: filePath }) || `Project saved to ${filePath} `);
     } catch (error) {
       addLog('error', t('logs.saveAsError', { error: error }) || `Save As Error: ${error} `);
     }
-  }, [projectStructure, selectedBoard, plcAddress, sshUser, sshPort, addLog]);
+  }, [projectStructure, selectedBoard, plcAddress, sshUser, sshPort, buses, busConfigs, addLog]);
 
   const handleSave = useCallback(async () => {
     if (!currentFilePath) {
@@ -347,13 +434,14 @@ function App() {
     }
 
     try {
-      const xmlContent = exportProjectToXml(projectStructure, selectedBoard, { plcAddress, sshUser, sshPort });
+      const xmlContent = exportProjectToXml(projectStructure, selectedBoard, { plcAddress, sshUser, sshPort }, buses, busConfigs);
       await writeTextFile(currentFilePath, xmlContent);
+      hasUnsavedRef.current = false;
       addLog('success', t('logs.projectSaved', { path: currentFilePath }) || `Project saved to ${currentFilePath} `);
     } catch (error) {
       addLog('error', t('logs.saveError', { error: error }) || `Save Error: ${error} `);
     }
-  }, [currentFilePath, handleSaveAs, projectStructure, selectedBoard, plcAddress, sshUser, sshPort, addLog]);
+  }, [currentFilePath, handleSaveAs, projectStructure, selectedBoard, plcAddress, sshUser, sshPort, buses, busConfigs, addLog]);
 
   // Keep ref up-to-date so onCloseRequested handler can call it without stale closure
   useEffect(() => { handleSaveRef.current = handleSave; }, [handleSave]);
@@ -377,6 +465,7 @@ function App() {
         { type: 'info', msg: t('logs.startedNewProject') || 'Started new project.' },
         { type: 'info', msg: `Board: ${boardInfo?.name || boardId}` }
       ]);
+      hasUnsavedRef.current = false;
       setIsProjectOpen(true);
       setPendingNewProject(false);
     } else {
@@ -392,9 +481,11 @@ function App() {
     });
 
     if (confirmation) {
+      hasUnsavedRef.current = false;
       setIsProjectOpen(false);
       setProjectStructure(defaultProjectStructure);
       setBuses([]);
+      setBusConfigs({});
       setCurrentFilePath(null);
       setActiveId(null);
       setSelectedBoard(null);
@@ -472,10 +563,15 @@ function App() {
           addLog('warning', t('logs.missingConfigRestored') || 'Project had no configuration; restored default.');
         }
 
+        isLoadingProjectRef.current = true;
         setProjectStructure(newStructure);
         setCurrentFilePath(filePath);
         setActiveId(null);
+        setBuses(result.buses || []);
+        setBusConfigs(result.busConfigs || {});
         setIsProjectOpen(true);
+        // Reset after state batch; setTimeout ensures effects ran first
+        setTimeout(() => { isLoadingProjectRef.current = false; hasUnsavedRef.current = false; }, 0);
 
         // Restore board from XML
         if (boardId) {
@@ -1180,6 +1276,12 @@ function App() {
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', height: '100vh', width: '100vw', background: '#1e1e1e', overflow: 'hidden' }}>
+      <SaveConfirmDialog
+        isOpen={saveConfirmOpen}
+        onSave={handleSaveConfirmSave}
+        onDiscard={handleSaveConfirmDiscard}
+        onCancel={handleSaveConfirmCancel}
+      />
 
       {/* CUSTOM TITLEBAR */}
       <div data-tauri-drag-region className="custom-titlebar">
@@ -1350,6 +1452,7 @@ function App() {
                 buses={buses}
                 onAddBus={handleAddBus}
                 onDeleteBus={handleDeleteBus}
+                onSelectBus={handleSelectBus}
               />
             </div>
 
@@ -1367,7 +1470,19 @@ function App() {
                 style={{ flex: 1, position: 'relative', overflow: 'hidden', display: 'flex', flexDirection: 'column' }}
                 onMouseDown={() => window.getSelection()?.removeAllRanges()}
               >
-                {activeId === 'SETTINGS' ? (
+                {buses.some(b => b.id === activeId && b.type === 'ethercat') ? (
+                  <ErrorBoundary>
+                    <Suspense fallback={<div style={{ padding: 20, color: '#888' }}>Loading EtherCAT editor...</div>}>
+                      <EtherCATEditor
+                        busConfig={busConfigs[activeId]}
+                        onChange={(cfg) => handleBusConfigChange(activeId, cfg)}
+                        onAddGlobalVars={handleAddGlobalVarsFromBus}
+                        isRunning={isRunning || isSimulationMode}
+                        esiLibrary={esiLibrary}
+                      />
+                    </Suspense>
+                  </ErrorBoundary>
+                ) : activeId === 'SETTINGS' ? (
                   <ErrorBoundary>
                     <SettingsPage
                       theme={theme}
@@ -1383,6 +1498,8 @@ function App() {
                       setSshPort={setSshPort}
                       isPlcConnected={isPlcConnected}
                       setConnectionEnabled={setConnectionEnabled}
+                      esiLibrary={esiLibrary}
+                      onLoadEsiFile={handleLoadEsiFile}
                     />
                   </ErrorBoundary>
                 ) : activeId === 'BOARD_CONFIG' ? (

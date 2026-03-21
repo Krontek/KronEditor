@@ -11,6 +11,7 @@
         "fs:allow-read-text-file",
         "fs:allow-write-text-file",
         "fs:allow-read-dir",
+        "fs:allow-mkdir",
         "fs:allow-exists",
         {
             "identifier": "fs:scope",
@@ -29,6 +30,7 @@
         "core:window:allow-unmaximize",
         "core:window:allow-toggle-maximize",
         "core:window:allow-close",
+        "core:window:allow-destroy",
         "core:window:allow-start-dragging",
         "core:window:allow-set-fullscreen"
     ]

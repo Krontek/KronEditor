@@ -905,7 +905,11 @@ fn compile_for_target(
         .arg("-static")
         .arg("-ffunction-sections")
         .arg("-fdata-sections")
-        .arg("-Wl,--gc-sections");
+        .arg("-Wl,--gc-sections")
+        // Disable LTO and its linker plugin — on Windows the bundled toolchain
+        // often lacks liblto_plugin.dll, causing "fatal error: '-fuse-linker-plugin'"
+        .arg("-fno-lto")
+        .arg("-fno-use-linker-plugin");
 
     // Architecture-specific flags
     if board_id.starts_with("bb_") && !board_id.starts_with("bb_ai64") {
@@ -926,6 +930,7 @@ fn compile_for_target(
 
     cmd.arg("-I").arg(&build_dir)
         .arg("-I").arg(&res_include)
+        .arg("-I").arg(res_include.join("soem"))
         .arg("-o").arg(&out_file)
         .arg(&plc_c);
 
@@ -940,7 +945,7 @@ fn compile_for_target(
     }
     a_files.sort();
     for a in &a_files { cmd.arg(a); }
-    cmd.arg("-lm");
+    cmd.arg("-lm").arg("-lpthread");
 
     let output = cmd.output()
         .map_err(|e| format!("Failed to run cross-compiler: {}", e))?;
@@ -1282,6 +1287,7 @@ fn compile_simulation(app: tauri::AppHandle) -> Result<String, String> {
         .arg("-Wl,--export-all-symbols")
         .arg("-I").arg(&build_dir)
         .arg("-I").arg(&res_include)
+        .arg("-I").arg(res_include.join("soem"))
         .arg("-o").arg(&plc_dll)
         .arg(&plc_c);
 
@@ -1295,7 +1301,13 @@ fn compile_simulation(app: tauri::AppHandle) -> Result<String, String> {
     }
     a_files.sort();
     for a in &a_files { cmd.arg(a); }
+    // SOEM on Windows requires winsock2, winmm, and IP helper
+    let has_soem = a_files.iter().any(|p| p.file_name()
+        .map_or(false, |n| n.to_string_lossy().contains("soem")));
     cmd.arg("-lm");
+    if has_soem {
+        cmd.arg("-lws2_32").arg("-lwinmm").arg("-liphlpapi");
+    }
 
     let output = cmd.output()
         .map_err(|e| format!("Failed to run gcc ({}): {}", gcc_path.display(), e))?;
@@ -1327,6 +1339,7 @@ fn compile_simulation(app: tauri::AppHandle) -> Result<String, String> {
     let mut cmd = Command::new("gcc");
     cmd.arg("-I").arg(&build_dir)
         .arg("-I").arg(&res_include)
+        .arg("-I").arg(res_include.join("soem"))
         .arg("-rdynamic")
         .arg("-no-pie")
         .arg("-o").arg(&out_file)
@@ -1342,7 +1355,7 @@ fn compile_simulation(app: tauri::AppHandle) -> Result<String, String> {
     }
     a_files.sort();
     for a in &a_files { cmd.arg(a); }
-    cmd.arg("-lm");
+    cmd.arg("-lm").arg("-lpthread");
 
     let output = cmd.output()
         .map_err(|e| format!("Failed to run gcc: {}", e))?;
@@ -1789,6 +1802,660 @@ fn simulate_st(code: String) -> Result<String, String> {
 }
 
 // ---------------------------------------------------------------------------
+// build_soem — Clone SOEM v2.0.0 and compile libsoem.a for all toolchains
+// ---------------------------------------------------------------------------
+
+fn do_build_soem(app: &tauri::AppHandle) -> Result<(), String> {
+    let resource_dir = get_resource_dir(app)?;
+    let include_dir  = resource_dir.join("resources/include/soem");
+    fs::create_dir_all(&include_dir).map_err(|e| e.to_string())?;
+
+    // Dev-mode mirror directories (so files survive across Tauri rebuilds)
+    let mut dev_include_dir: Option<PathBuf> = None;
+    let mut dev_target_dirs: std::collections::HashMap<&'static str, PathBuf> = std::collections::HashMap::new();
+    if let Ok(cwd) = std::env::current_dir() {
+        let project_root = std::iter::successors(Some(cwd.as_ref() as &Path), |p| p.parent())
+            .find(|p| p.join("src-tauri").exists() && p.join("resources").exists())
+            .map(|p| p.to_path_buf());
+        if let Some(root) = project_root {
+            let res = root.join("resources");
+            let inc = res.join("include/soem");
+            let _ = fs::create_dir_all(&inc);
+            dev_include_dir = Some(inc);
+            for tname in &["x86_64/linux","x86_64/win32","arm/aarch64","arm/armv7",
+                           "arm/CortexM/M0","arm/CortexM/M4","arm/CortexM/M7"] {
+                let d = res.join(tname);
+                let _ = fs::create_dir_all(&d);
+                dev_target_dirs.insert(tname, d);
+            }
+        }
+    }
+
+    let temp_dir = std::env::temp_dir().join("kroneditor_soem_build");
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(&temp_dir).map_err(|e| e.to_string())?;
+
+    let soem_dir = temp_dir.join("SOEM");
+    let _ = app.emit("library-update-progress", "[SOEM] Cloning v2.0.0...".to_string());
+
+    let clone_out = Command::new("git")
+        .args(["clone", "--depth=1", "--branch", "v2.0.0",
+               "https://github.com/OpenEtherCATsociety/SOEM.git"])
+        .arg(&soem_dir)
+        .output()
+        .map_err(|e| format!("git not found: {}", e))?;
+
+    if !clone_out.status.success() {
+        let msg = format!("[SOEM] Clone failed: {}",
+            String::from_utf8_lossy(&clone_out.stderr).trim());
+        let _ = app.emit("library-update-progress", format!("ERROR: {}", msg));
+        let _ = fs::remove_dir_all(&temp_dir);
+        return Err(msg);
+    }
+    let _ = app.emit("library-update-progress", "[SOEM] Cloned OK".to_string());
+
+    // ── Generate ec_options.h (cmake-generated, not present in raw git clone) ──
+    {
+        let cmake_gen_dir = temp_dir.join("soem_cmake_gen");
+        let ec_options_dst = soem_dir.join("include").join("soem").join("ec_options.h");
+
+        // Try cmake configure first
+        let cmake_ok = Command::new("cmake")
+            .args([
+                "-S", soem_dir.to_str().unwrap_or("."),
+                "-B", cmake_gen_dir.to_str().unwrap_or("soem_cmake_gen"),
+                "-DCMAKE_BUILD_TYPE=Release",
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+
+        let generated = if cmake_ok {
+            let cmake_out = cmake_gen_dir.join("include").join("soem").join("ec_options.h");
+            if cmake_out.exists() {
+                fs::copy(&cmake_out, &ec_options_dst).is_ok()
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
+        if generated {
+            let _ = app.emit("library-update-progress",
+                "[SOEM] ec_options.h generated via cmake".to_string());
+        } else {
+            // cmake not available or generated file missing — write hardcoded defaults
+            // These match SOEM v2.0.0 CMakeLists.txt default values
+            let default_content = "\
+/* ec_options.h — auto-generated defaults (cmake not available) */\n\
+#ifndef EC_OPTIONS_H\n\
+#define EC_OPTIONS_H\n\
+\n\
+/** Maximum number of slaves */\n\
+#define EC_MAXSLAVE          200\n\
+/** Maximum number of groups */\n\
+#define EC_MAXGROUP          2\n\
+/** Maximum number of IO segments per group */\n\
+#define EC_MAXIOSEGMENTS     64\n\
+/** Maximum mailbox size */\n\
+#define EC_MAXMBX            0x400\n\
+/** Size of EEPROM bitmap */\n\
+#define EC_MAXEEPBITMAP      128\n\
+/** Size of EEPROM buffer */\n\
+#define EC_MAXEEPBUF         (EC_MAXEEPBITMAP * 2)\n\
+/** Maximum entries in Object Description list */\n\
+#define EC_MAXODLIST         1024\n\
+/** Maximum number of SyncManagers */\n\
+#define EC_MAXSM             8\n\
+/** Maximum number of FMMU entries */\n\
+#define EC_MAXFMMU           4\n\
+/** Maximum number of process data frames */\n\
+#define EC_MAXBUF            16\n\
+/** Maximum number of lost EtherCAT frames */\n\
+#define EC_MAXLOST           2\n\
+/** Maximum burst reads */\n\
+#define EC_MAXBURSTREADS     15\n\
+/** Timeout value for safe mode in microseconds */\n\
+#define EC_TIMEOUTSAFE       20000\n\
+/** Timeout return in microseconds */\n\
+#define EC_TIMEOUTRET        2000\n\
+/** Monitor timeout in ms */\n\
+#define EC_TIMEOUTMON        500\n\
+/** Log level (0=off, 3=verbose) */\n\
+#define EC_LOG_LEVEL         3\n\
+\n\
+#endif /* EC_OPTIONS_H */\n";
+            let _ = fs::write(&ec_options_dst, default_content);
+            let _ = app.emit("library-update-progress",
+                "[SOEM] ec_options.h written with default values (cmake not found)".to_string());
+        }
+    }
+
+    // SOEM v2 directory layout:
+    //   include/soem/   ← public headers (ec_*.h, soem.h)
+    //   soem/           ← core .c sources
+    //   oshw/linux/     ← Linux OSHW sources + nicdrv.h, oshw.h
+    //   oshw/win32/     ← Win32 OSHW sources + nicdrv.h, oshw.h + wpcap/
+    //   osal/           ← common OSAL source + osal.h
+    //   osal/linux/     ← Linux OSAL
+    //   osal/win32/     ← Win32 OSAL
+    let repo_inc_dir     = soem_dir.join("include");          // -I for "soem/soem.h"
+    let soem_src_dir     = soem_dir.join("soem");
+    let oshw_linux_dir   = soem_dir.join("oshw").join("linux");
+    let oshw_win32_dir   = soem_dir.join("oshw").join("win32");
+    let wpcap_inc_dir    = oshw_win32_dir.join("wpcap").join("Include");
+    let osal_dir         = soem_dir.join("osal");
+    let osal_linux_dir   = soem_dir.join("osal").join("linux");
+    let osal_win32_dir   = soem_dir.join("osal").join("win32");
+
+    // Filter helper
+    let filter_c = |v: Vec<PathBuf>| -> Vec<PathBuf> {
+        v.into_iter().filter(|p| {
+            let n = p.file_name().unwrap_or_default().to_string_lossy().to_lowercase();
+            !n.starts_with("test") && !n.starts_with("example")
+        }).collect()
+    };
+
+    let core_sources        = filter_c(find_files_with_ext(&soem_src_dir,   "c"));
+    let linux_oshw_sources  = filter_c(find_files_with_ext(&oshw_linux_dir, "c"));
+    let win32_oshw_sources  = filter_c(find_files_with_ext(&oshw_win32_dir, "c"));
+    // Only collect .c files directly in osal/ root (not subdirs), to avoid
+    // picking up osal/linux/ and osal/win32/ files here — those are handled separately.
+    let osal_root_sources: Vec<PathBuf> = {
+        let mut v = Vec::new();
+        if let Ok(entries) = fs::read_dir(&osal_dir) {
+            for e in entries.flatten() {
+                let p = e.path();
+                if p.is_file() && p.extension().and_then(|x| x.to_str()) == Some("c") {
+                    let n = p.file_name().unwrap_or_default().to_string_lossy().to_lowercase();
+                    if !n.starts_with("test") && !n.starts_with("example") {
+                        v.push(p);
+                    }
+                }
+            }
+        }
+        v
+    };
+    let osal_linux_sources  = filter_c(find_files_with_ext(&osal_linux_dir, "c"));
+    let osal_win32_sources  = filter_c(find_files_with_ext(&osal_win32_dir, "c"));
+
+    // Copy entire SOEM repo header tree preserving directory structure:
+    //   SOEM/include/soem/soem.h  →  resources/include/soem/include/soem/soem.h
+    //   SOEM/oshw/linux/nicdrv.h  →  resources/include/soem/oshw/linux/nicdrv.h
+    //   SOEM/osal/osal.h          →  resources/include/soem/osal/osal.h  etc.
+    let all_hdrs = find_files_with_ext(&soem_dir, "h");
+    let mut copied = 0usize;
+    for h in &all_hdrs {
+        if let Ok(rel) = h.strip_prefix(&soem_dir) {
+            let dst = include_dir.join(rel);
+            if let Some(parent) = dst.parent() {
+                let _ = fs::create_dir_all(parent);
+            }
+            if fs::copy(h, &dst).is_ok() { copied += 1; }
+            if let Some(ref d) = dev_include_dir {
+                let dst2 = d.join(rel);
+                if let Some(parent) = dst2.parent() { let _ = fs::create_dir_all(parent); }
+                let _ = fs::copy(h, dst2);
+            }
+        }
+    }
+    let _ = app.emit("library-update-progress",
+        format!("[SOEM] Copied {} headers → resources/include/soem/ (structure preserved)", copied));
+
+    // Helper: compile .c files into libsoem.a
+    let compile_soem_ar = |
+        tag:        &str,
+        compiler:   &str,
+        cc_flags:   &[&str],
+        ar_cmd:     &str,
+        out_dir:    &Path,
+        dev_dir:    Option<&PathBuf>,
+        sources:    &[PathBuf],
+        inc_dirs:   &[&Path],
+    | -> Result<(), String> {
+        let _ = app.emit("library-update-progress",
+            format!("[SOEM] Compiling for {}...", tag));
+        let mut obj_files: Vec<PathBuf> = Vec::new();
+        for src in sources {
+            let stem = src.file_stem().unwrap_or_default().to_string_lossy();
+            let obj  = temp_dir.join(format!("soem_{}_{}.o", tag.replace('/', "_"), stem));
+            let mut cmd = Command::new(compiler);
+            for f in cc_flags { cmd.arg(f); }
+            for inc in inc_dirs { cmd.arg("-I").arg(inc); }
+            cmd.arg("-c").arg(src).arg("-o").arg(&obj);
+            let out = cmd.output()
+                .map_err(|e| format!("[SOEM][{}] spawn error: {}", tag, e))?;
+            if !out.status.success() {
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                let _ = fs::remove_file(&obj);
+                return Err(format!("[SOEM][{}] compile error ({}): {}",
+                    tag, src.file_name().unwrap_or_default().to_string_lossy(), stderr.trim()));
+            }
+            obj_files.push(obj);
+        }
+        if obj_files.is_empty() {
+            let _ = app.emit("library-update-progress",
+                format!("[SOEM][{}] WARN: no sources compiled", tag));
+            return Ok(());
+        }
+        let lib_path = out_dir.join("libsoem.a");
+        let mut ar = Command::new(ar_cmd);
+        ar.arg("rcs").arg(&lib_path);
+        for obj in &obj_files { ar.arg(obj); }
+        let ar_out = ar.output()
+            .map_err(|e| format!("[SOEM][{}] ar error: {}", tag, e))?;
+        for obj in &obj_files { let _ = fs::remove_file(obj); }
+        if !ar_out.status.success() {
+            return Err(format!("[SOEM][{}] archive error: {}",
+                tag, String::from_utf8_lossy(&ar_out.stderr).trim()));
+        }
+        if let Some(d) = dev_dir {
+            let _ = fs::copy(&lib_path, d.join("libsoem.a"));
+        }
+        let _ = app.emit("library-update-progress",
+            format!("[SOEM][{}] libsoem.a OK", tag));
+        Ok(())
+    };
+
+    let repo_inc_ref        = repo_inc_dir.as_path();
+    let oshw_linux_ref      = oshw_linux_dir.as_path();
+    let oshw_win32_ref      = oshw_win32_dir.as_path();
+    let wpcap_ref           = wpcap_inc_dir.as_path();
+    let osal_ref            = osal_dir.as_path();
+    let osal_linux_ref      = osal_linux_dir.as_path();
+    let osal_win32_ref      = osal_win32_dir.as_path();
+
+    // Linux sources: core + oshw/linux + osal_root (common) + osal/linux
+    let mut linux_sources: Vec<PathBuf> = core_sources.clone();
+    linux_sources.extend(linux_oshw_sources.clone());
+    linux_sources.extend(osal_root_sources.clone());
+    linux_sources.extend(osal_linux_sources.clone());
+
+    // Win32 sources: core + oshw/win32 + osal_root (common) + osal/win32
+    let mut win32_sources: Vec<PathBuf> = core_sources.clone();
+    win32_sources.extend(win32_oshw_sources.clone());
+    win32_sources.extend(osal_root_sources.clone());
+    // Patch osal/win32/osal.c: replace timespec_get() call with _ftime64_s().
+    // Older MinGW-w64 (MSVCRT runtime) doesn't expose timespec_get even with -std=c11.
+    for src in &osal_win32_sources {
+        let is_win32_osal = src.file_name().map(|n| n == "osal.c").unwrap_or(false)
+            && src.parent().map(|p| p.ends_with("win32")).unwrap_or(false);
+        if is_win32_osal {
+            if let Ok(content) = fs::read_to_string(src) {
+                if content.contains("timespec_get") {
+                    let patched = std::iter::once(
+                        "#include <sys/timeb.h>\n#ifndef TIME_UTC\n#define TIME_UTC 1\n#endif\n"
+                            .to_string(),
+                    )
+                    .chain(content.lines().map(|line| {
+                        if line.contains("timespec_get(") {
+                            // replace: timespec_get(&ts, TIME_UTC);
+                            // with:    _ftime64_s equivalent
+                            "   { struct __timeb64 _ftb; _ftime64_s(&_ftb); \
+                             ts.tv_sec=(time_t)_ftb.time; \
+                             ts.tv_nsec=(long)_ftb.millitm*1000000L; }\n"
+                                .to_string()
+                        } else if line.contains("TIME_UTC") && !line.contains("timespec_get(") {
+                            // drop bare TIME_UTC references that became orphaned
+                            String::new()
+                        } else {
+                            format!("{}\n", line)
+                        }
+                    }))
+                    .collect::<String>();
+                    let patched_path = temp_dir.join("osal_win32_patched.c");
+                    if fs::write(&patched_path, patched).is_ok() {
+                        win32_sources.push(patched_path);
+                        continue; // don't push the original
+                    }
+                }
+            }
+        }
+        win32_sources.push(src.clone());
+    }
+
+    // Linux include dirs: repo/include (soem/*.h), oshw/linux (nicdrv.h), osal, osal/linux
+    let linux_inc: &[&Path] = &[repo_inc_ref, oshw_linux_ref, osal_ref, osal_linux_ref];
+    // Win32 include dirs: repo/include, oshw/win32, wpcap/Include, osal, osal/win32
+    let win32_inc: &[&Path] = &[repo_inc_ref, oshw_win32_ref, wpcap_ref, osal_ref, osal_win32_ref];
+
+    // x86_64/linux
+    {
+        let out_dir = resource_dir.join("resources/x86_64/linux");
+        let dev_dir = dev_target_dirs.get("x86_64/linux");
+        let cc_flags: &[&str] = &["-O2", "-ffunction-sections", "-fdata-sections",
+                                   "-DLINUX", "-pthread"];
+        if let Err(e) = compile_soem_ar(
+            "x86_64/linux", "gcc", cc_flags, "ar", &out_dir, dev_dir, &linux_sources, linux_inc)
+        {
+            let _ = app.emit("library-update-progress", format!("WARN: {}", e));
+        }
+    }
+
+    // x86_64/win32 (MinGW)
+    {
+        let bundled_gcc = tc_bin(&resource_dir, "mingw", "gcc");
+        let bundled_ar  = tc_bin(&resource_dir, "mingw", "ar");
+        let (cc, ar_cmd): (String, String) = if bundled_gcc.exists() {
+            (bundled_gcc.to_string_lossy().to_string(), bundled_ar.to_string_lossy().to_string())
+        } else {
+            ("x86_64-w64-mingw32-gcc".to_string(), "x86_64-w64-mingw32-ar".to_string())
+        };
+        let has_cc = Command::new(&cc).arg("--version")
+            .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null())
+            .status().map(|s| s.success()).unwrap_or(false);
+        if !has_cc {
+            let _ = app.emit("library-update-progress",
+                "[SOEM][x86_64/win32] SKIP: MinGW gcc not found".to_string());
+        } else {
+            let out_dir = resource_dir.join("resources/x86_64/win32");
+            let dev_dir = dev_target_dirs.get("x86_64/win32");
+            let cc_flags: &[&str] = &["-O2", "-ffunction-sections", "-fdata-sections",
+                                       "-DWIN32", "-D_WIN32"];
+            if let Err(e) = compile_soem_ar(
+                "x86_64/win32", &cc, cc_flags, &ar_cmd, &out_dir, dev_dir, &win32_sources, win32_inc)
+            {
+                let _ = app.emit("library-update-progress", format!("WARN: {}", e));
+            }
+        }
+    }
+
+    // arm/aarch64
+    {
+        let cc_path = tc_bin(&resource_dir, "aarch64-none-linux-gnu", "aarch64-none-linux-gnu-gcc");
+        let ar_path = tc_bin(&resource_dir, "aarch64-none-linux-gnu", "aarch64-none-linux-gnu-ar");
+        if !cc_path.exists() {
+            let _ = app.emit("library-update-progress",
+                "[SOEM][arm/aarch64] SKIP: aarch64-none-linux-gnu-gcc not found".to_string());
+        } else {
+            let out_dir = resource_dir.join("resources/arm/aarch64");
+            let dev_dir = dev_target_dirs.get("arm/aarch64");
+            let cc_flags: &[&str] = &["-O2", "-ffunction-sections", "-fdata-sections",
+                                       "-DLINUX", "-pthread", "-fno-lto", "-fno-use-linker-plugin"];
+            if let Err(e) = compile_soem_ar(
+                "arm/aarch64", &cc_path.to_string_lossy(), cc_flags,
+                &ar_path.to_string_lossy(), &out_dir, dev_dir, &linux_sources, linux_inc)
+            {
+                let _ = app.emit("library-update-progress", format!("WARN: {}", e));
+            }
+        }
+    }
+
+    // arm/armv7 (ARMv7 Linux, e.g. Raspberry Pi 32-bit, BeagleBone)
+    {
+        let bundled = tc_bin(&resource_dir, "arm-linux-gnueabihf", "arm-linux-gnueabihf-gcc");
+        let bundled_ar = tc_bin(&resource_dir, "arm-linux-gnueabihf", "arm-linux-gnueabihf-ar");
+        let (cc7, ar7) = if bundled.exists() {
+            (bundled.to_string_lossy().to_string(), bundled_ar.to_string_lossy().to_string())
+        } else {
+            ("arm-linux-gnueabihf-gcc".to_string(), "arm-linux-gnueabihf-ar".to_string())
+        };
+        let has_cc7 = Command::new(&cc7).arg("--version")
+            .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null())
+            .status().map(|s| s.success()).unwrap_or(false);
+        if !has_cc7 {
+            let _ = app.emit("library-update-progress",
+                "[SOEM][arm/armv7] SKIP: arm-linux-gnueabihf-gcc not found".to_string());
+        } else {
+            let out_dir = resource_dir.join("resources/arm/armv7");
+            let dev_dir = dev_target_dirs.get("arm/armv7");
+            let cc_flags: &[&str] = &[
+                "-march=armv7-a", "-mfpu=vfpv3-d16", "-mfloat-abi=hard",
+                "-O2", "-ffunction-sections", "-fdata-sections", "-DLINUX", "-pthread",
+                "-fno-lto", "-fno-use-linker-plugin"];
+            if let Err(e) = compile_soem_ar(
+                "arm/armv7", &cc7, cc_flags, &ar7, &out_dir, dev_dir, &linux_sources, linux_inc)
+            {
+                let _ = app.emit("library-update-progress", format!("WARN: {}", e));
+            }
+        }
+    }
+
+    // arm/CortexM bare-metal
+    // We compile only core SOEM sources (soem/*.c) with a custom bare-metal OSAL stub.
+    // OSHW (nicdrv) functions are left unresolved — user provides their Ethernet driver at link time.
+    {
+        let arm_cc = "arm-none-eabi-gcc";
+        let arm_ar = "arm-none-eabi-ar";
+        let has_arm_cc = Command::new(arm_cc)
+            .arg("--version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status().map(|s| s.success()).unwrap_or(false);
+
+        if !has_arm_cc {
+            for m_tag in &["arm/CortexM/M0", "arm/CortexM/M4", "arm/CortexM/M7"] {
+                let _ = app.emit("library-update-progress",
+                    format!("[SOEM][{}] SKIP: arm-none-eabi-gcc not found", m_tag));
+            }
+        } else {
+            // Create bare-metal include override directory
+            let bm_inc_dir = temp_dir.join("bm_inc");
+            let _ = fs::create_dir_all(&bm_inc_dir);
+
+            // Custom osal.h: no POSIX/Win32 dependencies, pure stdint.h
+            let bm_osal_h = "\
+#ifndef OSAL_H\n\
+#define OSAL_H\n\
+#include <stdint.h>\n\
+typedef uint8_t  boolean;\n\
+#ifndef TRUE\n\
+# define TRUE  ((boolean)1u)\n\
+# define FALSE ((boolean)0u)\n\
+#endif\n\
+typedef int64_t ec_timet;\n\
+typedef struct { ec_timet stop_time; } osal_timert;\n\
+struct timeval { long tv_sec; long tv_usec; };\n\
+typedef uint32_t OSAL_MUTEX_HANDLE_T;\n\
+int      osal_usleep(uint32_t usec);\n\
+int      osal_gettimeofday(struct timeval *tv, void *tz);\n\
+ec_timet osal_current_time(void);\n\
+void     osal_timer_start(osal_timert *self, uint32_t timeout_usec);\n\
+boolean  osal_timer_is_expired(const osal_timert *self);\n\
+int      osal_thread_create(void *thandle, int stacksize, void *func, void *param);\n\
+int      osal_thread_create_rt(void *thandle, int stacksize, void *func, void *param);\n\
+#endif /* OSAL_H */\n";
+            let _ = fs::write(bm_inc_dir.join("osal.h"), bm_osal_h);
+
+            // Custom nicdrv.h: forward-declare ecx_portt as opaque type.
+            // Core SOEM only passes ecx_portt* through its context — no direct field access.
+            // Users provide the full ecx_portt definition and OSHW functions for their hardware.
+            let bm_nicdrv_h = "\
+#ifndef NICDRV_H\n\
+#define NICDRV_H\n\
+#include <stdint.h>\n\
+/* ecx_portt is opaque for bare-metal — user provides definition and OSHW implementation */\n\
+struct ecx_port;\n\
+typedef struct ecx_port ecx_portt;\n\
+int  ecx_setupnic(ecx_portt *port, const char *ifname, int secondary);\n\
+int  ecx_closenic(ecx_portt *port);\n\
+void ecx_setbufstat(ecx_portt *port, int idx, int bufstat);\n\
+int  ecx_getindex(ecx_portt *port);\n\
+int  ecx_outframe(ecx_portt *port, int idx, int stacknumber);\n\
+int  ecx_outframe_solo(ecx_portt *port, int idx);\n\
+int  ecx_inframe(ecx_portt *port, int idx, int stacknumber);\n\
+int  ecx_recvpkt(ecx_portt *port, int stacknumber);\n\
+int  ecx_getmac(const char *ifname, char *primary_mac);\n\
+#endif /* NICDRV_H */\n";
+            let _ = fs::write(bm_inc_dir.join("nicdrv.h"), bm_nicdrv_h);
+
+            // Bare-metal OSAL stub: weak default implementations
+            let bm_osal_c = "\
+/* bm_osal_stub.c — weak OSAL stubs for SOEM bare-metal port.                    */\n\
+/* Override osal_usleep / osal_current_time with your RTOS/SysTick implementation. */\n\
+#include <stdint.h>\n\
+typedef int64_t ec_timet;\n\
+typedef struct { ec_timet stop_time; } osal_timert;\n\
+typedef uint8_t boolean;\n\
+#define TRUE  ((boolean)1u)\n\
+#define FALSE ((boolean)0u)\n\
+struct timeval { long tv_sec; long tv_usec; };\n\
+__attribute__((weak)) int osal_usleep(uint32_t usec) { (void)usec; return 0; }\n\
+__attribute__((weak)) ec_timet osal_current_time(void) { return 0; }\n\
+__attribute__((weak)) void osal_timer_start(osal_timert *t, uint32_t us) {\n\
+    if (t) t->stop_time = osal_current_time() + (ec_timet)us;\n\
+}\n\
+__attribute__((weak)) boolean osal_timer_is_expired(const osal_timert *t) {\n\
+    return t ? (osal_current_time() >= t->stop_time ? TRUE : FALSE) : TRUE;\n\
+}\n\
+__attribute__((weak)) int osal_gettimeofday(struct timeval *tv, void *tz) {\n\
+    (void)tz;\n\
+    if (tv) { tv->tv_sec = 0; tv->tv_usec = 0; }\n\
+    return 0;\n\
+}\n\
+__attribute__((weak)) int osal_thread_create(void *h, int s, void *f, void *p) {\n\
+    (void)h; (void)s; (void)f; (void)p; return 0;\n\
+}\n\
+__attribute__((weak)) int osal_thread_create_rt(void *h, int s, void *f, void *p) {\n\
+    (void)h; (void)s; (void)f; (void)p; return 0;\n\
+}\n";
+            let bm_osal_c_path = temp_dir.join("bm_osal_stub.c");
+            let _ = fs::write(&bm_osal_c_path, bm_osal_c);
+
+            let mut bm_sources: Vec<PathBuf> = core_sources.clone();
+            bm_sources.push(bm_osal_c_path);
+
+            let bm_inc_ref   = bm_inc_dir.as_path();
+            let soem_dir_ref = soem_dir.as_path();
+            // bm_inc_dir first so our osal.h / nicdrv.h override repo versions
+            let bm_inc_dirs: &[&Path] = &[bm_inc_ref, repo_inc_ref, soem_dir_ref];
+
+            // M0: no FPU, Thumb only
+            {
+                let out_dir = resource_dir.join("resources/arm/CortexM/M0");
+                let dev_dir = dev_target_dirs.get("arm/CortexM/M0");
+                let cc_flags: &[&str] = &[
+                    "-mcpu=cortex-m0", "-mthumb",
+                    "-O2", "-ffunction-sections", "-fdata-sections",
+                    "-DBARE_METAL=1", "-DKRON_EC_BARE_METAL"];
+                if let Err(e) = compile_soem_ar(
+                    "arm/CortexM/M0", arm_cc, cc_flags, arm_ar,
+                    &out_dir, dev_dir, &bm_sources, bm_inc_dirs)
+                {
+                    let _ = app.emit("library-update-progress", format!("WARN: {}", e));
+                }
+            }
+            // M4: FPU single-precision
+            {
+                let out_dir = resource_dir.join("resources/arm/CortexM/M4");
+                let dev_dir = dev_target_dirs.get("arm/CortexM/M4");
+                let cc_flags: &[&str] = &[
+                    "-mcpu=cortex-m4", "-mthumb",
+                    "-mfpu=fpv4-sp-d16", "-mfloat-abi=hard",
+                    "-O2", "-ffunction-sections", "-fdata-sections",
+                    "-DBARE_METAL=1", "-DKRON_EC_BARE_METAL"];
+                if let Err(e) = compile_soem_ar(
+                    "arm/CortexM/M4", arm_cc, cc_flags, arm_ar,
+                    &out_dir, dev_dir, &bm_sources, bm_inc_dirs)
+                {
+                    let _ = app.emit("library-update-progress", format!("WARN: {}", e));
+                }
+            }
+            // M7: FPU double-precision
+            {
+                let out_dir = resource_dir.join("resources/arm/CortexM/M7");
+                let dev_dir = dev_target_dirs.get("arm/CortexM/M7");
+                let cc_flags: &[&str] = &[
+                    "-mcpu=cortex-m7", "-mthumb",
+                    "-mfpu=fpv5-d16", "-mfloat-abi=hard",
+                    "-O2", "-ffunction-sections", "-fdata-sections",
+                    "-DBARE_METAL=1", "-DKRON_EC_BARE_METAL"];
+                if let Err(e) = compile_soem_ar(
+                    "arm/CortexM/M7", arm_cc, cc_flags, arm_ar,
+                    &out_dir, dev_dir, &bm_sources, bm_inc_dirs)
+                {
+                    let _ = app.emit("library-update-progress", format!("WARN: {}", e));
+                }
+            }
+        }
+    }
+
+    let _ = fs::remove_dir_all(&temp_dir);
+    let _ = app.emit("library-update-progress", "[SOEM] Build complete".to_string());
+    Ok(())
+}
+
+#[tauri::command]
+fn build_soem(app: tauri::AppHandle) -> Result<String, String> {
+    std::thread::spawn(move || {
+        match do_build_soem(&app) {
+            Ok(()) => {
+                let _ = app.emit("library-update-done",
+                    json!({"success": true, "message": "SOEM built successfully"}));
+            }
+            Err(e) => {
+                let _ = app.emit("library-update-done",
+                    json!({"success": false, "message": e}));
+            }
+        }
+    });
+    Ok("started".to_string())
+}
+
+// ---------------------------------------------------------------------------
+// list_network_interfaces — return available network interface names
+// ---------------------------------------------------------------------------
+
+#[tauri::command]
+fn list_network_interfaces() -> Vec<String> {
+    #[cfg(target_os = "windows")]
+    {
+        // On Windows: parse `netsh interface show interface` output
+        let out = Command::new("netsh")
+            .args(["interface", "show", "interface"])
+            .output();
+        match out {
+            Ok(o) => {
+                let text = String::from_utf8_lossy(&o.stdout);
+                text.lines()
+                    .filter_map(|line| {
+                        let parts: Vec<&str> = line.split_whitespace().collect();
+                        // lines look like: "Enabled  Connected  Dedicated  Ethernet"
+                        if parts.len() >= 4 { Some(parts[3..].join(" ")) } else { None }
+                    })
+                    .filter(|s| !s.is_empty() && s != "Interface Name")
+                    .collect()
+            }
+            Err(_) => vec![],
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        // On Linux/macOS: read /sys/class/net directory entries
+        let net_dir = std::path::Path::new("/sys/class/net");
+        if let Ok(entries) = std::fs::read_dir(net_dir) {
+            let mut ifaces: Vec<String> = entries
+                .filter_map(|e| e.ok())
+                .map(|e| e.file_name().to_string_lossy().to_string())
+                .filter(|name| name != "lo")
+                .collect();
+            ifaces.sort();
+            ifaces
+        } else {
+            // Fallback: parse `ip link show`
+            let out = Command::new("ip").args(["link", "show"]).output();
+            match out {
+                Ok(o) => {
+                    let text = String::from_utf8_lossy(&o.stdout);
+                    text.lines()
+                        .filter(|l| l.starts_with(|c: char| c.is_ascii_digit()))
+                        .filter_map(|l| {
+                            let name = l.split(':').nth(1)?.trim().split('@').next()?;
+                            let name = name.trim().to_string();
+                            if name == "lo" { None } else { Some(name) }
+                        })
+                        .collect()
+                }
+                Err(_) => vec![],
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
 
@@ -1819,6 +2486,8 @@ fn main() {
             deploy_to_server,
             check_server_status,
             deploy_server_to_target,
+            build_soem,
+            list_network_interfaces,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

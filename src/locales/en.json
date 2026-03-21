@@ -29,6 +29,13 @@
         "baseType": "Base Type",
         "dimensions": "Dimensions"
     },
+    "saveConfirm": {
+        "title": "Unsaved Changes",
+        "message": "The project has been modified. Do you want to save before closing?",
+        "save": "Save",
+        "dontSave": "Don't Save",
+        "cancel": "Cancel"
+    },
     "common": {
         "add": "Add",
         "delete": "Delete",

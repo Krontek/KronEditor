@@ -7,6 +7,13 @@
         "global": "Global",
         "configuration": "Yapılandırma"
     },
+    "saveConfirm": {
+        "title": "Kaydedilmemiş Değişiklikler",
+        "message": "Proje değiştirildi. Kapatmadan önce kaydetmek ister misiniz?",
+        "save": "Kaydet",
+        "dontSave": "Kaydetme",
+        "cancel": "İptal"
+    },
     "common": {
         "add": "Ekle",
         "delete": "Sil",

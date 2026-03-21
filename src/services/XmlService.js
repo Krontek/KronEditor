@@ -4,7 +4,7 @@
  * Uses CDATA sections to store complex React Flow / Editor content to ensure exact restoration.
  */
 
-export const exportProjectToXml = (projectStructure, boardId, connectionSettings = {}) => {
+export const exportProjectToXml = (projectStructure, boardId, connectionSettings = {}, buses = [], busConfigs = {}) => {
     const doc = document.implementation.createDocument(null, "PLCProject", null);
     const root = doc.documentElement;
 
@@ -45,9 +45,15 @@ export const exportProjectToXml = (projectStructure, boardId, connectionSettings
     createSection("FunctionBlocks", projectStructure.functionBlocks);
     createSection("Functions", projectStructure.functions);
     createSection("Programs", projectStructure.programs);
-
-    // Resources is special structure in our state, but we can treat it similarly
     createSection("Resources", projectStructure.resources);
+
+    // Fieldbus: buses array + busConfigs map stored as JSON CDATA
+    if (buses.length > 0) {
+        const fieldbusSection = doc.createElement("Fieldbus");
+        const cdata = doc.createCDATASection(JSON.stringify({ buses, busConfigs }));
+        fieldbusSection.appendChild(cdata);
+        root.appendChild(fieldbusSection);
+    }
 
     const serializer = new XMLSerializer();
     return serializer.serializeToString(doc);
@@ -117,7 +123,21 @@ export const importProjectFromXml = (xmlString) => {
         parseSection("Programs", "programs");
         parseSection("Resources", "resources");
 
-        return { projectStructure, boardId, plcAddress, sshUser, sshPort };
+        // Fieldbus
+        let buses = [];
+        let busConfigs = {};
+        const fieldbusSection = doc.getElementsByTagName("Fieldbus")[0];
+        if (fieldbusSection && fieldbusSection.textContent) {
+            try {
+                const fb = JSON.parse(fieldbusSection.textContent);
+                buses = fb.buses || [];
+                busConfigs = fb.busConfigs || {};
+            } catch (e) {
+                console.error("Failed to parse Fieldbus section", e);
+            }
+        }
+
+        return { projectStructure, boardId, plcAddress, sshUser, sshPort, buses, busConfigs };
     } catch (e) {
         console.error("Critical Import Error:", e);
         return null;

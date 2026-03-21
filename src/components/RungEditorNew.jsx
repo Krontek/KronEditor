@@ -1,5 +1,4 @@
 import { useState, useCallback, useRef, useEffect } from 'react';
-import { useTranslation } from 'react-i18next';
 import RungContainer, { blockConfig } from './RungContainer';
 import ErrorBoundary from './ErrorBoundary';
 import BlockSettingsModal from './BlockSettingsModal';
@@ -35,7 +34,7 @@ const InsertZone = ({ onInsert, onPaste, canPaste, disabled }) => {
           <div
             onClick={onInsert}
             style={{ position: 'relative', zIndex: 1, width: 18, height: 18, background: '#007acc', borderRadius: '50%', display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#fff', fontSize: 14, fontWeight: 'bold', lineHeight: 1 }}
-            title={t('actions.addNew')}
+            title="Add new rung"
           >+</div>
           {canPaste && (
             <div
@@ -58,8 +57,6 @@ const InsertZone = ({ onInsert, onPaste, canPaste, disabled }) => {
  */
 
 const RungEditorNew = ({ variables, setVariables, rungs, setRungs, availableBlocks, globalVars = [], dataTypes = [], liveVariables = null, parentName = "", readOnly = false, onForceWrite = null }) => {
-  const { t } = useTranslation();
-
   // Undo/Redo history - her snapshot { rungs, variables } çiftini saklıyor
   const historyRef = useRef([{
     rungs: JSON.parse(JSON.stringify(rungs)),
