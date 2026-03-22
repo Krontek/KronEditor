@@ -11,7 +11,9 @@
  */
 
 import { useState, useCallback, useEffect } from 'react';
+import EtherCATIconSrc from '../assets/icons/ethercat.png';
 import { invoke } from '@tauri-apps/api/core';
+import { listen } from '@tauri-apps/api/event';
 import { pdoEntriesToGlobalVars } from '../services/EsiParser';
 
 /* ── Styles ────────────────────────────────────────────────────────────────── */
@@ -71,12 +73,21 @@ const S = {
   chipOut: { background: '#3d0a0a', color: '#ff7675' },
 };
 
+/* ── EtherCAT state machine ──────────────────────────────────────────────── */
+const EC_STATES = [
+  { id: 'init',   label: 'INIT',    code: 0x01, color: '#37474f', activeColor: '#90a4ae', desc: 'Power-on / Reset — no communication' },
+  { id: 'preop',  label: 'PRE-OP',  code: 0x02, color: '#1a237e', activeColor: '#5c6bc0', desc: 'Mailbox (SDO) communication enabled' },
+  { id: 'safeop', label: 'SAFE-OP', code: 0x04, color: '#bf360c', activeColor: '#ff7043', desc: 'PDO inputs active, outputs in safe state' },
+  { id: 'op',     label: 'OP',      code: 0x08, color: '#1b5e20', activeColor: '#66bb6a', desc: 'Full operation — all PDOs active' },
+];
+
 /* ── Default EtherCAT config ─────────────────────────────────────────────── */
 const defaultConfig = () => ({
-  ifname:      'eth0',
-  cycle_us:    1000,        /* 1 ms */
-  dc_enable:   false,
-  slaves:      [],          /* KRON_EC_Slave[] */
+  ifname:       'eth0',
+  cycle_us:     1000,        /* 1 ms */
+  dc_enable:    false,
+  target_state: 'op',        /* desired bus state: 'init'|'preop'|'safeop'|'op' */
+  slaves:       [],          /* KRON_EC_Slave[] */
 });
 
 /* ── Helper: format index/subindex ──────────────────────────────────────── */
@@ -264,9 +275,31 @@ export default function EtherCATEditor({ busConfig, onChange, onAddGlobalVars, i
   const [showEsiPicker, setShowEsiPicker] = useState(false);
   const [log, setLog] = useState('');
   const [netIfaces, setNetIfaces] = useState([]);
+  const [liveEcState, setLiveEcState] = useState(null); /* state id string or null */
 
   useEffect(() => {
     invoke('list_network_interfaces').then(setNetIfaces).catch(() => {});
+  }, []);
+
+  /* Subscribe to live EtherCAT state events while simulation is running */
+  useEffect(() => {
+    if (!isRunning) { setLiveEcState(null); return; }
+    let unlisten;
+    listen('ec-state-update', (event) => {
+      const code = event.payload?.state_code;
+      const st = EC_STATES.find(s => s.code === code);
+      if (st) setLiveEcState(st.id);
+    }).then(u => { unlisten = u; });
+    return () => { unlisten?.(); };
+  }, [isRunning]);
+
+  const handleRequestState = useCallback(async (stateId) => {
+    try {
+      await invoke('ec_request_state', { state: stateId });
+      setLog(`State transition to ${stateId.toUpperCase()} requested`);
+    } catch (e) {
+      setLog(`Error: ${e}`);
+    }
   }, []);
 
   /* Propagate changes up */
@@ -353,8 +386,8 @@ export default function EtherCATEditor({ busConfig, onChange, onAddGlobalVars, i
     <div style={S.root}>
       {/* ── Header ── */}
       <div style={S.header}>
-        <span>⬡</span>
-        <span style={S.title}>EtherCAT Master Configuration</span>
+        <img src={EtherCATIconSrc} height="18" style={{ objectFit: 'contain', flexShrink: 0 }} alt="EtherCAT" />
+        <span style={S.title}>Master Configuration</span>
         {log && <span style={{ color: '#4caf50', fontSize: 10, marginLeft: 'auto' }}>{log}</span>}
       </div>
 
@@ -449,6 +482,87 @@ export default function EtherCATEditor({ busConfig, onChange, onAddGlobalVars, i
                 isRunning={isRunning}
               />
             ))
+          )}
+        </div>
+
+        {/* ── State Machine ── */}
+        <div style={S.section}>
+          <div style={S.sectionTitle}>State Machine</div>
+
+          {/* State flow diagram */}
+          <div style={{ display: 'flex', alignItems: 'center', gap: 4, flexWrap: 'wrap', paddingBottom: 20 }}>
+            {EC_STATES.map((st, idx) => {
+              const isTarget = config.target_state === st.id;
+              const isLive   = liveEcState === st.id;
+              return (
+                <div key={st.id} style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+                  {idx > 0 && (
+                    <span style={{ color: '#444', fontSize: 18, lineHeight: 1 }}>→</span>
+                  )}
+                  <div style={{ position: 'relative' }}>
+                    <div
+                      title={st.desc}
+                      onClick={() => !isRunning && update({ ...config, target_state: st.id })}
+                      style={{
+                        padding: '7px 14px',
+                        borderRadius: 4,
+                        fontSize: 11,
+                        fontWeight: 'bold',
+                        cursor: isRunning ? 'default' : 'pointer',
+                        border: isLive
+                          ? '2px solid #fff'
+                          : isTarget
+                            ? `2px solid ${st.activeColor}`
+                            : '2px solid #333',
+                        background: isLive
+                          ? st.activeColor
+                          : isTarget
+                            ? `${st.color}dd`
+                            : '#2a2a2a',
+                        color: isLive || isTarget ? '#fff' : '#555',
+                        transition: 'all 0.15s',
+                        boxShadow: isLive ? `0 0 8px ${st.activeColor}88` : 'none',
+                      }}
+                    >
+                      {st.label}
+                    </div>
+                    {/* label below box */}
+                    <div style={{
+                      position: 'absolute', top: '100%', left: '50%',
+                      transform: 'translateX(-50%)',
+                      fontSize: 9, marginTop: 3, whiteSpace: 'nowrap',
+                      color: isLive ? '#fff' : isTarget ? st.activeColor : '#444',
+                    }}>
+                      {isLive ? '● live' : isTarget ? '▲ target' : ''}
+                    </div>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+
+          {/* Request state buttons — only when simulation running */}
+          {isRunning ? (
+            <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap', marginTop: 4 }}>
+              <span style={{ color: '#888', fontSize: 10 }}>Request transition:</span>
+              {EC_STATES.map(st => (
+                <button
+                  key={st.id}
+                  style={{
+                    ...S.btnSm,
+                    borderLeft: `3px solid ${st.activeColor}`,
+                    color: st.activeColor,
+                  }}
+                  onClick={() => handleRequestState(st.id)}
+                >
+                  → {st.label}
+                </button>
+              ))}
+            </div>
+          ) : (
+            <p style={{ color: '#555', fontSize: 10, margin: 0 }}>
+              Click a state to set the target operational state. Generated code will bring the bus to this state.
+            </p>
           )}
         </div>
 

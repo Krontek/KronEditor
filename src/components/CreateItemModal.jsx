@@ -1,18 +1,16 @@
-import React, { useState, useEffect } from 'react';
+import { useState, useEffect } from 'react';
 import { DataTypeSelector } from './common/Selectors';
 
 const CreateItemModal = ({ isOpen, onClose, onConfirm, category, defaultName, isEdit, initialData }) => {
     const [name, setName] = useState('');
     const [language, setLanguage] = useState('LD');
     const [returnType, setReturnType] = useState('BOOL');
-    const [cycleTime, setCycleTime] = useState('1ms');
 
     useEffect(() => {
         if (isOpen) {
             setName(isEdit ? initialData?.name || '' : defaultName || '');
             setLanguage(isEdit ? initialData?.language || 'LD' : category === 'dataTypes' ? 'UDT' : 'LD');
             setReturnType(isEdit ? initialData?.returnType || 'BOOL' : 'BOOL');
-            setCycleTime(isEdit ? initialData?.cycleTime || '1ms' : '1ms');
         }
     }, [isOpen, defaultName, category, isEdit, initialData]);
 
@@ -20,7 +18,6 @@ const CreateItemModal = ({ isOpen, onClose, onConfirm, category, defaultName, is
 
     const isDataType = category === 'dataTypes';
     const isFunction = category === 'functions';
-    const isProgram = category === 'programs';
     const title = isEdit ? 'Edit Properties' :
         category === 'dataTypes' ? 'Create Data Type' :
             category === 'programs' ? 'Create Program' :
@@ -29,14 +26,19 @@ const CreateItemModal = ({ isOpen, onClose, onConfirm, category, defaultName, is
 
     const handleConfirm = () => {
         if (!name.trim()) return;
-        const success = onConfirm(name, language, returnType, isProgram ? cycleTime.trim() || '1ms' : undefined);
+        const success = onConfirm(name, language, returnType);
         if (success === false) {
-            // Reset name to initial/default on duplicate
             setName(isEdit ? initialData?.name || '' : defaultName || '');
         } else {
             onClose();
         }
     };
+
+    const LANGUAGES = [
+        { value: 'LD', label: 'Ladder Logic (LD)' },
+        { value: 'ST', label: 'Structured Text (ST)' },
+        { value: 'SCL', label: 'SCL – Mixed LD/ST per rung' },
+    ];
 
     return (
         <div style={{
@@ -92,32 +94,6 @@ const CreateItemModal = ({ isOpen, onClose, onConfirm, category, defaultName, is
                     />
                 </div>
 
-                {/* Cycle Time Selection (Only for Programs) */}
-                {isProgram && (
-                    <div style={{ marginBottom: '20px' }}>
-                        <label style={{ display: 'block', marginBottom: '8px', fontSize: '12px', color: '#ccc' }}>
-                            Cycle Time
-                        </label>
-                        <input
-                            type="text"
-                            value={cycleTime}
-                            onChange={(e) => setCycleTime(e.target.value)}
-                            placeholder="Enter cycle time (e.g. 1ms)"
-                            style={{
-                                width: '100%',
-                                padding: '10px',
-                                background: '#1e1e1e',
-                                border: '1px solid #444',
-                                color: '#fff',
-                                borderRadius: '4px',
-                                outline: 'none',
-                                fontSize: '14px',
-                                boxSizing: 'border-box'
-                            }}
-                        />
-                    </div>
-                )}
-
                 {/* Return Type Selection (Only for Functions) */}
                 {isFunction && (
                     <div style={{ marginBottom: '20px' }}>
@@ -138,31 +114,21 @@ const CreateItemModal = ({ isOpen, onClose, onConfirm, category, defaultName, is
                         <label style={{ display: 'block', marginBottom: '8px', fontSize: '12px', color: '#ccc' }}>
                             Language
                         </label>
-                        <div style={{ display: 'flex', gap: '20px' }}>
-                            <label style={{ display: 'flex', alignItems: 'center', gap: '8px', cursor: isEdit ? 'not-allowed' : 'pointer' }}>
-                                <input
-                                    type="radio"
-                                    name="language"
-                                    value="LD"
-                                    checked={language === 'LD'}
-                                    onChange={(e) => setLanguage(e.target.value)}
-                                    disabled={isEdit}
-                                    style={{ accentColor: '#007acc', cursor: isEdit ? 'not-allowed' : 'pointer' }}
-                                />
-                                <span style={{ opacity: isEdit ? 0.6 : 1 }}>Ladder Logic (LD)</span>
-                            </label>
-                            <label style={{ display: 'flex', alignItems: 'center', gap: '8px', cursor: isEdit ? 'not-allowed' : 'pointer' }}>
-                                <input
-                                    type="radio"
-                                    name="language"
-                                    value="ST"
-                                    checked={language === 'ST'}
-                                    onChange={(e) => setLanguage(e.target.value)}
-                                    disabled={isEdit}
-                                    style={{ accentColor: '#007acc', cursor: isEdit ? 'not-allowed' : 'pointer' }}
-                                />
-                                <span style={{ opacity: isEdit ? 0.6 : 1 }}>Structured Text (ST)</span>
-                            </label>
+                        <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
+                            {LANGUAGES.map(({ value, label }) => (
+                                <label key={value} style={{ display: 'flex', alignItems: 'center', gap: '8px', cursor: isEdit ? 'not-allowed' : 'pointer' }}>
+                                    <input
+                                        type="radio"
+                                        name="language"
+                                        value={value}
+                                        checked={language === value}
+                                        onChange={(e) => setLanguage(e.target.value)}
+                                        disabled={isEdit}
+                                        style={{ accentColor: '#007acc', cursor: isEdit ? 'not-allowed' : 'pointer' }}
+                                    />
+                                    <span style={{ opacity: isEdit ? 0.6 : 1 }}>{label}</span>
+                                </label>
+                            ))}
                         </div>
                     </div>
                 )}

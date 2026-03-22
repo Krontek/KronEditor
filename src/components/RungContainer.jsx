@@ -255,7 +255,16 @@ export const blockConfig = {
   SCALE_X: { label: 'SCALE_X', descriptionKey: 'blockInfo.SCALE_X', inputs: [{ name: 'MIN', type: 'REAL' }, { name: 'MAX', type: 'REAL' }, { name: 'VALUE', type: 'REAL' }], outputs: [{ name: 'OUT', type: 'REAL' }] },
   // --- BASIC ELEMENTS ---
   Contact: { label: 'Contact', inputs: [], outputs: [] },
-  Coil: { label: 'Coil', inputs: [], outputs: [] }
+  Coil: { label: 'Coil', inputs: [], outputs: [] },
+  // --- ETHERCAT MASTER ---
+  EC_Init:        { label: 'EC_Init',        inputs: [{ name: 'EN', type: 'BOOL' }, { name: 'Interface', type: 'STRING' }], outputs: [{ name: 'ENO', type: 'BOOL' }, { name: 'Done', type: 'BOOL' }, { name: 'Error', type: 'BOOL' }, { name: 'ErrorID', type: 'INT' }] },
+  EC_Close:       { label: 'EC_Close',       inputs: [{ name: 'EN', type: 'BOOL' }],                                                                                                                                                                        outputs: [{ name: 'ENO', type: 'BOOL' }, { name: 'Done', type: 'BOOL' }] },
+  EC_ReadPDO:     { label: 'EC_ReadPDO',     inputs: [{ name: 'EN', type: 'BOOL' }, { name: 'Slave', type: 'INT' }, { name: 'Index', type: 'INT' }],                                                                                                        outputs: [{ name: 'ENO', type: 'BOOL' }, { name: 'Value', type: 'DWORD' }] },
+  EC_WritePDO:    { label: 'EC_WritePDO',    inputs: [{ name: 'EN', type: 'BOOL' }, { name: 'Slave', type: 'INT' }, { name: 'Index', type: 'INT' }, { name: 'Value', type: 'DWORD' }],                                                                      outputs: [{ name: 'ENO', type: 'BOOL' }] },
+  EC_ReadSDO:     { label: 'EC_ReadSDO',     inputs: [{ name: 'Execute', type: 'BOOL' }, { name: 'Slave', type: 'INT' }, { name: 'Index', type: 'WORD' }, { name: 'SubIndex', type: 'BYTE' }],                                                              outputs: [{ name: 'Done', type: 'BOOL' }, { name: 'Busy', type: 'BOOL' }, { name: 'Error', type: 'BOOL' }, { name: 'Value', type: 'DWORD' }] },
+  EC_WriteSDO:    { label: 'EC_WriteSDO',    inputs: [{ name: 'Execute', type: 'BOOL' }, { name: 'Slave', type: 'INT' }, { name: 'Index', type: 'WORD' }, { name: 'SubIndex', type: 'BYTE' }, { name: 'Value', type: 'DWORD' }],                            outputs: [{ name: 'Done', type: 'BOOL' }, { name: 'Busy', type: 'BOOL' }, { name: 'Error', type: 'BOOL' }] },
+  EC_SlaveStatus: { label: 'EC_SlaveStatus', inputs: [{ name: 'EN', type: 'BOOL' }, { name: 'Slave', type: 'INT' }],                                                                                                                                        outputs: [{ name: 'ENO', type: 'BOOL' }, { name: 'State', type: 'INT' }, { name: 'Online', type: 'BOOL' }] },
+  EC_MasterStatus:{ label: 'EC_MasterStatus',inputs: [{ name: 'EN', type: 'BOOL' }],                                                                                                                                                                        outputs: [{ name: 'ENO', type: 'BOOL' }, { name: 'State', type: 'INT' }, { name: 'SlaveCount', type: 'INT' }] },
 };
 
 // SVG Path Helper
@@ -721,12 +730,12 @@ const BlockNode = ({ id, data, isConnectable, selected }) => {
     };
   }
 
-  // Execution Control (EN) varsa inputlara ekle
+  // Prepend EN pin to inputs if Execution Control is enabled
   const effectiveInputs = data.executionControl
     ? [{ name: 'EN', type: 'BOOL' }, ...cfg.inputs]
     : cfg.inputs;
 
-  // Execution Control (EN) varsa outputlara ENO ekle
+  // Append ENO pin to outputs if Execution Control is enabled
   const effectiveOutputs = data.executionControl
     ? [{ name: 'ENO', type: 'BOOL' }, ...cfg.outputs]
     : cfg.outputs;
@@ -962,7 +971,7 @@ const BlockNode = ({ id, data, isConnectable, selected }) => {
                     width: 10,
                     height: 10,
                     background: '#4CAF50',
-                    left: -10, // Kutu dışına
+                    left: -10, // outside the box
                     top: '50%',
                     transform: 'translateY(-50%)',
                     border: '1px solid #fff'
@@ -1168,10 +1177,7 @@ const RungContainer = ({
   const rubberBandRef = useRef(null);
   const isRubberBandingRef = useRef(false);
 
-  // Container ve Rung boyutları
-
-
-  // Rung sınırları - containerWidth değişince güncellenir
+  // Rung bounds — recalculated when containerWidth changes
   const RUNG_BOUNDS = React.useMemo(() => {
     const safeWidth = Math.max(containerWidth, 200);
     return {
@@ -1181,7 +1187,7 @@ const RungContainer = ({
     };
   }, [containerWidth]);
 
-  // Container genişliğini hesapla
+  // Track container width
   React.useEffect(() => {
     const updateWidth = () => {
       if (containerRef.current) {
@@ -1320,7 +1326,7 @@ const RungContainer = ({
   // Wrap onNodesChange to add position control
   const handleNodesChange = useCallback((changes) => {
     const constrainedChanges = changes.map(change => {
-      // Terminal node'ları değiştirme
+      // Leave terminal nodes unchanged
       if (change.id === 'terminal_left_middle' || change.id === 'terminal_right_middle') {
         return change;
       }
@@ -1346,7 +1352,7 @@ const RungContainer = ({
     }))
   );
 
-  // Callback ref'i oluştur
+  // Stable callback refs
   const onUpdateBlockRef = useRef(onUpdateBlock);
   React.useEffect(() => {
     onUpdateBlockRef.current = onUpdateBlock;
@@ -1402,7 +1408,7 @@ const RungContainer = ({
     }
   }, [readOnly, onSelectBlock, rung.id, setNodes, nodes]);
 
-  // Simülasyon başlayınca çoklu seçimi temizle
+  // Clear multi-selection when simulation starts
   React.useEffect(() => {
     if (readOnly) {
       setNodes((nds) => {
@@ -1424,10 +1430,10 @@ const RungContainer = ({
     }
   }, [globalSelectedBlockId, setNodes]);
 
-  // Rung.blocks değişince nodes'u güncelle
+  // Sync nodes when rung.blocks changes
   React.useEffect(() => {
     setNodes((prevNodes) => {
-      // Mevcut seçim durumlarını sakla
+      // Preserve current selection and drag state
       const selectedMap = {};
       const draggingMap = {};
       if (prevNodes) {
@@ -1444,7 +1450,7 @@ const RungContainer = ({
     });
   }, [rung.blocks, setNodes, containerWidth, createTerminalNodes, mapBlocksToNodes]);
 
-  // Rung.connections değişince edges'ı güncelle
+  // Sync edges when rung.connections changes
   React.useEffect(() => {
     setEdges(
       rung.connections.map(conn => ({
@@ -1606,7 +1612,7 @@ const RungContainer = ({
 
 
 
-  // Çizgilere yakın olup olmadığını kontrol et ve terminal node'a yönlendir
+  // Check proximity to power rails and snap connection to terminal node
   const checkAndSnapToTerminal = useCallback((connection, endPosition = null) => {
     const safeWidth = Math.max(containerWidth, 200);
     const RIGHT_LINE_X_CALC = safeWidth - 12;
@@ -1614,11 +1620,11 @@ const RungContainer = ({
 
     let finalConnection = { ...connection };
 
-    // Eğer endPosition varsa (mouse pozisyonu), önce onu kontrol et
+    // If mouse position is provided, check it first
     if (endPosition) {
       const { x, y } = endPosition;
 
-      // Sol çizgiye yakın mı kontrol et
+      // Check proximity to left power rail
       if (Math.abs(x - LEFT_LINE_X) < SNAP_THRESHOLD &&
         Math.abs(y - MIDDLE_Y) < SNAP_THRESHOLD) {
         if (connection.target) {
@@ -1646,7 +1652,7 @@ const RungContainer = ({
       }
     }
 
-    // Mouse pozisyonu yoksa, node pozisyonlarını kontrol et
+    // No mouse position — fall back to checking node positions
     const targetNode = connection.target ? getNode(connection.target) : null;
     if (targetNode) {
       const targetX = targetNode.type === 'terminalConnectionPoint' ? targetNode.position.x + 10 : targetNode.position.x;
@@ -1748,7 +1754,7 @@ const RungContainer = ({
     const customData = dragData ? dragData.customData : null;
     // (We also keep the old logic as fallback if needed, but manager is primary)
 
-    // clientX, clientY'yi flow coordinate'lerine çevir
+    // Convert clientX/clientY to flow coordinates
     const position = screenToFlowPosition({
       x: event.clientX,
       y: event.clientY
@@ -1786,11 +1792,11 @@ const RungContainer = ({
 
     if (!sourceNode || !targetNode) return false;
 
-    // Terminal kontrolü
+    // Terminal validity checks
     const isSourceTerminal = sourceNode.type === 'terminalConnectionPoint';
     const isTargetTerminal = targetNode.type === 'terminalConnectionPoint';
 
-    if (isSourceTerminal && sourceNode.data.position !== 'left') return false; // Right terminal source olamaz
+    if (isSourceTerminal && sourceNode.data.position !== 'left') return false; // right terminal cannot be a source
     if (isTargetTerminal && targetNode.data.position !== 'right') return false; // Left terminal target olamaz
 
     // 2. TYPE CHECK
@@ -1863,10 +1869,7 @@ const RungContainer = ({
   }, []);
 
   const onNodeDragStop = useCallback((event, node) => {
-    // Blok pozisyonu değişince ana state'i güncelle
     if (node.id === 'terminal_left_middle' || node.id === 'terminal_right_middle') return;
-
-    // Position değişmişse güncelle
     onUpdateBlockPosition(node.id, node.position);
   }, [onUpdateBlockPosition]);
 

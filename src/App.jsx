@@ -12,6 +12,9 @@ import ShortcutsModal from './components/ShortcutsModal';
 import StartScreen from './components/StartScreen';
 import BoardSelectionModal from './components/BoardSelectionModal';
 import BoardConfigPage from './components/BoardConfigPage';
+import TaskManager from './components/TaskManager';
+import OutputPanel from './components/OutputPanel';
+import EditorTabs from './components/EditorTabs';
 import SaveConfirmDialog from './components/SaveConfirmDialog';
 import { getBoardById } from './utils/boardDefinitions';
 import ArrayTypeEditor from './components/ArrayTypeEditor';
@@ -28,6 +31,8 @@ import { invoke } from '@tauri-apps/api/core';
 import { transpileToC } from './services/CTranspilerService';
 import { PLCClient } from './services/PLCClient';
 import PlcIcon from './assets/icons/plc-icon.png';
+import EtherCATIconSrc from './assets/icons/ethercat.png';
+const EtherCATTabIcon = <img src={EtherCATIconSrc} height="13" style={{ objectFit: 'contain', verticalAlign: 'middle' }} alt="EtherCAT" />;
 import './App.css';
 
 function App() {
@@ -76,16 +81,13 @@ function App() {
     functionBlocks: [],
     functions: [],
     programs: [],
+    taskConfig: { tasks: [] },
     resources: [
       {
         id: 'res_config',
         name: 'Configuration',
         type: 'RESOURCE_EDITOR',
-        content: {
-          globalVars: [],
-          tasks: [],
-          instances: []
-        }
+        content: { globalVars: [], tasks: [], instances: [] }
       }
     ]
   };
@@ -208,13 +210,32 @@ function App() {
     return () => clearInterval(interval);
   }, [plcAddress, connectionEnabled]);
 
-  // --- isDirty: mark dirty when project changes after deployment ---
-  const projectStructureRef = React.useRef(projectStructure);
+  // --- isDirty: mark dirty only when LOGIC changes after deployment (not positions/layout) ---
+  const computeLogicFingerprint = (s) => {
+    const stripVisual = (v) => {
+      if (!v || typeof v !== 'object') return v;
+      if (Array.isArray(v)) return v.map(stripVisual);
+      const out = {};
+      for (const [k, val] of Object.entries(v)) {
+        if (k === 'position' || k === 'x' || k === 'y' || k === 'width' || k === 'height' ||
+            k === 'selected' || k === 'dragging' || k === 'measured') continue;
+        out[k] = stripVisual(val);
+      }
+      return out;
+    };
+    return JSON.stringify(stripVisual({
+      programs: s.programs, functions: s.functions,
+      functionBlocks: s.functionBlocks, dataTypes: s.dataTypes,
+      resources: s.resources,
+    }));
+  };
+  const logicFingerprintRef = React.useRef(computeLogicFingerprint(projectStructure));
   useEffect(() => {
-    if (projectStructureRef.current !== projectStructure && isDeployed) {
+    const fp = computeLogicFingerprint(projectStructure);
+    if (fp !== logicFingerprintRef.current && isDeployed) {
       setIsDirty(true);
     }
-    projectStructureRef.current = projectStructure;
+    logicFingerprintRef.current = fp;
   }, [projectStructure, isDeployed]);
 
   // Keep isDirtyRef in sync so the window close handler can read it without stale closure
@@ -267,27 +288,77 @@ function App() {
     const existing = buses.find(b => b.type === type);
     if (existing) {
       setActiveId(existing.id);
+      openTab(existing.id, type === 'ethercat' ? 'Master' : type, type === 'ethercat' ? EtherCATTabIcon : '🔌');
       return;
     }
     const newId = `bus_${type}_${Date.now()}`;
     setBuses(prev => [...prev, { id: newId, type }]);
     setActiveId(newId);
-  }, [buses]);
+    openTab(newId, type === 'ethercat' ? 'Master' : type, type === 'ethercat' ? EtherCATTabIcon : '🔌');
+  }, [buses]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const handleDeleteBus = useCallback(async (busId) => {
     const confirmed = await ask('Bu fieldbus bağlantısını kaldırmak istiyor musunuz?', {
       title: 'Fieldbus Kaldır', type: 'warning'
     });
     if (confirmed) {
+      const removedBus = buses.find(b => b.id === busId);
+
+      // If removing an EtherCAT master, strip all EC_* blocks from every program's rungs
+      if (removedBus?.type === 'ethercat') {
+        setProjectStructure(prev => ({
+          ...prev,
+          programs: prev.programs.map(prog => {
+            if (!prog.content?.rungs) return prog;
+            const cleanedRungs = prog.content.rungs.map(rung => ({
+              ...rung,
+              blocks: (rung.blocks || []).filter(b => !b.type?.startsWith('EC_')),
+              connections: (rung.connections || []).filter(conn => {
+                const remaining = new Set((rung.blocks || [])
+                  .filter(b => !b.type?.startsWith('EC_'))
+                  .map(b => b.id));
+                return remaining.has(conn.source) && remaining.has(conn.target);
+              }),
+            }));
+            return { ...prog, content: { ...prog.content, rungs: cleanedRungs } };
+          }),
+          functionBlocks: prev.functionBlocks.map(fb => {
+            if (!fb.content?.rungs) return fb;
+            const cleanedRungs = fb.content.rungs.map(rung => ({
+              ...rung,
+              blocks: (rung.blocks || []).filter(b => !b.type?.startsWith('EC_')),
+              connections: (rung.connections || []).filter(conn => {
+                const remaining = new Set((rung.blocks || [])
+                  .filter(b => !b.type?.startsWith('EC_'))
+                  .map(b => b.id));
+                return remaining.has(conn.source) && remaining.has(conn.target);
+              }),
+            }));
+            return { ...fb, content: { ...fb.content, rungs: cleanedRungs } };
+          }),
+        }));
+      }
+
       setBuses(prev => prev.filter(b => b.id !== busId));
       setBusConfigs(prev => { const n = { ...prev }; delete n[busId]; return n; });
-      if (activeId === busId) setActiveId(null);
+      // Close tab using functional updater to avoid depending on openTabs state
+      setOpenTabs(prev => {
+        const tabIdx = prev.findIndex(t => t.id === busId);
+        const newTabs = prev.filter(t => t.id !== busId);
+        if (activeId === busId) {
+          const next = newTabs[tabIdx] || newTabs[tabIdx - 1] || null;
+          setActiveId(next?.id || null);
+        }
+        return newTabs;
+      });
     }
-  }, [activeId]);
+  }, [activeId, buses]);
 
   const handleSelectBus = useCallback((busId) => {
     setActiveId(busId);
-  }, []);
+    const bus = buses.find(b => b.id === busId);
+    if (bus) openTab(busId, bus.type === 'ethercat' ? 'Master' : bus.type, bus.type === 'ethercat' ? EtherCATTabIcon : '🔌');
+  }, [buses]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const handleBusConfigChange = useCallback((busId, newConfig) => {
     setBusConfigs(prev => ({ ...prev, [busId]: newConfig }));
@@ -328,20 +399,73 @@ function App() {
   const [isResizing, setIsResizing] = useState(null); // 'left', 'right', 'console'
 
   // Console Scroll Ref
-  const consoleEndRef = React.useRef(null);
-
-  // Sahte Konsol Logları
   const [logs, setLogs] = useState([
     { type: 'info', msg: t('logs.systemInitialized') || 'System initialized.' },
     { type: 'info', msg: t('logs.systemReady') || 'Ready to map PLC project...' }
   ]);
 
-  // Auto-scroll Console
-  useEffect(() => {
-    if (consoleEndRef.current) {
-      consoleEndRef.current.scrollIntoView({ behavior: 'smooth' });
+  // Watch table state
+  const [watchTable, setWatchTable] = useState([]);
+  const addToWatchTable = useCallback((entry) => {
+    setWatchTable(prev => prev.some(e => e.liveKey === entry.liveKey) ? prev : [...prev, entry]);
+  }, []);
+  const removeFromWatchTable = useCallback((id) => {
+    setWatchTable(prev => prev.filter(e => e.id !== id));
+  }, []);
+  const updateWatchTableEntry = useCallback((id, updated) => {
+    setWatchTable(prev => prev.map(e => e.id === id ? updated : e));
+  }, []);
+
+  // ── Tab system ──
+  const [openTabs, setOpenTabs] = useState([]);
+
+  const SPECIAL_TABS = {
+    'SETTINGS':     { label: 'Settings',       icon: '⚙️' },
+    'BOARD_CONFIG': { label: 'Board Config',    icon: '🔧' },
+    'TASK_MANAGER': { label: 'Task Manager',    icon: '⏱' },
+    'VISUALIZATION':{ label: 'Visualization',   icon: '📊' },
+  };
+
+  const getItemIcon = (category, type) => {
+    if (category === 'programs') {
+      if (type === 'LD') return '🪜';
+      if (type === 'SCL') return '≋';
+      return '📋';
     }
-  }, [logs]);
+    if (category === 'functionBlocks') return '🧩';
+    if (category === 'functions') return '⚡';
+    if (category === 'dataTypes') return '🔷';
+    if (category === 'resources') return '⚙️';
+    return '📄';
+  };
+
+  // Open a tab; no-op if already open
+  const openTab = (id, label, icon) => {
+    setOpenTabs(prev => prev.some(t => t.id === id) ? prev : [...prev, { id, label, icon }]);
+  };
+
+  // Open a special tab (SETTINGS, TASK_MANAGER, etc.) and activate it
+  const openSpecialTab = (id) => {
+    const info = SPECIAL_TABS[id];
+    if (info) openTab(id, info.label, info.icon);
+    setActiveId(id);
+  };
+
+  // Close a tab; activate adjacent if it was active
+  const closeTab = (id) => {
+    const idx = openTabs.findIndex(t => t.id === id);
+    const newTabs = openTabs.filter(t => t.id !== id);
+    setOpenTabs(newTabs);
+    if (activeId === id) {
+      const next = newTabs[idx] || newTabs[idx - 1] || null;
+      setActiveId(next?.id || null);
+    }
+  };
+
+  // Update a tab's label (on rename)
+  const renameTab = (id, newLabel) => {
+    setOpenTabs(prev => prev.map(t => t.id === id ? { ...t, label: newLabel } : t));
+  };
 
   const addLog = useCallback((type, msg) => {
     const time = new Date().toLocaleTimeString();
@@ -416,7 +540,7 @@ function App() {
         filePath += '.xml';
       }
 
-      const xmlContent = exportProjectToXml(projectStructure, selectedBoard, { plcAddress, sshUser, sshPort }, buses, busConfigs);
+      const xmlContent = exportProjectToXml(projectStructure, selectedBoard, { plcAddress, sshUser, sshPort }, buses, busConfigs, watchTable);
       await writeTextFile(filePath, xmlContent);
 
       hasUnsavedRef.current = false;
@@ -434,7 +558,7 @@ function App() {
     }
 
     try {
-      const xmlContent = exportProjectToXml(projectStructure, selectedBoard, { plcAddress, sshUser, sshPort }, buses, busConfigs);
+      const xmlContent = exportProjectToXml(projectStructure, selectedBoard, { plcAddress, sshUser, sshPort }, buses, busConfigs, watchTable);
       await writeTextFile(currentFilePath, xmlContent);
       hasUnsavedRef.current = false;
       addLog('success', t('logs.projectSaved', { path: currentFilePath }) || `Project saved to ${currentFilePath} `);
@@ -488,6 +612,8 @@ function App() {
       setBusConfigs({});
       setCurrentFilePath(null);
       setActiveId(null);
+      setOpenTabs([]);
+      setWatchTable([]);
       setSelectedBoard(null);
       setIsDeployed(false);
       setIsDirty(false);
@@ -563,12 +689,19 @@ function App() {
           addLog('warning', t('logs.missingConfigRestored') || 'Project had no configuration; restored default.');
         }
 
+        // Ensure taskConfig exists for projects saved before Task Manager was added
+        if (!newStructure.taskConfig) {
+          newStructure.taskConfig = { tasks: [] };
+        }
+
         isLoadingProjectRef.current = true;
         setProjectStructure(newStructure);
         setCurrentFilePath(filePath);
         setActiveId(null);
+        setOpenTabs([]);
         setBuses(result.buses || []);
         setBusConfigs(result.busConfigs || {});
+        setWatchTable(result.watchTable || []);
         setIsProjectOpen(true);
         // Reset after state batch; setTimeout ensures effects ran first
         setTimeout(() => { isLoadingProjectRef.current = false; hasUnsavedRef.current = false; }, 0);
@@ -774,8 +907,20 @@ function App() {
     }
   }, [isRunning, isSimulationMode, addLog]);
 
+  const isBaremetalBoard = (boardId) => boardId === 'rpi_pico' || boardId === 'rpi_pico_w';
+
+  const checkBaremetalConcurrency = () => {
+    if (!isBaremetalBoard(selectedBoard)) return true;
+    const taskCount = (projectStructure.taskConfig?.tasks || []).length;
+    if (taskCount > 1) {
+      addLog('warning', `⚠ Baremetal target (${selectedBoard}) detected with ${taskCount} concurrent tasks. Concurrent pthreads are not supported on baremetal; tasks will run cooperatively via timer wheel. Ensure total CPU load fits within a single core.`);
+    }
+    return true;
+  };
+
   const handleBuild = async () => {
     const boardInfo = getBoardById(selectedBoard);
+    checkBaremetalConcurrency();
     addLog('info', `Build started for board: ${boardInfo?.name || selectedBoard}...`);
     try {
       const standardHeaders = await invoke('get_standard_headers').catch(() => []);
@@ -798,6 +943,7 @@ function App() {
       return;
     }
     const boardInfo = getBoardById(selectedBoard);
+    checkBaremetalConcurrency();
     addLog('info', `Build & Send for ${boardInfo?.name || selectedBoard}...`);
     try {
       const standardHeaders = await invoke('get_standard_headers').catch(() => []);
@@ -934,11 +1080,12 @@ function App() {
       return { ...prev, dataTypes: items };
     });
     setActiveId(newItem.id);
+    openTab(newItem.id, name, '🔷');
     addLog('info', t('logs.addedDataType', { name, type }) || `Added Data Type ${name} (${type})`);
     setDataTypeModal({ isOpen: false, existingNames: [] });
   };
 
-  const handleCreateConfirm = (name, type, returnType, cycleTime) => {
+  const handleCreateConfirm = (name, type, returnType) => {
     const category = createModal.category;
 
     // Check if name already exists in this category
@@ -964,51 +1111,24 @@ function App() {
               ...item,
               name,
               returnType: category === 'functions' ? returnType : item.returnType,
-              cycleTime: category === 'programs' ? (cycleTime || '1ms') : item.cycleTime
             };
           }
           return item;
         });
 
         if (category === 'programs' && oldProgramName && oldProgramName !== name) {
-          // Update the associated task interval and instance program name in res_config
-          nextStruct.resources = nextStruct.resources.map(r => {
-            if (r.id === 'res_config') {
-              const tasks = [...(r.content.tasks || [])];
-              const instances = [...(r.content.instances || [])];
-
-              const taskIndex = tasks.findIndex(t => t.name === `task_${oldProgramName}`);
-              if (taskIndex !== -1) {
-                const formattedInterval = cycleTime.startsWith('T#') ? cycleTime : `T#${cycleTime}`;
-                tasks[taskIndex] = { ...tasks[taskIndex], name: `task_${name}`, interval: formattedInterval };
-              }
-
-              const instIndex = instances.findIndex(inst => inst.program === oldProgramName);
-              if (instIndex !== -1) {
-                instances[instIndex] = { ...instances[instIndex], program: name, task: `task_${name}` };
-              }
-
-              return { ...r, content: { ...r.content, tasks, instances } };
-            }
-            return r;
-          });
-        } else if (category === 'programs' && oldProgramName === name) {
-          // Just updated cycle time
-          nextStruct.resources = nextStruct.resources.map(r => {
-            if (r.id === 'res_config') {
-              const tasks = [...(r.content.tasks || [])];
-              const taskIndex = tasks.findIndex(t => t.name === `task_${name}`);
-              if (taskIndex !== -1) {
-                const formattedInterval = cycleTime.startsWith('T#') ? cycleTime : `T#${cycleTime}`;
-                tasks[taskIndex] = { ...tasks[taskIndex], interval: formattedInterval };
-              }
-              return { ...r, content: { ...r.content, tasks } };
-            }
-            return r;
-          });
+          // Sync taskConfig program name
+          nextStruct.taskConfig = {
+            ...nextStruct.taskConfig,
+            tasks: (nextStruct.taskConfig?.tasks || []).map(t => ({
+              ...t,
+              programs: t.programs.map(p => p.program === oldProgramName ? { ...p, program: name } : p),
+            })),
+          };
         }
         return nextStruct;
       });
+      renameTab(createModal.editId, name);
       addLog('info', t('logs.updatedProperties', { name }) || `Updated properties for ${name}`);
       setCreateModal({ isOpen: false, category: '', defaultName: '', isEdit: false, editId: null, initialData: {}, insertIndex: null });
       return true;
@@ -1019,9 +1139,8 @@ function App() {
       name: name,
       type,
       returnType: category === 'functions' ? returnType : undefined,
-      cycleTime: category === 'programs' ? (cycleTime || '1ms') : undefined,
       content:
-        type === 'LD' ? { rungs: [], variables: [] } :
+        (type === 'LD' || type === 'SCL') ? { rungs: [], variables: [] } :
           type === 'UDT' ? { members: [] } :
             type === 'GVL' ? { variables: [] } :
               { code: '', variables: [] }
@@ -1035,56 +1154,11 @@ function App() {
       } else {
         catItems.push(newItem);
       }
-      const nextStruct = {
-        ...prev,
-        [category]: catItems
-      };
-
-      if (category === 'programs' && cycleTime) {
-        // Automatically create a task and instance for the program
-        const configResource = nextStruct.resources.find(r => r.id === 'res_config');
-        if (configResource) {
-          const tasks = configResource.content.tasks || [];
-          const instances = configResource.content.instances || [];
-
-          const taskName = `task_${name}`;
-          let newTasks = [...tasks];
-          newTasks.push({
-            id: `task_${Date.now()}`,
-            name: taskName,
-            triggering: 'Cyclic',
-            interval: cycleTime.startsWith('T#') ? cycleTime : `T#${cycleTime}`,
-            priority: 1
-          });
-
-          let i = 0;
-          const instNames = instances.map(inst => inst.name);
-          while (instNames.includes(`instance${i}`)) i++;
-
-          const newInstances = [...instances, {
-            id: `inst_${Date.now()}_${Math.random()}`,
-            name: `instance${i}`,
-            program: name,
-            task: taskName
-          }];
-
-          nextStruct.resources = nextStruct.resources.map(r =>
-            r.id === 'res_config' ? {
-              ...r,
-              content: {
-                ...r.content,
-                tasks: newTasks,
-                instances: newInstances
-              }
-            } : r
-          );
-        }
-      }
-
-      return nextStruct;
+      return { ...prev, [category]: catItems };
     });
 
     setActiveId(newItem.id);
+    openTab(newItem.id, name, getItemIcon(category, type));
     addLog('info', t('logs.addedItem', { name, type, category }) || `Added ${name} (${type}) to ${category}`);
     // Close modal handled by createModal state update below
     setCreateModal({ isOpen: false, category: '', defaultName: '', isEdit: false, editId: null, initialData: {}, insertIndex: null });
@@ -1092,11 +1166,32 @@ function App() {
   };
 
   const handleDeleteItem = (category, id) => {
-    setProjectStructure(prev => ({
-      ...prev,
-      [category]: prev[category].filter(item => item.id !== id)
-    }));
-    if (activeId === id) setActiveId(null);
+    setProjectStructure(prev => {
+      const removed = prev[category]?.find(item => item.id === id);
+      const next = { ...prev, [category]: prev[category].filter(item => item.id !== id) };
+      if (category === 'programs' && removed) {
+        const pName = removed.name;
+        next.taskConfig = {
+          ...prev.taskConfig,
+          tasks: (prev.taskConfig?.tasks || []).map(t => ({
+            ...t,
+            programs: t.programs
+              .filter(p => p.program !== pName)
+              .sort((a, b) => a.priority - b.priority)
+              .map((p, i) => ({ ...p, priority: i })),
+          })),
+        };
+      }
+      return next;
+    });
+    // Close tab
+    const idx = openTabs.findIndex(t => t.id === id);
+    const newTabs = openTabs.filter(t => t.id !== id);
+    setOpenTabs(newTabs);
+    if (activeId === id) {
+      const next = newTabs[idx] || newTabs[idx - 1] || null;
+      setActiveId(next?.id || null);
+    }
     addLog('warning', t('logs.deletedItem', { id }) || `Deleted item ${id}`);
   };
 
@@ -1136,6 +1231,7 @@ function App() {
       return { ...prev, [category]: items };
     });
     setActiveId(item.id);
+    openTab(item.id, item.name, getItemIcon(category, item.type));
     addLog('info', `Pasted ${category} item: ${item.name}`);
   };
 
@@ -1158,6 +1254,7 @@ function App() {
             it.id === id ? { ...it, name: newName } : it
           )
         }));
+        renameTab(id, newName);
         addLog('info', t('logs.renamedItem', { name: newName }) || `Renamed item to ${newName}`);
       }
       return;
@@ -1173,17 +1270,34 @@ function App() {
         name: item.name,
         language: item.type,
         returnType: item.returnType,
-        cycleTime: item.cycleTime
       }
     });
   };
 
   const handleSelectItem = (category, id) => {
     setActiveId(id);
+    // Special pages (TASK_MANAGER, VISUALIZATION, …)
+    if (SPECIAL_TABS[id]) {
+      openTab(id, SPECIAL_TABS[id].label, SPECIAL_TABS[id].icon);
+      return;
+    }
+    // Project items
+    for (const key of Object.keys(projectStructure)) {
+      if (!Array.isArray(projectStructure[key])) continue;
+      const item = projectStructure[key].find(i => i.id === id);
+      if (item) {
+        openTab(id, item.name, getItemIcon(key, item.type));
+        return;
+      }
+    }
+    // Buses
+    const bus = buses.find(b => b.id === id);
+    if (bus) openTab(id, bus.type === 'ethercat' ? 'Master' : bus.type, bus.type === 'ethercat' ? EtherCATTabIcon : '🔌');
   };
 
   const getActiveItem = () => {
     for (const key of Object.keys(projectStructure)) {
+      if (!Array.isArray(projectStructure[key])) continue;
       const item = projectStructure[key].find(i => i.id === activeId);
       if (item) return { ...item, category: key };
     }
@@ -1254,10 +1368,10 @@ function App() {
     return idx >= 0 ? projectStructure.dataTypes.slice(0, idx).map(d => d.name) : projectStructure.dataTypes.map(d => d.name);
   };
 
-  // Hangi POU'nun hangi bloklara erişebileceğini tanım sırasına göre filtrele:
-  // functions: yalnızca kendinden önceki functions + library
-  // functionBlocks: tüm functions + kendinden önceki FBs + library
-  // programs: hepsi
+  // Filter accessible blocks by declaration order:
+  // functions: only preceding functions + library
+  // functionBlocks: all functions + preceding FBs + library
+  // programs: all
   const getAvailableBlocks = () => {
     if (!activeItem) return [...projectStructure.functionBlocks, ...projectStructure.functions, ...parsedBlocks];
     const cat = activeItem.category;
@@ -1339,7 +1453,7 @@ function App() {
             </button>
             <button
               className="toolbar-btn"
-              onClick={() => setActiveId('SETTINGS')}
+              onClick={() => openSpecialTab('SETTINGS')}
               style={{ fontSize: '24px', lineHeight: 1, padding: '4px 6px', background: 'transparent', border: '1px solid transparent', marginRight: '10px' }}
               title={t('common.settings')}
             >
@@ -1446,9 +1560,10 @@ function App() {
                 onEditItem={handleEditItemDetails}
                 onReorderItem={handleReorderItem}
                 onPasteItem={handlePasteItem}
-                onBoardClick={() => setActiveId('BOARD_CONFIG')}
+                onBoardClick={() => openSpecialTab('BOARD_CONFIG')}
                 selectedBoard={selectedBoard}
                 isRunning={isRunning || isSimulationMode}
+                liveVariables={isRunning ? liveVariables : null}
                 buses={buses}
                 onAddBus={handleAddBus}
                 onDeleteBus={handleDeleteBus}
@@ -1464,6 +1579,14 @@ function App() {
 
             {/* CENTER COLUMN (Editor + Console) */}
             <div style={{ flex: 1, display: 'flex', flexDirection: 'column', minWidth: 0, background: '#1e1e1e' }}>
+
+              {/* EDITOR TABS */}
+              <EditorTabs
+                tabs={openTabs}
+                activeId={activeId}
+                onActivate={(id) => setActiveId(id)}
+                onClose={closeTab}
+              />
 
               {/* EDITOR */}
               <div
@@ -1506,6 +1629,21 @@ function App() {
                   <ErrorBoundary>
                     <BoardConfigPage boardId={selectedBoard} />
                   </ErrorBoundary>
+                ) : activeId === 'TASK_MANAGER' ? (
+                  <ErrorBoundary>
+                    <TaskManager
+                      taskConfig={projectStructure.taskConfig}
+                      onTaskConfigChange={(tc) => setProjectStructure(prev => ({ ...prev, taskConfig: tc }))}
+                      programs={projectStructure.programs}
+                      isRunning={isRunning}
+                      liveVariables={isRunning ? liveVariables : null}
+                    />
+                  </ErrorBoundary>
+                ) : activeId === 'VISUALIZATION' ? (
+                  <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: '100%', flexDirection: 'column', gap: 12, color: '#3a3a3a' }}>
+                    <span style={{ fontSize: 40 }}>📊</span>
+                    <span style={{ fontSize: 14, color: '#555' }}>Visualization Manager — Coming Soon</span>
+                  </div>
                 ) : activeItem ? (
                   <ErrorBoundary>
                     <div style={{ flex: 1, position: 'relative', overflow: 'hidden' }}>
@@ -1543,6 +1681,7 @@ function App() {
                           isRunning={isRunning}
                           isSimulationMode={isSimulationMode}
                           onForceWrite={isRunning ? handleForceWrite : null}
+                          onAddToWatchTable={addToWatchTable}
                         />
                       )}
                     </div>
@@ -1560,19 +1699,18 @@ function App() {
                 style={{ height: 5, cursor: 'row-resize', background: isResizing === 'console' ? '#007acc' : '#2d2d2d', zIndex: 10, flexShrink: 0, borderTop: '1px solid #333', borderBottom: '1px solid #333' }}
               />
 
-              {/* CONSOLE */}
-              <div style={{ height: layout.consoleHeight, background: '#1e1e1e', display: 'flex', flexDirection: 'column' }}>
-                <div style={{ padding: '5px 10px', background: '#2d2d2d', borderBottom: '1px solid #333', fontSize: '11px', fontWeight: 'bold', color: '#ccc' }}>
-                  OUTPUT
-                </div>
-                <div style={{ flex: 1, overflowY: 'auto', padding: '5px', fontFamily: 'Consolas, monospace', fontSize: '12px' }}>
-                  {logs.map((log, index) => (
-                    <div key={index} className={`log-line log-${log.type}`}>
-                      {log.msg}
-                    </div>
-                  ))}
-                  <div ref={consoleEndRef} />
-                </div>
+              {/* OUTPUT PANEL */}
+              <div style={{ height: layout.consoleHeight, display: 'flex', flexDirection: 'column' }}>
+                <OutputPanel
+                  logs={logs}
+                  watchTable={watchTable}
+                  onWatchTableRemove={removeFromWatchTable}
+                  onWatchTableUpdate={updateWatchTableEntry}
+                  onForceWrite={isRunning ? handleForceWrite : null}
+                  liveVariables={liveVariables}
+                  isRunning={isRunning}
+                  projectStructure={projectStructure}
+                />
               </div>
 
             </div>
@@ -1590,9 +1728,10 @@ function App() {
                   <h4 style={{ padding: '10px 15px', margin: 0, background: '#2d2d2d', fontSize: '11px', textTransform: 'uppercase', color: '#ccc' }}>Kütüphane</h4>
                   <div style={{ flex: 1, overflow: 'auto' }}>
                     <Toolbox
-                      libraryData={libraryData} // Pass Library Data
+                      libraryData={libraryData}
                       activeFileType={activeItem?.type}
                       selectedBoard={selectedBoard}
+                      buses={buses}
                       userDefinedBlocks={
                         activeItem.category === 'programs'
                           ? [...projectStructure.functionBlocks, ...projectStructure.functions]

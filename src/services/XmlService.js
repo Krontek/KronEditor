@@ -4,7 +4,7 @@
  * Uses CDATA sections to store complex React Flow / Editor content to ensure exact restoration.
  */
 
-export const exportProjectToXml = (projectStructure, boardId, connectionSettings = {}, buses = [], busConfigs = {}) => {
+export const exportProjectToXml = (projectStructure, boardId, connectionSettings = {}, buses = [], busConfigs = {}, watchTable = []) => {
     const doc = document.implementation.createDocument(null, "PLCProject", null);
     const root = doc.documentElement;
 
@@ -46,6 +46,20 @@ export const exportProjectToXml = (projectStructure, boardId, connectionSettings
     createSection("Functions", projectStructure.functions);
     createSection("Programs", projectStructure.programs);
     createSection("Resources", projectStructure.resources);
+
+    // TaskConfig: stored as JSON CDATA
+    if (projectStructure.taskConfig) {
+        const tcSection = doc.createElement("TaskConfig");
+        tcSection.appendChild(doc.createCDATASection(JSON.stringify(projectStructure.taskConfig)));
+        root.appendChild(tcSection);
+    }
+
+    // WatchTable: persisted as JSON CDATA
+    if (watchTable && watchTable.length > 0) {
+        const wtSection = doc.createElement("WatchTable");
+        wtSection.appendChild(doc.createCDATASection(JSON.stringify(watchTable)));
+        root.appendChild(wtSection);
+    }
 
     // Fieldbus: buses array + busConfigs map stored as JSON CDATA
     if (buses.length > 0) {
@@ -137,7 +151,26 @@ export const importProjectFromXml = (xmlString) => {
             }
         }
 
-        return { projectStructure, boardId, plcAddress, sshUser, sshPort, buses, busConfigs };
+        // TaskConfig
+        let taskConfig = { tasks: [] };
+        const tcSection = doc.getElementsByTagName("TaskConfig")[0];
+        if (tcSection && tcSection.textContent) {
+            try {
+                taskConfig = JSON.parse(tcSection.textContent);
+            } catch (e) {
+                console.error("Failed to parse TaskConfig section", e);
+            }
+        }
+        projectStructure.taskConfig = taskConfig;
+
+        // WatchTable
+        let watchTable = [];
+        const wtSection = doc.getElementsByTagName("WatchTable")[0];
+        if (wtSection && wtSection.textContent) {
+            try { watchTable = JSON.parse(wtSection.textContent); } catch (e) { /* ignore */ }
+        }
+
+        return { projectStructure, boardId, plcAddress, sshUser, sshPort, buses, busConfigs, watchTable };
     } catch (e) {
         console.error("Critical Import Error:", e);
         return null;

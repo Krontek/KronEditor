@@ -50,14 +50,14 @@ const InsertZone = ({ onInsert, onPaste, canPaste, disabled }) => {
 };
 
 /**
- * YENİ LADDER EDITOR MİMARİ
- * - Rung'lar bir liste olarak düzenleniyor
- * - Her rung'ın kendi blokları ve bağlantıları var
- * - Rung hareket ederken, içindeki her şey beraber hareket ediyor
+ * Ladder Editor
+ * - Rungs are arranged as a list
+ * - Each rung has its own blocks and connections
+ * - When a rung moves, everything inside moves with it
  */
 
-const RungEditorNew = ({ variables, setVariables, rungs, setRungs, availableBlocks, globalVars = [], dataTypes = [], liveVariables = null, parentName = "", readOnly = false, onForceWrite = null }) => {
-  // Undo/Redo history - her snapshot { rungs, variables } çiftini saklıyor
+const RungEditorNew = ({ variables, setVariables, rungs, setRungs, availableBlocks, globalVars = [], dataTypes = [], liveVariables = null, parentName = "", readOnly = false, onForceWrite = null, programType = 'LD' }) => {
+  // Undo/Redo history - each snapshot stores { rungs, variables } pair
   const historyRef = useRef([{
     rungs: JSON.parse(JSON.stringify(rungs)),
     variables: JSON.parse(JSON.stringify(variables))
@@ -71,13 +71,16 @@ const RungEditorNew = ({ variables, setVariables, rungs, setRungs, availableBloc
   // Simulation force-write modal (double-click on node during simulation)
   const [simForceModal, setSimForceModal] = useState(null); // { varName, varType, liveKey, currentValue }
 
+  // SCL: pending rung lang selection dialog
+  const [pendingSCLInsert, setPendingSCLInsert] = useState(null); // { targetId, before }
+
   // Rung selection & drag/drop
   const [focusedRungId, setFocusedRungId] = useState(null);
   const [draggedRungIndex, setDraggedRungIndex] = useState(null);
   const [dragOverRungIndex, setDragOverRungIndex] = useState(null);
   const [globalSelectedBlockId, setGlobalSelectedBlockId] = useState(null);
 
-  // History kaydet - hem rungs hem variables birlikte
+  // Save history snapshot - rungs and variables together
   const saveHistory = useCallback((newRungs, newVariables) => {
     const sliced = historyRef.current.slice(0, historyIndexRef.current + 1);
     sliced.push({
@@ -278,7 +281,7 @@ const RungEditorNew = ({ variables, setVariables, rungs, setRungs, availableBloc
     return () => window.removeEventListener('keydown', handleKeyDown);
   }, [undo, redo, handleCopy, handlePaste]);
 
-  // Blok verisini güncelleme
+  // Update block data
   const updateBlockData = useCallback((rungId, blockId, newData) => {
     if (readOnly) return;
 
@@ -300,7 +303,7 @@ const RungEditorNew = ({ variables, setVariables, rungs, setRungs, availableBloc
         return rung;
       });
 
-      // instanceName değiştiyse variables'ı da güncelle
+      // If instanceName changed, update variables accordingly
       if (newData.instanceName && oldInstanceName && newData.instanceName !== oldInstanceName) {
          setVariables(prev => {
             const newVars = prev.map(v => v.name === oldInstanceName ? { ...v, name: newData.instanceName } : v);
@@ -315,7 +318,7 @@ const RungEditorNew = ({ variables, setVariables, rungs, setRungs, availableBloc
     });
   }, [readOnly, variables, saveHistory, setVariables]);
 
-  // Blok pozisyonunu güncelleme (history'e kaydedilmez - performans için)
+  // Update block position (not saved to history for performance)
   const updateBlockPosition = useCallback((rungId, blockId, position) => {
     if (readOnly) return;
     setRungs(prevRungs => prevRungs.map(rung => {
@@ -329,7 +332,7 @@ const RungEditorNew = ({ variables, setVariables, rungs, setRungs, availableBloc
     }));
   }, [readOnly]);
 
-  // Blok çift tıklandığında ayarları aç (simülasyon modunda force-write modalı açar)
+  // On block double-click: open settings (or force-write modal in simulation mode)
   const handleNodeDoubleClick = useCallback((_event, node, rungId) => {
     if (readOnly) {
       // Simulation mode: open force-write modal for this node's variable
@@ -362,7 +365,7 @@ const RungEditorNew = ({ variables, setVariables, rungs, setRungs, availableBloc
     });
   }, [readOnly, liveVariables, onForceWrite, parentName, variables, globalVars]);
 
-  // Ayarları kaydet
+  // Save block settings
   const handleSaveSettings = useCallback((blockId, newSettings) => {
     if (!editingBlock) return;
     updateBlockData(editingBlock.rungId, blockId, newSettings);
@@ -429,13 +432,20 @@ const RungEditorNew = ({ variables, setVariables, rungs, setRungs, availableBloc
   // Add Rung
   // targetId: which rung to insert beside (null = add to end)
   // before: if true add before, if false add after
-  const addRung = useCallback((targetId = null, before = false) => {
+  const addRung = useCallback((targetId = null, before = false, lang = null) => {
     if (readOnly) return;
+    // SCL programs: ask user to choose rung language if not provided
+    if (programType === 'SCL' && !lang) {
+      setPendingSCLInsert({ targetId, before });
+      return;
+    }
     const newRung = {
       id: `rung_${Date.now()}_${Math.random()}`,
       label: '',
+      lang: programType === 'SCL' ? (lang || 'LD') : undefined,
       blocks: [],
-      connections: []
+      connections: [],
+      code: ''
     };
 
     let newRungs = [...rungs];
@@ -458,7 +468,21 @@ const RungEditorNew = ({ variables, setVariables, rungs, setRungs, availableBloc
     setRungs(newRungs);
     setFocusedRungId(newRung.id);
     saveHistory(newRungs, variables);
-  }, [readOnly, rungs, variables, focusedRungId, saveHistory]);
+  }, [readOnly, programType, rungs, variables, focusedRungId, saveHistory]);
+
+  const toggleRungLang = useCallback((rungId) => {
+    if (readOnly) return;
+    const newRungs = rungs.map(r => r.id === rungId ? { ...r, lang: r.lang === 'ST' ? 'LD' : 'ST' } : r);
+    setRungs(newRungs);
+    saveHistory(newRungs, variables);
+  }, [readOnly, rungs, variables, saveHistory]);
+
+  const updateRungCode = useCallback((rungId, code) => {
+    if (readOnly) return;
+    const newRungs = rungs.map(r => r.id === rungId ? { ...r, code } : r);
+    setRungs(newRungs);
+    // No history save on every keystroke — throttle by saving on blur
+  }, [readOnly, rungs]);
 
   // Delete Rung
   const deleteRung = useCallback((rungId) => {
@@ -468,7 +492,7 @@ const RungEditorNew = ({ variables, setVariables, rungs, setRungs, availableBloc
     saveHistory(newRungs, variables);
   }, [readOnly, rungs, variables, saveHistory]);
 
-  // Rung'lar arasında taşıma (yukarı/aşağı)
+  // Move rung up/down
   const moveRung = useCallback((rungId, direction) => {
     if (readOnly) return;
     const idx = rungs.findIndex(r => r.id === rungId);
@@ -578,7 +602,7 @@ const RungEditorNew = ({ variables, setVariables, rungs, setRungs, availableBloc
       ];
       const boolVars = allVars.filter(v => v.type === 'BOOL');
 
-      // Case A: BOOL değişken yok -> otomatik oluştur
+      // Case A: no BOOL variable exists → auto-create one
       if (boolVars.length === 0) {
         let index = 0;
         let newName = '';
@@ -605,14 +629,14 @@ const RungEditorNew = ({ variables, setVariables, rungs, setRungs, availableBloc
         setVariables(newVariables);
         insertBlock(rungId, blockType, position, newName, customData, newVariables);
       }
-      // Case B: BOOL değişken var -> boş placeholder
+      // Case B: BOOL variable exists → leave as empty placeholder
       else {
         insertBlock(rungId, blockType, position, '', customData, variables);
       }
       return;
     }
 
-    // 2. DİĞER BLOKLAR (Standard / UserDefined)
+    // 2. Other blocks (Standard / UserDefined)
     let instanceName;
     let newVariables = variables;
 
@@ -623,7 +647,7 @@ const RungEditorNew = ({ variables, setVariables, rungs, setRungs, availableBloc
     if (customData && customData.name) {
       if (customData.type === 'functions') {
         instanceName = customData.name;
-        // Function blok instance oluşturmaz, variables değişmez
+        // Functions do not create instances; variables unchanged
       } else {
         // User-defined Function Block Instance (has a name)
         const baseName = (namePatternBase || customData.name).trim().replace(/\s+/g, '_');
@@ -708,7 +732,7 @@ const RungEditorNew = ({ variables, setVariables, rungs, setRungs, availableBloc
     insertBlock(rungId, blockType, position, instanceName, customData, newVariables);
   }, [readOnly, variables, globalVars, insertBlock, setVariables]);
 
-  // Rung'dan blok silme - variable da siliniyorsa history'ye yeni hali kaydet
+  // Delete block from rung; also remove its variable if unused, then save history
   const deleteBlockFromRung = useCallback((rungId, blockId) => {
     if (readOnly) return;
     let blockToDelete = null;
@@ -725,7 +749,7 @@ const RungEditorNew = ({ variables, setVariables, rungs, setRungs, availableBloc
     });
     setRungs(newRungs);
 
-    // Silinen bloğun variable'ını da kaldır - yeni variables'ı senkron hesapla
+    // Remove the deleted block's variable if it is not used elsewhere
     let newVariables = variables;
     if (blockToDelete?.data?.instanceName) {
       const instanceName = blockToDelete.data.instanceName;
@@ -738,11 +762,11 @@ const RungEditorNew = ({ variables, setVariables, rungs, setRungs, availableBloc
       }
     }
 
-    // Her iki yeni state'i birlikte history'ye kaydet
+    // Save both new states together into history
     saveHistory(newRungs, newVariables);
   }, [readOnly, rungs, variables, saveHistory, setVariables]);
 
-  // Rung'a bağlantı ekleme
+  // Add connection to rung
   const addConnectionToRung = useCallback((rungId, connection) => {
     if (readOnly) return;
     const newRungs = rungs.map(rung => {
@@ -761,7 +785,7 @@ const RungEditorNew = ({ variables, setVariables, rungs, setRungs, availableBloc
     saveHistory(newRungs, variables);
   }, [readOnly, rungs, variables, saveHistory]);
 
-  // Rung'dan bağlantı silme
+  // Remove connection from rung
   const deleteConnectionFromRung = useCallback((rungId, connectionId) => {
     if (readOnly) return;
     const newRungs = rungs.map(rung => {
@@ -876,50 +900,87 @@ const RungEditorNew = ({ variables, setVariables, rungs, setRungs, availableBloc
                   transition: 'border 0.2s',
                 }}
               >
+                {/* SCL lang toggle bar */}
+                {programType === 'SCL' && (
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '2px 8px', background: '#2d2d2d', borderBottom: '1px solid #3a3a3a' }}>
+                    <span style={{ fontSize: 10, color: '#888' }}>Rung {rung.label} lang:</span>
+                    {['LD', 'ST'].map(l => (
+                      <button
+                        key={l}
+                        disabled={readOnly}
+                        onClick={() => toggleRungLang(rung.id)}
+                        style={{
+                          padding: '1px 8px', fontSize: 11, borderRadius: 3, border: 'none', cursor: readOnly ? 'default' : 'pointer',
+                          background: (rung.lang || 'LD') === l ? '#007acc' : '#3a3a3a',
+                          color: (rung.lang || 'LD') === l ? '#fff' : '#aaa',
+                          fontWeight: (rung.lang || 'LD') === l ? 'bold' : 'normal',
+                        }}
+                      >{l}</button>
+                    ))}
+                  </div>
+                )}
                 <ErrorBoundary>
-                  <RungContainer
-                    rung={rung}
-                    index={index}
-                    totalRungs={rungs.length}
-                    isFocused={focusedRungId === rung.id}
-                    onDelete={() => deleteRung(rung.id)}
-                    onMoveUp={() => moveRung(rung.id, 'up')}
-                    onMoveDown={() => moveRung(rung.id, 'down')}
-                    onAddBlock={(blockType, position, customData) => addBlockToRung(rung.id, blockType, position, customData)}
-                    onDeleteBlock={(blockId) => deleteBlockFromRung(rung.id, blockId)}
-                    onAddConnection={(connection) => addConnectionToRung(rung.id, connection)}
-                    onDeleteConnection={(connectionId) => deleteConnectionFromRung(rung.id, connectionId)}
-                    onUpdateBlock={(blockId, newData) => updateBlockData(rung.id, blockId, newData)}
-                    onUpdateBlockPosition={(blockId, position) => updateBlockPosition(rung.id, blockId, position)}
-                    onNodeDoubleClick={(e, node) => handleNodeDoubleClick(e, node, rung.id)}
-                    globalSelectedBlockId={globalSelectedBlockId}
-                    onSelectBlock={(rungId, node) => {
-                      if (!node) {
+                  {programType === 'SCL' && (rung.lang || 'LD') === 'ST' ? (
+                    <div style={{ background: '#1e1e1e', padding: '4px 8px' }}>
+                      <textarea
+                        value={rung.code || ''}
+                        readOnly={readOnly}
+                        onChange={e => updateRungCode(rung.id, e.target.value)}
+                        onBlur={() => saveHistory(rungs, variables)}
+                        onClick={() => setFocusedRungId(rung.id)}
+                        placeholder="// ST code for this rung..."
+                        style={{
+                          width: '100%', minHeight: 100, background: '#1e1e1e', color: '#d4d4d4',
+                          fontFamily: "'Consolas', 'Courier New', monospace", fontSize: 13,
+                          border: '1px solid #3a3a3a', borderRadius: 3, outline: 'none',
+                          resize: 'vertical', padding: '6px 8px', boxSizing: 'border-box',
+                          lineHeight: 1.5,
+                        }}
+                      />
+                    </div>
+                  ) : (
+                    <RungContainer
+                      rung={rung}
+                      index={index}
+                      totalRungs={rungs.length}
+                      isFocused={focusedRungId === rung.id}
+                      onDelete={() => deleteRung(rung.id)}
+                      onMoveUp={() => moveRung(rung.id, 'up')}
+                      onMoveDown={() => moveRung(rung.id, 'down')}
+                      onAddBlock={(blockType, position, customData) => addBlockToRung(rung.id, blockType, position, customData)}
+                      onDeleteBlock={(blockId) => deleteBlockFromRung(rung.id, blockId)}
+                      onAddConnection={(connection) => addConnectionToRung(rung.id, connection)}
+                      onDeleteConnection={(connectionId) => deleteConnectionFromRung(rung.id, connectionId)}
+                      onUpdateBlock={(blockId, newData) => updateBlockData(rung.id, blockId, newData)}
+                      onUpdateBlockPosition={(blockId, position) => updateBlockPosition(rung.id, blockId, position)}
+                      onNodeDoubleClick={(e, node) => handleNodeDoubleClick(e, node, rung.id)}
+                      globalSelectedBlockId={globalSelectedBlockId}
+                      onSelectBlock={(rungId, node) => {
+                        if (!node) {
+                          selectedNodeRef.current = null;
+                          setGlobalSelectedBlockId(null);
+                        } else {
+                          setFocusedRungId(null);
+                          selectedNodeRef.current = { rungId, ...node };
+                          setGlobalSelectedBlockId(node.id);
+                        }
+                      }}
+                      availableBlocks={availableBlocks}
+                      variables={variables}
+                      globalVars={globalVars}
+                      dataTypes={dataTypes}
+                      liveVariables={liveVariables}
+                      parentName={parentName}
+                      readOnly={readOnly}
+                      onForceWrite={onForceWrite}
+                      onFocusRung={() => {
+                        if (readOnly) return;
                         selectedNodeRef.current = null;
                         setGlobalSelectedBlockId(null);
-                      } else {
-                        // Block selected → clear rung focus (mutual exclusion)
-                        setFocusedRungId(null);
-                        selectedNodeRef.current = { rungId, ...node };
-                        setGlobalSelectedBlockId(node.id);
-                      }
-                    }}
-                    availableBlocks={availableBlocks}
-                    variables={variables}
-                    globalVars={globalVars}
-                    dataTypes={dataTypes}
-                    liveVariables={liveVariables}
-                    parentName={parentName}
-                    readOnly={readOnly}
-                    onForceWrite={onForceWrite}
-                    onFocusRung={() => {
-                      if (readOnly) return;
-                      // Rung focused → clear block selection (mutual exclusion)
-                      selectedNodeRef.current = null;
-                      setGlobalSelectedBlockId(null);
-                      setFocusedRungId(rung.id);
-                    }}
-                  />
+                        setFocusedRungId(rung.id);
+                      }}
+                    />
+                  )}
                 </ErrorBoundary>
               </div>
               {index < rungs.length - 1 && (
@@ -954,6 +1015,27 @@ const RungEditorNew = ({ variables, setVariables, rungs, setRungs, availableBloc
           />
         </div>
       </div>
+
+      {/* SCL: choose rung language dialog */}
+      {pendingSCLInsert && (
+        <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.55)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 2000 }}>
+          <div style={{ background: '#252526', border: '1px solid #444', borderRadius: 8, padding: 24, minWidth: 260, boxShadow: '0 4px 16px rgba(0,0,0,0.4)' }}>
+            <div style={{ color: '#eee', fontWeight: 'bold', fontSize: 14, marginBottom: 16 }}>Choose rung language</div>
+            <div style={{ display: 'flex', gap: 12, justifyContent: 'center' }}>
+              {['LD', 'ST'].map(l => (
+                <button
+                  key={l}
+                  onClick={() => { const p = pendingSCLInsert; setPendingSCLInsert(null); addRung(p.targetId, p.before, l); }}
+                  style={{ padding: '8px 28px', fontSize: 14, borderRadius: 4, border: 'none', cursor: 'pointer', background: l === 'LD' ? '#1a6b3a' : '#0d47a1', color: '#fff', fontWeight: 'bold' }}
+                >{l === 'LD' ? 'Ladder (LD)' : 'Structured Text (ST)'}</button>
+              ))}
+            </div>
+            <div style={{ textAlign: 'center', marginTop: 12 }}>
+              <button onClick={() => setPendingSCLInsert(null)} style={{ background: 'transparent', border: 'none', color: '#888', cursor: 'pointer', fontSize: 12 }}>Cancel</button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* SETTINGS MODAL */}
       <BlockSettingsModal

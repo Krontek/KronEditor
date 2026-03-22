@@ -3,6 +3,7 @@ import { useTranslation } from 'react-i18next';
 import { ask } from '@tauri-apps/plugin-dialog';
 import { getBoardById } from '../utils/boardDefinitions';
 import PlcIcon from '../assets/icons/plc-icon.png';
+import EtherCATIconSrc from '../assets/icons/ethercat.png';
 
 const EMPTY_IMG = new Image();
 EMPTY_IMG.src = 'data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7';
@@ -149,9 +150,22 @@ const itemIcon = (item) => {
 
 /* ─── Bus node icons ───────────────────────────────────────────────────────── */
 
+const EtherCATImg = () => (
+    <img src={EtherCATIconSrc} height="14" style={{ objectFit: 'contain', verticalAlign: 'middle', flexShrink: 0 }} alt="EtherCAT" />
+);
+
+const CANIcon = () => (
+    <svg width="14" height="14" viewBox="0 0 14 14" fill="none" style={{ flexShrink: 0, verticalAlign: 'middle' }}>
+        <rect x="1" y="4" width="12" height="6" rx="1.5" fill="none" stroke="#4A9EEA" strokeWidth="1.5"/>
+        <circle cx="3.5" cy="7" r="1" fill="#4A9EEA"/>
+        <circle cx="7"   cy="7" r="1" fill="#4A9EEA"/>
+        <circle cx="10.5" cy="7" r="1" fill="#4A9EEA"/>
+    </svg>
+);
+
 const BUS_META = {
-    ethercat: { label: 'EtherCAT Master', icon: '⬡' },
-    canbus:   { label: 'CANbus',          icon: '⬡' },
+    ethercat: { label: 'Master', icon: <EtherCATImg /> },
+    canbus:   { label: 'CANbus', icon: <CANIcon /> },
 };
 
 /* ═══════════════════════════════════════════════════════════════════════════ */
@@ -159,7 +173,7 @@ const BUS_META = {
 const ProjectSidebar = ({
     projectStructure, onSelectItem, activeId,
     onAddItem, onDeleteItem, onEditItem, onReorderItem, onPasteItem,
-    onBoardClick, selectedBoard, isRunning = false,
+    onBoardClick, selectedBoard, isRunning = false, liveVariables = null,
     buses = [], onAddBus, onDeleteBus, onSelectBus,
 }) => {
     const { t } = useTranslation();
@@ -289,12 +303,12 @@ const ProjectSidebar = ({
         const hasBus = (type) => buses.some(b => b.type === type);
         return [
             {
-                icon: '⬡', label: `${t('actions.add')} EtherCAT Master`,
+                icon: <EtherCATImg />, label: `${t('actions.add')} Master`,
                 disabled: isRunning || hasBus('ethercat'),
                 action: () => !isRunning && !hasBus('ethercat') && onAddBus?.('ethercat'),
             },
             {
-                icon: '⬡', label: `${t('actions.add')} CANbus`,
+                icon: <CANIcon />, label: `${t('actions.add')} CANbus`,
                 disabled: isRunning || hasBus('canbus'),
                 action: () => !isRunning && !hasBus('canbus') && onAddBus?.('canbus'),
             },
@@ -371,28 +385,43 @@ const ProjectSidebar = ({
                                     opacity: isBeingDragged ? 0.4 : 1,
                                 }}
                             >
-                                {/* Drag handle */}
-                                <div
-                                    onMouseEnter={() => { if (!isRunning) setDragEnabled(true); }}
-                                    onMouseLeave={() => setDragEnabled(false)}
-                                    style={{
-                                        display: 'grid', gridTemplateColumns: 'repeat(2, 2px)', gap: '2px',
-                                        padding: '4px', cursor: isRunning ? 'not-allowed' : 'grab',
-                                        opacity: isRunning ? 0.2 : 0.5,
-                                    }}
-                                    title="Drag"
-                                >
-                                    {[...Array(6)].map((_, i) => (
-                                        <div key={i} style={{ width: 2, height: 2, background: '#ccc', borderRadius: '50%' }} />
-                                    ))}
-                                </div>
+                                {/* Drag handle — hidden for Programs (order managed by Task Manager) */}
+                                {key !== 'programs' && (
+                                    <div
+                                        onMouseEnter={() => { if (!isRunning) setDragEnabled(true); }}
+                                        onMouseLeave={() => setDragEnabled(false)}
+                                        style={{
+                                            display: 'grid', gridTemplateColumns: 'repeat(2, 2px)', gap: '2px',
+                                            padding: '4px', cursor: isRunning ? 'not-allowed' : 'grab',
+                                            opacity: isRunning ? 0.2 : 0.5,
+                                        }}
+                                        title="Drag to reorder"
+                                    >
+                                        {[...Array(6)].map((_, i) => (
+                                            <div key={i} style={{ width: 2, height: 2, background: '#ccc', borderRadius: '50%' }} />
+                                        ))}
+                                    </div>
+                                )}
                                 <span>{itemIcon(item)}</span>
                                 <span style={{ flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
                                     {item.name}
                                 </span>
-                                {key === 'programs' && item.cycleTime && (
-                                    <span style={{ fontSize: 10, color: '#888' }}>[{item.cycleTime}]</span>
-                                )}
+                                {key === 'programs' && liveVariables && (() => {
+                                    const pName = (item.name || '').trim().replace(/\s+/g, '_');
+                                    const us = liveVariables[`prog____exec_us_${pName}`];
+                                    if (us == null) return null;
+                                    const label = us >= 1000 ? `${(us/1000).toFixed(1)}ms` : `${us}µs`;
+                                    // Look up task interval for this program from taskConfig
+                                    const taskForProg = (projectStructure.taskConfig?.tasks || [])
+                                        .find(t => (t.programs || []).some(p => (p.program || '').replace(/\s+/g, '_') === pName));
+                                    const rawInterval = taskForProg?.interval || '';
+                                    const ivStr = rawInterval.toUpperCase().replace('T#','').replace('TIME#','');
+                                    const cycleUs = ivStr.endsWith('MS') ? parseFloat(ivStr)*1000
+                                        : ivStr.endsWith('US') ? parseFloat(ivStr)
+                                        : ivStr.endsWith('S') ? parseFloat(ivStr)*1000000 : 10000;
+                                    const overrun = us > cycleUs;
+                                    return <span style={{ fontSize: 10, color: overrun ? '#f44747' : '#4ec9b0', marginLeft: 2 }}>{label}</span>;
+                                })()}
                                 {item.type && (
                                     <span style={{ fontSize: 9, color: '#666', border: '1px solid #444', padding: '0 2px', borderRadius: 2 }}>
                                         {item.type}
@@ -485,7 +514,7 @@ const ProjectSidebar = ({
                     {/* Global Variables */}
                     <TreeNode
                         level={2}
-                        icon="⚙️"
+                        icon="🌐"
                         label={t('sidebar.global') || 'Global Variables'}
                         active={activeId === globalItem?.id}
                         onClick={() => globalItem && onSelectItem('resources', globalItem.id)}
@@ -497,9 +526,27 @@ const ProjectSidebar = ({
                     {renderCategory(t('sidebar.programs') || 'Programs',          'programs',        projectStructure.programs)}
                 </TreeNode>
 
+                {/* ── Task Manager ── */}
+                <TreeNode
+                    level={1}
+                    icon="⏱"
+                    label="Task Manager"
+                    active={activeId === 'TASK_MANAGER'}
+                    onClick={() => onSelectItem?.('TASK_MANAGER', 'TASK_MANAGER')}
+                />
+
+                {/* ── Visualization ── */}
+                <TreeNode
+                    level={1}
+                    icon="📊"
+                    label="Visualization"
+                    active={activeId === 'VISUALIZATION'}
+                    onClick={() => onSelectItem?.('VISUALIZATION', 'VISUALIZATION')}
+                />
+
                 {/* ── Optional Bus nodes ── */}
                 {buses.map(bus => {
-                    const meta = BUS_META[bus.type] || { label: bus.type, icon: '⬡' };
+                    const meta = BUS_META[bus.type] || { label: bus.type, icon: '🔌' };
                     return (
                         <TreeNode
                             key={bus.id}
@@ -511,7 +558,7 @@ const ProjectSidebar = ({
                             onClick={() => onSelectBus?.(bus.id)}
                             onContextMenu={(e) => openCtx(e, [
                                 {
-                                    icon: '🗑', label: 'Kaldır', danger: true,
+                                    icon: '🗑', label: 'Remove', danger: true,
                                     disabled: isRunning,
                                     action: () => !isRunning && onDeleteBus?.(bus.id),
                                 }

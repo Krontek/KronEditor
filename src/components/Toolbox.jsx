@@ -1,6 +1,7 @@
 import React, { useState, useMemo, useRef } from 'react';
+import EtherCATIconSrc from '../assets/icons/ethercat.png';
 import { PLC_BLOCKS } from '../utils/plcStandards';
-import { LIBRARY_TREE } from '../utils/libraryTree';
+import { LIBRARY_TREE, ETHERCAT_LIBRARY_TREE } from '../utils/libraryTree';
 import { getBoardLibraryTree } from '../utils/boardLibraryBlocks';
 import { getBoardFamily } from '../utils/boardDefinitions';
 import DragDropManager from '../utils/DragDropManager';
@@ -196,8 +197,10 @@ const UD_COLOR = '#007acc';   // user-defined
 const CONTACT_COLOR = '#1a6b3a'; // contacts (green)
 const COIL_COLOR = '#8b3a0f'; // coils (brown-red)
 const BOARD_COLOR = '#00695c'; // board-specific blocks (teal)
+const EC_COLOR    = '#1565c0'; // EtherCAT blocks (blue)
 
-const Toolbox = ({ userDefinedBlocks = [], libraryData = [], activeFileType, selectedBoard }) => {
+const Toolbox = ({ userDefinedBlocks = [], libraryData = [], activeFileType, selectedBoard, buses = [] }) => {
+  const hasEtherCAT = buses.some(b => b.type === 'ethercat');
   // expand state: category-level and subcategory-level
   const [expandedCats, setExpandedCats] = useState({});
   const [expandedSubs, setExpandedSubs] = useState({});
@@ -323,6 +326,65 @@ const Toolbox = ({ userDefinedBlocks = [], libraryData = [], activeFileType, sel
                           desc={item.desc}
                           customData={item.customData}
                           color={BOARD_COLOR}
+                        />
+                      ))}
+                    </div>
+                  )}
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* ── EtherCAT Master blocks (only when an EtherCAT bus is present) ── */}
+      {hasEtherCAT && (
+        <div style={{ marginBottom: 6 }}>
+          <div
+            onClick={() => toggleCat('ethercat')}
+            style={{
+              padding: '8px 4px', color: '#ccc', fontSize: '11px',
+              fontWeight: 'bold', textTransform: 'uppercase', letterSpacing: '0.5px',
+              borderBottom: '1px solid #3e3e42', marginBottom: 4,
+              cursor: 'pointer', display: 'flex', alignItems: 'center', userSelect: 'none'
+            }}
+          >
+            <span style={{ marginRight: 6, fontSize: 9, opacity: 0.7 }}>
+              {expandedCats['ethercat'] ? '▼' : '▶'}
+            </span>
+            <img src={EtherCATIconSrc} height="13" style={{ objectFit: 'contain', verticalAlign: 'middle', marginRight: 5, flexShrink: 0 }} alt="EtherCAT" />
+            Master
+          </div>
+
+          {expandedCats['ethercat'] && (
+            <div style={{ paddingLeft: 6 }}>
+              {ETHERCAT_LIBRARY_TREE.map(sub => (
+                <div key={sub.id} style={{ marginBottom: 4 }}>
+                  {/* Subcategory header */}
+                  <div
+                    onClick={() => toggleSub(sub.id)}
+                    style={{
+                      padding: '4px 4px', fontSize: '10px', color: '#aaa',
+                      cursor: 'pointer', display: 'flex', alignItems: 'center',
+                      userSelect: 'none', letterSpacing: '0.3px',
+                    }}
+                  >
+                    <span style={{ marginRight: 5, fontSize: 8, opacity: 0.6 }}>
+                      {expandedSubs[sub.id] !== false ? '▼' : '▶'}
+                    </span>
+                    {sub.title}
+                  </div>
+
+                  {expandedSubs[sub.id] !== false && (
+                    <div style={{ paddingLeft: 12 }}>
+                      {sub.items.map(item => (
+                        <ToolboxItem
+                          key={item.blockType}
+                          blockType={item.blockType}
+                          label={item.label}
+                          desc={item.desc}
+                          customData={item.customData}
+                          color={EC_COLOR}
                         />
                       ))}
                     </div>

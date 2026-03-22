@@ -20,7 +20,8 @@ const EditorPane = ({
   parentName = "",
   isRunning = false,
   isSimulationMode = false,
-  onForceWrite = null
+  onForceWrite = null,
+  onAddToWatchTable = null,
 }) => {
   // --- STATE MANAGEMENT ---
   // We use separate state checks to ensure safety
@@ -799,6 +800,7 @@ const EditorPane = ({
             isRunning={isRunning}
             isSimulationMode={isSimulationMode}
             onForceWrite={onForceWrite}
+            onAddToWatchTable={onAddToWatchTable}
             projectStructure={projectStructure}
           />
         </div>
@@ -821,7 +823,7 @@ const EditorPane = ({
       )}
 
       <div style={{ flex: 1, overflow: 'hidden', position: 'relative' }}>
-        {fileType === 'LD' ? (
+        {(fileType === 'LD' || fileType === 'SCL') ? (
           <RungEditorNew
             variables={variables}
             setVariables={setVariables}
@@ -834,6 +836,7 @@ const EditorPane = ({
             parentName={parentName}
             readOnly={isRunning}
             onForceWrite={onForceWrite}
+            programType={fileType}
           />
         ) : fileType === 'ST' ? (
           <div

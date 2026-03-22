@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { DataTypeSelector, ModernSelect } from './common/Selectors';
 import ForceWriteModal from './common/ForceWriteModal';
 import { useTranslation } from 'react-i18next';
@@ -169,12 +169,24 @@ const VariableManager = ({
   disabled = false,
   isSimulationMode = false,
   onForceWrite = null,
+  onAddToWatchTable = null,
   projectStructure = null
 }) => {
   const { t } = useTranslation();
   const [selectedId, setSelectedId] = useState(null);
   const [forceModal, setForceModal] = useState(null); // { varName, varType, liveKey, liveVal }
   const [complexPopup, setComplexPopup] = useState(null); // { variable, anchorRect }
+  const [ctxMenu, setCtxMenu] = useState(null); // { x, y, variable }
+  const ctxMenuRef = useRef(null);
+
+  useEffect(() => {
+    if (!ctxMenu) return;
+    const close = (e) => {
+      if (ctxMenuRef.current && !ctxMenuRef.current.contains(e.target)) setCtxMenu(null);
+    };
+    document.addEventListener('mousedown', close);
+    return () => document.removeEventListener('mousedown', close);
+  }, [ctxMenu]);
 
   // ── Handlers ──────────────────────────────────────────────────────────────
 
@@ -212,9 +224,16 @@ const VariableManager = ({
 
   // ── Live value lookup ─────────────────────────────────────────────────────
 
+  /** Computes the liveVariables key for a variable without requiring liveVariables to be set. */
+  const computeLiveKey = (varName) => {
+    const safeName = (varName || '').trim().replace(/\s+/g, '_');
+    const safeProgName = (parentName || '').trim().replace(/\s+/g, '_');
+    return `prog_${safeProgName}_${safeName}`;
+  };
+
   /** Returns the correct liveVariables key for a variable name. */
   const getLiveKey = (varName) => {
-    if (!liveVariables) return null;
+    if (!liveVariables) return computeLiveKey(varName);
     const safeName = (varName || '').trim().replace(/\s+/g, '_');
     const safeProgName = (parentName || '').trim().replace(/\s+/g, '_');
     const progKey = `prog_${safeProgName}_${safeName}`;
@@ -222,6 +241,13 @@ const VariableManager = ({
     const globalKey = `prog__${safeName}`;
     if (liveVariables[globalKey] !== undefined) return globalKey;
     return progKey; // default even if not found (shows ---)
+  };
+
+  const handleContextMenu = (e, v) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setCtxMenu({ x: e.clientX, y: e.clientY, variable: v });
+    setSelectedId(v.id);
   };
 
   const getLiveValue = (varName) => {
@@ -322,6 +348,7 @@ const VariableManager = ({
                 <React.Fragment key={v.id}>
                 <tr
                   onClick={() => setSelectedId(v.id)}
+                  onContextMenu={(e) => handleContextMenu(e, v)}
                   style={{ borderBottom: '1px solid #333', background: selectedId === v.id ? '#0d47a1' : 'transparent', cursor: 'pointer' }}
                 >
                   <td style={{ padding: '5px' }}>
@@ -483,6 +510,70 @@ const VariableManager = ({
           anchorRect={complexPopup.anchorRect}
           onClose={() => setComplexPopup(null)}
         />
+      )}
+
+      {/* Right-click Context Menu */}
+      {ctxMenu && (
+        <div
+          ref={ctxMenuRef}
+          style={{
+            position: 'fixed',
+            top: ctxMenu.y,
+            left: ctxMenu.x,
+            background: '#2d2d2d',
+            border: '1px solid #444',
+            borderRadius: 4,
+            boxShadow: '0 4px 12px rgba(0,0,0,0.5)',
+            zIndex: 9999,
+            minWidth: 170,
+            fontSize: 12,
+            color: '#ccc',
+            overflow: 'hidden',
+          }}
+        >
+          {onAddToWatchTable && (
+            <div
+              onClick={() => {
+                onAddToWatchTable({
+                  id: `${Date.now()}_${Math.random()}`,
+                  liveKey: computeLiveKey(ctxMenu.variable.name),
+                  displayName: parentName ? `${parentName}.${ctxMenu.variable.name}` : ctxMenu.variable.name,
+                  varType: ctxMenu.variable.type,
+                });
+                setCtxMenu(null);
+              }}
+              style={{ padding: '7px 14px', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 8 }}
+              onMouseEnter={e => e.currentTarget.style.background = '#3a3a3a'}
+              onMouseLeave={e => e.currentTarget.style.background = 'transparent'}
+            >
+              <span style={{ fontSize: 13 }}>👁</span> Add to Watchtable
+            </div>
+          )}
+          {onForceWrite && liveVariables && (
+            <div
+              onClick={() => {
+                const liveKey = getLiveKey(ctxMenu.variable.name);
+                const liveVal = liveVariables[liveKey] ?? null;
+                setForceModal({ varName: ctxMenu.variable.name, varType: ctxMenu.variable.type, liveKey, liveVal });
+                setCtxMenu(null);
+              }}
+              style={{ padding: '7px 14px', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 8 }}
+              onMouseEnter={e => e.currentTarget.style.background = '#3a3a3a'}
+              onMouseLeave={e => e.currentTarget.style.background = 'transparent'}
+            >
+              <span style={{ fontSize: 13 }}>✎</span> Write Value...
+            </div>
+          )}
+          <div style={{ height: 1, background: '#444', margin: '2px 0' }} />
+          <div
+            onClick={() => { navigator.clipboard?.writeText(ctxMenu.variable.name); setCtxMenu(null); }}
+            style={{ padding: '7px 14px', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 8 }}
+            onMouseEnter={e => e.currentTarget.style.background = '#3a3a3a'}
+            onMouseLeave={e => e.currentTarget.style.background = 'transparent'}
+          >
+            <span style={{ fontSize: 13 }}>📋</span> Copy Name
+          </div>
+        </div>
       )}
     </div>
   );

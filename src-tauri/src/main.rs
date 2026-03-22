@@ -292,7 +292,7 @@ fn write_plc_files(
     let build_dir = get_build_dir(&app)?;
     fs::write(build_dir.join("plc.h"), &header).map_err(|e| e.to_string())?;
     fs::write(build_dir.join("plc.c"), &source).map_err(|e| e.to_string())?;
-    fs::write(build_dir.join("variable_table.json"), &variable_table).map_err(|e| e.to_string())?;
+    fs::write(build_dir.join("variables.json"), &variable_table).map_err(|e| e.to_string())?;
     Ok(build_dir.to_string_lossy().to_string())
 }
 
@@ -304,13 +304,18 @@ fn write_plc_files(
 fn get_standard_headers(app: tauri::AppHandle) -> Result<Vec<(String, String)>, String> {
     let mut headers = Vec::new();
 
-    // Read headers from bundled resources/include/ (the definitive location)
+    // Return ONLY Krontek library headers (kron*.h) and known board support headers (gpiod.h).
+    // SOEM, CANopen, wpcap, and other third-party headers are accessed via compiler -I paths
+    // and must NOT be included directly in plc.h via customIncludes — they require
+    // specific include ordering and platform-specific prerequisites.
     if let Ok(resource_dir) = get_resource_dir(&app) {
         let include_dir = resource_dir.join("resources/include");
         if let Ok(entries) = fs::read_dir(&include_dir) {
             for entry in entries.flatten() {
                 if let Some(name) = entry.file_name().to_str() {
-                    if name.ends_with(".h") {
+                    let is_kron = name.starts_with("kron") && name.ends_with(".h");
+                    let is_allowed = is_kron || name == "gpiod.h";
+                    if is_allowed {
                         if let Ok(content) = fs::read_to_string(entry.path()) {
                             headers.push((name.to_string(), content));
                         }
@@ -517,21 +522,55 @@ fn do_update_libraries(app: &tauri::AppHandle, repos: Vec<String>) -> Result<(),
 
     // --- Compile for each target ---
 
+    // Pre-compute SOEM platform include paths (structure-preserved from do_build_soem)
+    let soem_base        = include_dir.join("soem");
+    let soem_inc_dir     = soem_base.join("include");          // soem/include  → soem/soem.h
+    let soem_osal_dir    = soem_base.join("osal");             // soem/osal/    → osal.h dispatch
+    let soem_osal_linux  = soem_base.join("osal/linux");       // Linux osal
+    let soem_osal_win32  = soem_base.join("osal/win32");       // Win32 osal
+    let soem_oshw_linux  = soem_base.join("oshw/linux");       // Linux nicdrv.h
+    let soem_oshw_win32  = soem_base.join("oshw/win32");       // Win32 nicdrv.h
+
+    // Returns extra include dirs + extra cc flags for repos that wrap SOEM (KronEthercatMaster).
+    // Returns empty vecs for all other repos.
+    let soem_extra = |lib_name: &str, platform: &str| -> (Vec<PathBuf>, Vec<&'static str>) {
+        if lib_name != "kronethercatmaster" { return (vec![], vec![]); }
+        match platform {
+            "linux" => (
+                vec![soem_inc_dir.clone(), soem_osal_dir.clone(), soem_osal_linux.clone(), soem_oshw_linux.clone()],
+                vec!["-DLINUX"]
+            ),
+            "win32" => (
+                vec![soem_inc_dir.clone(), soem_osal_dir.clone(), soem_osal_win32.clone(), soem_oshw_win32.clone()],
+                vec!["-DWIN32"]
+            ),
+            "bare" => {
+                // Bare-metal: skip — EtherCAT master requires an OS/HAL; user links their own
+                (vec![], vec!["-DKRON_EC_BARE_METAL"])
+            },
+            _ => (vec![], vec![]),
+        }
+    };
+
     // Helper: compile one .c → lib<lib_name>.a  (used for Linux and ARM targets)
     let compile_one_ar = |
-        target_tag: &str,
-        compiler:   &str,
-        cc_args:    &[&str],
-        ar_cmd:     &str,
-        lib_dir:    &Path,
-        dev_dir:    &Option<PathBuf>,
-        lib_name:   &str,
-        c_file:     &Path,
+        target_tag:  &str,
+        compiler:    &str,
+        cc_args:     &[&str],
+        extra_incs:  &[PathBuf],
+        extra_flags: &[&str],
+        ar_cmd:      &str,
+        lib_dir:     &Path,
+        dev_dir:     &Option<PathBuf>,
+        lib_name:    &str,
+        c_file:      &Path,
     | -> Result<(), String> {
         let obj_path = temp_base.join(format!("{}_{}.o", target_tag.replace('/', "_"), lib_name));
         let mut cmd = std::process::Command::new(compiler);
-        for arg in cc_args { cmd.arg(arg); }
+        for arg in cc_args  { cmd.arg(arg); }
+        for arg in extra_flags { cmd.arg(arg); }
         cmd.arg("-I").arg(&include_dir);
+        for ei in extra_incs { if ei.exists() { cmd.arg("-I").arg(ei); } }
         for cdir in &cloned_dirs { cmd.arg("-I").arg(cdir); }
         cmd.arg("-c").arg(c_file).arg("-o").arg(&obj_path);
 
@@ -564,8 +603,9 @@ fn do_update_libraries(app: &tauri::AppHandle, repos: Vec<String>) -> Result<(),
         let t = &targets[0];
         let cc_args: &[&str] = &["-O2", "-ffunction-sections", "-fdata-sections"];
         for (lib_name, c_file) in &repo_sources {
+            let (ei, ef) = soem_extra(lib_name, "linux");
             match compile_one_ar(
-                "x86_64/linux", "gcc", cc_args, "ar",
+                "x86_64/linux", "gcc", cc_args, &ei, &ef, "ar",
                 &t.dir, &t.dev_dir, lib_name, c_file,
             ) {
                 Ok(()) => { let _ = app.emit("library-update-progress", format!(
@@ -599,8 +639,9 @@ fn do_update_libraries(app: &tauri::AppHandle, repos: Vec<String>) -> Result<(),
             let t = &targets[1];
             let cc_args: &[&str] = &["-O2", "-ffunction-sections", "-fdata-sections"];
             for (lib_name, c_file) in &repo_sources {
+                let (ei, ef) = soem_extra(lib_name, "win32");
                 match compile_one_ar(
-                    "x86_64/win32", &cc, cc_args, &ar_cmd,
+                    "x86_64/win32", &cc, cc_args, &ei, &ef, &ar_cmd,
                     &t.dir, &t.dev_dir, lib_name, c_file,
                 ) {
                     Ok(()) => { let _ = app.emit("library-update-progress", format!(
@@ -626,8 +667,9 @@ fn do_update_libraries(app: &tauri::AppHandle, repos: Vec<String>) -> Result<(),
             let ar_str = ar_path.to_string_lossy().to_string();
             let cc_args: &[&str] = &["-O2", "-ffunction-sections", "-fdata-sections"];
             for (lib_name, c_file) in &repo_sources {
+                let (ei, ef) = soem_extra(lib_name, "linux");
                 match compile_one_ar(
-                    "arm/aarch64", &cc_str, cc_args, &ar_str,
+                    "arm/aarch64", &cc_str, cc_args, &ei, &ef, &ar_str,
                     &t.dir, &t.dev_dir, lib_name, c_file,
                 ) {
                     Ok(()) => { let _ = app.emit("library-update-progress", format!(
@@ -654,8 +696,9 @@ fn do_update_libraries(app: &tauri::AppHandle, repos: Vec<String>) -> Result<(),
             let cc_args: &[&str] = &["-march=armv7-a", "-mfpu=vfpv3-d16", "-mfloat-abi=hard",
                                      "-O2", "-ffunction-sections", "-fdata-sections"];
             for (lib_name, c_file) in &repo_sources {
+                let (ei, ef) = soem_extra(lib_name, "linux");
                 match compile_one_ar(
-                    "arm/armv7", &cc_str, cc_args, &ar_str,
+                    "arm/armv7", &cc_str, cc_args, &ei, &ef, &ar_str,
                     &t.dir, &t.dev_dir, lib_name, c_file,
                 ) {
                     Ok(()) => { let _ = app.emit("library-update-progress", format!(
@@ -692,8 +735,9 @@ fn do_update_libraries(app: &tauri::AppHandle, repos: Vec<String>) -> Result<(),
         let cc_str = arm_gcc.to_string_lossy().to_string();
         let ar_str = arm_ar.to_string_lossy().to_string();
         for (lib_name, c_file) in &repo_sources {
+            let (ei, ef) = soem_extra(lib_name, "bare");
             match compile_one_ar(
-                name, &cc_str, cc_args, &ar_str,
+                name, &cc_str, cc_args, &ei, &ef, &ar_str,
                 &t.dir, &t.dev_dir, lib_name, c_file,
             ) {
                 Ok(()) => { let _ = app.emit("library-update-progress", format!(
@@ -873,7 +917,7 @@ fn compile_for_target(
     // Write source files
     fs::write(build_dir.join("plc.h"), &header).map_err(|e| e.to_string())?;
     fs::write(build_dir.join("plc.c"), &source).map_err(|e| e.to_string())?;
-    fs::write(build_dir.join("variable_table.json"), &variable_table).map_err(|e| e.to_string())?;
+    fs::write(build_dir.join("variables.json"), &variable_table).map_err(|e| e.to_string())?;
 
     let plc_c = build_dir.join("plc.c");
     let out_file = build_dir.join("runtime.bin");
@@ -928,9 +972,24 @@ fn compile_for_target(
         cmd.arg(format!("-DKRON_DO_COUNT={}", do_));
     }
 
+    // Use real EtherCAT implementation only when libkronethercatmaster.a is present.
+    // Without it, add -DKRON_EC_SIM so the header's inline stubs are used and the
+    // program compiles cleanly even without the EtherCAT library installed.
+    let has_ec_lib = fs::read_dir(&lib_dir).map(|entries| {
+        entries.flatten().any(|e| {
+            let n = e.file_name().to_string_lossy().to_lowercase();
+            n.contains("ethercatmaster") || n.contains("kronec")
+        })
+    }).unwrap_or(false);
+
+    let soem_inc = res_include.join("soem/include");
+
+    if !has_ec_lib {
+        cmd.arg("-DKRON_EC_SIM");
+    }
     cmd.arg("-I").arg(&build_dir)
         .arg("-I").arg(&res_include)
-        .arg("-I").arg(res_include.join("soem"))
+        .arg("-I").arg(&soem_inc)
         .arg("-o").arg(&out_file)
         .arg(&plc_c);
 
@@ -959,68 +1018,7 @@ fn compile_for_target(
         ));
     }
 
-    // Build server-format variable table from transpiler pre-computed SHM offsets
-    build_server_variable_table(&variable_table, &build_dir)?;
-
     Ok(out_file.to_string_lossy().to_string())
-}
-
-/// Build a KronServer-compatible variable_table_server.json using the
-/// SHM offsets pre-computed by the JS transpiler (stored in debugDefaults).
-/// No ELF parsing required — offsets are already layout-stable.
-fn build_server_variable_table(
-    variable_table_json: &str,
-    build_dir: &Path,
-) -> Result<(), String> {
-    let vt: Value = serde_json::from_str(variable_table_json)
-        .map_err(|e| format!("Variable table JSON parse error: {}", e))?;
-
-    let debug_defaults = vt.get("debugDefaults")
-        .and_then(|v| v.as_object())
-        .ok_or("No debugDefaults in variable table")?;
-
-    let mut variables: Vec<Value> = Vec::new();
-
-    for (key, info) in debug_defaults {
-        // Only entries with a pre-computed SHM offset are included
-        let offset = match info.get("offset").and_then(|v| v.as_u64()) {
-            Some(o) => o as i64,
-            None => continue,
-        };
-        let size = info.get("size").and_then(|v| v.as_u64()).unwrap_or(1) as i64;
-        let iec_type = info.get("type").and_then(|v| v.as_str()).unwrap_or("BOOL");
-
-        let server_type = match iec_type {
-            "BOOL"            => "bool",
-            "SINT" | "USINT" | "BYTE" => "uint8",
-            "INT"             => "int16",
-            "UINT" | "WORD"   => "uint16",
-            "DINT"            => "int32",
-            "UDINT" | "DWORD" => "uint32",
-            "REAL"            => "float32",
-            "LREAL"           => "float64",
-            "TIME"            => "uint32",
-            _                 => "int32",
-        };
-
-        let mut var_entry = json!({
-            "name": key,
-            "offset": offset,
-            "type": server_type,
-            "size": size
-        });
-        if let Some(flag_offset) = info.get("force_flag_offset").and_then(|v| v.as_u64()) {
-            var_entry["force_flag_offset"] = json!(flag_offset);
-        }
-        variables.push(var_entry);
-    }
-
-    let server_vt = json!({ "variables": variables });
-    let out_path = build_dir.join("variable_table_server.json");
-    fs::write(&out_path, serde_json::to_string_pretty(&server_vt).unwrap())
-        .map_err(|e| format!("Failed to write server variable table: {}", e))?;
-
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1046,10 +1044,10 @@ fn deploy_to_server(app: tauri::AppHandle, server_addr: String) -> Result<String
         return Err(format!("Runtime deploy failed: HTTP {}", resp.status()));
     }
 
-    // POST variable_table_server.json
-    let vt_path = build_dir.join("variable_table_server.json");
+    // POST variables.json
+    let vt_path = build_dir.join("variables.json");
     let vt_bytes = fs::read(&vt_path)
-        .map_err(|e| format!("Cannot read variable_table_server.json: {}", e))?;
+        .map_err(|e| format!("Cannot read variables.json: {}", e))?;
 
     let url_vt = format!("http://{}/deploy/variable-table", server_addr);
     let resp = ureq::post(&url_vt)
@@ -1285,9 +1283,10 @@ fn compile_simulation(app: tauri::AppHandle) -> Result<String, String> {
     cmd.arg(format!("-B{}", gcc_bin_dir.display()))
         .arg("-shared")
         .arg("-Wl,--export-all-symbols")
+        .arg("-DKRON_EC_SIM")
         .arg("-I").arg(&build_dir)
         .arg("-I").arg(&res_include)
-        .arg("-I").arg(res_include.join("soem"))
+        .arg("-I").arg(res_include.join("soem/include"))
         .arg("-o").arg(&plc_dll)
         .arg(&plc_c);
 
@@ -1337,9 +1336,11 @@ fn compile_simulation(app: tauri::AppHandle) -> Result<String, String> {
     let sim_lib      = resource_dir.join("resources/x86_64/linux");
 
     let mut cmd = Command::new("gcc");
-    cmd.arg("-I").arg(&build_dir)
+    // KRON_EC_SIM: use inline no-op stubs in kronethercatmaster.h (no SOEM linking needed for simulation)
+    cmd.arg("-DKRON_EC_SIM")
+        .arg("-I").arg(&build_dir)
         .arg("-I").arg(&res_include)
-        .arg("-I").arg(res_include.join("soem"))
+        .arg("-I").arg(res_include.join("soem/include"))
         .arg("-rdynamic")
         .arg("-no-pie")
         .arg("-o").arg(&out_file)
@@ -1614,10 +1615,10 @@ fn run_simulation(
     state: State<'_, SimState>,
 ) -> Result<String, String> {
     let build_dir     = plain_path(&get_build_dir(&app)?);
-    let var_table_str = fs::read_to_string(build_dir.join("variable_table.json"))
-        .map_err(|e| format!("Failed to read variable_table.json: {}", e))?;
+    let var_table_str = fs::read_to_string(build_dir.join("variables.json"))
+        .map_err(|e| format!("Failed to read variables.json: {}", e))?;
     let var_table: Value = serde_json::from_str(&var_table_str)
-        .map_err(|e| format!("Failed to parse variable_table.json: {}", e))?;
+        .map_err(|e| format!("Failed to parse variables.json: {}", e))?;
 
     if state.win.lock().unwrap().is_some() {
         return Err("Simulation is already running".into());
@@ -1639,12 +1640,12 @@ fn run_simulation(
 ) -> Result<String, String> {
     let build_dir      = plain_path(&get_build_dir(&app)?);
     let bin_path       = build_dir.join(SIM_BIN);
-    let var_table_path = build_dir.join("variable_table.json");
+    let var_table_path = build_dir.join("variables.json");
 
     let var_table_str = fs::read_to_string(&var_table_path)
-        .map_err(|e| format!("Failed to read variable_table.json: {}", e))?;
+        .map_err(|e| format!("Failed to read variables.json: {}", e))?;
     let var_table: Value = serde_json::from_str(&var_table_str)
-        .map_err(|e| format!("Failed to parse variable_table.json: {}", e))?;
+        .map_err(|e| format!("Failed to parse variables.json: {}", e))?;
 
     let symbols   = parse_symbols(&bin_path)?;
     let var_specs = build_var_specs(&var_table, &symbols);
@@ -2396,6 +2397,403 @@ fn build_soem(app: tauri::AppHandle) -> Result<String, String> {
 }
 
 // ---------------------------------------------------------------------------
+// ec_request_state — request an EtherCAT state transition at runtime
+// ---------------------------------------------------------------------------
+
+#[tauri::command]
+fn ec_request_state(app: tauri::AppHandle, state: String) -> Result<(), String> {
+    // Emit the request so the simulation layer (or future IPC channel) can act on it.
+    // State id strings: "init" | "preop" | "safeop" | "op"
+    let code: u8 = match state.as_str() {
+        "init"   => 0x01,
+        "preop"  => 0x02,
+        "safeop" => 0x04,
+        "op"     => 0x08,
+        other    => return Err(format!("Unknown EC state: {}", other)),
+    };
+    let _ = app.emit("ec-state-request", json!({ "state": state, "state_code": code }));
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// build_canopen — Clone CANopenNode and compile libcanopen.a for all toolchains
+// ---------------------------------------------------------------------------
+
+fn do_build_canopen(app: &tauri::AppHandle) -> Result<(), String> {
+    let resource_dir = get_resource_dir(app)?;
+    let include_dir  = resource_dir.join("resources/include/canopen");
+    fs::create_dir_all(&include_dir).map_err(|e| e.to_string())?;
+
+    // Dev-mode mirror directories
+    let mut dev_include_dir: Option<PathBuf> = None;
+    let mut dev_target_dirs: std::collections::HashMap<&'static str, PathBuf> = std::collections::HashMap::new();
+    if let Ok(cwd) = std::env::current_dir() {
+        let project_root = std::iter::successors(Some(cwd.as_ref() as &Path), |p| p.parent())
+            .find(|p| p.join("src-tauri").exists() && p.join("resources").exists())
+            .map(|p| p.to_path_buf());
+        if let Some(root) = project_root {
+            let res = root.join("resources");
+            let inc = res.join("include/canopen");
+            let _ = fs::create_dir_all(&inc);
+            dev_include_dir = Some(inc);
+            for tname in &["x86_64/linux","x86_64/win32","arm/aarch64","arm/armv7",
+                           "arm/CortexM/M0","arm/CortexM/M4","arm/CortexM/M7"] {
+                let d = res.join(tname);
+                let _ = fs::create_dir_all(&d);
+                dev_target_dirs.insert(tname, d);
+            }
+        }
+    }
+
+    let temp_dir = std::env::temp_dir().join("kroneditor_canopen_build");
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(&temp_dir).map_err(|e| e.to_string())?;
+
+    let repo_dir = temp_dir.join("CANopenNode");
+    let _ = app.emit("library-update-progress", "[CANopen] Cloning CANopenNode...".to_string());
+
+    let clone_out = Command::new("git")
+        .args(["clone", "--depth=1",
+               "https://github.com/CANopenNode/CANopenNode.git"])
+        .arg(&repo_dir)
+        .output()
+        .map_err(|e| format!("git not found: {}", e))?;
+
+    if !clone_out.status.success() {
+        let msg = format!("[CANopen] Clone failed: {}",
+            String::from_utf8_lossy(&clone_out.stderr).trim());
+        let _ = app.emit("library-update-progress", format!("ERROR: {}", msg));
+        let _ = fs::remove_dir_all(&temp_dir);
+        return Err(msg);
+    }
+    let _ = app.emit("library-update-progress", "[CANopen] Cloned OK".to_string());
+
+    // Copy all headers preserving directory structure
+    //   CANopenNode/CANopen.h          → resources/include/canopen/CANopen.h
+    //   CANopenNode/301/CO_SDOserver.h → resources/include/canopen/301/CO_SDOserver.h
+    //   CANopenNode/socketCAN/*.h      → resources/include/canopen/socketCAN/*.h  etc.
+    let all_hdrs = find_files_with_ext(&repo_dir, "h");
+    let mut copied = 0usize;
+    for h in &all_hdrs {
+        if let Ok(rel) = h.strip_prefix(&repo_dir) {
+            // skip example / test / doc directories
+            let rel_str = rel.to_string_lossy().to_lowercase();
+            if rel_str.starts_with("example") || rel_str.starts_with("doc")
+                || rel_str.starts_with("test") { continue; }
+            let dst = include_dir.join(rel);
+            if let Some(parent) = dst.parent() { let _ = fs::create_dir_all(parent); }
+            if fs::copy(h, &dst).is_ok() { copied += 1; }
+            if let Some(ref d) = dev_include_dir {
+                let dst2 = d.join(rel);
+                if let Some(p) = dst2.parent() { let _ = fs::create_dir_all(p); }
+                let _ = fs::copy(h, dst2);
+            }
+        }
+    }
+    let _ = app.emit("library-update-progress",
+        format!("[CANopen] Copied {} headers → resources/include/canopen/ (structure preserved)", copied));
+
+    // ── Source file collections ──────────────────────────────────────────────
+    let dir_301        = repo_dir.join("301");
+    let dir_303        = repo_dir.join("303");
+    let dir_305        = repo_dir.join("305");
+    let dir_socketcan  = repo_dir.join("socketCAN");
+
+    let filter_c = |v: Vec<PathBuf>| -> Vec<PathBuf> {
+        v.into_iter().filter(|p| {
+            let n = p.file_name().unwrap_or_default().to_string_lossy().to_lowercase();
+            !n.starts_with("test") && !n.starts_with("example")
+        }).collect()
+    };
+
+    // Root CANopen.c
+    let root_c: Vec<PathBuf> = {
+        let f = repo_dir.join("CANopen.c");
+        if f.exists() { vec![f] } else { vec![] }
+    };
+
+    let core_301  = filter_c(find_files_with_ext(&dir_301,       "c"));
+    let core_303  = filter_c(find_files_with_ext(&dir_303,       "c"));
+    let core_305  = filter_c(find_files_with_ext(&dir_305,       "c"));
+    let socketcan = filter_c(find_files_with_ext(&dir_socketcan, "c"));
+
+    // Linux/aarch64/armv7: core + socketCAN driver
+    let mut linux_sources: Vec<PathBuf> = Vec::new();
+    linux_sources.extend(root_c.clone());
+    linux_sources.extend(core_301.clone());
+    linux_sources.extend(core_303.clone());
+    linux_sources.extend(core_305.clone());
+    linux_sources.extend(socketcan.clone());
+
+    // Bare-metal: core only — CAN driver supplied by user at link time
+    let mut bm_sources: Vec<PathBuf> = Vec::new();
+    bm_sources.extend(root_c.clone());
+    bm_sources.extend(core_301.clone());
+    bm_sources.extend(core_303.clone());
+    bm_sources.extend(core_305.clone());
+
+    // ── Write bare-metal CO_driver_target.h stub ────────────────────────────
+    // CANopenNode requires CO_driver_target.h (not shipped — platform-specific).
+    // This stub satisfies the include for compilation; users replace it at link time.
+    let bm_inc_dir = temp_dir.join("co_bm_inc");
+    let _ = fs::create_dir_all(&bm_inc_dir);
+    let co_driver_target_h = "\
+/* CO_driver_target.h — bare-metal stub generated by KronEditor */\n\
+#ifndef CO_DRIVER_TARGET_H\n\
+#define CO_DRIVER_TARGET_H\n\
+\n\
+#include <stddef.h>\n\
+#include <stdint.h>\n\
+#include <stdbool.h>\n\
+\n\
+/* CAN message structure */\n\
+typedef struct {\n\
+    uint32_t ident;   /* CAN identifier, 11 or 29 bit */\n\
+    uint8_t  DLC;     /* Data length code (0..8) */\n\
+    uint8_t  data[8]; /* Data bytes */\n\
+} CO_CANrxMsg_t;\n\
+\n\
+/* CAN receive callback type */\n\
+typedef void (*CO_CANrxBufferCallback_t)(void *object, void *message);\n\
+\n\
+/* CAN TX buffer */\n\
+typedef struct {\n\
+    uint32_t ident;   /* CAN identifier with flags */\n\
+    uint8_t  DLC;\n\
+    uint8_t  data[8];\n\
+    volatile bool bufferFull;\n\
+    volatile bool syncFlag;\n\
+} CO_CANtx_t;\n\
+\n\
+/* CAN module (opaque — provided by platform driver) */\n\
+typedef struct CO_CANmodule_t CO_CANmodule_t;\n\
+\n\
+/* Endianness: assume little-endian (ARM Cortex-M) */\n\
+#ifndef CO_LITTLE_ENDIAN\n\
+# define CO_LITTLE_ENDIAN\n\
+#endif\n\
+\n\
+/* Memory alignment */\n\
+#define CO_CONFIG_GLOBAL_FLAG_CALLBACK_PRE  0\n\
+#define CO_CONFIG_GLOBAL_FLAG_OD_DYNAMIC    0\n\
+\n\
+/* Atomic access — bare-metal: disable interrupts around critical sections */\n\
+#define CO_LOCK_CAN_SEND(m)    do {} while(0)\n\
+#define CO_UNLOCK_CAN_SEND(m)  do {} while(0)\n\
+#define CO_LOCK_EMCY(m)        do {} while(0)\n\
+#define CO_UNLOCK_EMCY(m)      do {} while(0)\n\
+#define CO_LOCK_OD(m)          do {} while(0)\n\
+#define CO_UNLOCK_OD(m)        do {} while(0)\n\
+\n\
+/* Memory barriers */\n\
+#define CANrxMemoryBarrier()   do {} while(0)\n\
+\n\
+#endif /* CO_DRIVER_TARGET_H */\n";
+    let _ = fs::write(bm_inc_dir.join("CO_driver_target.h"), co_driver_target_h);
+
+    // Also write a minimal CO_driver.h override for bare-metal (some builds expect it at root)
+    // Most versions include it transitively; write a passthrough just in case.
+    let _ = fs::write(bm_inc_dir.join("CO_driver.h"),
+        "/* CO_driver.h — bare-metal passthrough */\n\
+         #pragma once\n\
+         #include \"CO_driver_target.h\"\n");
+
+    // ── compile_canopen_ar closure ──────────────────────────────────────────
+    let compile_canopen_ar = |
+        tag:        &str,
+        compiler:   &str,
+        cc_flags:   &[&str],
+        ar_cmd:     &str,
+        out_dir:    &Path,
+        dev_dir:    Option<&PathBuf>,
+        sources:    &[PathBuf],
+        inc_dirs:   &[&Path],
+    | -> Result<(), String> {
+        let _ = app.emit("library-update-progress",
+            format!("[CANopen] Compiling for {}...", tag));
+        if sources.is_empty() {
+            let _ = app.emit("library-update-progress",
+                format!("[CANopen][{}] WARN: no sources found", tag));
+            return Ok(());
+        }
+        let mut obj_files: Vec<PathBuf> = Vec::new();
+        for src in sources {
+            let stem = src.file_stem().unwrap_or_default().to_string_lossy();
+            let obj  = temp_dir.join(format!("co_{}_{}.o", tag.replace('/', "_"), stem));
+            let mut cmd = Command::new(compiler);
+            for f in cc_flags { cmd.arg(f); }
+            for inc in inc_dirs { cmd.arg("-I").arg(inc); }
+            cmd.arg("-c").arg(src).arg("-o").arg(&obj);
+            let out = cmd.output()
+                .map_err(|e| format!("[CANopen][{}] spawn error: {}", tag, e))?;
+            if !out.status.success() {
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                let _ = fs::remove_file(&obj);
+                return Err(format!("[CANopen][{}] compile error ({}): {}",
+                    tag, src.file_name().unwrap_or_default().to_string_lossy(), stderr.trim()));
+            }
+            obj_files.push(obj);
+        }
+        let lib_path = out_dir.join("libcanopen.a");
+        let mut ar = Command::new(ar_cmd);
+        ar.arg("rcs").arg(&lib_path);
+        for obj in &obj_files { ar.arg(obj); }
+        let ar_out = ar.output()
+            .map_err(|e| format!("[CANopen][{}] ar error: {}", tag, e))?;
+        for obj in &obj_files { let _ = fs::remove_file(obj); }
+        if !ar_out.status.success() {
+            return Err(format!("[CANopen][{}] archive error: {}",
+                tag, String::from_utf8_lossy(&ar_out.stderr).trim()));
+        }
+        if let Some(d) = dev_dir {
+            let _ = fs::copy(&lib_path, d.join("libcanopen.a"));
+        }
+        let _ = app.emit("library-update-progress",
+            format!("[CANopen][{}] libcanopen.a OK", tag));
+        Ok(())
+    };
+
+    // Include dirs
+    let repo_ref        = repo_dir.as_path();
+    let dir_301_ref     = dir_301.as_path();
+    let dir_303_ref     = dir_303.as_path();
+    let dir_305_ref     = dir_305.as_path();
+    let socketcan_ref   = dir_socketcan.as_path();
+    let bm_inc_ref      = bm_inc_dir.as_path();
+
+    let linux_inc: &[&Path] = &[repo_ref, dir_301_ref, dir_303_ref, dir_305_ref, socketcan_ref];
+    let bm_inc:    &[&Path] = &[bm_inc_ref, repo_ref, dir_301_ref, dir_303_ref, dir_305_ref];
+
+    // x86_64/linux
+    {
+        let out_dir = resource_dir.join("resources/x86_64/linux");
+        let dev_dir = dev_target_dirs.get("x86_64/linux");
+        let cc_flags: &[&str] = &["-O2", "-ffunction-sections", "-fdata-sections",
+                                   "-DLINUX", "-pthread"];
+        if let Err(e) = compile_canopen_ar(
+            "x86_64/linux", "gcc", cc_flags, "ar", &out_dir, dev_dir, &linux_sources, linux_inc)
+        {
+            let _ = app.emit("library-update-progress", format!("WARN: {}", e));
+        }
+    }
+
+    // x86_64/win32 — CANopen over SocketCAN not available on Windows; skip
+    {
+        let _ = app.emit("library-update-progress",
+            "[CANopen][x86_64/win32] SKIP: SocketCAN not available on Windows".to_string());
+    }
+
+    // arm/aarch64
+    {
+        let cc_path = tc_bin(&resource_dir, "aarch64-none-linux-gnu", "aarch64-none-linux-gnu-gcc");
+        let ar_path = tc_bin(&resource_dir, "aarch64-none-linux-gnu", "aarch64-none-linux-gnu-ar");
+        if !cc_path.exists() {
+            let _ = app.emit("library-update-progress",
+                "[CANopen][arm/aarch64] SKIP: aarch64-none-linux-gnu-gcc not found".to_string());
+        } else {
+            let out_dir = resource_dir.join("resources/arm/aarch64");
+            let dev_dir = dev_target_dirs.get("arm/aarch64");
+            let cc_flags: &[&str] = &["-O2", "-ffunction-sections", "-fdata-sections",
+                                       "-DLINUX", "-pthread", "-fno-lto", "-fno-use-linker-plugin"];
+            if let Err(e) = compile_canopen_ar(
+                "arm/aarch64", &cc_path.to_string_lossy(), cc_flags,
+                &ar_path.to_string_lossy(), &out_dir, dev_dir, &linux_sources, linux_inc)
+            {
+                let _ = app.emit("library-update-progress", format!("WARN: {}", e));
+            }
+        }
+    }
+
+    // arm/armv7
+    {
+        let bundled = tc_bin(&resource_dir, "arm-linux-gnueabihf", "arm-linux-gnueabihf-gcc");
+        let bundled_ar = tc_bin(&resource_dir, "arm-linux-gnueabihf", "arm-linux-gnueabihf-ar");
+        let (cc7, ar7) = if bundled.exists() {
+            (bundled.to_string_lossy().to_string(), bundled_ar.to_string_lossy().to_string())
+        } else {
+            ("arm-linux-gnueabihf-gcc".to_string(), "arm-linux-gnueabihf-ar".to_string())
+        };
+        let has_cc7 = Command::new(&cc7).arg("--version")
+            .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null())
+            .status().map(|s| s.success()).unwrap_or(false);
+        if !has_cc7 {
+            let _ = app.emit("library-update-progress",
+                "[CANopen][arm/armv7] SKIP: arm-linux-gnueabihf-gcc not found".to_string());
+        } else {
+            let out_dir = resource_dir.join("resources/arm/armv7");
+            let dev_dir = dev_target_dirs.get("arm/armv7");
+            let cc_flags: &[&str] = &[
+                "-march=armv7-a", "-mfpu=vfpv3-d16", "-mfloat-abi=hard",
+                "-O2", "-ffunction-sections", "-fdata-sections", "-DLINUX", "-pthread",
+                "-fno-lto", "-fno-use-linker-plugin"];
+            if let Err(e) = compile_canopen_ar(
+                "arm/armv7", &cc7, cc_flags, &ar7, &out_dir, dev_dir, &linux_sources, linux_inc)
+            {
+                let _ = app.emit("library-update-progress", format!("WARN: {}", e));
+            }
+        }
+    }
+
+    // arm/CortexM bare-metal (core only, no SocketCAN)
+    {
+        let arm_cc = "arm-none-eabi-gcc";
+        let arm_ar = "arm-none-eabi-ar";
+        let has_arm_cc = Command::new(arm_cc).arg("--version")
+            .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null())
+            .status().map(|s| s.success()).unwrap_or(false);
+
+        if !has_arm_cc {
+            for m_tag in &["arm/CortexM/M0", "arm/CortexM/M4", "arm/CortexM/M7"] {
+                let _ = app.emit("library-update-progress",
+                    format!("[CANopen][{}] SKIP: arm-none-eabi-gcc not found", m_tag));
+            }
+        } else {
+            let targets: &[(&str, &[&str])] = &[
+                ("arm/CortexM/M0", &["-mcpu=cortex-m0", "-mthumb",
+                    "-O2", "-ffunction-sections", "-fdata-sections", "-DBARE_METAL=1"]),
+                ("arm/CortexM/M4", &["-mcpu=cortex-m4", "-mthumb",
+                    "-mfpu=fpv4-sp-d16", "-mfloat-abi=hard",
+                    "-O2", "-ffunction-sections", "-fdata-sections", "-DBARE_METAL=1"]),
+                ("arm/CortexM/M7", &["-mcpu=cortex-m7", "-mthumb",
+                    "-mfpu=fpv5-d16", "-mfloat-abi=hard",
+                    "-O2", "-ffunction-sections", "-fdata-sections", "-DBARE_METAL=1"]),
+            ];
+            for (m_tag, cc_flags) in targets {
+                let out_dir = resource_dir.join(format!("resources/{}", m_tag));
+                let dev_dir = dev_target_dirs.get(m_tag);
+                if let Err(e) = compile_canopen_ar(
+                    m_tag, arm_cc, cc_flags, arm_ar,
+                    &out_dir, dev_dir, &bm_sources, bm_inc)
+                {
+                    let _ = app.emit("library-update-progress", format!("WARN: {}", e));
+                }
+            }
+        }
+    }
+
+    let _ = fs::remove_dir_all(&temp_dir);
+    let _ = app.emit("library-update-progress", "[CANopen] Build complete".to_string());
+    Ok(())
+}
+
+#[tauri::command]
+fn build_canopen(app: tauri::AppHandle) -> Result<String, String> {
+    std::thread::spawn(move || {
+        match do_build_canopen(&app) {
+            Ok(()) => {
+                let _ = app.emit("library-update-done",
+                    json!({"success": true, "message": "CANopen built successfully"}));
+            }
+            Err(e) => {
+                let _ = app.emit("library-update-done",
+                    json!({"success": false, "message": e}));
+            }
+        }
+    });
+    Ok("started".to_string())
+}
+
+// ---------------------------------------------------------------------------
 // list_network_interfaces — return available network interface names
 // ---------------------------------------------------------------------------
 
@@ -2487,6 +2885,8 @@ fn main() {
             check_server_status,
             deploy_server_to_target,
             build_soem,
+            ec_request_state,
+            build_canopen,
             list_network_interfaces,
         ])
         .run(tauri::generate_context!())

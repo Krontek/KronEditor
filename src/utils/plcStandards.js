@@ -117,7 +117,7 @@ export const PLC_BLOCKS = {
     ]
   },
 
-  // --- TETİKLEYİCİLER ---
+  // --- EDGE DETECTORS ---
   R_TRIG: {
     label: 'R_TRIG',
     description: 'Rising Edge',
@@ -131,7 +131,7 @@ export const PLC_BLOCKS = {
     outputs: [{ id: 'Q', type: 'BOOL', label: 'Q' }]
   },
 
-  // --- BİSTABLE ---
+  // --- BISTABLE LATCHES ---
   SR: {
     label: 'SR',
     description: 'Set Dominant',
@@ -159,7 +159,7 @@ export const PLC_BLOCKS = {
   LE:   { label: 'LE',   description: 'Less or Equal',    inputs: [{ id: 'EN', type: 'BOOL', label: 'EN' }, { id: 'IN1', type: 'DINT', label: 'IN1' }, { id: 'IN2', type: 'DINT', label: 'IN2' }], outputs: [{ id: 'ENO', type: 'BOOL', label: 'ENO' }, { id: 'Q', type: 'BOOL', label: 'Q' }] },
   LT:   { label: 'LT',   description: 'Less Than',        inputs: [{ id: 'EN', type: 'BOOL', label: 'EN' }, { id: 'IN1', type: 'DINT', label: 'IN1' }, { id: 'IN2', type: 'DINT', label: 'IN2' }], outputs: [{ id: 'ENO', type: 'BOOL', label: 'ENO' }, { id: 'Q', type: 'BOOL', label: 'Q' }] },
 
-  // --- ARİTMETİK ---
+  // --- ARITHMETIC ---
   ADD:  { label: 'ADD',  description: 'Addition',       inputs: [{ id: 'EN', type: 'BOOL', label: 'EN' }, { id: 'IN1', type: 'DINT', label: 'IN1' }, { id: 'IN2', type: 'DINT', label: 'IN2' }], outputs: [{ id: 'ENO', type: 'BOOL', label: 'ENO' }, { id: 'OUT', type: 'DINT', label: 'OUT' }] },
   SUB:  { label: 'SUB',  description: 'Subtraction',    inputs: [{ id: 'EN', type: 'BOOL', label: 'EN' }, { id: 'IN1', type: 'DINT', label: 'IN1' }, { id: 'IN2', type: 'DINT', label: 'IN2' }], outputs: [{ id: 'ENO', type: 'BOOL', label: 'ENO' }, { id: 'OUT', type: 'DINT', label: 'OUT' }] },
   MUL:  { label: 'MUL',  description: 'Multiplication', inputs: [{ id: 'EN', type: 'BOOL', label: 'EN' }, { id: 'IN1', type: 'DINT', label: 'IN1' }, { id: 'IN2', type: 'DINT', label: 'IN2' }], outputs: [{ id: 'ENO', type: 'BOOL', label: 'ENO' }, { id: 'OUT', type: 'DINT', label: 'OUT' }] },
@@ -167,7 +167,7 @@ export const PLC_BLOCKS = {
   MOD:  { label: 'MOD',  description: 'Modulo',         inputs: [{ id: 'EN', type: 'BOOL', label: 'EN' }, { id: 'IN1', type: 'DINT', label: 'IN1' }, { id: 'IN2', type: 'DINT', label: 'IN2' }], outputs: [{ id: 'ENO', type: 'BOOL', label: 'ENO' }, { id: 'OUT', type: 'DINT', label: 'OUT' }] },
   MOVE: { label: 'MOVE', description: 'Move / Assign',  inputs: [{ id: 'EN', type: 'BOOL', label: 'EN' }, { id: 'IN',  type: 'DINT', label: 'IN'  }],                                              outputs: [{ id: 'ENO', type: 'BOOL', label: 'ENO' }, { id: 'OUT', type: 'DINT', label: 'OUT' }] },
 
-  // --- MATEMATİK ---
+  // --- MATH ---
   ABS:   { label: 'ABS',   description: 'Absolute Value',          inputs: [{ id: 'EN', type: 'BOOL', label: 'EN' }, { id: 'IN',  type: 'REAL', label: 'IN'  }],                                              outputs: [{ id: 'ENO', type: 'BOOL', label: 'ENO' }, { id: 'OUT', type: 'REAL', label: 'OUT' }] },
   SQRT:  { label: 'SQRT',  description: 'Square Root',             inputs: [{ id: 'EN', type: 'BOOL', label: 'EN' }, { id: 'IN',  type: 'REAL', label: 'IN'  }],                                              outputs: [{ id: 'ENO', type: 'BOOL', label: 'ENO' }, { id: 'OUT', type: 'REAL', label: 'OUT' }] },
   EXPT:  { label: 'EXPT',  description: 'Exponentiation',          inputs: [{ id: 'EN', type: 'BOOL', label: 'EN' }, { id: 'IN',  type: 'REAL', label: 'IN'  }, { id: 'EXP', type: 'REAL', label: 'EXP' }], outputs: [{ id: 'ENO', type: 'BOOL', label: 'ENO' }, { id: 'OUT', type: 'REAL', label: 'OUT' }] },
@@ -175,7 +175,7 @@ export const PLC_BLOCKS = {
   MIN:   { label: 'MIN',   description: 'Minimum of two values',   inputs: [{ id: 'EN', type: 'BOOL', label: 'EN' }, { id: 'IN1', type: 'REAL', label: 'IN1' }, { id: 'IN2', type: 'REAL', label: 'IN2' }], outputs: [{ id: 'ENO', type: 'BOOL', label: 'ENO' }, { id: 'OUT', type: 'REAL', label: 'OUT' }] },
   LIMIT: { label: 'LIMIT', description: 'Clamp to [MN, MX]',       inputs: [{ id: 'EN', type: 'BOOL', label: 'EN' }, { id: 'IN',  type: 'REAL', label: 'IN'  }, { id: 'MN',  type: 'REAL', label: 'MN'  }, { id: 'MX', type: 'REAL', label: 'MX' }], outputs: [{ id: 'ENO', type: 'BOOL', label: 'ENO' }, { id: 'OUT', type: 'REAL', label: 'OUT' }] },
 
-  // --- BİTSEL ---
+  // --- BITWISE ---
   BAND:  { label: 'BAND', description: 'Bitwise AND',    inputs: [{ id: 'EN', type: 'BOOL',  label: 'EN' }, { id: 'IN1', type: 'DWORD', label: 'IN1' }, { id: 'IN2', type: 'DWORD', label: 'IN2' }], outputs: [{ id: 'ENO', type: 'BOOL', label: 'ENO' }, { id: 'OUT', type: 'DWORD', label: 'OUT' }] },
   BOR:   { label: 'BOR',  description: 'Bitwise OR',     inputs: [{ id: 'EN', type: 'BOOL',  label: 'EN' }, { id: 'IN1', type: 'DWORD', label: 'IN1' }, { id: 'IN2', type: 'DWORD', label: 'IN2' }], outputs: [{ id: 'ENO', type: 'BOOL', label: 'ENO' }, { id: 'OUT', type: 'DWORD', label: 'OUT' }] },
   BXOR:  { label: 'BXOR', description: 'Bitwise XOR',    inputs: [{ id: 'EN', type: 'BOOL',  label: 'EN' }, { id: 'IN1', type: 'DWORD', label: 'IN1' }, { id: 'IN2', type: 'DWORD', label: 'IN2' }], outputs: [{ id: 'ENO', type: 'BOOL', label: 'ENO' }, { id: 'OUT', type: 'DWORD', label: 'OUT' }] },
@@ -185,7 +185,7 @@ export const PLC_BLOCKS = {
   ROL:   { label: 'ROL',  description: 'Rotate Left',    inputs: [{ id: 'EN', type: 'BOOL',  label: 'EN' }, { id: 'IN',  type: 'DWORD', label: 'IN'  }, { id: 'N', type: 'USINT', label: 'N' }], outputs: [{ id: 'ENO', type: 'BOOL', label: 'ENO' }, { id: 'OUT', type: 'DWORD', label: 'OUT' }] },
   ROR:   { label: 'ROR',  description: 'Rotate Right',   inputs: [{ id: 'EN', type: 'BOOL',  label: 'EN' }, { id: 'IN',  type: 'DWORD', label: 'IN'  }, { id: 'N', type: 'USINT', label: 'N' }], outputs: [{ id: 'ENO', type: 'BOOL', label: 'ENO' }, { id: 'OUT', type: 'DWORD', label: 'OUT' }] },
 
-  // --- TRİGONOMETRİK ---
+  // --- TRIGONOMETRIC ---
   SIN:  { label: 'SIN',  description: 'Sine (rad)',       inputs: [{ id: 'EN', type: 'BOOL', label: 'EN' }, { id: 'IN', type: 'REAL', label: 'IN' }], outputs: [{ id: 'ENO', type: 'BOOL', label: 'ENO' }, { id: 'OUT', type: 'REAL', label: 'OUT' }] },
   COS:  { label: 'COS',  description: 'Cosine (rad)',     inputs: [{ id: 'EN', type: 'BOOL', label: 'EN' }, { id: 'IN', type: 'REAL', label: 'IN' }], outputs: [{ id: 'ENO', type: 'BOOL', label: 'ENO' }, { id: 'OUT', type: 'REAL', label: 'OUT' }] },
   TAN:  { label: 'TAN',  description: 'Tangent (rad)',    inputs: [{ id: 'EN', type: 'BOOL', label: 'EN' }, { id: 'IN', type: 'REAL', label: 'IN' }], outputs: [{ id: 'ENO', type: 'BOOL', label: 'ENO' }, { id: 'OUT', type: 'REAL', label: 'OUT' }] },
@@ -193,11 +193,11 @@ export const PLC_BLOCKS = {
   ACOS: { label: 'ACOS', description: 'Arc Cosine',       inputs: [{ id: 'EN', type: 'BOOL', label: 'EN' }, { id: 'IN', type: 'REAL', label: 'IN' }], outputs: [{ id: 'ENO', type: 'BOOL', label: 'ENO' }, { id: 'OUT', type: 'REAL', label: 'OUT' }] },
   ATAN: { label: 'ATAN', description: 'Arc Tangent',      inputs: [{ id: 'EN', type: 'BOOL', label: 'EN' }, { id: 'IN', type: 'REAL', label: 'IN' }], outputs: [{ id: 'ENO', type: 'BOOL', label: 'ENO' }, { id: 'OUT', type: 'REAL', label: 'OUT' }] },
 
-  // --- SEÇİM ---
+  // --- SELECTION ---
   SEL: { label: 'SEL', description: 'Binary Select',      inputs: [{ id: 'EN', type: 'BOOL', label: 'EN' }, { id: 'G', type: 'BOOL', label: 'G' }, { id: 'IN0', type: 'DINT', label: 'IN0' }, { id: 'IN1', type: 'DINT', label: 'IN1' }], outputs: [{ id: 'ENO', type: 'BOOL', label: 'ENO' }, { id: 'OUT', type: 'DINT', label: 'OUT' }] },
   MUX: { label: 'MUX', description: '2-to-1 Multiplexer', inputs: [{ id: 'EN', type: 'BOOL', label: 'EN' }, { id: 'K', type: 'USINT', label: 'K' }, { id: 'IN0', type: 'DINT', label: 'IN0' }, { id: 'IN1', type: 'DINT', label: 'IN1' }], outputs: [{ id: 'ENO', type: 'BOOL', label: 'ENO' }, { id: 'OUT', type: 'DINT', label: 'OUT' }] },
 
-  // --- DÖNÜŞTÜRME (TO_BOOL) ---
+  // --- TYPE CONVERSION (TO_BOOL) ---
   BYTE_TO_BOOL:  { label: 'BYTE_TO_BOOL',  description: 'BYTE → BOOL',  inputs: [{ id: 'EN', type: 'BOOL', label: 'EN' }, { id: 'IN', type: 'BYTE',  label: 'IN' }], outputs: [{ id: 'ENO', type: 'BOOL', label: 'ENO' }, { id: 'OUT', type: 'BOOL', label: 'OUT' }] },
   WORD_TO_BOOL:  { label: 'WORD_TO_BOOL',  description: 'WORD → BOOL',  inputs: [{ id: 'EN', type: 'BOOL', label: 'EN' }, { id: 'IN', type: 'WORD',  label: 'IN' }], outputs: [{ id: 'ENO', type: 'BOOL', label: 'ENO' }, { id: 'OUT', type: 'BOOL', label: 'OUT' }] },
   DWORD_TO_BOOL: { label: 'DWORD_TO_BOOL', description: 'DWORD → BOOL', inputs: [{ id: 'EN', type: 'BOOL', label: 'EN' }, { id: 'IN', type: 'DWORD', label: 'IN' }], outputs: [{ id: 'ENO', type: 'BOOL', label: 'ENO' }, { id: 'OUT', type: 'BOOL', label: 'OUT' }] },
@@ -206,7 +206,7 @@ export const PLC_BLOCKS = {
   DINT_TO_BOOL:  { label: 'DINT_TO_BOOL',  description: 'DINT → BOOL',  inputs: [{ id: 'EN', type: 'BOOL', label: 'EN' }, { id: 'IN', type: 'DINT',  label: 'IN' }], outputs: [{ id: 'ENO', type: 'BOOL', label: 'ENO' }, { id: 'OUT', type: 'BOOL', label: 'OUT' }] },
   UDINT_TO_BOOL: { label: 'UDINT_TO_BOOL', description: 'UDINT → BOOL', inputs: [{ id: 'EN', type: 'BOOL', label: 'EN' }, { id: 'IN', type: 'UDINT', label: 'IN' }], outputs: [{ id: 'ENO', type: 'BOOL', label: 'ENO' }, { id: 'OUT', type: 'BOOL', label: 'OUT' }] },
   REAL_TO_BOOL:  { label: 'REAL_TO_BOOL',  description: 'REAL → BOOL',  inputs: [{ id: 'EN', type: 'BOOL', label: 'EN' }, { id: 'IN', type: 'REAL',  label: 'IN' }], outputs: [{ id: 'ENO', type: 'BOOL', label: 'ENO' }, { id: 'OUT', type: 'BOOL', label: 'OUT' }] },
-  // --- DÖNÜŞTÜRME (TO_BYTE) ---
+  // --- CONVERSION (TO_BYTE) ---
   BOOL_TO_BYTE:  { label: 'BOOL_TO_BYTE',  description: 'BOOL → BYTE',  inputs: [{ id: 'EN', type: 'BOOL', label: 'EN' }, { id: 'IN', type: 'BOOL',  label: 'IN' }], outputs: [{ id: 'ENO', type: 'BOOL', label: 'ENO' }, { id: 'OUT', type: 'BYTE', label: 'OUT' }] },
   WORD_TO_BYTE:  { label: 'WORD_TO_BYTE',  description: 'WORD → BYTE',  inputs: [{ id: 'EN', type: 'BOOL', label: 'EN' }, { id: 'IN', type: 'WORD',  label: 'IN' }], outputs: [{ id: 'ENO', type: 'BOOL', label: 'ENO' }, { id: 'OUT', type: 'BYTE', label: 'OUT' }] },
   DWORD_TO_BYTE: { label: 'DWORD_TO_BYTE', description: 'DWORD → BYTE', inputs: [{ id: 'EN', type: 'BOOL', label: 'EN' }, { id: 'IN', type: 'DWORD', label: 'IN' }], outputs: [{ id: 'ENO', type: 'BOOL', label: 'ENO' }, { id: 'OUT', type: 'BYTE', label: 'OUT' }] },
@@ -215,7 +215,7 @@ export const PLC_BLOCKS = {
   DINT_TO_BYTE:  { label: 'DINT_TO_BYTE',  description: 'DINT → BYTE',  inputs: [{ id: 'EN', type: 'BOOL', label: 'EN' }, { id: 'IN', type: 'DINT',  label: 'IN' }], outputs: [{ id: 'ENO', type: 'BOOL', label: 'ENO' }, { id: 'OUT', type: 'BYTE', label: 'OUT' }] },
   UDINT_TO_BYTE: { label: 'UDINT_TO_BYTE', description: 'UDINT → BYTE', inputs: [{ id: 'EN', type: 'BOOL', label: 'EN' }, { id: 'IN', type: 'UDINT', label: 'IN' }], outputs: [{ id: 'ENO', type: 'BOOL', label: 'ENO' }, { id: 'OUT', type: 'BYTE', label: 'OUT' }] },
   REAL_TO_BYTE:  { label: 'REAL_TO_BYTE',  description: 'REAL → BYTE',  inputs: [{ id: 'EN', type: 'BOOL', label: 'EN' }, { id: 'IN', type: 'REAL',  label: 'IN' }], outputs: [{ id: 'ENO', type: 'BOOL', label: 'ENO' }, { id: 'OUT', type: 'BYTE', label: 'OUT' }] },
-  // --- DÖNÜŞTÜRME (TO_WORD) ---
+  // --- CONVERSION (TO_WORD) ---
   BOOL_TO_WORD:  { label: 'BOOL_TO_WORD',  description: 'BOOL → WORD',  inputs: [{ id: 'EN', type: 'BOOL', label: 'EN' }, { id: 'IN', type: 'BOOL',  label: 'IN' }], outputs: [{ id: 'ENO', type: 'BOOL', label: 'ENO' }, { id: 'OUT', type: 'WORD', label: 'OUT' }] },
   BYTE_TO_WORD:  { label: 'BYTE_TO_WORD',  description: 'BYTE → WORD',  inputs: [{ id: 'EN', type: 'BOOL', label: 'EN' }, { id: 'IN', type: 'BYTE',  label: 'IN' }], outputs: [{ id: 'ENO', type: 'BOOL', label: 'ENO' }, { id: 'OUT', type: 'WORD', label: 'OUT' }] },
   DWORD_TO_WORD: { label: 'DWORD_TO_WORD', description: 'DWORD → WORD', inputs: [{ id: 'EN', type: 'BOOL', label: 'EN' }, { id: 'IN', type: 'DWORD', label: 'IN' }], outputs: [{ id: 'ENO', type: 'BOOL', label: 'ENO' }, { id: 'OUT', type: 'WORD', label: 'OUT' }] },
@@ -224,7 +224,7 @@ export const PLC_BLOCKS = {
   DINT_TO_WORD:  { label: 'DINT_TO_WORD',  description: 'DINT → WORD',  inputs: [{ id: 'EN', type: 'BOOL', label: 'EN' }, { id: 'IN', type: 'DINT',  label: 'IN' }], outputs: [{ id: 'ENO', type: 'BOOL', label: 'ENO' }, { id: 'OUT', type: 'WORD', label: 'OUT' }] },
   UDINT_TO_WORD: { label: 'UDINT_TO_WORD', description: 'UDINT → WORD', inputs: [{ id: 'EN', type: 'BOOL', label: 'EN' }, { id: 'IN', type: 'UDINT', label: 'IN' }], outputs: [{ id: 'ENO', type: 'BOOL', label: 'ENO' }, { id: 'OUT', type: 'WORD', label: 'OUT' }] },
   REAL_TO_WORD:  { label: 'REAL_TO_WORD',  description: 'REAL → WORD',  inputs: [{ id: 'EN', type: 'BOOL', label: 'EN' }, { id: 'IN', type: 'REAL',  label: 'IN' }], outputs: [{ id: 'ENO', type: 'BOOL', label: 'ENO' }, { id: 'OUT', type: 'WORD', label: 'OUT' }] },
-  // --- DÖNÜŞTÜRME (TO_DWORD) ---
+  // --- CONVERSION (TO_DWORD) ---
   BOOL_TO_DWORD:  { label: 'BOOL_TO_DWORD',  description: 'BOOL → DWORD',  inputs: [{ id: 'EN', type: 'BOOL', label: 'EN' }, { id: 'IN', type: 'BOOL',  label: 'IN' }], outputs: [{ id: 'ENO', type: 'BOOL', label: 'ENO' }, { id: 'OUT', type: 'DWORD', label: 'OUT' }] },
   BYTE_TO_DWORD:  { label: 'BYTE_TO_DWORD',  description: 'BYTE → DWORD',  inputs: [{ id: 'EN', type: 'BOOL', label: 'EN' }, { id: 'IN', type: 'BYTE',  label: 'IN' }], outputs: [{ id: 'ENO', type: 'BOOL', label: 'ENO' }, { id: 'OUT', type: 'DWORD', label: 'OUT' }] },
   WORD_TO_DWORD:  { label: 'WORD_TO_DWORD',  description: 'WORD → DWORD',  inputs: [{ id: 'EN', type: 'BOOL', label: 'EN' }, { id: 'IN', type: 'WORD',  label: 'IN' }], outputs: [{ id: 'ENO', type: 'BOOL', label: 'ENO' }, { id: 'OUT', type: 'DWORD', label: 'OUT' }] },
@@ -233,7 +233,7 @@ export const PLC_BLOCKS = {
   DINT_TO_DWORD:  { label: 'DINT_TO_DWORD',  description: 'DINT → DWORD',  inputs: [{ id: 'EN', type: 'BOOL', label: 'EN' }, { id: 'IN', type: 'DINT',  label: 'IN' }], outputs: [{ id: 'ENO', type: 'BOOL', label: 'ENO' }, { id: 'OUT', type: 'DWORD', label: 'OUT' }] },
   UDINT_TO_DWORD: { label: 'UDINT_TO_DWORD', description: 'UDINT → DWORD', inputs: [{ id: 'EN', type: 'BOOL', label: 'EN' }, { id: 'IN', type: 'UDINT', label: 'IN' }], outputs: [{ id: 'ENO', type: 'BOOL', label: 'ENO' }, { id: 'OUT', type: 'DWORD', label: 'OUT' }] },
   REAL_TO_DWORD:  { label: 'REAL_TO_DWORD',  description: 'REAL → DWORD',  inputs: [{ id: 'EN', type: 'BOOL', label: 'EN' }, { id: 'IN', type: 'REAL',  label: 'IN' }], outputs: [{ id: 'ENO', type: 'BOOL', label: 'ENO' }, { id: 'OUT', type: 'DWORD', label: 'OUT' }] },
-  // --- DÖNÜŞTÜRME (TO_INT) ---
+  // --- CONVERSION (TO_INT) ---
   BOOL_TO_INT:   { label: 'BOOL_TO_INT',   description: 'BOOL → INT',   inputs: [{ id: 'EN', type: 'BOOL', label: 'EN' }, { id: 'IN', type: 'BOOL',  label: 'IN' }], outputs: [{ id: 'ENO', type: 'BOOL', label: 'ENO' }, { id: 'OUT', type: 'INT', label: 'OUT' }] },
   BYTE_TO_INT:   { label: 'BYTE_TO_INT',   description: 'BYTE → INT',   inputs: [{ id: 'EN', type: 'BOOL', label: 'EN' }, { id: 'IN', type: 'BYTE',  label: 'IN' }], outputs: [{ id: 'ENO', type: 'BOOL', label: 'ENO' }, { id: 'OUT', type: 'INT', label: 'OUT' }] },
   WORD_TO_INT:   { label: 'WORD_TO_INT',   description: 'WORD → INT',   inputs: [{ id: 'EN', type: 'BOOL', label: 'EN' }, { id: 'IN', type: 'WORD',  label: 'IN' }], outputs: [{ id: 'ENO', type: 'BOOL', label: 'ENO' }, { id: 'OUT', type: 'INT', label: 'OUT' }] },
@@ -242,7 +242,7 @@ export const PLC_BLOCKS = {
   DINT_TO_INT:   { label: 'DINT_TO_INT',   description: 'DINT → INT',   inputs: [{ id: 'EN', type: 'BOOL', label: 'EN' }, { id: 'IN', type: 'DINT',  label: 'IN' }], outputs: [{ id: 'ENO', type: 'BOOL', label: 'ENO' }, { id: 'OUT', type: 'INT', label: 'OUT' }] },
   UDINT_TO_INT:  { label: 'UDINT_TO_INT',  description: 'UDINT → INT',  inputs: [{ id: 'EN', type: 'BOOL', label: 'EN' }, { id: 'IN', type: 'UDINT', label: 'IN' }], outputs: [{ id: 'ENO', type: 'BOOL', label: 'ENO' }, { id: 'OUT', type: 'INT', label: 'OUT' }] },
   REAL_TO_INT:   { label: 'REAL_TO_INT',   description: 'REAL → INT',   inputs: [{ id: 'EN', type: 'BOOL', label: 'EN' }, { id: 'IN', type: 'REAL',  label: 'IN' }], outputs: [{ id: 'ENO', type: 'BOOL', label: 'ENO' }, { id: 'OUT', type: 'INT', label: 'OUT' }] },
-  // --- DÖNÜŞTÜRME (TO_UINT) ---
+  // --- CONVERSION (TO_UINT) ---
   BOOL_TO_UINT:  { label: 'BOOL_TO_UINT',  description: 'BOOL → UINT',  inputs: [{ id: 'EN', type: 'BOOL', label: 'EN' }, { id: 'IN', type: 'BOOL',  label: 'IN' }], outputs: [{ id: 'ENO', type: 'BOOL', label: 'ENO' }, { id: 'OUT', type: 'UINT', label: 'OUT' }] },
   BYTE_TO_UINT:  { label: 'BYTE_TO_UINT',  description: 'BYTE → UINT',  inputs: [{ id: 'EN', type: 'BOOL', label: 'EN' }, { id: 'IN', type: 'BYTE',  label: 'IN' }], outputs: [{ id: 'ENO', type: 'BOOL', label: 'ENO' }, { id: 'OUT', type: 'UINT', label: 'OUT' }] },
   WORD_TO_UINT:  { label: 'WORD_TO_UINT',  description: 'WORD → UINT',  inputs: [{ id: 'EN', type: 'BOOL', label: 'EN' }, { id: 'IN', type: 'WORD',  label: 'IN' }], outputs: [{ id: 'ENO', type: 'BOOL', label: 'ENO' }, { id: 'OUT', type: 'UINT', label: 'OUT' }] },
@@ -251,7 +251,7 @@ export const PLC_BLOCKS = {
   DINT_TO_UINT:  { label: 'DINT_TO_UINT',  description: 'DINT → UINT',  inputs: [{ id: 'EN', type: 'BOOL', label: 'EN' }, { id: 'IN', type: 'DINT',  label: 'IN' }], outputs: [{ id: 'ENO', type: 'BOOL', label: 'ENO' }, { id: 'OUT', type: 'UINT', label: 'OUT' }] },
   UDINT_TO_UINT: { label: 'UDINT_TO_UINT', description: 'UDINT → UINT', inputs: [{ id: 'EN', type: 'BOOL', label: 'EN' }, { id: 'IN', type: 'UDINT', label: 'IN' }], outputs: [{ id: 'ENO', type: 'BOOL', label: 'ENO' }, { id: 'OUT', type: 'UINT', label: 'OUT' }] },
   REAL_TO_UINT:  { label: 'REAL_TO_UINT',  description: 'REAL → UINT',  inputs: [{ id: 'EN', type: 'BOOL', label: 'EN' }, { id: 'IN', type: 'REAL',  label: 'IN' }], outputs: [{ id: 'ENO', type: 'BOOL', label: 'ENO' }, { id: 'OUT', type: 'UINT', label: 'OUT' }] },
-  // --- DÖNÜŞTÜRME (TO_DINT) ---
+  // --- CONVERSION (TO_DINT) ---
   BOOL_TO_DINT:  { label: 'BOOL_TO_DINT',  description: 'BOOL → DINT',  inputs: [{ id: 'EN', type: 'BOOL', label: 'EN' }, { id: 'IN', type: 'BOOL',  label: 'IN' }], outputs: [{ id: 'ENO', type: 'BOOL', label: 'ENO' }, { id: 'OUT', type: 'DINT', label: 'OUT' }] },
   BYTE_TO_DINT:  { label: 'BYTE_TO_DINT',  description: 'BYTE → DINT',  inputs: [{ id: 'EN', type: 'BOOL', label: 'EN' }, { id: 'IN', type: 'BYTE',  label: 'IN' }], outputs: [{ id: 'ENO', type: 'BOOL', label: 'ENO' }, { id: 'OUT', type: 'DINT', label: 'OUT' }] },
   WORD_TO_DINT:  { label: 'WORD_TO_DINT',  description: 'WORD → DINT',  inputs: [{ id: 'EN', type: 'BOOL', label: 'EN' }, { id: 'IN', type: 'WORD',  label: 'IN' }], outputs: [{ id: 'ENO', type: 'BOOL', label: 'ENO' }, { id: 'OUT', type: 'DINT', label: 'OUT' }] },
@@ -260,7 +260,7 @@ export const PLC_BLOCKS = {
   UINT_TO_DINT:  { label: 'UINT_TO_DINT',  description: 'UINT → DINT',  inputs: [{ id: 'EN', type: 'BOOL', label: 'EN' }, { id: 'IN', type: 'UINT',  label: 'IN' }], outputs: [{ id: 'ENO', type: 'BOOL', label: 'ENO' }, { id: 'OUT', type: 'DINT', label: 'OUT' }] },
   UDINT_TO_DINT: { label: 'UDINT_TO_DINT', description: 'UDINT → DINT', inputs: [{ id: 'EN', type: 'BOOL', label: 'EN' }, { id: 'IN', type: 'UDINT', label: 'IN' }], outputs: [{ id: 'ENO', type: 'BOOL', label: 'ENO' }, { id: 'OUT', type: 'DINT', label: 'OUT' }] },
   REAL_TO_DINT:  { label: 'REAL_TO_DINT',  description: 'REAL → DINT',  inputs: [{ id: 'EN', type: 'BOOL', label: 'EN' }, { id: 'IN', type: 'REAL',  label: 'IN' }], outputs: [{ id: 'ENO', type: 'BOOL', label: 'ENO' }, { id: 'OUT', type: 'DINT', label: 'OUT' }] },
-  // --- DÖNÜŞTÜRME (TO_UDINT) ---
+  // --- CONVERSION (TO_UDINT) ---
   BOOL_TO_UDINT:  { label: 'BOOL_TO_UDINT',  description: 'BOOL → UDINT',  inputs: [{ id: 'EN', type: 'BOOL', label: 'EN' }, { id: 'IN', type: 'BOOL',  label: 'IN' }], outputs: [{ id: 'ENO', type: 'BOOL', label: 'ENO' }, { id: 'OUT', type: 'UDINT', label: 'OUT' }] },
   BYTE_TO_UDINT:  { label: 'BYTE_TO_UDINT',  description: 'BYTE → UDINT',  inputs: [{ id: 'EN', type: 'BOOL', label: 'EN' }, { id: 'IN', type: 'BYTE',  label: 'IN' }], outputs: [{ id: 'ENO', type: 'BOOL', label: 'ENO' }, { id: 'OUT', type: 'UDINT', label: 'OUT' }] },
   WORD_TO_UDINT:  { label: 'WORD_TO_UDINT',  description: 'WORD → UDINT',  inputs: [{ id: 'EN', type: 'BOOL', label: 'EN' }, { id: 'IN', type: 'WORD',  label: 'IN' }], outputs: [{ id: 'ENO', type: 'BOOL', label: 'ENO' }, { id: 'OUT', type: 'UDINT', label: 'OUT' }] },
@@ -269,7 +269,7 @@ export const PLC_BLOCKS = {
   UINT_TO_UDINT:  { label: 'UINT_TO_UDINT',  description: 'UINT → UDINT',  inputs: [{ id: 'EN', type: 'BOOL', label: 'EN' }, { id: 'IN', type: 'UINT',  label: 'IN' }], outputs: [{ id: 'ENO', type: 'BOOL', label: 'ENO' }, { id: 'OUT', type: 'UDINT', label: 'OUT' }] },
   DINT_TO_UDINT:  { label: 'DINT_TO_UDINT',  description: 'DINT → UDINT',  inputs: [{ id: 'EN', type: 'BOOL', label: 'EN' }, { id: 'IN', type: 'DINT',  label: 'IN' }], outputs: [{ id: 'ENO', type: 'BOOL', label: 'ENO' }, { id: 'OUT', type: 'UDINT', label: 'OUT' }] },
   REAL_TO_UDINT:  { label: 'REAL_TO_UDINT',  description: 'REAL → UDINT',  inputs: [{ id: 'EN', type: 'BOOL', label: 'EN' }, { id: 'IN', type: 'REAL',  label: 'IN' }], outputs: [{ id: 'ENO', type: 'BOOL', label: 'ENO' }, { id: 'OUT', type: 'UDINT', label: 'OUT' }] },
-  // --- DÖNÜŞTÜRME (TO_REAL) ---
+  // --- CONVERSION (TO_REAL) ---
   BOOL_TO_REAL:  { label: 'BOOL_TO_REAL',  description: 'BOOL → REAL',  inputs: [{ id: 'EN', type: 'BOOL', label: 'EN' }, { id: 'IN', type: 'BOOL',  label: 'IN' }], outputs: [{ id: 'ENO', type: 'BOOL', label: 'ENO' }, { id: 'OUT', type: 'REAL', label: 'OUT' }] },
   BYTE_TO_REAL:  { label: 'BYTE_TO_REAL',  description: 'BYTE → REAL',  inputs: [{ id: 'EN', type: 'BOOL', label: 'EN' }, { id: 'IN', type: 'BYTE',  label: 'IN' }], outputs: [{ id: 'ENO', type: 'BOOL', label: 'ENO' }, { id: 'OUT', type: 'REAL', label: 'OUT' }] },
   WORD_TO_REAL:  { label: 'WORD_TO_REAL',  description: 'WORD → REAL',  inputs: [{ id: 'EN', type: 'BOOL', label: 'EN' }, { id: 'IN', type: 'WORD',  label: 'IN' }], outputs: [{ id: 'ENO', type: 'BOOL', label: 'ENO' }, { id: 'OUT', type: 'REAL', label: 'OUT' }] },

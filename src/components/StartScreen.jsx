@@ -121,7 +121,7 @@ const StartScreen = ({ onNewProject, onOpenProject, theme, setTheme }) => {
         {/* Language */}
         <section>
           <h4 style={{ margin: '0 0 12px', fontSize: '12px', textTransform: 'uppercase', letterSpacing: '0.08em', color: '#888' }}>
-            {t('settingsPage.language') || 'Language'}
+            {t('common.language') || 'Language'}
           </h4>
           <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
             {LANGUAGES.map(lang => (

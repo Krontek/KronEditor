@@ -30,7 +30,7 @@ const ESI_DTYPE_BITS = {
   'ULINT': 64, 'LINT': 64,
 };
 
-/** Map ESI data type string → kronec.h KRON_EC_DataType enum value */
+/** Map ESI data type string → kronethercatmaster.h KRON_EC_DataType enum value */
 export const esiDtypeToKron = (dtype) => {
   const u = (dtype || '').toUpperCase();
   if (u === 'BOOL' || u.startsWith('BIT')) return 'KRON_EC_DTYPE_BOOL';

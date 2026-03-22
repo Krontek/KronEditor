@@ -268,3 +268,63 @@ export const LIBRARY_TREE = [
     ]
   }
 ];
+
+// EtherCAT Master function block tree — shown in Toolbox only when an EtherCAT bus is present
+export const ETHERCAT_LIBRARY_TREE = [
+  {
+    id: 'ec_master_ctrl',
+    title: 'Master Control',
+    items: [
+      { blockType: 'EC_Init',  label: 'EC_Init',  desc: 'Initialize EtherCAT master on a network interface',
+        customData: { class: 'FunctionBlock',
+          inputs:  [{ name: 'EN', type: 'BOOL' }, { name: 'Interface', type: 'STRING' }],
+          outputs: [{ name: 'ENO', type: 'BOOL' }, { name: 'Done', type: 'BOOL' }, { name: 'Error', type: 'BOOL' }, { name: 'ErrorID', type: 'INT' }] } },
+      { blockType: 'EC_Close', label: 'EC_Close', desc: 'Release EtherCAT master and close all slaves',
+        customData: { class: 'FunctionBlock',
+          inputs:  [{ name: 'EN', type: 'BOOL' }],
+          outputs: [{ name: 'ENO', type: 'BOOL' }, { name: 'Done', type: 'BOOL' }] } },
+    ]
+  },
+  {
+    id: 'ec_pdo',
+    title: 'PDO Access',
+    items: [
+      { blockType: 'EC_ReadPDO',  label: 'EC_ReadPDO',  desc: 'Read a PDO entry from the IOmap (slave input)',
+        customData: { class: 'FunctionBlock',
+          inputs:  [{ name: 'EN', type: 'BOOL' }, { name: 'Slave', type: 'INT' }, { name: 'Index', type: 'INT' }],
+          outputs: [{ name: 'ENO', type: 'BOOL' }, { name: 'Value', type: 'DWORD' }] } },
+      { blockType: 'EC_WritePDO', label: 'EC_WritePDO', desc: 'Write a PDO entry to the IOmap (slave output)',
+        customData: { class: 'FunctionBlock',
+          inputs:  [{ name: 'EN', type: 'BOOL' }, { name: 'Slave', type: 'INT' }, { name: 'Index', type: 'INT' }, { name: 'Value', type: 'DWORD' }],
+          outputs: [{ name: 'ENO', type: 'BOOL' }] } },
+    ]
+  },
+  {
+    id: 'ec_sdo',
+    title: 'SDO Access',
+    items: [
+      { blockType: 'EC_ReadSDO',  label: 'EC_ReadSDO',  desc: 'Asynchronous SDO upload from slave object dictionary',
+        customData: { class: 'FunctionBlock',
+          inputs:  [{ name: 'Execute', type: 'BOOL' }, { name: 'Slave', type: 'INT' }, { name: 'Index', type: 'WORD' }, { name: 'SubIndex', type: 'BYTE' }],
+          outputs: [{ name: 'Done', type: 'BOOL' }, { name: 'Busy', type: 'BOOL' }, { name: 'Error', type: 'BOOL' }, { name: 'Value', type: 'DWORD' }] } },
+      { blockType: 'EC_WriteSDO', label: 'EC_WriteSDO', desc: 'Asynchronous SDO download to slave object dictionary',
+        customData: { class: 'FunctionBlock',
+          inputs:  [{ name: 'Execute', type: 'BOOL' }, { name: 'Slave', type: 'INT' }, { name: 'Index', type: 'WORD' }, { name: 'SubIndex', type: 'BYTE' }, { name: 'Value', type: 'DWORD' }],
+          outputs: [{ name: 'Done', type: 'BOOL' }, { name: 'Busy', type: 'BOOL' }, { name: 'Error', type: 'BOOL' }] } },
+    ]
+  },
+  {
+    id: 'ec_diag',
+    title: 'Diagnostics',
+    items: [
+      { blockType: 'EC_SlaveStatus',  label: 'EC_SlaveStatus',  desc: 'Read slave state (Init/PreOp/SafeOp/Op) and online flag',
+        customData: { class: 'FunctionBlock',
+          inputs:  [{ name: 'EN', type: 'BOOL' }, { name: 'Slave', type: 'INT' }],
+          outputs: [{ name: 'ENO', type: 'BOOL' }, { name: 'State', type: 'INT' }, { name: 'Online', type: 'BOOL' }] } },
+      { blockType: 'EC_MasterStatus', label: 'EC_MasterStatus', desc: 'Read master state and total online slave count',
+        customData: { class: 'FunctionBlock',
+          inputs:  [{ name: 'EN', type: 'BOOL' }],
+          outputs: [{ name: 'ENO', type: 'BOOL' }, { name: 'State', type: 'INT' }, { name: 'SlaveCount', type: 'INT' }] } },
+    ]
+  },
+];

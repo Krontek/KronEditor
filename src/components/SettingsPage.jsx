@@ -8,6 +8,7 @@ import { readTextFile } from '@tauri-apps/plugin-fs';
 const KRON_REPOS = [
     'KronStandard', 'KronControl', 'KronCompare', 'KronConverter',
     'KronMathematic', 'KronCommunication', 'KronLogic', 'KronMotion',
+    'KronEthercatMaster',
 ];
 
 const SettingsPage = ({ theme, setTheme, editorSettings, setEditorSettings, selectedBoard, plcAddress, setPlcAddress, sshUser: sshUserProp, setSshUser: setSshUserProp, sshPort: sshPortProp, setSshPort: setSshPortProp, isPlcConnected, setConnectionEnabled, esiLibrary = [], onLoadEsiFile }) => {
@@ -106,6 +107,34 @@ const SettingsPage = ({ theme, setTheme, editorSettings, setEditorSettings, sele
         unlistenRef.current = { progress: unlistenProgress, done: unlistenDone };
 
         invoke('update_libraries', { repos: selectedRepos }).catch(err => {
+            setProgressLog(prev => prev + 'Error: ' + err + '\n');
+            setIsUpdating(false);
+            unlistenProgress();
+            unlistenDone();
+            unlistenRef.current = null;
+        });
+    };
+
+    const handleBuildCanopen = async () => {
+        setIsUpdating(true);
+        setProgressLog('Starting CANopen build (cloning + compiling for all toolchains)...\n');
+
+        const unlistenProgress = await listen('library-update-progress', (event) => {
+            setProgressLog(prev => prev + event.payload + '\n');
+        });
+
+        const unlistenDone = await listen('library-update-done', (event) => {
+            const { success, message } = event.payload;
+            setProgressLog(prev => prev + (success ? '✓ ' : '✗ ') + message + '\n');
+            setIsUpdating(false);
+            unlistenProgress();
+            unlistenDone();
+            unlistenRef.current = null;
+        });
+
+        unlistenRef.current = { progress: unlistenProgress, done: unlistenDone };
+
+        invoke('build_canopen').catch(err => {
             setProgressLog(prev => prev + 'Error: ' + err + '\n');
             setIsUpdating(false);
             unlistenProgress();
@@ -255,7 +284,7 @@ const SettingsPage = ({ theme, setTheme, editorSettings, setEditorSettings, sele
         { id: 'general', label: t('settingsPage.general'), icon: '⚙️' },
         { id: 'editor', label: t('settingsPage.editor'), icon: '📝' },
         { id: 'connection', label: t('settingsPage.connection', 'Connection'), icon: '🔌' },
-        { id: 'fieldbus', label: 'Fieldbus', icon: '⬡' },
+        { id: 'fieldbus', label: 'Fieldbus', icon: '⊕' },
         ...(import.meta.env.DEV ? [{ id: 'libraries', label: 'Libraries', icon: '📦' }] : []),
         { id: 'about', label: t('settingsPage.about'), icon: 'ℹ️' }
     ];
@@ -639,12 +668,29 @@ const SettingsPage = ({ theme, setTheme, editorSettings, setEditorSettings, sele
                                 border: 'none',
                                 borderRadius: '4px',
                                 cursor: isUpdating ? 'not-allowed' : 'pointer',
-                                marginBottom: '16px',
+                                marginBottom: '8px',
                                 width: '100%',
                                 fontSize: '14px'
                             }}
                         >
                             Build SOEM
+                        </button>
+                        <button
+                            onClick={handleBuildCanopen}
+                            disabled={isUpdating}
+                            style={{
+                                padding: '10px 20px',
+                                backgroundColor: isUpdating ? '#444' : '#0d47a1',
+                                color: '#fff',
+                                border: 'none',
+                                borderRadius: '4px',
+                                cursor: isUpdating ? 'not-allowed' : 'pointer',
+                                marginBottom: '16px',
+                                width: '100%',
+                                fontSize: '14px'
+                            }}
+                        >
+                            Build CANopen
                         </button>
                         {progressLog && (
                             <textarea
