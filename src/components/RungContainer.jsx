@@ -73,6 +73,67 @@ const TerminalConnectionPoint = ({ data, isConnectable }) => {
   );
 };
 
+const NUMERIC_FAMILY_TYPES = new Set(['SINT', 'INT', 'DINT', 'LINT', 'USINT', 'UINT', 'UDINT', 'ULINT', 'REAL', 'LREAL', 'BYTE', 'WORD', 'DWORD', 'LWORD']);
+const INTEGER_FAMILY_TYPES = new Set(['SINT', 'INT', 'DINT', 'LINT', 'USINT', 'UINT', 'UDINT', 'ULINT', 'BYTE', 'WORD', 'DWORD', 'LWORD']);
+const REAL_FAMILY_TYPES = new Set(['REAL', 'LREAL']);
+const BIT_FAMILY_TYPES = new Set(['BOOL', 'BYTE', 'WORD', 'DWORD', 'LWORD']);
+const STRING_FAMILY_TYPES = new Set(['STRING', 'WSTRING']);
+
+const normalizePinTypeLabel = (rawType) => rawType === 'PVOID' ? 'POINTER' : rawType;
+
+const getVisiblePinType = (pinDef) => {
+  const normalized = normalizePinTypeLabel(pinDef?.type);
+  const storageType = normalizePinTypeLabel(pinDef?.storageType || pinDef?.type);
+  if (pinDef?.editorType) return pinDef.editorType;
+  if (pinDef?.acceptsType) return pinDef.acceptsType;
+  if ((pinDef?.passByReference || storageType === 'POINTER') && normalized.startsWith('ANY')) return `${normalized}*`;
+  if (pinDef?.passByReference && normalized === 'POINTER') return 'ANY*';
+  if (normalized === 'POINTER') return 'ANY*';
+  return normalized;
+};
+
+const isPassByReferencePin = (pinDef) => !!pinDef?.passByReference || normalizePinTypeLabel(pinDef?.storageType || pinDef?.type) === 'POINTER';
+
+const normalizeEditorPinType = (rawType) => {
+  if (!rawType) return 'ANY';
+  const normalized = normalizePinTypeLabel(rawType).replace(/\*$/, '');
+  if (normalized.endsWith('_PORT')) return 'USINT';
+  if (normalized === 'POINTER') return 'ANY';
+  return normalized;
+};
+
+const matchTypeFamily = (candidateType, expectedType) => {
+  const candidate = normalizeEditorPinType(candidateType);
+  const expected = normalizeEditorPinType(expectedType);
+  const isDerivedType = (type) => {
+    const normalized = normalizeEditorPinType(type);
+    return !!normalized && !normalized.startsWith('ANY') &&
+      !NUMERIC_FAMILY_TYPES.has(normalized) &&
+      !BIT_FAMILY_TYPES.has(normalized) &&
+      !STRING_FAMILY_TYPES.has(normalized) &&
+      normalized !== 'BOOL' &&
+      normalized !== 'TIME' &&
+      normalized !== 'DATE' &&
+      normalized !== 'TOD' &&
+      normalized !== 'DT';
+  };
+
+  if (candidate === expected || candidate === 'ANY' || expected === 'ANY') return true;
+  if (expected === 'ANY_NUM') return NUMERIC_FAMILY_TYPES.has(candidate);
+  if (candidate === 'ANY_NUM') return NUMERIC_FAMILY_TYPES.has(expected);
+  if (expected === 'ANY_INT') return INTEGER_FAMILY_TYPES.has(candidate);
+  if (candidate === 'ANY_INT') return INTEGER_FAMILY_TYPES.has(expected);
+  if (expected === 'ANY_REAL') return REAL_FAMILY_TYPES.has(candidate);
+  if (candidate === 'ANY_REAL') return REAL_FAMILY_TYPES.has(expected);
+  if (expected === 'ANY_BIT') return BIT_FAMILY_TYPES.has(candidate);
+  if (candidate === 'ANY_BIT') return BIT_FAMILY_TYPES.has(expected);
+  if (expected === 'ANY_STRING') return STRING_FAMILY_TYPES.has(candidate);
+  if (candidate === 'ANY_STRING') return STRING_FAMILY_TYPES.has(expected);
+  if (expected === 'ANY_DERIVED') return isDerivedType(candidate);
+  if (candidate === 'ANY_DERIVED') return isDerivedType(expected);
+  return false;
+};
+
 // Block Configuration and Type Definitions
 export const blockConfig = {
   TON: {
@@ -675,11 +736,16 @@ const BlockNode = ({ id, data, isConnectable, selected }) => {
       label: data.type,
       inputs: data.customData.inputs
         .filter(i => i.name !== 'EN')
-        .map(i => ({ name: i.name, type: i.type })),
+        .map(i => ({
+          name: i.name,
+          type: getVisiblePinType(i),
+          storageType: normalizePinTypeLabel(i.storageType || i.type),
+          passByReference: isPassByReferencePin(i)
+        })),
       outputs: data.customData.outputs
         ? data.customData.outputs
             .filter(o => o.name !== 'ENO')
-            .map(o => ({ name: o.name, type: o.type }))
+            .map(o => ({ name: o.name, type: getVisiblePinType(o) }))
         : []
     };
   } else {
@@ -739,6 +805,11 @@ const BlockNode = ({ id, data, isConnectable, selected }) => {
   const effectiveOutputs = data.executionControl
     ? [{ name: 'ENO', type: 'BOOL' }, ...cfg.outputs]
     : cfg.outputs;
+
+  const getPinSuggestionList = (pin) => {
+    const normalizedType = normalizeEditorPinType(pin.type);
+    return normalizedType === 'ANY' ? 'ladder-vars-ANY' : `ladder-vars-${normalizedType}`;
+  };
 
   // Instance Name (Header)
   const instanceName = data.instanceName || `${data.type}_1`;
@@ -804,8 +875,7 @@ const BlockNode = ({ id, data, isConnectable, selected }) => {
       }}>
         {instanceName}
       </div>
-      <div style={{ background: isBoardBlock ? '#00695c' : '#0d47a1', padding: '4px 8px', textAlign: 'center', fontWeight: 'bold' }}
-        title={isBoardBlock && data.customData?.desc ? data.customData.desc : undefined}>
+      <div style={{ background: isBoardBlock ? '#00695c' : '#0d47a1', padding: '4px 8px', textAlign: 'center', fontWeight: 'bold' }}>
         {cfg.label}
       </div>
 
@@ -818,7 +888,8 @@ const BlockNode = ({ id, data, isConnectable, selected }) => {
           {effectiveInputs.map((pin) => {
             const handleId = `in_${pin.name}`;
             const connected = isHandleConnected(handleId, 'target');
-            const isTime = pin.type === 'TIME';
+            const normalizedPinType = normalizeEditorPinType(pin.type);
+            const isTime = normalizedPinType === 'TIME';
             const val = data.values?.[pin.name] || '';
 
             const safeProgName = (data.parentName || "").trim().replace(/\s+/g, '_');
@@ -834,8 +905,10 @@ const BlockNode = ({ id, data, isConnectable, selected }) => {
             const cleanVal = val.replace(/[🌍🏠⊞⊡⊟]/g, '').trim();
             const baseValName = cleanVal.split(/[\[.]/)[0];
             const valVarDef = [...variables, ...globalVars].find(v => v.name === baseValName);
+            const allowsWholeArrayRef = !!pin.passByReference;
             const isArrayWithoutIndex = valVarDef && arrayTypeMap[valVarDef.type] && !cleanVal.includes('[');
-            const isValid = !isArrayWithoutIndex && (!isTime || !val || TIME_FORMAT_REGEX.test(val));
+            const isInvalidWholeArrayUsage = isArrayWithoutIndex && !allowsWholeArrayRef;
+            const isValid = !isInvalidWholeArrayUsage && (!isTime || !val || TIME_FORMAT_REGEX.test(val));
             // Literal value: starts with digit, sign, T#, 0x/0b/0o, or true/false — not a variable ref
             const isLiteralVal = cleanVal && !/^[A-Za-z_]/.test(cleanVal);
 
@@ -881,7 +954,7 @@ const BlockNode = ({ id, data, isConnectable, selected }) => {
                               forceCurrent = liveVariables?.[forceKey];
                               forceName = cleanedVal;
                             }
-                            const modalVarType = pin.type === 'TIME' ? 'INT' : (pin.type === 'ANY' ? 'INT' : pin.type);
+                            const modalVarType = normalizedPinType === 'TIME' ? 'INT' : (normalizedPinType === 'ANY' ? 'INT' : normalizedPinType);
                             setForceModal({ liveKey: forceKey, varName: forceName, varType: modalVarType, currentValue: forceCurrent });
                           }}
                           style={{
@@ -910,7 +983,7 @@ const BlockNode = ({ id, data, isConnectable, selected }) => {
                       type="text"
                       className="nodrag"
                       value={localPinValues[pin.name] !== undefined ? localPinValues[pin.name] : (val || '')}
-                      list={data.readOnly ? undefined : (pin.type === 'ANY' ? "ladder-vars-ANY" : `ladder-vars-${pin.type}`)}
+                      list={data.readOnly ? undefined : getPinSuggestionList(pin)}
                       readOnly={!!data.readOnly}
                       onDoubleClick={(e) => e.stopPropagation()}
                       onClick={(e) => {
@@ -928,7 +1001,7 @@ const BlockNode = ({ id, data, isConnectable, selected }) => {
                           forceCurrent = liveVariables?.[forceKey];
                           forceName = cleanedVal;
                         }
-                        const modalVarType = pin.type === 'TIME' ? 'INT' : (pin.type === 'ANY' ? 'INT' : pin.type);
+                        const modalVarType = normalizedPinType === 'TIME' ? 'INT' : (normalizedPinType === 'ANY' ? 'INT' : normalizedPinType);
                         setForceModal({ liveKey: forceKey, varName: forceName, varType: modalVarType, currentValue: forceCurrent });
                       }}
                       onChange={(e) => {
@@ -1084,7 +1157,7 @@ const BlockNode = ({ id, data, isConnectable, selected }) => {
                       type="text"
                       className="nodrag"
                       value={localPinValues[pin.name] !== undefined ? localPinValues[pin.name] : val}
-                      list={data.readOnly ? undefined : (pin.type === 'ANY' ? "ladder-vars-ANY" : `ladder-vars-${pin.type}`)}
+                      list={data.readOnly ? undefined : getPinSuggestionList(pin)}
                       readOnly={!!data.readOnly}
                       onDoubleClick={(e) => e.stopPropagation()}
                       onChange={(e) => {
@@ -1163,6 +1236,7 @@ const RungContainer = ({
   parentName = "",
   readOnly = false,
   onForceWrite,
+  hwPortVars = [],
   isFocused = false,
   onFocusRung,
   onInsertAbove,
@@ -1287,14 +1361,15 @@ const RungContainer = ({
           dataTypes: dataTypes,
           liveVariables: liveVariables, // Pass online mode data mapping
           parentName: parentName,
-          readOnly: readOnly
+          readOnly: readOnly,
+          hwPortVars: hwPortVars
         },
         draggable: !readOnly,
         selected: !!selectedMap[block.id],
         extent: [[bounds.minX, 0], [bounds.maxX, RUNG_HEIGHT]] // Fully relaxed Y constraint
       };
     });
-  }, [getBlockHeight, variables, globalVars, dataTypes, liveVariables, parentName, readOnly, RUNG_HEIGHT]);
+  }, [getBlockHeight, variables, globalVars, dataTypes, liveVariables, parentName, readOnly, hwPortVars, RUNG_HEIGHT]);
 
   const [nodes, setNodes, onNodesChange] = useNodesState([
     ...createTerminalNodes(containerWidth),
@@ -1807,49 +1882,46 @@ const RungContainer = ({
     if (isTargetTerminal && targetNode.data.position !== 'right') return false; // Left terminal target olamaz
 
     // 2. TYPE CHECK
-    const sourceType = isSourceTerminal ? 'BOOL' : (() => {
-      if (!connection.sourceHandle) return 'ANY';
-      const pinIndex = parseInt(connection.sourceHandle.split('_')[1]);
+    const getBlockPinType = (node, handle, direction) => {
+      if (!handle) return 'ANY';
+      const pinIndex = parseInt(handle.split('_')[1]);
+      const pinListKey = direction === 'input' ? 'inputs' : 'outputs';
+      const flowPin = direction === 'input' ? 'EN' : 'ENO';
 
-      // Dynamic output adjustment for ENO
-      if (sourceNode.data.executionControl) {
-        if (pinIndex === 0) return 'BOOL'; // ENO pin
-        const config = blockConfig[sourceNode.data.type];
-        return config?.outputs[pinIndex - 1]?.type || 'ANY';
+      if (node.data.customData?.[pinListKey]) {
+        const pins = (node.data.customData[pinListKey] || [])
+          .filter((pin) => pin.name !== flowPin)
+          .map((pin) => getVisiblePinType(pin));
+        if (node.data.executionControl) {
+          if (pinIndex === 0) return 'BOOL';
+          return pins[pinIndex - 1] || 'ANY';
+        }
+        return pins[pinIndex] || 'ANY';
       }
 
-      const config = blockConfig[sourceNode.data.type];
-      return config?.outputs[pinIndex]?.type || 'ANY';
+      const config = blockConfig[node.data.type];
+      if (node.data.executionControl) {
+        if (pinIndex === 0) return 'BOOL';
+        return config?.[pinListKey]?.[pinIndex - 1]?.type || 'ANY';
+      }
+      return config?.[pinListKey]?.[pinIndex]?.type || 'ANY';
+    };
+
+    const sourceType = isSourceTerminal ? 'BOOL' : (() => {
+      return getBlockPinType(sourceNode, connection.sourceHandle, 'output');
     })();
 
     const targetType = isTargetTerminal ? 'BOOL' : (() => {
-      if (!connection.targetHandle) return 'ANY';
-      const pinIndex = parseInt(connection.targetHandle.split('_')[1]);
-
-      // Dynamic input adjustment for EN
-      if (targetNode.data.executionControl) {
-        if (pinIndex === 0) return 'BOOL'; // EN pin
-        const config = blockConfig[targetNode.data.type];
-        return config?.inputs[pinIndex - 1]?.type || 'ANY';
-      }
-
-      const config = blockConfig[targetNode.data.type];
-      return config?.inputs[pinIndex]?.type || 'ANY';
+      return getBlockPinType(targetNode, connection.targetHandle, 'input');
     })();
 
-    if (sourceType !== targetType && sourceType !== 'ANY' && targetType !== 'ANY') {
-      // ANY_NUM accepts any numeric type
-      const NUMERIC_TYPES = ['INT', 'UINT', 'SINT', 'USINT', 'DINT', 'UDINT', 'REAL', 'LREAL', 'BYTE', 'WORD', 'DWORD', 'ANY_NUM'];
-      const srcIsNum = NUMERIC_TYPES.includes(sourceType);
-      const tgtIsNum = NUMERIC_TYPES.includes(targetType);
-      if (srcIsNum && tgtIsNum) return true;
-
+    if (!matchTypeFamily(sourceType, targetType)) {
       console.warn(`Type Mismatch: ${sourceType} -> ${targetType}`);
       return false;
     }
 
     return true;
-  }, [getNode, blockConfig]);
+  }, [getNode, blockConfig, getVisiblePinType, matchTypeFamily]);
 
   // Throttled Drag Handler (24 FPS ~= 40ms)
   const lastDragTimeRef = useRef(0);

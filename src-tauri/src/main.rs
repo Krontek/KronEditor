@@ -308,13 +308,23 @@ fn get_standard_headers(app: tauri::AppHandle) -> Result<Vec<(String, String)>, 
     // SOEM, CANopen, wpcap, and other third-party headers are accessed via compiler -I paths
     // and must NOT be included directly in plc.h via customIncludes — they require
     // specific include ordering and platform-specific prerequisites.
+    // Board-specific HAL implementation headers are conditionally included
+    // by kronhal.h itself — they must never be passed to the JS transpiler
+    // for direct #include generation, as that would cause redefinition errors
+    // when both kronhal.h and the board header are compiled together.
+    let hal_impl_headers: std::collections::HashSet<&str> = [
+        "kronhal_rpi.h", "kronhal_bb.h", "kronhal_jetson.h",
+        "kronhal_pico.h", "kronhal_sim.h",
+    ].iter().copied().collect();
+
     if let Ok(resource_dir) = get_resource_dir(&app) {
         let include_dir = resource_dir.join("resources/include");
         if let Ok(entries) = fs::read_dir(&include_dir) {
             for entry in entries.flatten() {
                 if let Some(name) = entry.file_name().to_str() {
                     let is_kron = name.starts_with("kron") && name.ends_with(".h");
-                    let is_allowed = is_kron || name == "gpiod.h";
+                    let is_allowed = (is_kron || name == "gpiod.h")
+                        && !hal_impl_headers.contains(name);
                     if is_allowed {
                         if let Ok(content) = fs::read_to_string(entry.path()) {
                             headers.push((name.to_string(), content));
@@ -908,8 +918,8 @@ fn compile_for_target(
     source: String,
     variable_table: String,
     board_id: String,
-    di_count: Option<u8>,
-    do_count: Option<u8>,
+    _di_count: Option<u8>,
+    _do_count: Option<u8>,
 ) -> Result<String, String> {
     let resource_dir = get_resource_dir(&app)?;
     let build_dir = plain_path(&get_build_dir(&app)?);
@@ -964,12 +974,6 @@ fn compile_for_target(
     if board_id == "rpi_5" {
         // RPi 5 uses /dev/gpiochip4 (RP1 chip) instead of the default gpiochip0
         cmd.arg(r#"-DKRON_GPIO_CHIP="/dev/gpiochip4""#);
-    }
-    if board_id.starts_with("edatec_") {
-        let di = di_count.unwrap_or(8);
-        let do_ = do_count.unwrap_or(8);
-        cmd.arg(format!("-DKRON_DI_COUNT={}", di));
-        cmd.arg(format!("-DKRON_DO_COUNT={}", do_));
     }
     // Jetson: all models use /dev/gpiochip0 by default (same as RPi).
     // Static linking (-static above) is sufficient — kronhal_jetson.h uses
@@ -1105,9 +1109,9 @@ fn deploy_server_to_target(
     // Select the right binary based on board
     let binary_name = if board_id.starts_with("rpi_pico") {
         return Err("Pico targets do not support remote server deployment".into());
-    } else if board_id.starts_with("rpi_") || board_id.starts_with("edatec_")
+    } else if board_id.starts_with("rpi_")
             || board_id == "bb_ai64" || board_id.starts_with("jetson_") {
-        // aarch64: all RPi Linux boards + Edatec IPC + BeagleBone AI-64 + NVIDIA Jetson
+        // aarch64: all RPi Linux boards + BeagleBone AI-64 + NVIDIA Jetson
         "plc-agent_linux_arm64"
     } else if board_id.starts_with("bb_") {
         // armv7: BeagleBone Black / Green / AI

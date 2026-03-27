@@ -1,6 +1,5 @@
 import React, { useState, useEffect } from 'react';
 import { useTranslation } from 'react-i18next';
-
 const BlockSettingsModal = ({ isOpen, onClose, blockData, onSave, blockConfig, variables = [], globalVars = [] }) => {
     const { t } = useTranslation();
     const [instanceName, setInstanceName] = useState('');
@@ -15,25 +14,35 @@ const BlockSettingsModal = ({ isOpen, onClose, blockData, onSave, blockConfig, v
         }
     }, [isOpen, blockData]);
 
+    const cleanVal = (val) => val.replace(/[🌍🏠⚙]\s*/g, '').trim();
+
     if (!isOpen || !blockData) return null;
 
     const isContact = blockData.type === 'Contact';
     const isCoil = blockData.type === 'Coil';
     const isFunctionBlock = !isContact && !isCoil;
+    const normalizePinType = (rawType) => rawType === 'PVOID' ? 'POINTER' : rawType;
+    const getVisiblePinType = (pinDef) => {
+        const normalized = normalizePinType(pinDef?.type);
+        const storageType = normalizePinType(pinDef?.storageType || pinDef?.type);
+        if (pinDef?.editorType) return pinDef.editorType;
+        if (pinDef?.acceptsType) return pinDef.acceptsType;
+        if ((pinDef?.passByReference || storageType === 'POINTER') && normalized.startsWith('ANY')) return `${normalized}*`;
+        if (pinDef?.passByReference && normalized === 'POINTER') return 'ANY*';
+        if (normalized === 'POINTER') return 'ANY*';
+        return normalized;
+    };
 
     let config = blockConfig[blockData.type];
-    let blockDesc = null;
-
     // Dynamic config for Board/HAL blocks (customData has inputs/outputs directly)
     if (blockData.customData && blockData.customData.inputs) {
         config = {
             label: blockData.type,
-            inputs: blockData.customData.inputs.map(i => ({ name: i.name, type: i.type })),
+            inputs: blockData.customData.inputs.map(i => ({ name: i.name, type: getVisiblePinType(i) })),
             outputs: blockData.customData.outputs
-                ? blockData.customData.outputs.map(o => ({ name: o.name, type: o.type }))
+                ? blockData.customData.outputs.map(o => ({ name: o.name, type: getVisiblePinType(o) }))
                 : []
         };
-        blockDesc = blockData.customData.desc || null;
     // Dynamic config for User Defined Blocks
     } else if (blockData.customData && blockData.customData.content) {
         const variables = blockData.customData.content?.variables || [];
@@ -62,11 +71,10 @@ const BlockSettingsModal = ({ isOpen, onClose, blockData, onSave, blockConfig, v
             instanceName,
             executionControl: isFunctionBlock ? executionControl : false,
             subType: (isContact || isCoil) ? subType : undefined,
-            // Variables for Contact/Coil
             values: {
                 ...blockData.values,
                 ...(isContact ? { var: instanceName } : {}),
-                ...(isCoil ? { coil: instanceName } : {})
+                ...(isCoil ? { coil: instanceName } : {}),
             }
         };
         onSave(blockData.id, newData);
@@ -111,10 +119,7 @@ const BlockSettingsModal = ({ isOpen, onClose, blockData, onSave, blockConfig, v
                         list="var-suggestions"
                         type="text"
                         value={instanceName}
-                        onChange={(e) => {
-                            const val = e.target.value.replace(/[🌍🏠]/g, '').trim();
-                            setInstanceName(val);
-                        }}
+                        onChange={(e) => setInstanceName(cleanVal(e.target.value))}
                         style={{
                             width: '100%',
                             padding: '8px',
@@ -184,11 +189,6 @@ const BlockSettingsModal = ({ isOpen, onClose, blockData, onSave, blockConfig, v
                         <h4 style={{ fontSize: '12px', color: '#888', textTransform: 'uppercase', marginBottom: '10px' }}>
                             {t('common.pinInformation')}
                         </h4>
-                        {(blockDesc || config.descriptionKey) && (
-                            <div style={{ background: '#1a2a1a', border: '1px solid #2a4a2a', borderRadius: '4px', padding: '8px 10px', marginBottom: '8px', fontSize: '12px', color: '#a0d0a0', lineHeight: '1.4' }}>
-                                {blockDesc || t(config.descriptionKey)}
-                            </div>
-                        )}
                         <div style={{ background: '#1e1e1e', padding: '10px', borderRadius: '4px', fontSize: '12px' }}>
                             <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '10px', marginBottom: '5px', fontWeight: 'bold' }}>
                                 <span>{t('common.pin')}</span>

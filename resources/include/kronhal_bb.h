@@ -59,6 +59,18 @@ static inline void HAL_I2C_Write_Call(HAL_I2C_Write *inst, uint8_t ch) {
     inst->ENO = inst->EN;
     inst->OK = inst->EN;
 }
+static inline void HAL_I2C_BurstRead_Call(HAL_I2C_BurstRead *inst, uint8_t ch) {
+    (void)ch;
+    inst->ENO = inst->EN; inst->OK = false; inst->ERR_ID = 1; /* TODO: /dev/i2c-N */
+}
+static inline void HAL_I2C_BurstWrite_Call(HAL_I2C_BurstWrite *inst, uint8_t ch) {
+    (void)ch;
+    inst->ENO = inst->EN; inst->OK = false; inst->ERR_ID = 1; /* TODO: /dev/i2c-N */
+}
+static inline void HAL_SPI_BurstTransfer_Call(HAL_SPI_BurstTransfer *inst, uint8_t ch) {
+    (void)ch;
+    inst->ENO = inst->EN; inst->DONE = false; inst->ERR_ID = 1; /* TODO: /dev/spidevN.M */
+}
 
 /* UART
  *   UART0 = /dev/ttyS0  (console — avoid in production)

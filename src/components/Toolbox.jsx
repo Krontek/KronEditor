@@ -1,7 +1,7 @@
 import React, { useState, useMemo, useRef } from 'react';
 import EtherCATIconSrc from '../assets/icons/ethercat.png';
 import { PLC_BLOCKS } from '../utils/plcStandards';
-import { LIBRARY_TREE, ETHERCAT_LIBRARY_TREE } from '../utils/libraryTree';
+import { LIBRARY_TREE, ETHERCAT_LIBRARY_TREE, GENERIC_FB_DEFS } from '../utils/libraryTree';
 import { getBoardLibraryTree } from '../utils/boardLibraryBlocks';
 import { getBoardFamily } from '../utils/boardDefinitions';
 import DragDropManager from '../utils/DragDropManager';
@@ -94,7 +94,7 @@ const buildGhostHTML = (blockType, subType, label, customData) => {
 
 // ─── ToolboxItem ──────────────────────────────────────────────────────────────
 
-const ToolboxItem = ({ blockType, subType, label, desc, color, customData }) => {
+const ToolboxItem = ({ blockType, subType, label, color, customData }) => {
   const ghostRef = useRef(null);
   const listenerRef = useRef(null);
 
@@ -171,7 +171,6 @@ const ToolboxItem = ({ blockType, subType, label, desc, color, customData }) => 
       draggable
       onDragStart={onDragStart}
       onDragEnd={onDragEnd}
-      title={desc || ''}
       style={{
         padding: '6px 10px',
         margin: '3px 0 3px 0',
@@ -199,14 +198,44 @@ const COIL_COLOR = '#8b3a0f'; // coils (brown-red)
 const BOARD_COLOR = '#00695c'; // board-specific blocks (teal)
 const EC_COLOR    = '#1565c0'; // EtherCAT blocks (blue)
 
-const Toolbox = ({ userDefinedBlocks = [], libraryData = [], activeFileType, selectedBoard, buses = [] }) => {
+const COMM_PROTO_BLOCKS = {
+  UART: ['UART_Send', 'UART_Receive'],
+  I2C:  ['I2C_WriteRead'],
+  SPI:  ['SPI_Transfer'],
+};
+
+const Toolbox = ({ userDefinedBlocks = [], libraryData = [], activeFileType, selectedBoard, buses = [], interfaceConfig = {} }) => {
   const hasEtherCAT = buses.some(b => b.type === 'ethercat');
   // expand state: category-level and subcategory-level
   const [expandedCats, setExpandedCats] = useState({});
   const [expandedSubs, setExpandedSubs] = useState({});
 
   const blockMap = useMemo(() => buildBlockMap(libraryData), [libraryData]);
-  const boardTree = useMemo(() => getBoardLibraryTree(selectedBoard), [selectedBoard]);
+
+  const boardTree = useMemo(() => {
+    const tree = getBoardLibraryTree(selectedBoard);
+    // Append subcategories for each enabled comm protocol
+    for (const proto of ['UART', 'I2C', 'SPI']) {
+      const ports = interfaceConfig[proto];
+      const hasEnabled = ports && Object.values(ports).some(p => p?.enabled);
+      if (!hasEnabled) continue;
+      const blockTypes = COMM_PROTO_BLOCKS[proto];
+      tree.push({
+        id: `board_comm_${proto.toLowerCase()}`,
+        title: proto,
+        items: blockTypes.map(blockType => {
+          const def = GENERIC_FB_DEFS[blockType];
+          return {
+            blockType,
+            label: blockType,
+            desc: def?.inputs?.find(i => i.name === 'Port_ID')?.desc || '',
+            customData: { inputs: def?.inputs || [], outputs: def?.outputs || [], class: def?.class || 'FunctionBlock' },
+          };
+        }),
+      });
+    }
+    return tree;
+  }, [selectedBoard, interfaceConfig]);
 
   const toggleCat = (id) => setExpandedCats(prev => ({ ...prev, [id]: !prev[id] }));
   const toggleSub = (id) => setExpandedSubs(prev => ({ ...prev, [id]: !prev[id] }));

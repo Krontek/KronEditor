@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useMemo } from 'react';
 import { lazy, Suspense } from 'react';
 const EtherCATEditor = lazy(() => import('./components/EtherCATEditor'));
 import EditorPane from './components/EditorPane';
@@ -18,6 +18,8 @@ import EditorTabs from './components/EditorTabs';
 import SaveConfirmDialog from './components/SaveConfirmDialog';
 import VisualizationEditor from './components/visualization/VisualizationEditor';
 import { getBoardById } from './utils/boardDefinitions';
+import { getBoardFamilyDefine } from './utils/devicePortMapping';
+import { buildHardwarePortVars } from './utils/hwPortVars';
 import ArrayTypeEditor from './components/ArrayTypeEditor';
 import StructureTypeEditor from './components/StructureTypeEditor';
 import EnumTypeEditor from './components/EnumTypeEditor';
@@ -426,7 +428,7 @@ function App() {
 
   const SPECIAL_TABS = {
     'SETTINGS':     { label: 'Settings',       icon: '⚙️' },
-    'BOARD_CONFIG': { label: 'Board Config',    icon: '🔧' },
+    'BOARD_CONFIG': { label: 'Devices',         icon: '🖥' },
     'TASK_MANAGER': { label: 'Task Manager',    icon: '⏱' },
     'VISUALIZATION':{ label: 'Visualization',   icon: '📊' },
   };
@@ -1351,6 +1353,30 @@ function App() {
   };
 
   const activeItem = getActiveItem();
+  const deviceInterfaceConfig =
+    projectStructure.resources?.find(r => r.id === 'res_config')?.content?.deviceInterfaceConfig || {};
+
+  const hwPortVars = useMemo(
+    () => buildHardwarePortVars(deviceInterfaceConfig, getBoardFamilyDefine(selectedBoard)),
+    [deviceInterfaceConfig, selectedBoard]
+  );
+
+  const handleDeviceInterfaceConfigChange = useCallback((nextConfig) => {
+    setProjectStructure(prev => ({
+      ...prev,
+      resources: (prev.resources || []).map(resource =>
+        resource.id === 'res_config'
+          ? {
+              ...resource,
+              content: {
+                ...(resource.content || {}),
+                deviceInterfaceConfig: nextConfig,
+              },
+            }
+          : resource
+      ),
+    }));
+  }, []);
 
   const handleContentChange = (newContent) => {
     if (!activeItem) return;
@@ -1673,7 +1699,11 @@ function App() {
                   </ErrorBoundary>
                 ) : activeId === 'BOARD_CONFIG' ? (
                   <ErrorBoundary>
-                    <BoardConfigPage boardId={selectedBoard} />
+                    <BoardConfigPage
+                      boardId={selectedBoard}
+                      interfaceConfig={deviceInterfaceConfig}
+                      onInterfaceConfigChange={handleDeviceInterfaceConfigChange}
+                    />
                   </ErrorBoundary>
                 ) : activeId === 'TASK_MANAGER' ? (
                   <ErrorBoundary>
@@ -1733,6 +1763,7 @@ function App() {
                           isSimulationMode={isSimulationMode}
                           onForceWrite={isRunning ? handleForceWrite : null}
                           onAddToWatchTable={addToWatchTable}
+                          hwPortVars={hwPortVars}
                         />
                       )}
                     </div>
@@ -1767,7 +1798,7 @@ function App() {
             </div>
 
             {/* RIGHT SIDEBAR (Only if LD) */}
-            {(activeItem?.type === 'LD' || activeItem?.type === 'ST') && (
+            {(activeItem?.type === 'LD' || activeItem?.type === 'ST' || activeItem?.type === 'SCL') && (
               <>
                 {/* RESIZER (RIGHT) */}
                 <div
@@ -1783,6 +1814,7 @@ function App() {
                       activeFileType={activeItem?.type}
                       selectedBoard={selectedBoard}
                       buses={buses}
+                      interfaceConfig={deviceInterfaceConfig}
                       userDefinedBlocks={
                         activeItem.category === 'programs'
                           ? [...projectStructure.functionBlocks, ...projectStructure.functions]

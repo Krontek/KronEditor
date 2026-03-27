@@ -232,7 +232,7 @@ export const LIBRARY_TREE = [
       {
         id: 'comm_generic',
         title: 'Generic',
-        fromLibrary: ['TSEND', 'TRCV']
+        fromLibrary: ['TSEND', 'TRCV', 'I2C_WriteRead', 'SPI_Transfer', 'UART_Send', 'UART_Receive']
       },
       {
         id: 'comm_protocols',
@@ -268,6 +268,133 @@ export const LIBRARY_TREE = [
     ]
   }
 ];
+
+// ─── Generic Device I/O FB Definitions ──────────────────────────────────────
+// Inputs/outputs for Category-1 generic communication FBs.
+// These are used by buildDeviceLibraryTree() to create per-port Toolbox entries.
+
+export const GENERIC_FB_DEFS = {
+  I2C_WriteRead: {
+    class: 'FunctionBlock',
+    inputs: [
+      { name: 'Execute',          type: 'BOOL',  desc: 'Rising edge triggers operation' },
+      { name: 'Port_ID',          type: 'USINT', desc: 'I2C port number or suggested hardware port symbol (for example: I2C1_PORT)' },
+      { name: 'Device_Address',   type: 'USINT', desc: 'I2C slave address (7-bit)' },
+      { name: 'Register_Address', type: 'USINT', desc: 'Starting register address' },
+      { name: 'pTxBuffer',        type: 'ANY', storageType: 'POINTER', passByReference: true, desc: 'Write buffer variable. Transpiler uses its pointer automatically (NULL = read-only)' },
+      { name: 'TxLength',         type: 'UINT',  desc: 'Number of bytes to write' },
+      { name: 'pRxBuffer',        type: 'ANY', storageType: 'POINTER', passByReference: true, desc: 'Read buffer variable. Transpiler uses its pointer automatically (NULL = write-only)' },
+      { name: 'RxLength',         type: 'UINT',  desc: 'Number of bytes to read' },
+    ],
+    outputs: [
+      { name: 'Done',  type: 'BOOL', desc: 'Operation completed successfully' },
+      { name: 'Busy',  type: 'BOOL', desc: 'Operation in progress' },
+      { name: 'Error', type: 'BOOL', desc: 'I/O error (NACK, timeout, etc.)' },
+    ],
+  },
+
+  SPI_Transfer: {
+    class: 'FunctionBlock',
+    inputs: [
+      { name: 'Execute',   type: 'BOOL',  desc: 'Rising edge triggers full-duplex transfer' },
+      { name: 'Port_ID',   type: 'USINT', desc: 'SPI port number or suggested hardware port symbol (for example: SPI0_CE0_PORT)' },
+      { name: 'pTxBuffer', type: 'ANY', storageType: 'POINTER', passByReference: true, desc: 'Transmit buffer variable. Transpiler uses its pointer automatically' },
+      { name: 'pRxBuffer', type: 'ANY', storageType: 'POINTER', passByReference: true, desc: 'Receive buffer variable. Transpiler uses its pointer automatically' },
+      { name: 'Length',    type: 'UINT',  desc: 'Total bytes to transfer (Tx and Rx simultaneously)' },
+    ],
+    outputs: [
+      { name: 'Done',  type: 'BOOL', desc: 'Transfer completed successfully' },
+      { name: 'Busy',  type: 'BOOL', desc: 'Transfer in progress' },
+      { name: 'Error', type: 'BOOL', desc: 'SPI I/O error' },
+    ],
+  },
+
+  UART_Send: {
+    class: 'FunctionBlock',
+    inputs: [
+      { name: 'Execute',   type: 'BOOL',  desc: 'Rising edge triggers send' },
+      { name: 'Port_ID',   type: 'USINT', desc: 'UART port number or suggested hardware port symbol (for example: UART0_PORT)' },
+      { name: 'pTxBuffer', type: 'ANY', storageType: 'POINTER', passByReference: true, desc: 'Transmit buffer variable. Transpiler uses its pointer automatically' },
+      { name: 'Length',    type: 'UINT',  desc: 'Number of bytes to send' },
+    ],
+    outputs: [
+      { name: 'Done',  type: 'BOOL', desc: 'All bytes sent' },
+      { name: 'Busy',  type: 'BOOL', desc: 'Transmission in progress' },
+      { name: 'Error', type: 'BOOL', desc: 'Framing or hardware error' },
+    ],
+  },
+
+  UART_Receive: {
+    class: 'FunctionBlock',
+    inputs: [
+      { name: 'Enable',    type: 'BOOL',  desc: 'TRUE = continuously poll ring-buffer' },
+      { name: 'Port_ID',   type: 'USINT', desc: 'UART port number or suggested hardware port symbol (for example: UART0_PORT)' },
+      { name: 'pRxBuffer', type: 'ANY', storageType: 'POINTER', passByReference: true, desc: 'Destination buffer variable. Transpiler uses its pointer automatically' },
+      { name: 'MaxSize',   type: 'UINT',  desc: 'Maximum bytes to copy (overflow guard)' },
+    ],
+    outputs: [
+      { name: 'NewData',        type: 'BOOL', desc: 'TRUE for one cycle when new data arrives' },
+      { name: 'ReceivedLength', type: 'UINT', desc: 'Number of bytes copied this cycle' },
+      { name: 'Error',          type: 'BOOL', desc: 'Framing, parity, or overrun error' },
+    ],
+  },
+};
+
+// Protocol → which generic FB block types to expose per enabled port
+const PROTOCOL_BLOCKS = {
+  I2C:  ['I2C_WriteRead'],
+  SPI:  ['SPI_Transfer'],
+  UART: ['UART_Send', 'UART_Receive'],
+};
+
+// Colors used in Toolbox for device I/O items
+export const DEVICE_IO_COLOR = '#00838f'; // teal-cyan
+
+/**
+ * Build a dynamic Toolbox tree from the enabled ports in interfaceConfig.
+ *
+ * interfaceConfig shape:
+ *   { I2C: { I2C_1: { enabled: true, clockHz: 400000, ... }, ... }, UART: { ... } }
+ *
+ * Returns an array of top-level sections:
+ *   [{ id, title, subcategories: [{ id, title, items: [...ToolboxItem props] }] }]
+ */
+export const buildDeviceLibraryTree = (interfaceConfig) => {
+  if (!interfaceConfig) return [];
+
+  const sections = [];
+
+  for (const protocol of ['I2C', 'SPI', 'UART']) {
+    const ports = interfaceConfig[protocol];
+    if (!ports) continue;
+
+    const enabledEntries = Object.entries(ports).filter(([, c]) => c?.enabled);
+    if (enabledEntries.length === 0) continue;
+
+    const subcategories = enabledEntries.map(([portId]) => ({
+      id: `dev_${protocol}_${portId}`,
+      title: portId,
+      items: (PROTOCOL_BLOCKS[protocol] || []).map((blockType) => ({
+        blockType,
+        label: blockType,
+        desc: `${blockType} — ${portId}`,
+        color: DEVICE_IO_COLOR,
+        customData: {
+          ...GENERIC_FB_DEFS[blockType],
+          portId,
+        },
+      })),
+    }));
+
+    sections.push({
+      id: `dev_${protocol}`,
+      title: protocol,
+      subcategories,
+    });
+  }
+
+  return sections;
+};
 
 // EtherCAT Master function block tree — shown in Toolbox only when an EtherCAT bus is present
 export const ETHERCAT_LIBRARY_TREE = [

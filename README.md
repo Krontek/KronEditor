@@ -31,7 +31,7 @@
 
 ## ⚡ Turn Your Raspberry Pi Into a PLC
 
-KronEditor runs on affordable hardware — Raspberry Pi, BeagleBone, Edatec IPC — or on any x86 Linux/Windows machine. Write IEC 61131-3 control logic, compile it to a native binary, deploy it, and watch variables update live from your laptop.
+KronEditor runs on affordable hardware — Raspberry Pi, BeagleBone — or on any x86 Linux/Windows machine. Write IEC 61131-3 control logic, compile it to a native binary, deploy it, and watch variables update live from your laptop.
 
 No proprietary runtime. No license fees. The compiled output is plain C.
 
@@ -82,7 +82,7 @@ Built-in SOEM v2.0.0 integration. Configure slaves, map PDO entries, set up SDO 
 </p>
 
 ### Board Configuration
-Interactive pin maps for Raspberry Pi (3/4/5, Zero 2W, Pico), BeagleBone, and Edatec industrial IPCs. Inspect GPIO, I2C, SPI, and UART assignments. Digital I/O blocks map directly to physical hardware pins.
+Interactive pin maps for Raspberry Pi (3/4/5, Zero 2W, Pico) and BeagleBone. Inspect GPIO, I2C, SPI, and UART assignments. Digital I/O blocks map directly to physical hardware pins.
 
 ### CodeSys-Style Tab Interface
 Every opened program, function block, function, data type, or fieldbus editor opens as a closable tab. Middle-click to close. Active tab stays visible with auto-scroll. Navigate the project tree and reopen any item at any time.

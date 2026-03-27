@@ -8,6 +8,8 @@
 #ifndef KRONHAL_SIM_H
 #define KRONHAL_SIM_H
 
+#include <string.h>  /* memset for BurstRead simulation */
+
 /* Lifecycle */
 static inline void HAL_Init(void)    {}
 static inline void HAL_Cleanup(void) {}
@@ -61,6 +63,33 @@ static inline void HAL_I2C_Write_Call(HAL_I2C_Write *inst, uint8_t ch) {
     inst->ENO    = inst->EN;
     inst->OK     = inst->EN;
     inst->ERR_ID = 0;
+}
+
+/* I2C Burst Read  (simulation: no real hardware, buffer zeroed) */
+static inline void HAL_I2C_BurstRead_Call(HAL_I2C_BurstRead *inst, uint8_t ch) {
+    (void)ch;
+    inst->ENO    = inst->EN;
+    inst->ERR_ID = 0;
+    inst->OK     = inst->EN;
+    if (inst->EN && inst->BUFFER && inst->LEN > 0)
+        memset(inst->BUFFER, 0, inst->LEN);
+}
+
+/* I2C Burst Write  (simulation: accepted silently) */
+static inline void HAL_I2C_BurstWrite_Call(HAL_I2C_BurstWrite *inst, uint8_t ch) {
+    (void)ch;
+    inst->ENO    = inst->EN;
+    inst->OK     = inst->EN;
+    inst->ERR_ID = 0;
+}
+
+static inline void HAL_SPI_BurstTransfer_Call(HAL_SPI_BurstTransfer *inst, uint8_t ch) {
+    (void)ch;
+    inst->ENO    = inst->EN;
+    inst->DONE   = inst->EN;
+    inst->ERR_ID = 0;
+    if (inst->EN && inst->RX_BUF && inst->LEN > 0)
+        memset(inst->RX_BUF, 0, inst->LEN);
 }
 
 /* UART Send */

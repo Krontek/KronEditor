@@ -2,7 +2,6 @@ import React, { useState, useRef, useCallback, useEffect } from 'react';
 import { useTranslation } from 'react-i18next';
 import { ask } from '@tauri-apps/plugin-dialog';
 import { getBoardById } from '../utils/boardDefinitions';
-import PlcIcon from '../assets/icons/plc-icon.png';
 import EtherCATIconSrc from '../assets/icons/ethercat.png';
 
 const EMPTY_IMG = new Image();
@@ -491,16 +490,9 @@ const ProjectSidebar = ({
                 icon="🖥"
                 label={boardName}
                 isOpen={true}
+                active={activeId === 'BOARD_CONFIG'}
+                onClick={() => onBoardClick?.()}
                 onContextMenu={(e) => openCtx(e, deviceCtxItems())}
-                endAdornment={
-                    <span
-                        onClick={(e) => { e.stopPropagation(); onBoardClick?.(); }}
-                        style={{ fontSize: 10, opacity: 0.5, marginLeft: 4, padding: '1px 4px', borderRadius: 3, border: '1px solid #555', cursor: 'pointer' }}
-                        title="Board ayarla"
-                        onMouseEnter={e => e.currentTarget.style.opacity = 1}
-                        onMouseLeave={e => e.currentTarget.style.opacity = 0.5}
-                    >⚙</span>
-                }
             >
 
                 {/* ── PLC Logic ── */}

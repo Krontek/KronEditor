@@ -214,11 +214,16 @@ const VariableManager = ({
     if (!trimmed) return;
     const currentVar = variables.find(v => v.id === id);
     if (!currentVar || currentVar.name === trimmed) return;
-    if (variables.some(v => v.id !== id && v.name === trimmed) || globalVars.some(v => v.name === trimmed)) {
+    // Block duplicate within same scope
+    if (variables.some(v => v.id !== id && v.name === trimmed)) {
       alert(t('errors.varExistsScope', { name: trimmed }));
       return;
     }
-
+    // Block same name AND same type as a global variable
+    if (globalVars.some(v => v.name === trimmed && v.type === currentVar.type)) {
+      alert(t('errors.varExistsScope', { name: trimmed }));
+      return;
+    }
     if (onUpdate) onUpdate(id, 'name', trimmed);
   };
 
@@ -337,7 +342,7 @@ const VariableManager = ({
             </tr>
           </thead>
           <tbody>
-            {variables.map((v, index) => {
+{variables.map((v, index) => {
               const liveVal = getLiveValue(v.name);
               const liveKey = getLiveKey(v.name);
               const hasValue = liveVal !== null && liveVal !== undefined;

@@ -8,6 +8,9 @@
  */
 import { getBoardById } from './boardDefinitions';
 
+const GENERIC_COMM_INTERFACES = new Set(['I2C', 'SPI', 'UART']);
+const isPicoBoard = (boardId) => boardId?.startsWith('rpi_pico');
+
 // ─── Channel counts per board family / board ─────────────────────────────────
 
 const BOARD_CHANNELS = {
@@ -35,44 +38,6 @@ const BOARD_CHANNELS = {
   jetson_orin_nano:  { PWM: 2, SPI: 1, I2C: 2, UART: 4, CAN: 1 },
   jetson_orin_nx:    { PWM: 2, SPI: 1, I2C: 2, UART: 4, CAN: 1 },
   jetson_agx_orin:   { PWM: 2, SPI: 1, I2C: 2, UART: 4, CAN: 2 },
-  // Edatec IPC — CM4/CM5/Pi5 based industrial computers
-  // ED-IPC2000: CM4 Basic
-  edatec_ipc2010:    { SPI: 2, I2C: 2, UART: 2 },
-  edatec_ipc2020:    { SPI: 2, I2C: 2, UART: 2 },
-  // ED-IPC2100: CM4 + 4x isolated serial
-  edatec_ipc2110:    { SPI: 2, I2C: 2, UART: 4 },
-  edatec_ipc2120:    { SPI: 2, I2C: 2, UART: 4 },
-  edatec_ipc2130:    { SPI: 2, I2C: 2, UART: 4 },
-  edatec_ipc2140:    { SPI: 2, I2C: 2, UART: 4 },
-  // ED-IPC2200: CM4 Multi-GigE
-  edatec_ipc2200:    { SPI: 2, I2C: 2, UART: 2 },
-  // ED-IPC2400: CM4 + 3x mixed serial
-  edatec_ipc2410:    { SPI: 2, I2C: 2, UART: 3 },
-  edatec_ipc2420:    { SPI: 2, I2C: 2, UART: 3 },
-  edatec_ipc2430:    { SPI: 2, I2C: 2, UART: 3 },
-  // ED-IPC2610: CM4 + 8DI + 8DO + 4x serial
-  edatec_ipc2612:    { SPI: 2, I2C: 2, UART: 4, DI: 8, DO: 8 },
-  edatec_ipc2613:    { SPI: 2, I2C: 2, UART: 4, DI: 8, DO: 8 },
-  edatec_ipc2614:    { SPI: 2, I2C: 2, UART: 4, DI: 8, DO: 8 },
-  // ED-IPC2620: CM4 + 4DI + 4DO + 1CAN + 4x serial
-  edatec_ipc2622:    { SPI: 2, I2C: 2, UART: 4, DI: 4, DO: 4, CAN: 1 },
-  edatec_ipc2623:    { SPI: 2, I2C: 2, UART: 4, DI: 4, DO: 4, CAN: 1 },
-  edatec_ipc2624:    { SPI: 2, I2C: 2, UART: 4, DI: 4, DO: 4, CAN: 1 },
-  // ED-IPC2630: CM4 + 8DI + 8DO + 2CAN + 4x serial
-  edatec_ipc2632:    { SPI: 2, I2C: 2, UART: 4, DI: 8, DO: 8, CAN: 2 },
-  edatec_ipc2633:    { SPI: 2, I2C: 2, UART: 4, DI: 8, DO: 8, CAN: 2 },
-  edatec_ipc2634:    { SPI: 2, I2C: 2, UART: 4, DI: 8, DO: 8, CAN: 2 },
-  // ED-IPC3020: Pi5 + 2x serial
-  edatec_ipc3020:    { SPI: 2, I2C: 2, UART: 2 },
-  // ED-IPC3100: CM5 + 4x isolated serial
-  edatec_ipc3110:    { SPI: 2, I2C: 2, UART: 4 },
-  edatec_ipc3120:    { SPI: 2, I2C: 2, UART: 4 },
-  edatec_ipc3130:    { SPI: 2, I2C: 2, UART: 4 },
-  edatec_ipc3140:    { SPI: 2, I2C: 2, UART: 4 },
-  // ED-IPC3630: CM5 + 8DI + 8DO + 2CAN + 4x serial
-  edatec_ipc3632:    { SPI: 2, I2C: 2, UART: 4, DI: 8, DO: 8, CAN: 2 },
-  edatec_ipc3633:    { SPI: 2, I2C: 2, UART: 4, DI: 8, DO: 8, CAN: 2 },
-  edatec_ipc3634:    { SPI: 2, I2C: 2, UART: 4, DI: 8, DO: 8, CAN: 2 },
 };
 
 // ─── Block templates per interface ──────────────────────────────────────────
@@ -262,35 +227,6 @@ const INTERFACE_BLOCKS = {
             ],
             class: 'FunctionBlock',
           },
-          {
-            blockType: `IBUS${i}_Receiver`,
-            label: `IBUS${i}_Receiver`,
-            desc: `UART${i} – FlySky iBUS receiver (32-byte frame, 14 channels, 115200 baud)`,
-            inputs: [
-              { name: 'BAUD', type: 'DINT', default: '115200' },
-              { name: 'EN', type: 'BOOL', default: 'TRUE' },
-            ],
-            outputs: [
-              { name: 'ENO',   type: 'BOOL' },
-              { name: 'VALID', type: 'BOOL' },
-              { name: 'FAULT', type: 'BOOL' },
-              { name: 'CH1',   type: 'UINT' },
-              { name: 'CH2',   type: 'UINT' },
-              { name: 'CH3',   type: 'UINT' },
-              { name: 'CH4',   type: 'UINT' },
-              { name: 'CH5',   type: 'UINT' },
-              { name: 'CH6',   type: 'UINT' },
-              { name: 'CH7',   type: 'UINT' },
-              { name: 'CH8',   type: 'UINT' },
-              { name: 'CH9',   type: 'UINT' },
-              { name: 'CH10',  type: 'UINT' },
-              { name: 'CH11',  type: 'UINT' },
-              { name: 'CH12',  type: 'UINT' },
-              { name: 'CH13',  type: 'UINT' },
-              { name: 'CH14',  type: 'UINT' },
-            ],
-            class: 'FunctionBlock',
-          }
         );
       }
       return blocks;
@@ -549,6 +485,10 @@ export const getBoardLibraryTree = (boardId) => {
   const subcategories = [];
 
   for (const iface of interfaces) {
+    if (GENERIC_COMM_INTERFACES.has(iface) && !isPicoBoard(boardId)) {
+      continue;
+    }
+
     const template = INTERFACE_BLOCKS[iface];
     if (!template) continue;
 

@@ -1,9 +1,72 @@
 import { useState, useCallback, useRef, useEffect } from 'react';
+import { Editor } from '@monaco-editor/react';
 import RungContainer, { blockConfig } from './RungContainer';
 import ErrorBoundary from './ErrorBoundary';
 import BlockSettingsModal from './BlockSettingsModal';
 import ForceWriteModal from './common/ForceWriteModal';
 import DragDropManager from '../utils/DragDropManager';
+import { registerIECSTLanguage } from '../utils/iecSTLanguage';
+
+// Auto-sizing Monaco editor for SCL ST rungs.
+// IMPORTANT: must stop mouse event propagation to prevent the outer
+// draggable rung div from intercepting clicks and blocking Monaco input.
+const SCLInlineEditor = ({ code, readOnly, onCodeChange, onBlur }) => {
+  const [height, setHeight] = useState(60);
+  const editorRef = useRef(null);
+
+  // Sync external code (undo/redo) into Monaco without resetting cursor
+  useEffect(() => {
+    const ed = editorRef.current;
+    if (!ed) return;
+    const model = ed.getModel();
+    if (model && model.getValue() !== code) {
+      const pos = ed.getPosition();
+      model.setValue(code || '');
+      if (pos) ed.setPosition(pos);
+    }
+  }, [code]);
+
+  return (
+    <div
+      draggable={false}
+      onMouseDown={e => e.stopPropagation()}
+      style={{ background: '#1e1e1e' }}
+    >
+      <Editor
+        height={height}
+        defaultLanguage="iec-st"
+        theme="plc-dark"
+        defaultValue={code || ''}
+        options={{
+          readOnly: !!readOnly,
+          fontSize: 13,
+          minimap: { enabled: false },
+          lineNumbers: 'on',
+          scrollBeyondLastLine: false,
+          wordWrap: 'off',
+          automaticLayout: true,
+          renderLineHighlight: 'line',
+          overviewRulerLanes: 0,
+          folding: false,
+          contextmenu: true,
+          scrollbar: { vertical: 'hidden', horizontal: 'auto', alwaysConsumeMouseWheel: false },
+        }}
+        beforeMount={registerIECSTLanguage}
+        onChange={val => onCodeChange(val ?? '')}
+        onMount={editor => {
+          editorRef.current = editor;
+          const updateHeight = () => {
+            const h = Math.max(60, editor.getContentHeight());
+            setHeight(h);
+          };
+          editor.onDidContentSizeChange(updateHeight);
+          updateHeight();
+          editor.onDidBlurEditorText(onBlur);
+        }}
+      />
+    </div>
+  );
+};
 
 const EMPTY_IMG = new Image();
 EMPTY_IMG.src = 'data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7';
@@ -56,7 +119,7 @@ const InsertZone = ({ onInsert, onPaste, canPaste, disabled }) => {
  * - When a rung moves, everything inside moves with it
  */
 
-const RungEditorNew = ({ variables, setVariables, rungs, setRungs, availableBlocks, globalVars = [], dataTypes = [], liveVariables = null, parentName = "", readOnly = false, onForceWrite = null, programType = 'LD' }) => {
+const RungEditorNew = ({ variables, setVariables, rungs, setRungs, availableBlocks, globalVars = [], dataTypes = [], liveVariables = null, parentName = "", readOnly = false, onForceWrite = null, programType = 'LD', hwPortVars = [] }) => {
   // Undo/Redo history - each snapshot stores { rungs, variables } pair
   const historyRef = useRef([{
     rungs: JSON.parse(JSON.stringify(rungs)),
@@ -253,8 +316,13 @@ const RungEditorNew = ({ variables, setVariables, rungs, setRungs, availableBloc
 
   useEffect(() => {
     const handleKeyDown = (e) => {
-      // Don't trigger if user is typing in an input field (except possibly read-only ones)
-      if (document.activeElement && document.activeElement.tagName === 'INPUT' && document.activeElement.type === 'text') {
+      const ae = document.activeElement;
+      // Skip if typing in an input/textarea or inside a Monaco editor
+      if (ae && (
+        (ae.tagName === 'INPUT' && ae.type === 'text') ||
+        ae.tagName === 'TEXTAREA' ||
+        ae.closest?.('.monaco-editor')
+      )) {
         return;
       }
 
@@ -804,42 +872,86 @@ const RungEditorNew = ({ variables, setVariables, rungs, setRungs, availableBloc
   // Type icons for complex types (stripped on input in RungContainer)
   // ⊞ = Array, ⊡ = Struct, ⊟ = Enum
   const dtMap = (dataTypes || []).reduce((acc, dt) => { acc[dt.name] = dt; return acc; }, {});
+  const blockTypeNames = new Set([
+    ...Object.keys(blockConfig || {}),
+    ...((availableBlocks || []).flatMap((block) => {
+      const names = [];
+      if (block?.name) names.push(block.name);
+      if (block?.type && typeof block.type === 'string') names.push(block.type);
+      if (block?.blockType) names.push(block.blockType);
+      return names;
+    })),
+  ]);
 
   const allRawVars = [
     ...(variables || []).map(v => ({ ...v, scope: 'Local' })),
     ...(globalVars || []).map(v => ({ ...v, scope: 'Global' })),
   ];
+  const allDataVars = allRawVars.filter((v) => {
+    if (!v?.name || !v?.type) return false;
+    if (v.description === 'FB Instance' || v.description === 'HAL Block') return false;
+    return !blockTypeNames.has(v.type);
+  });
 
   const varsByType = {};
-  const NUMERIC_TYPES = new Set(['INT', 'UINT', 'SINT', 'USINT', 'DINT', 'UDINT', 'REAL', 'LREAL', 'BYTE', 'WORD', 'DWORD']);
-  const addOption = (type, value) => {
+  const NUMERIC_TYPES = new Set(['SINT', 'INT', 'DINT', 'LINT', 'USINT', 'UINT', 'UDINT', 'ULINT', 'REAL', 'LREAL', 'BYTE', 'WORD', 'DWORD', 'LWORD']);
+  const INTEGER_TYPES = new Set(['SINT', 'INT', 'DINT', 'LINT', 'USINT', 'UINT', 'UDINT', 'ULINT', 'BYTE', 'WORD', 'DWORD', 'LWORD']);
+  const REAL_TYPES = new Set(['REAL', 'LREAL']);
+  const BIT_TYPES = new Set(['BOOL', 'BYTE', 'WORD', 'DWORD', 'LWORD']);
+  const STRING_TYPES = new Set(['STRING', 'WSTRING']);
+  const addOption = (type, value, options = {}) => {
+    const { includeAnyFamilies = true } = options;
     if (!varsByType[type]) varsByType[type] = [];
     varsByType[type].push(value);
-    if (type !== 'ANY') {
+    if (includeAnyFamilies && type !== 'ANY') {
       if (!varsByType['ANY']) varsByType['ANY'] = [];
       varsByType['ANY'].push(value);
     }
-    if (NUMERIC_TYPES.has(type)) {
+    if (includeAnyFamilies && NUMERIC_TYPES.has(type)) {
       if (!varsByType['ANY_NUM']) varsByType['ANY_NUM'] = [];
       varsByType['ANY_NUM'].push(value);
     }
+    if (includeAnyFamilies && INTEGER_TYPES.has(type)) {
+      if (!varsByType['ANY_INT']) varsByType['ANY_INT'] = [];
+      varsByType['ANY_INT'].push(value);
+    }
+    if (includeAnyFamilies && REAL_TYPES.has(type)) {
+      if (!varsByType['ANY_REAL']) varsByType['ANY_REAL'] = [];
+      varsByType['ANY_REAL'].push(value);
+    }
+    if (includeAnyFamilies && BIT_TYPES.has(type)) {
+      if (!varsByType['ANY_BIT']) varsByType['ANY_BIT'] = [];
+      varsByType['ANY_BIT'].push(value);
+    }
+    if (includeAnyFamilies && STRING_TYPES.has(type)) {
+      if (!varsByType['ANY_STRING']) varsByType['ANY_STRING'] = [];
+      varsByType['ANY_STRING'].push(value);
+    }
   };
 
-  allRawVars.forEach(v => {
+  allDataVars.forEach(v => {
     const s = v.scope === 'Global' ? '🌍' : '🏠';
     const dt = dtMap[v.type];
     if (dt?.type === 'Array') {
+      addOption('ANY_DERIVED', `${s} ${v.name}`);
       const minIdx = parseInt(dt.content.dimensions[0].min);
       addOption(dt.content.baseType, `${s}⊞ ${v.name}[${minIdx}]`);
     } else if (dt?.type === 'Structure') {
+      addOption('ANY_DERIVED', `${s} ${v.name}`);
       (dt.content.members || []).forEach(member => {
         addOption(member.type, `${s}⊡ ${v.name}.${member.name}`);
       });
     } else if (dt?.type === 'Enumerated') {
+      addOption('ANY_DERIVED', `${s} ${v.name}`);
       addOption(v.type, `${s}⊟ ${v.name}`);
     } else {
       addOption(v.type, `${s} ${v.name}`);
     }
+  });
+
+  (hwPortVars || []).forEach((portVar) => {
+    if (!portVar?.name) return;
+    addOption('USINT', portVar.name, { includeAnyFamilies: false });
   });
 
   const uniqueTypes = Object.keys(varsByType).filter(t => t !== 'ANY');
@@ -903,7 +1015,11 @@ const RungEditorNew = ({ variables, setVariables, rungs, setRungs, availableBloc
                 {/* SCL lang toggle bar */}
                 {programType === 'SCL' && (
                   <div style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '2px 8px', background: '#2d2d2d', borderBottom: '1px solid #3a3a3a' }}>
-                    <span style={{ fontSize: 10, color: '#888' }}>Rung {rung.label} lang:</span>
+                    <div
+                      className="rung-drag-handle"
+                      style={{ cursor: 'grab', color: '#555', fontSize: 14, padding: '0 2px', lineHeight: 1, userSelect: 'none' }}
+                    >⠿</div>
+                    <span style={{ fontSize: 10, color: '#888' }}>Rung {index}:</span>
                     {['LD', 'ST'].map(l => (
                       <button
                         key={l}
@@ -917,25 +1033,45 @@ const RungEditorNew = ({ variables, setVariables, rungs, setRungs, availableBloc
                         }}
                       >{l}</button>
                     ))}
+                    {(rung.lang || 'LD') === 'ST' && !readOnly && (
+                      <div style={{ marginLeft: 'auto', display: 'flex', gap: 4 }}>
+                        <button
+                          onClick={() => moveRung(rung.id, 'up')}
+                          disabled={index === 0}
+                          style={{ background: index === 0 ? '#444' : '#0d47a1', color: '#fff', border: 'none', padding: '2px 7px', borderRadius: 3, cursor: index === 0 ? 'not-allowed' : 'pointer', fontSize: 10 }}
+                        >↑ Yukarı</button>
+                        <button
+                          onClick={() => moveRung(rung.id, 'down')}
+                          disabled={index === rungs.length - 1}
+                          style={{ background: index === rungs.length - 1 ? '#444' : '#0d47a1', color: '#fff', border: 'none', padding: '2px 7px', borderRadius: 3, cursor: index === rungs.length - 1 ? 'not-allowed' : 'pointer', fontSize: 10 }}
+                        >↓ Aşağı</button>
+                        <button
+                          onClick={() => deleteRung(rung.id)}
+                          style={{ background: '#c62828', color: '#fff', border: 'none', padding: '2px 7px', borderRadius: 3, cursor: 'pointer', fontSize: 10 }}
+                        >🗑 Delete</button>
+                      </div>
+                    )}
                   </div>
                 )}
                 <ErrorBoundary>
                   {programType === 'SCL' && (rung.lang || 'LD') === 'ST' ? (
-                    <div style={{ background: '#1e1e1e', padding: '4px 8px' }}>
-                      <textarea
-                        value={rung.code || ''}
+                    <div
+                      draggable={false}
+                      onClick={() => setFocusedRungId(rung.id)}
+                      style={{
+                        background: '#2a2a2a',
+                        border: focusedRungId === rung.id ? '2px solid #007acc' : '2px solid #444',
+                        borderRadius: 8,
+                        overflow: 'hidden',
+                        boxShadow: '0 4px 6px rgba(0,0,0,0.3)',
+                        transition: 'border-color 0.2s',
+                      }}
+                    >
+                      <SCLInlineEditor
+                        code={rung.code || ''}
                         readOnly={readOnly}
-                        onChange={e => updateRungCode(rung.id, e.target.value)}
+                        onCodeChange={val => updateRungCode(rung.id, val)}
                         onBlur={() => saveHistory(rungs, variables)}
-                        onClick={() => setFocusedRungId(rung.id)}
-                        placeholder="// ST code for this rung..."
-                        style={{
-                          width: '100%', minHeight: 100, background: '#1e1e1e', color: '#d4d4d4',
-                          fontFamily: "'Consolas', 'Courier New', monospace", fontSize: 13,
-                          border: '1px solid #3a3a3a', borderRadius: 3, outline: 'none',
-                          resize: 'vertical', padding: '6px 8px', boxSizing: 'border-box',
-                          lineHeight: 1.5,
-                        }}
                       />
                     </div>
                   ) : (
@@ -973,6 +1109,7 @@ const RungEditorNew = ({ variables, setVariables, rungs, setRungs, availableBloc
                       parentName={parentName}
                       readOnly={readOnly}
                       onForceWrite={onForceWrite}
+                      hwPortVars={hwPortVars}
                       onFocusRung={() => {
                         if (readOnly) return;
                         selectedNodeRef.current = null;

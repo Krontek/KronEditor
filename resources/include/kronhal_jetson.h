@@ -30,6 +30,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <string.h>
+#include <stdio.h>
 #include <stdint.h>
 #include <stdbool.h>
 #include <termios.h>
@@ -100,7 +101,10 @@ static int _can_fd[2] = { -1, -1 };
 static int _uart_fd[6] = { -1, -1, -1, -1, -1, -1 };
 
 /* I2C file descriptors (lazy-opened, one per bus) */
-static int _i2c_fd[4] = { -1, -1, -1, -1 };
+static int _i2c_fd[16] = {
+    -1, -1, -1, -1, -1, -1, -1, -1,
+    -1, -1, -1, -1, -1, -1, -1, -1
+};
 
 /* ---------------------------------------------------------------------------
  * HAL lifecycle
@@ -124,7 +128,7 @@ static inline void HAL_Cleanup(void) {
     if (_chip_fd >= 0) { close(_chip_fd); _chip_fd = -1; }
     for (i = 0; i < 2; i++) { if (_can_fd[i] >= 0) { close(_can_fd[i]); _can_fd[i] = -1; } }
     for (i = 0; i < 6; i++) { if (_uart_fd[i] >= 0) { close(_uart_fd[i]); _uart_fd[i] = -1; } }
-    for (i = 0; i < 4; i++) { if (_i2c_fd[i] >= 0) { close(_i2c_fd[i]); _i2c_fd[i] = -1; } }
+    for (i = 0; i < 16; i++) { if (_i2c_fd[i] >= 0) { close(_i2c_fd[i]); _i2c_fd[i] = -1; } }
     _gpio_hal_ready = 0;
 }
 
@@ -252,14 +256,58 @@ static inline void HAL_PWM_Call(HAL_PWM *inst, uint8_t ch) {
 }
 
 /* ---------------------------------------------------------------------------
- * SPI  — Linux SPI device ioctl (/dev/spidevN.0)
+ * SPI  — Linux SPI device ioctl (/dev/spidevN.M)
  * -------------------------------------------------------------------------*/
+#include <linux/spi/spidev.h>
+
+static int _spi_fd[4][4] = {
+    { -1,-1,-1,-1 }, { -1,-1,-1,-1 },
+    { -1,-1,-1,-1 }, { -1,-1,-1,-1 },
+};
+
 static inline void HAL_SPI_Call(HAL_SPI *inst, uint8_t ch) {
     (void)ch;
     inst->ENO     = inst->EN;
     inst->RX_DATA = 0;
     inst->DONE    = inst->EN;
-    /* TODO: /dev/spidevN.0 SPI_IOC_MESSAGE ioctl */
+    /* TODO: single-byte spidev */
+}
+
+static inline int _spi_open(uint8_t bus, uint8_t cs, uint8_t mode, int32_t clk_hz) {
+    if (bus >= 4 || cs >= 4) return -1;
+    if (_spi_fd[bus][cs] >= 0) return _spi_fd[bus][cs];
+    char path[24];
+    snprintf(path, sizeof(path), "/dev/spidev%d.%d", (int)bus, (int)cs);
+    int fd = open(path, O_RDWR);
+    if (fd < 0) return -1;
+    uint8_t m = mode & 3u, bits = 8;
+    uint32_t spd = (clk_hz > 0) ? (uint32_t)clk_hz : 1000000u;
+    ioctl(fd, SPI_IOC_WR_MODE,          &m);
+    ioctl(fd, SPI_IOC_WR_BITS_PER_WORD, &bits);
+    ioctl(fd, SPI_IOC_WR_MAX_SPEED_HZ,  &spd);
+    _spi_fd[bus][cs] = fd;
+    return fd;
+}
+
+static inline void HAL_SPI_BurstTransfer_Call(HAL_SPI_BurstTransfer *inst, uint8_t ch) {
+    inst->ENO = inst->EN; inst->DONE = false; inst->ERR_ID = 0;
+    if (!inst->EN) return;
+    if (inst->LEN == 0 || inst->LEN > 255) { inst->ERR_ID = 1; return; }
+    int fd = _spi_open(ch, inst->CS, inst->MODE, inst->CLK_HZ);
+    if (fd < 0) { inst->ERR_ID = 2; return; }
+    uint8_t tx_buf[255], rx_buf[255];
+    if (inst->TX_BUF) memcpy(tx_buf, inst->TX_BUF, inst->LEN);
+    else              memset(tx_buf, 0,             inst->LEN);
+    struct spi_ioc_transfer tr;
+    memset(&tr, 0, sizeof(tr));
+    tr.tx_buf = (unsigned long)tx_buf; tr.rx_buf = (unsigned long)rx_buf;
+    tr.len = inst->LEN;
+    tr.speed_hz = (inst->CLK_HZ > 0) ? (uint32_t)inst->CLK_HZ : 1000000u;
+    tr.bits_per_word = 8;
+    if (ioctl(fd, SPI_IOC_MESSAGE(1), &tr) >= 0) {
+        if (inst->RX_BUF) memcpy(inst->RX_BUF, rx_buf, inst->LEN);
+        inst->DONE = true;
+    } else { inst->ERR_ID = 3; }
 }
 
 /* ---------------------------------------------------------------------------
@@ -267,14 +315,12 @@ static inline void HAL_SPI_Call(HAL_SPI *inst, uint8_t ch) {
  * -------------------------------------------------------------------------*/
 #include <linux/i2c-dev.h>
 
-static const char * const _i2c_devs[4] = {
-    KRON_I2C0, KRON_I2C1, KRON_I2C2, KRON_I2C3
-};
-
 static inline int _i2c_open(uint8_t ch) {
-    if (ch >= 4) return -1;
+    if (ch >= 16) return -1;
     if (_i2c_fd[ch] < 0) {
-        _i2c_fd[ch] = open(_i2c_devs[ch], O_RDWR);
+        char path[24];
+        snprintf(path, sizeof(path), "/dev/i2c-%u", (unsigned)ch);
+        _i2c_fd[ch] = open(path, O_RDWR);
     }
     return _i2c_fd[ch];
 }
@@ -314,6 +360,38 @@ static inline void HAL_I2C_Write_Call(HAL_I2C_Write *inst, uint8_t ch) {
     inst->OK = (write(fd, buf, 2) == 2);
 }
 
+static inline void HAL_I2C_BurstRead_Call(HAL_I2C_BurstRead *inst, uint8_t ch) {
+    inst->ENO    = inst->EN;
+    inst->OK     = false;
+    inst->ERR_ID = 0;
+    if (!inst->EN) return;
+    if (!inst->BUFFER || inst->LEN == 0) { inst->ERR_ID = 1; return; }
+    int fd = _i2c_open(ch);
+    if (fd < 0) { inst->ERR_ID = 2; return; }
+    if (ioctl(fd, I2C_SLAVE, (long)inst->ADDR) < 0) { inst->ERR_ID = 3; return; }
+    uint8_t reg = inst->REG;
+    if (write(fd, &reg, 1) != 1) { inst->ERR_ID = 3; return; }
+    ssize_t n = read(fd, inst->BUFFER, inst->LEN);
+    if (n == (ssize_t)inst->LEN) inst->OK = true;
+    else inst->ERR_ID = 3;
+}
+
+static inline void HAL_I2C_BurstWrite_Call(HAL_I2C_BurstWrite *inst, uint8_t ch) {
+    inst->ENO    = inst->EN;
+    inst->OK     = false;
+    inst->ERR_ID = 0;
+    if (!inst->EN) return;
+    if (!inst->BUFFER || inst->LEN == 0 || inst->LEN > 255) { inst->ERR_ID = 1; return; }
+    int fd = _i2c_open(ch);
+    if (fd < 0) { inst->ERR_ID = 2; return; }
+    if (ioctl(fd, I2C_SLAVE, (long)inst->ADDR) < 0) { inst->ERR_ID = 3; return; }
+    uint8_t txbuf[256];
+    txbuf[0] = inst->REG;
+    memcpy(txbuf + 1, inst->BUFFER, inst->LEN);
+    inst->OK = (write(fd, txbuf, (size_t)inst->LEN + 1) == (ssize_t)(inst->LEN + 1));
+    if (!inst->OK) inst->ERR_ID = 3;
+}
+
 /* ---------------------------------------------------------------------------
  * UART  — Tegra High-Speed UART (ttyTHS*) via termios, no external lib
  * -------------------------------------------------------------------------*/
@@ -347,12 +425,17 @@ static inline int _uart_open(uint8_t ch, int32_t baud) {
         if (tcgetattr(fd, &tty) != 0) { close(fd); return -1; }
 
         speed_t spd = _baud_to_speed(baud);
+        uint8_t parity = KRON_UART_PortParity(ch);
+        uint8_t stop_bits = KRON_UART_PortStopBits(ch);
         cfsetispeed(&tty, spd);
         cfsetospeed(&tty, spd);
 
         tty.c_cflag = (tty.c_cflag & ~CSIZE) | CS8;
         tty.c_cflag |= (CLOCAL | CREAD);
         tty.c_cflag &= ~(PARENB | PARODD | CSTOPB | CRTSCTS);
+        if (parity == 1) tty.c_cflag |= PARENB;
+        else if (parity == 2) tty.c_cflag |= (PARENB | PARODD);
+        if (stop_bits == 2) tty.c_cflag |= CSTOPB;
         tty.c_lflag  = 0;
         tty.c_oflag  = 0;
         tty.c_iflag  = 0;

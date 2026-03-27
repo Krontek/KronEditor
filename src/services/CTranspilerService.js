@@ -1,14 +1,219 @@
 import { getBoardBlockMeta } from '../utils/halBlockMeta';
-import { getBoardFamily } from '../utils/boardDefinitions';
+import { buildGeneratedDeviceArtifacts } from '../utils/deviceCodegen';
+import { getPortOptions } from '../utils/devicePortMapping';
 
 const getBoardFamilyDefine = (boardId) => {
     if (!boardId) return null;
     if (boardId.startsWith('rpi_pico')) return 'HAL_BOARD_FAMILY_PICO';
     if (boardId.startsWith('rpi_')) return 'HAL_BOARD_FAMILY_RPI';
     if (boardId.startsWith('bb_')) return 'HAL_BOARD_FAMILY_BB';
-    if (boardId.startsWith('edatec_')) return 'HAL_BOARD_FAMILY_EDATEC';
     if (boardId.startsWith('jetson_')) return 'HAL_BOARD_FAMILY_JETSON';
     return null;
+};
+
+const parseNumeric = (value, fallback = 0) => {
+    if (value === undefined || value === null || value === '') return fallback;
+    if (typeof value === 'number' && Number.isFinite(value)) return value;
+    const str = String(value).trim();
+    if (!str) return fallback;
+    if (/^0x[0-9a-f]+$/i.test(str)) return parseInt(str, 16);
+    const num = Number(str);
+    return Number.isFinite(num) ? num : fallback;
+};
+
+const parseUartChannel = (port) =>
+    parseNumeric(String(port?.id || '').match(/UART_(\d+)/)?.[1], 0);
+
+const parseI2CBus = (port) =>
+    parseNumeric(
+        String(port?.path || '').match(/i2c-(\d+)/)?.[1]
+        ?? String(port?.id || '').match(/I2C_(\d+)/)?.[1],
+        0
+    );
+
+const parseSpiEndpoint = (port) => {
+    const pathMatch = String(port?.path || '').match(/spidev(\d+)\.(\d+)/i);
+    const idMatch = String(port?.id || '').match(/SPI_(\d+)_CE(\d+)/i);
+    const bus = parseNumeric(pathMatch?.[1] ?? idMatch?.[1], 0);
+    const cs = parseNumeric(pathMatch?.[2] ?? idMatch?.[2], 0);
+    return { logicalId: (bus * 2) + cs, bus, cs };
+};
+
+const POINTER_INPUT_TYPES = new Set(['POINTER']);
+const IDENTIFIER_REF_REGEX = /^[A-Za-z_][A-Za-z0-9_]*(\[[^\]]*\]|\.[A-Za-z_][A-Za-z0-9_]*)*$/;
+
+const isPointerInputType = (iecType) => POINTER_INPUT_TYPES.has(String(iecType || '').toUpperCase());
+const isBooleanLiteral = (value) => /^(?:BOOL#)?(?:TRUE|FALSE)$/i.test(String(value || '').trim());
+const normalizeBooleanLiteral = (value) => {
+    const normalized = String(value || '').trim().replace(/^BOOL#/i, '').toUpperCase();
+    if (normalized === 'TRUE') return 'true';
+    if (normalized === 'FALSE') return 'false';
+    return null;
+};
+
+const resolveHardwarePortSymbol = (value) => {
+    if (value === undefined || value === null) return null;
+    const normalized = String(value).replace(/[🌍🏠⊞⊡⊟]/g, '').trim().toUpperCase();
+    if (!normalized) return null;
+
+    const i2cMatch = normalized.match(/^I2C(?:_|)?(\d+)(?:_PORT)?$/);
+    if (i2cMatch) return String(parseNumeric(i2cMatch[1], 0));
+
+    const uartMatch = normalized.match(/^UART(?:_|)?(\d+)(?:_PORT)?$/);
+    if (uartMatch) return String(parseNumeric(uartMatch[1], 0));
+
+    const spiMatch = normalized.match(/^SPI(?:_|)?(\d+)_CE(\d+)(?:_PORT)?$/);
+    if (spiMatch) {
+        const bus = parseNumeric(spiMatch[1], 0);
+        const cs = parseNumeric(spiMatch[2], 0);
+        return String((bus * 2) + cs);
+    }
+
+    return null;
+};
+
+const parityToCode = (value) => {
+    const normalized = String(value || 'NONE').toUpperCase();
+    if (normalized === 'EVEN') return 1;
+    if (normalized === 'ODD') return 2;
+    return 0;
+};
+
+const buildRuntimePortHelpers = (boardId, interfaceConfig = {}) => {
+    const boardFamily = getBoardFamilyDefine(boardId);
+    if (!boardFamily) return '';
+
+    const i2cPorts = getPortOptions(boardFamily, 'I2C')
+        .map((port) => {
+            const config = {
+                enabled: false,
+                ...(interfaceConfig?.I2C?.[port.id] || {}),
+            };
+            return { bus: parseI2CBus(port), enabled: !!config.enabled };
+        })
+        .sort((a, b) => a.bus - b.bus);
+
+    const spiPorts = getPortOptions(boardFamily, 'SPI')
+        .map((port) => {
+            const endpoint = parseSpiEndpoint(port);
+            const config = {
+                enabled: false,
+                clockHz: 1000000,
+                mode: 0,
+                bitOrder: 'MSB',
+                ...(interfaceConfig?.SPI?.[port.id] || {}),
+            };
+            return {
+                logicalId: endpoint.logicalId,
+                bus: endpoint.bus,
+                cs: endpoint.cs,
+                enabled: !!config.enabled,
+                clockHz: parseNumeric(config.clockHz, 1000000),
+                mode: parseNumeric(config.mode, 0),
+                bitOrder: String(config.bitOrder || 'MSB').toUpperCase() === 'LSB' ? 1 : 0,
+            };
+        })
+        .sort((a, b) => a.logicalId - b.logicalId);
+
+    const uartPorts = getPortOptions(boardFamily, 'UART')
+        .map((port) => {
+            const config = {
+                enabled: false,
+                baudRate: 115200,
+                parity: 'NONE',
+                stopBits: 1,
+                ...(interfaceConfig?.UART?.[port.id] || {}),
+            };
+            return {
+                channel: parseUartChannel(port),
+                enabled: !!config.enabled,
+                baudRate: parseNumeric(config.baudRate, 115200),
+                parity: parityToCode(config.parity),
+                stopBits: parseNumeric(config.stopBits, 1),
+            };
+        })
+        .sort((a, b) => a.channel - b.channel);
+
+    const renderSwitch = (cases, defaultValue, mapper) => {
+        if (cases.length === 0) return `    (void)port;\n    return ${defaultValue};\n`;
+        let code = '    switch (port) {\n';
+        cases.forEach((entry) => {
+            code += `        case ${entry.caseValue}: return ${mapper(entry)};\n`;
+        });
+        code += `        default: return ${defaultValue};\n`;
+        code += '    }\n';
+        return code;
+    };
+
+    let helpers = `#define KRON_RUNTIME_PORT_HELPERS 1\n\n`;
+    helpers += `static inline bool KRON_I2C_PortEnabled(uint8_t port) {\n`;
+    helpers += renderSwitch(
+        i2cPorts.map((entry) => ({ caseValue: entry.bus, enabled: entry.enabled })),
+        'false',
+        (entry) => entry.enabled ? 'true' : 'false'
+    );
+    helpers += `}\n\n`;
+
+    helpers += `static inline bool KRON_SPI_PortResolve(uint8_t port, uint8_t *bus, uint8_t *cs, uint8_t *mode, uint8_t *bit_order, int32_t *clk_hz, bool *enabled) {\n`;
+    if (spiPorts.length === 0) {
+        helpers += `    (void)port;\n    if (bus) *bus = 0;\n    if (cs) *cs = 0;\n    if (mode) *mode = 0;\n    if (bit_order) *bit_order = 0;\n    if (clk_hz) *clk_hz = 1000000;\n    if (enabled) *enabled = false;\n    return false;\n`;
+    } else {
+        helpers += `    switch (port) {\n`;
+        spiPorts.forEach((entry) => {
+            helpers += `        case ${entry.logicalId}:\n`;
+            helpers += `            if (bus) *bus = ${entry.bus};\n`;
+            helpers += `            if (cs) *cs = ${entry.cs};\n`;
+            helpers += `            if (mode) *mode = ${entry.mode};\n`;
+            helpers += `            if (bit_order) *bit_order = ${entry.bitOrder};\n`;
+            helpers += `            if (clk_hz) *clk_hz = ${entry.clockHz};\n`;
+            helpers += `            if (enabled) *enabled = ${entry.enabled ? 'true' : 'false'};\n`;
+            helpers += `            return true;\n`;
+        });
+        helpers += `        default:\n`;
+        helpers += `            if (bus) *bus = 0;\n`;
+        helpers += `            if (cs) *cs = 0;\n`;
+        helpers += `            if (mode) *mode = 0;\n`;
+        helpers += `            if (bit_order) *bit_order = 0;\n`;
+        helpers += `            if (clk_hz) *clk_hz = 1000000;\n`;
+        helpers += `            if (enabled) *enabled = false;\n`;
+        helpers += `            return false;\n`;
+        helpers += `    }\n`;
+    }
+    helpers += `}\n\n`;
+
+    helpers += `static inline bool KRON_UART_PortEnabled(uint8_t port) {\n`;
+    helpers += renderSwitch(
+        uartPorts.map((entry) => ({ caseValue: entry.channel, enabled: entry.enabled })),
+        'false',
+        (entry) => entry.enabled ? 'true' : 'false'
+    );
+    helpers += `}\n\n`;
+
+    helpers += `static inline int32_t KRON_UART_PortBaud(uint8_t port) {\n`;
+    helpers += renderSwitch(
+        uartPorts.map((entry) => ({ caseValue: entry.channel, baudRate: entry.baudRate })),
+        '115200',
+        (entry) => `${entry.baudRate}`
+    );
+    helpers += `}\n\n`;
+
+    helpers += `static inline uint8_t KRON_UART_PortParity(uint8_t port) {\n`;
+    helpers += renderSwitch(
+        uartPorts.map((entry) => ({ caseValue: entry.channel, parity: entry.parity })),
+        '0',
+        (entry) => `${entry.parity}`
+    );
+    helpers += `}\n\n`;
+
+    helpers += `static inline uint8_t KRON_UART_PortStopBits(uint8_t port) {\n`;
+    helpers += renderSwitch(
+        uartPorts.map((entry) => ({ caseValue: entry.channel, stopBits: entry.stopBits })),
+        '1',
+        (entry) => `${entry.stopBits}`
+    );
+    helpers += `}\n\n`;
+
+    return helpers;
 };
 
 export const transpileToC = (projectStructure, standardHeaders = [], boardId = null, simMode = true) => {
@@ -18,23 +223,13 @@ export const transpileToC = (projectStructure, standardHeaders = [], boardId = n
     // Board-specific HAL implementation headers: excluded from direct #include
     // because kronhal.h conditionally includes the right one based on defines.
     const HAL_IMPL_HEADERS = new Set([
-        'kronhal_sim.h', 'kronhal_pico.h', 'kronhal_rpi.h', 'kronhal_bb.h', 'kronhal_edatec.h'
-    ]);
-
-    // Board HAL headers that must come AFTER type definitions (kronstandard.h etc.)
-    const HAL_LAST_HEADERS = new Set([
+        'kronhal_sim.h', 'kronhal_pico.h', 'kronhal_rpi.h', 'kronhal_bb.h',
         'kronhal_jetson.h'
     ]);
 
-    const lateIncludes = [];
-
     standardHeaders.forEach(([filename, content]) => {
         if (!HAL_IMPL_HEADERS.has(filename)) {
-            if (HAL_LAST_HEADERS.has(filename)) {
-                lateIncludes.push(filename);
-            } else {
-                customIncludes += `#include "${filename}"\n`;
-            }
+            customIncludes += `#include "${filename}"\n`;
         }
         const regex = /\b([A-Za-z0-9_]+)_Call\s*\(([^)]*)\)/g;
         let match;
@@ -113,6 +308,9 @@ export const transpileToC = (projectStructure, standardHeaders = [], boardId = n
         }
     }
 
+    const config = projectStructure.resources?.find(r => r.id === 'res_config');
+    const runtimePortHelpers = buildRuntimePortHelpers(boardId, config?.content?.deviceInterfaceConfig || {});
+
     let header = `// Autogenerated by KronEditor CTranspiler
 #ifndef PLC_H
 #define PLC_H
@@ -120,7 +318,8 @@ export const transpileToC = (projectStructure, standardHeaders = [], boardId = n
 #include <stdint.h>
 #include <stdbool.h>
 #include <string.h>
-${boardDefines}${customIncludes}${lateIncludes.map(f => `#include "${f}"\n`).join('')}
+#include <stdlib.h>
+${boardDefines}${runtimePortHelpers}${customIncludes}
 
 extern volatile uint64_t us_tick;
 
@@ -159,6 +358,27 @@ extern volatile uint64_t us_tick;
         });
     }
 
+    const deviceArtifacts = buildGeneratedDeviceArtifacts(projectStructure, config, boardId);
+    const _deviceSavedKeys = { triggerPin: [], qOutput: [], inputs: [], outputs: [], inputTypes: [], outputTypes: [] };
+    Object.keys(deviceArtifacts.meta.triggerPin).forEach(k => {
+        if (!(k in FB_TRIGGER_PIN)) { FB_TRIGGER_PIN[k] = deviceArtifacts.meta.triggerPin[k]; _deviceSavedKeys.triggerPin.push(k); HAL_BLOCK_TYPES.add(k); }
+    });
+    Object.keys(deviceArtifacts.meta.qOutput).forEach(k => {
+        if (!(k in FB_Q_OUTPUT)) { FB_Q_OUTPUT[k] = deviceArtifacts.meta.qOutput[k]; _deviceSavedKeys.qOutput.push(k); }
+    });
+    Object.keys(deviceArtifacts.meta.inputs).forEach(k => {
+        if (!(k in FB_INPUTS)) { FB_INPUTS[k] = deviceArtifacts.meta.inputs[k]; _deviceSavedKeys.inputs.push(k); }
+    });
+    Object.keys(deviceArtifacts.meta.outputs).forEach(k => {
+        if (!(k in FB_OUTPUTS)) { FB_OUTPUTS[k] = deviceArtifacts.meta.outputs[k]; _deviceSavedKeys.outputs.push(k); }
+    });
+    Object.keys(deviceArtifacts.meta.inputTypes).forEach(k => {
+        if (!(k in FB_INPUT_TYPES)) { FB_INPUT_TYPES[k] = deviceArtifacts.meta.inputTypes[k]; _deviceSavedKeys.inputTypes.push(k); }
+    });
+    Object.keys(deviceArtifacts.meta.outputTypes).forEach(k => {
+        if (!(k in GENERATED_FB_OUTPUT_TYPES)) { GENERATED_FB_OUTPUT_TYPES[k] = deviceArtifacts.meta.outputTypes[k]; _deviceSavedKeys.outputTypes.push(k); }
+    });
+
     // 1. Data Types (Header only)
     if (projectStructure.dataTypes && projectStructure.dataTypes.length > 0) {
         header += `// --- DATA TYPES ---\n`;
@@ -173,7 +393,6 @@ extern volatile uint64_t us_tick;
     }
 
     // 2. Global Variables
-    const config = projectStructure.resources?.find(r => r.id === 'res_config');
 
     // Build lookup: typeName → data type definition (for array/struct/enum expansion)
     const dataTypeDefs = (projectStructure.dataTypes || []).reduce((acc, dt) => {
@@ -241,8 +460,15 @@ extern volatile uint64_t us_tick;
         });
     }
 
+    if (deviceArtifacts.headerTypedefs) {
+        header += `// --- GENERATED DEVICE FUNCTION BLOCKS ---\n`;
+        header += deviceArtifacts.headerTypedefs;
+    }
+
     // 4. Function and Program Signatures
     header += `// --- SIGNATURES ---\n`;
+    header += `void PLC_Init(void);\n`;
+    header += `void PLC_Cleanup(void);\n`;
 
     if (projectStructure.functions) {
         projectStructure.functions.forEach(fn => {
@@ -265,12 +491,23 @@ extern volatile uint64_t us_tick;
             header += `static inline void ${progName}();\n`;
         });
     }
+    if (deviceArtifacts.headerSignatures) {
+        header += deviceArtifacts.headerSignatures;
+    }
 
     // Collect global variable names (used by LD transpiler to skip prog_ prefix)
     const globalVarNames = (config?.content?.globalVars || [])
         .map(v => (v.name || '').trim().replace(/\s+/g, '_'));
 
     header += `\n// --- IMPLEMENTATIONS ---\n`;
+    if (deviceArtifacts.headerHelpers) {
+        header += `// --- GENERATED DEVICE HELPERS ---\n`;
+        header += deviceArtifacts.headerHelpers;
+    }
+    if (deviceArtifacts.headerImplementations) {
+        header += `// --- GENERATED DEVICE IMPLEMENTATIONS ---\n`;
+        header += deviceArtifacts.headerImplementations;
+    }
 
     if (projectStructure.functions) {
         header += `// --- FUNCTIONS ---\n`;
@@ -349,7 +586,7 @@ extern volatile uint64_t us_tick;
                 }
             });
             // Collect shadow vars BEFORE transpiling so they can be declared before the function body
-            const shadowVars = prog.type === 'LD'
+            const shadowVars = (prog.type === 'LD' || prog.type === 'SCL')
                 ? collectShadowVars(prog.content?.rungs, progName)
                 : [];
             // Declare shadow tracking globals in header
@@ -371,7 +608,7 @@ extern volatile uint64_t us_tick;
             });
 
             // Collect input shadow vars — writable placeholders for unassigned/literal FB input pins
-            const inputShadowVars = prog.type === 'LD'
+            const inputShadowVars = (prog.type === 'LD' || prog.type === 'SCL')
                 ? collectInputShadowVars(prog.content?.rungs, progName)
                 : [];
             inputShadowVars.forEach(sv => {
@@ -487,7 +724,10 @@ extern volatile uint64_t us_tick;
     }
 
     // --- 6. DETERMINISTIC SCAN LOOP ---
-    const mainLoop = generateMainLoop(projectStructure, config, boardId, shmEntries.length > 0, execTimeVars);
+    if (deviceArtifacts.sourceSupport) {
+        source += deviceArtifacts.sourceSupport;
+    }
+    const mainLoop = generateMainLoop(projectStructure, config, boardId, shmEntries.length > 0, execTimeVars, deviceArtifacts.initCode, deviceArtifacts.cleanupCode);
     source += mainLoop.src;
     variableTable.tasks = mainLoop.programTasks.map(pt => ({
         program: pt.name,
@@ -504,6 +744,12 @@ extern volatile uint64_t us_tick;
     _halSavedKeys.inputs.forEach(k => delete FB_INPUTS[k]);
     _halSavedKeys.outputs.forEach(k => delete FB_OUTPUTS[k]);
     _halSavedKeys.inputTypes.forEach(k => delete FB_INPUT_TYPES[k]);
+    _deviceSavedKeys.triggerPin.forEach(k => { delete FB_TRIGGER_PIN[k]; HAL_BLOCK_TYPES.delete(k); });
+    _deviceSavedKeys.qOutput.forEach(k => delete FB_Q_OUTPUT[k]);
+    _deviceSavedKeys.inputs.forEach(k => delete FB_INPUTS[k]);
+    _deviceSavedKeys.outputs.forEach(k => delete FB_OUTPUTS[k]);
+    _deviceSavedKeys.inputTypes.forEach(k => delete FB_INPUT_TYPES[k]);
+    _deviceSavedKeys.outputTypes.forEach(k => delete GENERATED_FB_OUTPUT_TYPES[k]);
 
     return { header, source, variableTable };
 };
@@ -530,7 +776,7 @@ const formatUsDisplay = (us) => {
 
 
 
-const generateMainLoop = (projectStructure, config, boardId = null, shmEnabled = false, execTimeVars = []) => {
+const generateMainLoop = (projectStructure, config, boardId = null, shmEnabled = false, execTimeVars = [], initCode = '', cleanupCode = '') => {
     let mainSrc = `\n// --- DETERMINISTIC SCAN LOOP ---\n`;
 
     // --- 1. Discover task→program groupings (priority: taskConfig > res_config > fallback) ---
@@ -591,6 +837,24 @@ const generateMainLoop = (projectStructure, config, boardId = null, shmEnabled =
     // Bare-metal:  must be incremented by a hardware timer ISR every ~${formatUsDisplay(baseTickUs)}.
     mainSrc += `volatile int plc_stop = 0;\n`;
     mainSrc += `volatile uint64_t us_tick = 0;\n\n`;
+    mainSrc += `void PLC_Init(void) {\n`;
+    if (boardId) {
+        mainSrc += `    HAL_Init();\n`;
+    }
+    mainSrc += `    KRON_UART_RuntimeInit();\n`;
+    if (initCode) {
+        mainSrc += initCode;
+    }
+    mainSrc += `}\n\n`;
+    mainSrc += `void PLC_Cleanup(void) {\n`;
+    if (cleanupCode) {
+        mainSrc += cleanupCode;
+    }
+    mainSrc += `    KRON_UART_RuntimeCleanup();\n`;
+    if (boardId) {
+        mainSrc += `    HAL_Cleanup();\n`;
+    }
+    mainSrc += `}\n\n`;
 
     // --- 3. Linux: one pthread function per task group ---
     mainSrc += `#if defined(__linux__)\n\n`;
@@ -643,9 +907,7 @@ const generateMainLoop = (projectStructure, config, boardId = null, shmEnabled =
     mainSrc += `int main() {\n`;
     mainSrc += `    { struct sched_param __sp = { .sched_priority = sched_get_priority_max(SCHED_FIFO) };\n`;
     mainSrc += `      sched_setscheduler(0, SCHED_FIFO, &__sp); }\n`;
-    if (boardId) {
-        mainSrc += `    HAL_Init();\n`;
-    }
+    mainSrc += `    PLC_Init();\n`;
     if (shmEnabled) {
         mainSrc += `    plc_shm_init();\n`;
     }
@@ -656,9 +918,7 @@ const generateMainLoop = (projectStructure, config, boardId = null, shmEnabled =
         });
         mainSrc += `    for (int i = 0; i < ${taskGroups.length}; i++) pthread_join(__plc_threads[i], NULL);\n`;
     }
-    if (boardId) {
-        mainSrc += `    HAL_Cleanup();\n`;
-    }
+    mainSrc += `    PLC_Cleanup();\n`;
     mainSrc += `    return 0;\n}\n\n`;
 
     // --- 4. Windows: cooperative timer wheel ---
@@ -675,7 +935,7 @@ const generateMainLoop = (projectStructure, config, boardId = null, shmEnabled =
     mainSrc += `int main() {\n`;
     mainSrc += `    SetPriorityClass(GetCurrentProcess(), REALTIME_PRIORITY_CLASS);\n`;
     mainSrc += `    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);\n`;
-    if (boardId) mainSrc += `    HAL_Init();\n`;
+    mainSrc += `    PLC_Init();\n`;
     mainSrc += `    uint64_t __prev_us = 0;\n`;
     mainSrc += `    while (!plc_stop) {\n`;
     mainSrc += `        __update_us_tick();\n`;
@@ -685,16 +945,13 @@ const generateMainLoop = (projectStructure, config, boardId = null, shmEnabled =
     mainSrc += `        __prev_us = us_tick;\n`;
     mainSrc += `        Sleep(${Math.max(1, Math.floor(baseTickUs / 1000))});\n`;
     mainSrc += `    }\n`;
-    if (boardId) mainSrc += `    HAL_Cleanup();\n`;
+    mainSrc += `    PLC_Cleanup();\n`;
     mainSrc += `    return 0;\n}\n\n`;
 
     // --- 5. Bare-metal: cooperative timer wheel called from HAL ---
     mainSrc += `#else\n\n`;
     mainSrc += `// Bare-metal / RTOS-less execution engine.\n`;
     mainSrc += `// us_tick must be incremented by a hardware timer ISR every ${formatUsDisplay(baseTickUs)}.\n`;
-    if (boardId) {
-        mainSrc += `void PLC_Init(void) { HAL_Init(); }\n\n`;
-    }
     mainSrc += `void PLC_Run(void) {\n`;
     programTasks.forEach(pt => {
         mainSrc += `    if (us_tick % ${pt.intervalUs}ULL == 0) { ${pt.name}(); }\n`;
@@ -779,6 +1036,8 @@ const FB_TRIGGER_PIN = {
     'CTU': 'CU', 'CTD': 'CD', 'CTUD': 'CU',
     // Edge detectors
     'R_TRIG': 'CLK', 'F_TRIG': 'CLK',
+    // Generic communication runtime FBs
+    'I2C_WriteRead': 'Execute', 'SPI_Transfer': 'Execute', 'UART_Send': 'Execute', 'UART_Receive': 'Enable',
     // Comparison / Arithmetic / Math / Bitwise / Trig / Selection / Conversion — EN is the power-flow input
     'GT': 'EN', 'GE': 'EN', 'EQ': 'EN', 'NE': 'EN', 'LE': 'EN', 'LT': 'EN',
     'ADD': 'EN', 'SUB': 'EN', 'MUL': 'EN', 'DIV': 'EN', 'MOD': 'EN', 'MOVE': 'EN',
@@ -817,6 +1076,8 @@ const FB_Q_OUTPUT = {
     'CTU': 'Q', 'CTD': 'Q', 'CTUD': 'QU',
     // Edge detectors
     'R_TRIG': 'Q', 'F_TRIG': 'Q',
+    // Generic communication runtime FBs
+    'I2C_WriteRead': 'Done', 'SPI_Transfer': 'Done', 'UART_Send': 'Done', 'UART_Receive': 'NewData',
     // Bistable
     'RS': 'Q1', 'SR': 'Q1',
     // Comparison: ENO = EN && (result) — acts as conditional power flow
@@ -850,10 +1111,14 @@ const FB_Q_OUTPUT = {
     'NORM_X': 'ENO', 'SCALE_X': 'ENO'
 };
 
+const GENERATED_FB_OUTPUT_TYPES = {};
+
 // Returns the IEC type of an output pin for a given block type
 // customData is optional — used for user-defined FB output pin types
 const getOutputPinType = (blockType, pinName, customData) => {
     if (['Q', 'Q1', 'QU', 'QD', 'ENO'].includes(pinName)) return 'BOOL';
+    if (blockType === 'UART_Receive' && pinName === 'ReceivedLength') return 'UINT';
+    if (GENERATED_FB_OUTPUT_TYPES[blockType]?.[pinName]) return GENERATED_FB_OUTPUT_TYPES[blockType][pinName];
     if (pinName === 'ET') return 'TIME';
     if (pinName === 'CV') return 'INT';
     if (pinName === 'OUT') {
@@ -913,6 +1178,9 @@ const collectInputShadowVars = (rungs, progName) => {
     const isVarRef = (val) => {
         if (!val) return false;
         const v = (val + '').replace(/[🌍🏠⊞⊡⊟]/g, '').trim();
+        if (isBooleanLiteral(v)) return false;
+        if (/^ADR\s*\(.+\)$/i.test(v)) return true;
+        if (/^NULL$/i.test(v)) return true;
         return v.length > 0 && /^[A-Za-z_][A-Za-z0-9_]*(\[[^\]]*\]|\.[A-Za-z_][A-Za-z0-9_]*)*$/.test(v);
     };
     (rungs || []).forEach(rung => {
@@ -923,6 +1191,7 @@ const collectInputShadowVars = (rungs, progName) => {
             const instName = (data.instanceName || type).trim().replace(/\s+/g, '_');
             const pinTypes = FB_INPUT_TYPES[type];
             Object.entries(pinTypes).forEach(([editorPin, iecType]) => {
+                if (isPointerInputType(iecType)) return;
                 const rawVal = data.values?.[editorPin];
                 if (isVarRef(rawVal)) return;
                 const sym = `prog_${progName}_in_${instName}_${editorPin}`;
@@ -939,9 +1208,9 @@ const collectInputShadowVars = (rungs, progName) => {
                     } else if (/^-?\d+(\.\d+)?$/.test(cleanVal)) {
                         initStr = cleanVal;
                         initVal = parseFloat(cleanVal);
-                    } else if (/^(true|false)$/i.test(cleanVal)) {
-                        initStr = cleanVal.toLowerCase();
-                        initVal = cleanVal.toLowerCase() === 'true' ? 1 : 0;
+                    } else if (isBooleanLiteral(cleanVal)) {
+                        initStr = normalizeBooleanLiteral(cleanVal) || 'false';
+                        initVal = initStr === 'true' ? 1 : 0;
                     }
                 }
                 vars.push({ symbol: sym, type: iecType, instName, editorPin, initStr, initVal });
@@ -973,7 +1242,7 @@ const collectUndeclaredPinVars = (rungs, progName, declaredVarNames, globalVarNa
                 const raw = (vals[pinKey] || data.instanceName || '') + '';
                 const v = raw.replace(/[🌍🏠⊞⊡⊟]/g, '').trim();
                 if (v && idRegex.test(v) && !isLiteral(v)) {
-                    const baseName = v.split(/[\.\[]/)[0];
+                    const baseName = v.split(/[.[]/)[0];
                     if (!globalVarNames.includes(baseName) && !declaredVarNames.has(baseName) && !seen.has(baseName)) {
                         seen.add(baseName);
                         vars.push({ symbol: `prog_${progName}_${baseName}`, type: 'BOOL' });
@@ -986,7 +1255,7 @@ const collectUndeclaredPinVars = (rungs, progName, declaredVarNames, globalVarNa
             Object.entries(vals).forEach(([pinName, rawVal]) => {
                 const v = rawVal ? (rawVal + '').replace(/[🌍🏠⊞⊡⊟]/g, '').trim() : '';
                 if (!v || !idRegex.test(v) || isLiteral(v)) return;
-                const baseName = v.split(/[\.\[]/)[0];
+                const baseName = v.split(/[.[]/)[0];
                 if (globalVarNames.includes(baseName) || declaredVarNames.has(baseName) || seen.has(baseName)) return;
                 seen.add(baseName);
                 const pinType = getOutputPinType(type, pinName);
@@ -1003,6 +1272,10 @@ const FB_OUTPUTS = {
     'CTU': ['Q', 'CV'], 'CTD': ['Q', 'CV'], 'CTUD': ['QU', 'QD', 'CV'],
     'SR': ['Q1'], 'RS': ['Q1'],
     'R_TRIG': ['Q'], 'F_TRIG': ['Q'],
+    'I2C_WriteRead': ['Done', 'Busy', 'Error'],
+    'SPI_Transfer': ['Done', 'Busy', 'Error'],
+    'UART_Send': ['Done', 'Busy', 'Error'],
+    'UART_Receive': ['NewData', 'ReceivedLength', 'Error'],
     // Comparison — ENO (power-flow) + Q (raw comparison result)
     'GT': ['ENO', 'Q'], 'GE': ['ENO', 'Q'], 'EQ': ['ENO', 'Q'], 'NE': ['ENO', 'Q'], 'LE': ['ENO', 'Q'], 'LT': ['ENO', 'Q'],
     // Arithmetic / Math / Bitwise / Trig / Selection — ENO + OUT
@@ -1078,6 +1351,10 @@ const FB_INPUTS = {
     'CTUD': ['CU', 'CD', 'R', 'LD', 'PV'],
     'R_TRIG': ['CLK'],
     'F_TRIG': ['CLK'],
+    'I2C_WriteRead': ['Execute', 'Port_ID', 'Device_Address', 'Register_Address', 'pTxBuffer', 'TxLength', 'pRxBuffer', 'RxLength'],
+    'SPI_Transfer': ['Execute', 'Port_ID', 'pTxBuffer', 'pRxBuffer', 'Length'],
+    'UART_Send': ['Execute', 'Port_ID', 'pTxBuffer', 'Length'],
+    'UART_Receive': ['Enable', 'Port_ID', 'pRxBuffer', 'MaxSize'],
     'RS': ['S', 'R1'],
     'SR': ['S1', 'R'],
     // Comparison
@@ -1146,6 +1423,10 @@ const cStructPin = (blockType, editorPin) => FB_C_PIN_NAME[blockType]?.[editorPi
 
 // IEC type of each non-trigger input pin for standard FBs (for input shadow var generation)
 const FB_INPUT_TYPES = {
+    'I2C_WriteRead': { 'Port_ID': 'USINT', 'Device_Address': 'USINT', 'Register_Address': 'USINT', 'pTxBuffer': 'POINTER', 'TxLength': 'UINT', 'pRxBuffer': 'POINTER', 'RxLength': 'UINT' },
+    'SPI_Transfer': { 'Port_ID': 'USINT', 'pTxBuffer': 'POINTER', 'pRxBuffer': 'POINTER', 'Length': 'UINT' },
+    'UART_Send': { 'Port_ID': 'USINT', 'pTxBuffer': 'POINTER', 'Length': 'UINT' },
+    'UART_Receive': { 'Port_ID': 'USINT', 'pRxBuffer': 'POINTER', 'MaxSize': 'UINT' },
     'TON':   { 'PT': 'TIME' },
     'TOF':   { 'PT': 'TIME' },
     'TP':    { 'PT': 'TIME' },
@@ -1189,7 +1470,11 @@ const transpileSTLogics = (code, stdFunctions = {}, parentName = '', category = 
     const transformExpr = (expr) => {
         let result = expr
             .replace(/\b[A-Za-z_][A-Za-z0-9_]*#([A-Za-z_][A-Za-z0-9_]*)\b/g, '$1') // TypeName#EnumValue → EnumValue
-            .replace(/:=/g, '=')
+            .replace(/\b16#([0-9A-Fa-f]+)/gi, '0x$1')  // IEC hex literal: 16#FF → 0xFF
+            .replace(/:=/g, '__ASSIGN__')               // protect assignments before = → == pass
+            .replace(/<>/g, '!=')                       // IEC not-equal → C not-equal
+            .replace(/(?<![:=<>!])=(?!=)/g, '==')       // comparison = → == (not :=, <=, >=, !=, ==)
+            .replace(/__ASSIGN__/g, '=')                // restore assignments
             .replace(/\bAND\b/g, '&&')
             .replace(/\bOR\b/g, '||')
             .replace(/\bNOT\b/g, '!')
@@ -1197,6 +1482,8 @@ const transpileSTLogics = (code, stdFunctions = {}, parentName = '', category = 
             .replace(/\bXOR\b/g, '^')
             .replace(/\bTRUE\b/gi, 'true')
             .replace(/\bFALSE\b/gi, 'false');
+        result = result.replace(/\bADR\s*\(\s*([^)]+?)\s*\)/gi, (_, inner) => `(&(${resolveVarsInExpr(inner.trim())}))`);
+        result = result.replace(/\bNULL\b/g, 'NULL');
         return resolveVarsInExpr(result);
     };
 
@@ -1322,7 +1609,7 @@ const transpileLDLogics = (rungs, stdFunctions = {}, parentName = '', category =
         if (!varName) return null;
         const s = varName.trim();
         // Split base name from suffix (array index or struct member access)
-        const sepIdx = s.search(/[\[.]/);
+        const sepIdx = s.search(/[[.]/);
         const baseName = (sepIdx >= 0 ? s.slice(0, sepIdx) : s).replace(/\s+/g, '_');
         const suffix = sepIdx >= 0 ? s.slice(sepIdx) : '';
         if (category === 'program') {
@@ -1341,6 +1628,15 @@ const transpileLDLogics = (rungs, stdFunctions = {}, parentName = '', category =
         // Strip any UI scope/type icons (🌍🏠⊞⊡⊟)
         const s = val.toString().replace(/[🌍🏠⊞⊡⊟]/g, '').trim();
         if (!s) return null;
+        if (/^NULL$/i.test(s)) return 'NULL';
+        const adrMatch = s.match(/^ADR\s*\(\s*(.+?)\s*\)$/i);
+        if (adrMatch) {
+            const adrTarget = adrMatch[1].trim();
+            if (/^[A-Za-z_][A-Za-z0-9_]*(\[[^\]]*\]|\.[A-Za-z_][A-Za-z0-9_]*)*$/.test(adrTarget)) {
+                return `&(${resolveVar(adrTarget)})`;
+            }
+            return null;
+        }
         if (s.toUpperCase().startsWith('T#') || s.toUpperCase().startsWith('TIME#')) {
             return mapIECtoTimeUs(s).toString();
         }
@@ -1351,12 +1647,72 @@ const transpileLDLogics = (rungs, stdFunctions = {}, parentName = '', category =
         // Numeric literal (int, float, hex 0x...)
         if (/^-?[0-9][0-9a-fA-FxX.]*$/.test(s)) return s;
         // Boolean literals
-        if (/^(true|false|TRUE|FALSE)$/.test(s)) return s.toLowerCase();
+        if (isBooleanLiteral(s)) return normalizeBooleanLiteral(s);
         // Variable reference: simple, arr[idx], or struct.member
         if (/^[A-Za-z_][A-Za-z0-9_]*(\[[^\]]*\]|\.[A-Za-z_][A-Za-z0-9_]*)*$/.test(s)) {
             return resolveVar(s);
         }
         return null; // unrecognised
+    };
+
+    const getInputPinMeta = (blockType, pinName, customData = null) => {
+        if (customData?.content?.variables) {
+            const pinVar = customData.content.variables.find((v) => v.name === pinName && (v.class === 'Input' || v.class === 'InOut'));
+            if (pinVar?.type) return { type: pinVar.type, passByReference: false };
+        }
+        if (customData?.inputs) {
+            const pinDef = customData.inputs.find((input) => input.name === pinName);
+            if (pinDef) {
+                return {
+                    type: pinDef.storageType || pinDef.type || null,
+                    passByReference: !!pinDef.passByReference || isPointerInputType(pinDef.storageType || pinDef.type),
+                };
+            }
+        }
+        return {
+            type: FB_INPUT_TYPES[blockType]?.[pinName] || null,
+            passByReference: isPointerInputType(FB_INPUT_TYPES[blockType]?.[pinName]),
+        };
+    };
+
+    const resolveInputPinValue = (blockType, pinName, rawValue, customData = null) => {
+        if (rawValue === undefined || rawValue === null || rawValue === '') return null;
+        const cleanValue = String(rawValue).replace(/[🌍🏠⊞⊡⊟]/g, '').trim();
+        if (!cleanValue) return null;
+
+        if (pinName === 'Port_ID') {
+            const resolvedPort = resolveHardwarePortSymbol(cleanValue);
+            if (resolvedPort !== null) return resolvedPort;
+        }
+
+        const pinMeta = getInputPinMeta(blockType, pinName, customData);
+        if (pinMeta.passByReference) {
+            if (/^NULL$/i.test(cleanValue)) return 'NULL';
+            const adrMatch = cleanValue.match(/^ADR\s*\(\s*(.+?)\s*\)$/i);
+            if (adrMatch && IDENTIFIER_REF_REGEX.test(adrMatch[1].trim())) {
+                return `&(${resolveVar(adrMatch[1].trim())})`;
+            }
+            if (IDENTIFIER_REF_REGEX.test(cleanValue)) {
+                return `&(${resolveVar(cleanValue)})`;
+            }
+        }
+
+        return resolveVal(cleanValue);
+    };
+
+    const adaptExprForInputPin = (blockType, pinName, expr, customData = null) => {
+        if (!expr) return expr;
+        const pinMeta = getInputPinMeta(blockType, pinName, customData);
+        if (pinMeta.passByReference) {
+            if (expr === 'NULL') return 'NULL';
+            if (
+                /^out_r\d+_b\d+$/.test(expr) ||
+                /^[A-Za-z_][A-Za-z0-9_]*(?:->[A-Za-z_][A-Za-z0-9_]*|\.[A-Za-z_][A-Za-z0-9_]*|\[[^\]]+\])*$/.test(expr)
+            ) {
+                return `&(${expr})`;
+            }
+        }
+        return expr;
     };
 
     // Get the C call-target for an FB instance
@@ -1656,7 +2012,7 @@ const transpileLDLogics = (rungs, stdFunctions = {}, parentName = '', category =
                         if (shadowSym) {
                             out += `    ${callTarget}.${cPin} = ${shadowSym};\n`;
                         } else {
-                            const resolved = resolveVal(val);
+                            const resolved = resolveInputPinValue(type, pinName, val, data.customData);
                             if (resolved !== null && resolved !== undefined) {
                                 out += `    ${callTarget}.${cPin} = ${resolved};\n`;
                             }
@@ -1676,6 +2032,15 @@ const transpileLDLogics = (rungs, stdFunctions = {}, parentName = '', category =
                         }
                     });
                 }
+                (inputPins || []).forEach(pinName => {
+                    if (pinName === FB_TRIGGER_PIN[type]) return;
+                    if (outputPinNames.has(pinName)) return;
+                    if (data.values?.[pinName] !== undefined && data.values[pinName] !== '') return;
+                    if (inputShadowMap?.get(`${safeInst}_${pinName}`)) return;
+                    if (!getInputPinMeta(type, pinName, data.customData).passByReference) return;
+                    const cPin = cStructPin(type, pinName);
+                    out += `    ${callTarget}.${cPin} = NULL;\n`;
+                });
 
                 // Step 2: assign non-trigger inputs that arrive via wire connections
                 // Skip for built-in blocks without a trigger pin (e.g. SR/RS) — their inputs
@@ -1694,16 +2059,21 @@ const transpileLDLogics = (rungs, stdFunctions = {}, parentName = '', category =
                     if (!pinName || !inputPins.includes(pinName)) return;
                     const cPin = cStructPin(type, pinName);
                     if (c.source && c.source.startsWith('terminal_left')) {
-                        out += `    ${callTarget}.${cPin} = true;\n`;
+                        const sourceExpr = getInputPinMeta(type, pinName, data.customData).passByReference
+                            ? 'NULL'
+                            : adaptExprForInputPin(type, pinName, 'true', data.customData);
+                        out += `    ${callTarget}.${cPin} = ${sourceExpr};\n`;
                     } else if (sortedIndex[c.source] !== undefined) {
                         const sp = c.sourcePin || '';
                         if (sp.startsWith('out_') && !/^out_\d+$/.test(sp)) {
                             // Named data output pin (e.g. "out_VALUE", "out_Q") — read from source struct directly
                             const srcBlock = nodeMap[c.source];
                             const srcInstName = (srcBlock?.data?.instanceName || srcBlock?.type || '');
-                            out += `    ${callTarget}.${cPin} = ${getCallTarget(srcInstName)}.${sp.slice(4)};\n`;
+                            const sourceExpr = adaptExprForInputPin(type, pinName, `${getCallTarget(srcInstName)}.${sp.slice(4)}`, data.customData);
+                            out += `    ${callTarget}.${cPin} = ${sourceExpr};\n`;
                         } else {
-                            out += `    ${callTarget}.${cPin} = out_r${rungIdx}_b${sortedIndex[c.source]};\n`;
+                            const sourceExpr = adaptExprForInputPin(type, pinName, `out_r${rungIdx}_b${sortedIndex[c.source]}`, data.customData);
+                            out += `    ${callTarget}.${cPin} = ${sourceExpr};\n`;
                         }
                     }
                 });
@@ -1801,6 +2171,7 @@ const mapType = (iecType) => {
         'LWORD': 'uint64_t',
         'TIME': 'uint32_t',
         'STRING': 'char*',
+        'POINTER': 'void*',
         'VOID': 'void'
     };
     return typeMap[iecType] || iecType; // Fallback to custom name
