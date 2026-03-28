@@ -122,6 +122,7 @@ const buildRuntimePortHelpers = (boardId, interfaceConfig = {}) => {
                 baudRate: 115200,
                 parity: 'NONE',
                 stopBits: 1,
+                devicePath: '',
                 ...(interfaceConfig?.UART?.[port.id] || {}),
             };
             return {
@@ -130,6 +131,7 @@ const buildRuntimePortHelpers = (boardId, interfaceConfig = {}) => {
                 baudRate: parseNumeric(config.baudRate, 115200),
                 parity: parityToCode(config.parity),
                 stopBits: parseNumeric(config.stopBits, 1),
+                devicePath: (config.devicePath || '').trim(),
             };
         })
         .sort((a, b) => a.channel - b.channel);
@@ -145,7 +147,18 @@ const buildRuntimePortHelpers = (boardId, interfaceConfig = {}) => {
         return code;
     };
 
-    let helpers = `#define KRON_RUNTIME_PORT_HELPERS 1\n\n`;
+    // UART device path overrides — emitted before kronhal.h so #ifndef KRON_UARTx picks them up
+    let uartPathDefines = '';
+    uartPorts.forEach((entry) => {
+        if (entry.devicePath) {
+            const escaped = entry.devicePath.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+            uartPathDefines += `#ifndef KRON_UART${entry.channel}\n`;
+            uartPathDefines += `#define KRON_UART${entry.channel} "${escaped}"\n`;
+            uartPathDefines += `#endif\n`;
+        }
+    });
+
+    let helpers = `#define KRON_RUNTIME_PORT_HELPERS 1\n${uartPathDefines}\n`;
     helpers += `static inline bool KRON_I2C_PortEnabled(uint8_t port) {\n`;
     helpers += renderSwitch(
         i2cPorts.map((entry) => ({ caseValue: entry.bus, enabled: entry.enabled })),
@@ -251,7 +264,9 @@ export const validateProjectST = (projectStructure, stdFunctionNames = []) => {
     );
 
     const validateCode = (code, varNames, contextLabel) => {
-        const lines = (code || '').split('\n');
+        // Strip multi-line (* block comments *) preserving line count, then split
+        const stripped = (code || '').replace(/\(\*[\s\S]*?\*\)/g, match => '\n'.repeat((match.match(/\n/g) || []).length));
+        const lines = stripped.split('\n');
         lines.forEach((rawLine, i) => {
             const line = rawLine.replace(/\/\/.*$/, '').replace(/\(\*.*?\*\)/g, '');
             const regex = /\b[a-zA-Z_][a-zA-Z0-9_]*\b/g;
@@ -1530,8 +1545,11 @@ const FB_INPUT_TYPES = {
 const transpileSTLogics = (code, stdFunctions = {}, parentName = '', category = 'program', varMap = {}) => {
     if (!code) return `    // ST Implementation Empty\n`;
 
-    // Split on actual newlines or escaped \n sequences (both may appear depending on storage)
-    const lines = code.split(/\r?\n|\\n/);
+    // Strip IEC 61131-3 comments before splitting:
+    //   (* block comments — single or multi-line *)
+    //   // line comments
+    const stripped = code.replace(/\(\*[\s\S]*?\*\)/g, '');
+    const lines = stripped.split(/\r?\n|\\n/).map(l => l.replace(/\/\/.*$/, ''));
     let out = '';
     let indentLevel = 1; // 1 = inside function body (4 spaces)
 

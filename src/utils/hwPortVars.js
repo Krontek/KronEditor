@@ -31,9 +31,11 @@ export const buildHardwarePortVars = (interfaceConfig, boardFamilyDefine) => {
       if (!cfg?.enabled) continue;
 
       const devPath =
-        (boardFamilyDefine
-          ? resolveDevicePath(boardFamilyDefine, protocol, portId)
-          : null) || portId;
+        (cfg.devicePath && cfg.devicePath.trim())
+          ? cfg.devicePath.trim()
+          : (boardFamilyDefine
+              ? resolveDevicePath(boardFamilyDefine, protocol, portId)
+              : null) || portId;
 
       const portNum = getPortNumericId(portId);
 

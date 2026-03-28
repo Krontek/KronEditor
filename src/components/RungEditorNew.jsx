@@ -34,7 +34,9 @@ function validateSCLCode(code, variables, globalVars, monaco, model) {
   globalVars.forEach(v => { if (v.name) allowed.add(v.name.toLowerCase()); });
 
   const markers = [];
-  const lines = (code || '').split('\n');
+  // Strip multi-line (* block comments *) from the whole code before line-by-line scan
+  const strippedCode = (code || '').replace(/\(\*[\s\S]*?\*\)/g, match => '\n'.repeat((match.match(/\n/g) || []).length));
+  const lines = strippedCode.split('\n');
   lines.forEach((rawLine, i) => {
     const line = rawLine.replace(/\/\/.*$/, '').replace(/\(\*.*?\*\)/g, '');
     const regex = /\b[a-zA-Z_][a-zA-Z0-9_]*\b/g;

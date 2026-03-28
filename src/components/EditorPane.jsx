@@ -164,7 +164,9 @@ const EditorPane = ({
     const validate = () => {
       const text = model.getValue();
       const markers = [];
-      const lines = text.split('\n');
+      // Strip multi-line (* block comments *) from the whole text before line-by-line scan
+      const stripped = text.replace(/\(\*[\s\S]*?\*\)/g, match => '\n'.repeat((match.match(/\n/g) || []).length));
+      const lines = stripped.split('\n');
 
       // Case-insensitive set: IEC 61131-3 identifiers are case-insensitive
       const allowedLower = new Set([

@@ -499,7 +499,7 @@ const getDefaultProtocolConfig = (protocol, port) => {
   if (protocol === 'SPI') {
     return { enabled: false, clockHz: 1000000, mode: 0, bitOrder: 'MSB', pins: { ...(port.pins || {}) } };
   }
-  return { enabled: false, baudRate: 115200, parity: 'NONE', stopBits: 1, pins: { ...(port.pins || {}) } };
+  return { enabled: false, baudRate: 115200, parity: 'NONE', stopBits: 1, devicePath: port.path || '', pins: { ...(port.pins || {}) } };
 };
 
 const DetailBadge = ({ label, value, color = '#4a90d9' }) => (
@@ -563,7 +563,7 @@ const ProtocolPortCard = ({ board, protocol, port, value, onChange }) => {
         </div>
       )}
 
-      <div style={{ display: 'grid', gridTemplateColumns: protocol === 'UART' ? 'repeat(3, minmax(0, 1fr))' : 'repeat(2, minmax(0, 1fr))', gap: 10 }}>
+      <div style={{ display: 'grid', gridTemplateColumns: protocol === 'UART' ? 'repeat(4, minmax(0, 1fr))' : 'repeat(2, minmax(0, 1fr))', gap: 10 }}>
         {protocol === 'I2C' && (
           <>
             <div>
@@ -637,6 +637,17 @@ const ProtocolPortCard = ({ board, protocol, port, value, onChange }) => {
                 <option value={1}>1</option>
                 <option value={2}>2</option>
               </select>
+            </div>
+            <div>
+              <FieldLabel>Device Path</FieldLabel>
+              <input
+                type="text"
+                value={value.devicePath ?? port.path ?? ''}
+                onChange={(e) => update({ devicePath: e.target.value })}
+                placeholder={port.path || '/dev/ttyAMA0'}
+                style={InputBaseStyle}
+                spellCheck={false}
+              />
             </div>
           </>
         )}
