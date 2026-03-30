@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useCallback, useMemo } from 'react';
 import { lazy, Suspense } from 'react';
 const EtherCATEditor = lazy(() => import('./components/EtherCATEditor'));
+import SlaveConfigPage from './components/SlaveConfigPage';
 import EditorPane from './components/EditorPane';
 import Toolbox from './components/Toolbox';
 import ProjectSidebar from './components/ProjectSidebar';
@@ -367,9 +368,152 @@ function App() {
     if (bus) openTab(busId, bus.type === 'ethercat' ? 'Master' : bus.type, bus.type === 'ethercat' ? EtherCATTabIcon : '🔌');
   }, [buses]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  const handleBusConfigChange = useCallback((busId, newConfig) => {
-    setBusConfigs(prev => ({ ...prev, [busId]: newConfig }));
+  const handleBusConfigChange = useCallback((busId, masterSettings) => {
+    // Preserve slaves — EtherCATEditor only sends master settings now
+    setBusConfigs(prev => ({
+      ...prev,
+      [busId]: { ...masterSettings, slaves: prev[busId]?.slaves || [] },
+    }));
   }, []);
+
+  /* ── Slave handlers ── */
+  const handleAddSlave = useCallback((busId) => {
+    const existingSlaves = busConfigs[busId]?.slaves || [];
+    const id = `slave_${Date.now()}`;
+    const newSlave = {
+      id,
+      position: existingSlaves.length + 1,
+      name: `Slave_${existingSlaves.length + 1}`,
+      vendorId: 0, productCode: 0, revision: 0,
+      pdos: [], sdos: [],
+    };
+    setBusConfigs(prev => ({
+      ...prev,
+      [busId]: { ...(prev[busId] || {}), slaves: [...existingSlaves, newSlave] },
+    }));
+    setActiveId(id);
+    openTab(id, newSlave.name, '🔌');
+  }, [busConfigs]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const [esiPickerBusId, setEsiPickerBusId] = useState(null);
+
+  const handleAddSlaveFromLibrary = useCallback((busId) => {
+    setEsiPickerBusId(busId);
+  }, []);
+
+  const handleEsiDevicePicked = useCallback((device) => {
+    const busId = esiPickerBusId;
+    if (!busId) return;
+    setEsiPickerBusId(null);
+    const existingSlaves = busConfigs[busId]?.slaves || [];
+    const id = `slave_${Date.now()}`;
+    const newSlave = {
+      id,
+      position: existingSlaves.length + 1,
+      name: device.name,
+      vendorId: device.vendorId,
+      productCode: device.productCode,
+      revision: device.revision,
+      pdos: (device.allPdos || []).map(pdo => ({
+        ...pdo,
+        entries: (pdo.entries || []).map(e => ({ ...e, selected: false, varName: '' })),
+      })),
+      sdos: (device.sdos || []).map(s => ({ ...s })),
+    };
+    setBusConfigs(prev => ({
+      ...prev,
+      [busId]: { ...(prev[busId] || {}), slaves: [...existingSlaves, newSlave] },
+    }));
+    setActiveId(id);
+    openTab(id, newSlave.name, '🔌');
+  }, [busConfigs, esiPickerBusId]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const handleDeleteSlave = useCallback(async (busId, slaveId) => {
+    const slave = (busConfigs[busId]?.slaves || []).find(s => s.id === slaveId);
+    const confirmed = await ask(`"${slave?.name || 'Slave'}" silinsin mi?`, { title: 'Slave Sil', type: 'warning' });
+    if (!confirmed) return;
+    setBusConfigs(prev => ({
+      ...prev,
+      [busId]: { ...(prev[busId] || {}), slaves: (prev[busId]?.slaves || []).filter(s => s.id !== slaveId) },
+    }));
+    setOpenTabs(prev => prev.filter(t => t.id !== slaveId));
+    if (activeId === slaveId) setActiveId(busId);
+  }, [busConfigs, activeId]);
+
+  const handleSelectSlave = useCallback((busId, slaveId) => {
+    const slave = (busConfigs[busId]?.slaves || []).find(s => s.id === slaveId);
+    setActiveId(slaveId);
+    openTab(slaveId, slave?.name || 'Slave', '🔌');
+  }, [busConfigs]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const handleUpdateSlave = useCallback((busId, slaveId, updatedSlave) => {
+    // Sync AXIS_REF to global variables automatically
+    const oldSlave = busConfigs[busId]?.slaves?.find(s => s.id === slaveId);
+    const oldAxis  = oldSlave?.axisRef;
+    const newAxis  = updatedSlave.axisRef;
+
+    if (newAxis?.enabled) {
+      const cleanName = (n) => (n || '').replace(/[^A-Za-z0-9_]/g, '_') || 'Axis_1';
+      const newName = cleanName(newAxis.name || `Axis_${updatedSlave.position || 1}`);
+      const oldName = oldAxis?.enabled
+        ? cleanName(oldAxis.name || `Axis_${oldSlave.position || 1}`)
+        : null;
+
+      setProjectStructure(prev => {
+        const res = prev.resources.find(r => r.type === 'RESOURCE_EDITOR');
+        if (!res) return prev;
+        const vars = res.content.globalVars || [];
+
+        let newVars;
+        if (oldName && oldName !== newName) {
+          // Axis renamed → rename the existing AXIS_REF global var
+          newVars = vars.map(v =>
+            v.name === oldName && v.type === 'AXIS_REF' ? { ...v, name: newName } : v
+          );
+        } else if (!vars.some(v => v.name === newName && v.type === 'AXIS_REF')) {
+          // Axis newly enabled → add global var
+          newVars = [...vars, {
+            id: `gv_axis_${Date.now()}`,
+            name: newName,
+            type: 'AXIS_REF',
+            initialValue: '',
+            comment: `Axis for ${updatedSlave.name || 'slave'}`,
+          }];
+        } else {
+          newVars = vars;
+        }
+
+        return {
+          ...prev,
+          resources: prev.resources.map(r =>
+            r.type === 'RESOURCE_EDITOR'
+              ? { ...r, content: { ...r.content, globalVars: newVars } }
+              : r
+          ),
+        };
+      });
+    }
+
+    setBusConfigs(prev => ({
+      ...prev,
+      [busId]: {
+        ...(prev[busId] || {}),
+        slaves: (prev[busId]?.slaves || []).map(s => s.id === slaveId ? updatedSlave : s),
+      },
+    }));
+    // Keep tab label in sync with slave name
+    setOpenTabs(prev => prev.map(t => t.id === slaveId ? { ...t, label: updatedSlave.name || 'Slave' } : t));
+  }, [busConfigs]);
+
+  // Find which bus + slave the current activeId belongs to
+  const activeSlave = useMemo(() => {
+    for (const bus of buses) {
+      const slaves = busConfigs[bus.id]?.slaves || [];
+      const slave = slaves.find(s => s.id === activeId);
+      if (slave) return { busId: bus.id, slave };
+    }
+    return null;
+  }, [activeId, buses, busConfigs]);
 
   const handleAddGlobalVarsFromBus = useCallback((vars) => {
     const configResource = projectStructure.resources.find(r => r.type === 'RESOURCE_EDITOR');
@@ -1666,6 +1810,11 @@ function App() {
                 onAddBus={handleAddBus}
                 onDeleteBus={handleDeleteBus}
                 onSelectBus={handleSelectBus}
+                busConfigs={busConfigs}
+                onAddSlave={handleAddSlave}
+                onAddSlaveFromLibrary={esiLibrary.length > 0 ? handleAddSlaveFromLibrary : undefined}
+                onDeleteSlave={handleDeleteSlave}
+                onSelectSlave={handleSelectSlave}
               />
             </div>
 
@@ -1691,15 +1840,22 @@ function App() {
                 style={{ flex: 1, position: 'relative', overflow: 'hidden', display: 'flex', flexDirection: 'column' }}
                 onMouseDown={() => window.getSelection()?.removeAllRanges()}
               >
-                {buses.some(b => b.id === activeId && b.type === 'ethercat') ? (
+                {activeSlave ? (
+                  <SlaveConfigPage
+                    key={activeSlave.slave.id}
+                    slave={activeSlave.slave}
+                    onChange={(updated) => handleUpdateSlave(activeSlave.busId, activeSlave.slave.id, updated)}
+                    onAddGlobalVars={handleAddGlobalVarsFromBus}
+                    isRunning={isRunning || isSimulationMode}
+                    esiLibrary={esiLibrary}
+                  />
+                ) : buses.some(b => b.id === activeId && b.type === 'ethercat') ? (
                   <ErrorBoundary>
                     <Suspense fallback={<div style={{ padding: 20, color: '#888' }}>Loading EtherCAT editor...</div>}>
                       <EtherCATEditor
                         busConfig={busConfigs[activeId]}
                         onChange={(cfg) => handleBusConfigChange(activeId, cfg)}
-                        onAddGlobalVars={handleAddGlobalVarsFromBus}
                         isRunning={isRunning || isSimulationMode}
-                        esiLibrary={esiLibrary}
                       />
                     </Suspense>
                   </ErrorBoundary>
@@ -1880,6 +2036,50 @@ function App() {
         isOpen={shortcutsModalOpen}
         onClose={() => setShortcutsModalOpen(false)}
       />
+
+      {/* ── ESI Slave Picker (triggered from sidebar "Add from Library") ── */}
+      {esiPickerBusId && (
+        <>
+          <div
+            onClick={() => setEsiPickerBusId(null)}
+            style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.5)', zIndex: 9998 }}
+          />
+          <div style={{
+            position: 'fixed', top: '50%', left: '50%', transform: 'translate(-50%,-50%)',
+            background: '#252526', border: '1px solid #444', borderRadius: 6,
+            padding: 16, zIndex: 9999, minWidth: 420, maxWidth: 640,
+            maxHeight: '70vh', overflowY: 'auto',
+          }}>
+            <div style={{ fontWeight: 'bold', color: '#ddd', marginBottom: 10, fontSize: 13 }}>
+              Select Device from Library ({esiLibrary.length} found)
+            </div>
+            {esiLibrary.map((dev, i) => (
+              <div
+                key={i}
+                onClick={() => handleEsiDevicePicked(dev)}
+                style={{ border: '1px solid #333', borderRadius: 4, padding: '7px 10px', marginBottom: 5,
+                  cursor: 'pointer', background: '#2a2a2a', display: 'flex', flexDirection: 'column', gap: 3 }}
+                onMouseEnter={e => e.currentTarget.style.background = '#333'}
+                onMouseLeave={e => e.currentTarget.style.background = '#2a2a2a'}
+              >
+                <div style={{ fontWeight: 'bold', color: '#9cdcfe', fontSize: 12 }}>{dev.name}</div>
+                <div style={{ color: '#555', fontSize: 10 }}>
+                  {dev.vendorName} · VID:0x{(dev.vendorId >>> 0).toString(16).toUpperCase().padStart(8,'0')} · PC:0x{(dev.productCode >>> 0).toString(16).toUpperCase().padStart(8,'0')}
+                </div>
+                <div style={{ color: '#888', fontSize: 10 }}>
+                  {(dev.txPdos || []).length} TxPDO · {(dev.rxPdos || []).length} RxPDO · {(dev.sdos || []).length} SDO init
+                </div>
+              </div>
+            ))}
+            <button
+              onClick={() => setEsiPickerBusId(null)}
+              style={{ marginTop: 8, background: '#37474f', color: '#ccc', border: 'none', borderRadius: 3, padding: '4px 10px', fontSize: 11, cursor: 'pointer' }}
+            >
+              Cancel
+            </button>
+          </div>
+        </>
+      )}
 
       <BoardSelectionModal
         isOpen={isBoardModalOpen}

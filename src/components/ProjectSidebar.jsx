@@ -174,6 +174,7 @@ const ProjectSidebar = ({
     onAddItem, onDeleteItem, onEditItem, onReorderItem, onPasteItem,
     onBoardClick, selectedBoard, isRunning = false, liveVariables = null,
     buses = [], onAddBus, onDeleteBus, onSelectBus,
+    busConfigs = {}, onAddSlave, onAddSlaveFromLibrary, onDeleteSlave, onSelectSlave,
 }) => {
     const { t } = useTranslation();
 
@@ -186,6 +187,14 @@ const ProjectSidebar = ({
         programs:       true,
     });
     const toggle = (key) => setExpanded(prev => ({ ...prev, [key]: !prev[key] }));
+
+    /* Expanded buses (Set of bus IDs) */
+    const [expandedBuses, setExpandedBuses] = useState(new Set());
+    const toggleBus = (busId) => setExpandedBuses(prev => {
+        const next = new Set(prev);
+        if (next.has(busId)) next.delete(busId); else next.add(busId);
+        return next;
+    });
 
     /* Drag & drop */
     const [dragItem, setDragItem] = useState(null);
@@ -539,23 +548,99 @@ const ProjectSidebar = ({
                 {/* ── Optional Bus nodes ── */}
                 {buses.map(bus => {
                     const meta = BUS_META[bus.type] || { label: bus.type, icon: '🔌' };
+                    const slaves = busConfigs[bus.id]?.slaves || [];
+                    const isExpanded = expandedBuses.has(bus.id);
+                    const hasEsiLibrary = typeof onAddSlaveFromLibrary === 'function';
+
+                    const masterCtxItems = [
+                        {
+                            icon: '🔌', label: 'Add Slave',
+                            disabled: isRunning,
+                            action: () => !isRunning && onAddSlave?.(bus.id),
+                        },
+                        ...(hasEsiLibrary ? [{
+                            icon: '📚', label: 'Add from Library',
+                            disabled: isRunning,
+                            action: () => !isRunning && onAddSlaveFromLibrary?.(bus.id),
+                        }] : []),
+                        'sep',
+                        {
+                            icon: '🗑', label: 'Remove Master', danger: true,
+                            disabled: isRunning,
+                            action: () => !isRunning && onDeleteBus?.(bus.id),
+                        },
+                    ];
+
                     return (
                         <TreeNode
                             key={bus.id}
                             level={1}
                             icon={meta.icon}
-                            label={meta.label}
-                            isOpen={false}
+                            label={`${meta.label} (${slaves.length})`}
+                            isOpen={isExpanded}
+                            onToggle={() => toggleBus(bus.id)}
                             active={activeId === bus.id}
                             onClick={() => onSelectBus?.(bus.id)}
-                            onContextMenu={(e) => openCtx(e, [
-                                {
-                                    icon: '🗑', label: 'Remove', danger: true,
-                                    disabled: isRunning,
-                                    action: () => !isRunning && onDeleteBus?.(bus.id),
-                                }
-                            ])}
-                        />
+                            onContextMenu={(e) => openCtx(e, masterCtxItems)}
+                        >
+                            {/* Slave children */}
+                            {slaves.map((slave) => {
+                                const slaveId = slave.id;
+                                const hasAxis = slave.axisRef?.enabled;
+                                return (
+                                    <div
+                                        key={slaveId}
+                                        onClick={() => onSelectSlave?.(bus.id, slaveId)}
+                                        onContextMenu={(e) => openCtx(e, [
+                                            {
+                                                icon: '🗑', label: 'Delete Slave', danger: true,
+                                                disabled: isRunning,
+                                                action: () => !isRunning && onDeleteSlave?.(bus.id, slaveId),
+                                            },
+                                        ])}
+                                        style={{
+                                            display: 'flex', alignItems: 'center', gap: 6,
+                                            padding: '4px 8px 4px 42px',
+                                            cursor: 'pointer', userSelect: 'none',
+                                            background: activeId === slaveId ? '#37373d' : 'transparent',
+                                            borderLeft: activeId === slaveId ? '2px solid #007acc' : '2px solid transparent',
+                                            color: activeId === slaveId ? '#fff' : '#ccc',
+                                            fontSize: 12,
+                                        }}
+                                        onMouseEnter={e => { if (activeId !== slaveId) e.currentTarget.style.background = '#2a2d2e'; }}
+                                        onMouseLeave={e => { if (activeId !== slaveId) e.currentTarget.style.background = 'transparent'; }}
+                                    >
+                                        <span style={{ marginRight: 2 }}>🔌</span>
+                                        <span style={{ flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                                            [{slave.position || '?'}] {slave.name || 'Slave'}
+                                        </span>
+                                        {hasAxis && (
+                                            <span style={{ fontSize: 9, color: '#ffd54f', background: '#3d2e00', padding: '1px 4px', borderRadius: 3 }}>
+                                                ⚡
+                                            </span>
+                                        )}
+                                    </div>
+                                );
+                            })}
+
+                            {/* Add Slave button inside expanded master */}
+                            {!isRunning && (
+                                <div
+                                    onClick={() => onAddSlave?.(bus.id)}
+                                    style={{
+                                        display: 'flex', alignItems: 'center', gap: 5,
+                                        padding: '3px 8px 3px 42px', cursor: 'pointer',
+                                        color: '#555', fontSize: 11,
+                                    }}
+                                    onMouseEnter={e => e.currentTarget.style.color = '#888'}
+                                    onMouseLeave={e => e.currentTarget.style.color = '#555'}
+                                    title="Add Slave"
+                                >
+                                    <span style={{ width: 14, height: 14, background: '#007acc', borderRadius: '50%', display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#fff', fontSize: 11, fontWeight: 'bold', flexShrink: 0 }}>+</span>
+                                    <span>Add Slave</span>
+                                </div>
+                            )}
+                        </TreeNode>
                     );
                 })}
 

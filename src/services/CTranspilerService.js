@@ -417,8 +417,7 @@ export const transpileToC = (projectStructure, standardHeaders = [], boardId = n
 #include <stdbool.h>
 #include <string.h>
 #include <stdlib.h>
-${boardDefines}${runtimePortHelpers}${customIncludes}
-extern volatile uint64_t us_tick;
+${boardDefines}${runtimePortHelpers}${customIncludes}${ecCfgEarly.motionIncludes ? ecCfgEarly.motionIncludes + '\n' : ''}extern volatile uint64_t us_tick;
 
 `;
 
@@ -811,8 +810,18 @@ extern volatile uint64_t us_tick;
         source += `    close(fd);\n`;
         source += `}\n`;
         source += `#define PLC_FORCE_FLAGS_BASE ${FORCE_FLAGS_BASE}\n`;
-        // Per-task plc_shm_pull_TaskName / plc_shm_sync_TaskName are generated
-        // by generateMainLoop so each task only touches its own program variables.
+        source += `static void plc_shm_pull(void) {\n`;
+        source += `    if (!__plc_shm) return;\n`;
+        shmEntries.forEach(({ c_symbol, offset, size, flagOffset }) => {
+            source += `    if (__plc_shm[${flagOffset}] != 0) { memcpy((void*)&(${c_symbol}), __plc_shm + ${offset}, ${size}); }\n`;
+        });
+        source += `}\n`;
+        source += `static void plc_shm_sync(void) {\n`;
+        source += `    if (!__plc_shm) return;\n`;
+        shmEntries.forEach(({ c_symbol, offset, size, flagOffset }) => {
+            source += `    if (__plc_shm[${flagOffset}] == 0) { memcpy(__plc_shm + ${offset}, (const void*)&(${c_symbol}), ${size}); }\n`;
+        });
+        source += `}\n`;
         source += `#endif /* __linux__ */\n\n`;
     }
 
@@ -905,7 +914,7 @@ const KRON_DTYPE_TO_C = {
 const generateEtherCATConfig = (buses, busConfigs) => {
     const ecBuses = (buses || []).filter(b => b.type === 'ethercat' && busConfigs?.[b.id]);
     if (ecBuses.length === 0) return {
-        headerDecl: '', headerExtern: '', gpiMacros: '', initCode: '', cleanupCode: '',
+        headerDecl: '', headerExtern: '', gpiMacros: '', motionIncludes: '', initCode: '', cleanupCode: '',
         pdoReadCode: '', pdoWriteCode: '',
         ecThreadCode: '', ecThreadStartCode: '', ecThreadJoinCode: '',
         halContent: ''
@@ -926,6 +935,14 @@ const generateEtherCATConfig = (buses, busConfigs) => {
     const gpiInputVars  = [];  // { varName, cType }  — TxPDO: slave → master
     const gpiOutputVars = [];  // { varName, cType }  — RxPDO: master → slave
     const usedVarNames = new Set();
+
+    // CiA402 object index → KRON_SERVO_SLOT field name
+    const CIA402_IN  = { 0x6041:'status_word', 0x6064:'actual_pos_raw', 0x606C:'actual_vel_raw',
+                         0x6077:'actual_torque_raw', 0x60F4:'following_error_raw', 0x6061:'mode_display' };
+    const CIA402_OUT = { 0x6040:'control_word', 0x607A:'target_pos_raw', 0x60FF:'target_vel_raw',
+                         0x6071:'target_torque_raw', 0x6060:'mode_of_operation' };
+    // Per-slave bridge map: slaveIndex → { axisNo, reads:[{varName,field}], writes:[{varName,field}] }
+    const slaveBridges = {};
 
     const makeUniqueVarName = (rawName, slaveIndex) => {
         const cleaned = (rawName || '')
@@ -981,6 +998,12 @@ const generateEtherCATConfig = (buses, busConfigs) => {
                 initCode += `    __ec_cfg.slaves[${si}].pdo_entries[${pdoCount}].var_ptr  = &__gpi_hw._pi_${varName};\n`;
                 if (isInput) gpiInputVars.push({ varName, cType });
                 else         gpiOutputVars.push({ varName, cType });
+                // CiA402 bridge: record GPI↔slot mapping for axis slaves
+                if (slave.axisRef?.enabled) {
+                    if (!slaveBridges[si]) slaveBridges[si] = { reads: [], writes: [] };
+                    if (isInput  && CIA402_IN[idx])  slaveBridges[si].reads.push({ varName, field: CIA402_IN[idx] });
+                    if (!isInput && CIA402_OUT[idx]) slaveBridges[si].writes.push({ varName, field: CIA402_OUT[idx] });
+                }
                 pdoCount++;
             });
         });
@@ -1102,10 +1125,74 @@ extern KRON_Process_Image __gpi;
 #endif /* KRON_HAL_H */
 `;
 
+    // Collect axis-enabled slaves for motion init codegen.
+    // NOTE: AXIS_REF declarations are NOT generated here — they come from the
+    // user-facing global variable table (type = 'AXIS_REF'), so the user can
+    // reference Axis1.ControlWord etc. directly in PLC programs.
+    // Only KRON_PROCESS_IMAGE Kron_PI is declared here (internal, not user-visible).
+    const axisSlaves = slaves
+        .map((slave, si) => ({ slave, si }))
+        .filter(({ slave }) => slave.axisRef?.enabled);
+
+    // Helper: emit a float literal that always has a decimal point (C99 requires it)
+    const floatLit = (n) => {
+        const f = parseFloat(n);
+        return Number.isInteger(f) ? `${f}.0f` : `${f}f`;
+    };
+
+    const hasAxes = axisSlaves.length > 0;
+
+    // Generate GPI↔KRON_SERVO_SLOT bridge code for the IO Bus thread.
+    // ncReadBridge : after kron_ec_pdo_read  — copy GPI inputs  → Kron_PI.servo[n]
+    // ncWriteBridge: after NC_ProcessOne     — copy Kron_PI.servo[n] → GPI outputs
+    let ncReadBridge = '';
+    let ncWriteBridge = '';
+    axisSlaves.forEach(({ slave, si }) => {
+        const axisNo = Math.max(0, parseInt(slave.axisRef.axisNo) || 0);
+        const br = slaveBridges[si];
+        if (!br) return;
+        if (br.reads.length)  ncReadBridge  += `        /* Axis ${axisNo} inputs */\n`;
+        br.reads.forEach(({ varName, field }) => {
+            ncReadBridge  += `        Kron_PI.servo[${axisNo}].${field} = __gpi_hw._pi_${varName};\n`;
+        });
+        if (br.writes.length) ncWriteBridge += `        /* Axis ${axisNo} outputs */\n`;
+        br.writes.forEach(({ varName, field }) => {
+            ncWriteBridge += `        __gpi_hw._pi_${varName} = Kron_PI.servo[${axisNo}].${field};\n`;
+        });
+    });
+
+    let axisInitCode = '';
+    if (hasAxes) {
+        axisInitCode += `\n    /* ── Motion Axes ── */\n    memset(&Kron_PI, 0, sizeof(Kron_PI));\n`;
+        axisSlaves.forEach(({ slave }, i) => {
+            const axisName = (slave.axisRef.name || `Axis_${slave.position}`).replace(/[^A-Za-z0-9_]/g, '_');
+            const axisNo   = Math.max(0, parseInt(slave.axisRef.axisNo) || 0);
+            const cpu      = parseFloat(slave.axisRef.countsPerUnit) || 10000;
+            const vpu      = parseFloat(slave.axisRef.velRawPerUnit) || 1000;
+            const sim      = slave.axisRef.simMode ? 'true' : 'false';
+            // AXIS_REF_Init zeroes the struct and sets AxisNo, slot, VelFactor=1, AccFactor=1
+            axisInitCode += `    AXIS_REF_Init(&${axisName}, ${axisNo}, &Kron_PI.servo[${axisNo}]);\n`;
+            // Simulation flag lives on AXIS_REF, not on KRON_SERVO_SLOT
+            axisInitCode += `    ${axisName}.Simulation = ${sim};\n`;
+            // Scaling factors on the servo slot (set after AXIS_REF_Init so slot is valid)
+            axisInitCode += `    Kron_PI.servo[${axisNo}].counts_per_unit   = ${floatLit(cpu)};\n`;
+            axisInitCode += `    Kron_PI.servo[${axisNo}].vel_raw_per_unit  = ${floatLit(vpu)};\n`;
+            axisInitCode += `    Kron_PI.servo[${axisNo}].present           = !${sim};\n`;
+            // NC engine private state
+            axisInitCode += `    NC_Init(&g_NC_Axes[${i}], &${axisName});\n`;
+        });
+    }
+    initCode += axisInitCode;
+
     // headerDecl: definitions in plc.c
     // __gpi_snap is initialised to NULL; generateMainLoop sets it via
     // atomic_load_explicit at the top of every logic task's scan loop,
     // so it is always valid before any POU macro dereferences it.
+    const kronjPIDecl = hasAxes
+        ? `KRON_PROCESS_IMAGE  Kron_PI;\n` +
+          `KRON_HAL_Driver    *Kron_HAL = NULL;\n` +
+          `NC_AXIS             g_NC_Axes[${axisSlaves.length}];\n`
+        : '';
     const headerDecl =
 `\n#if defined(__linux__)\n` +
 `KRON_Process_Image            __gpi_hw;\n` +
@@ -1115,12 +1202,24 @@ extern KRON_Process_Image __gpi;
 `#else\n` +
 `KRON_Process_Image __gpi;\n` +
 `#endif\n` +
-`KRON_EC_Config __ec_cfg;\n`;
+`KRON_EC_Config __ec_cfg;\n` +
+kronjPIDecl;
 
-    // headerExtern: injected into plc.h — all GPI externs live in kron_hal.h itself
+    // motionIncludes: injected EARLY in plc.h (before global vars) so AXIS_REF type
+    // is defined by the time the global variable `AXIS_REF Axis1;` is emitted.
+    const motionIncludes = hasAxes
+        ? `#include "kron_pi.h"\n#include "kronmotion.h"\n#include "kron_nc.h"\nextern KRON_PROCESS_IMAGE Kron_PI;\n`
+        : '';
+
+    // headerExtern: injected into plc.h in the EtherCAT HAL section (after global vars).
+    // Does NOT repeat motion includes — they are in motionIncludes (injected earlier).
     const headerExtern =
 `\n#include "kron_hal.h"\n` +
-`extern KRON_EC_Config __ec_cfg;\n`;
+`extern KRON_EC_Config __ec_cfg;\n` +
+(hasAxes
+    ? `extern NC_AXIS             g_NC_Axes[${axisSlaves.length}];\n` +
+      `extern KRON_HAL_Driver    *Kron_HAL;\n`
+    : '');
 
     // SDO background thread + watchdog thread + IO_Bus thread (Linux only)
     const ecThreadCode = `
@@ -1178,7 +1277,13 @@ static void* plc_task_IO_Bus(void *arg) {
         /* Step 3: Receive hardware inputs into HW staging */
         kron_ec_pdo_read(&__ec_cfg);
 
-        /* Step 4: Propagate HW-updated staging to the back buffer.
+${hasAxes ? `${ncReadBridge}        /* NC Engine: run motion profile for each axis (cycle-synchronous) */
+        { float __nc_dt = (float)__ec_cfg.cycle_us * 1e-6f;
+          for (uint16_t __i = 0; __i < ${axisSlaves.length}U; __i++) {
+              NC_ProcessOne(&g_NC_Axes[__i], __nc_dt);
+          }
+        }
+${ncWriteBridge}` : ''}        /* Step 4: Propagate HW-updated staging to the back buffer.
          * Back buffer now has: fresh hardware inputs + last logic outputs. */
         *back = __gpi_hw;
 
@@ -1206,11 +1311,10 @@ static void* plc_task_IO_Bus(void *arg) {
 `    pthread_join(__ec_wd_tid,  NULL);\n` +
 `    pthread_join(__ec_io_tid,  NULL);\n`;
 
-    return { headerDecl, headerExtern, gpiMacros, initCode, cleanupCode, pdoReadCode, pdoWriteCode, ecThreadCode, ecThreadStartCode, ecThreadJoinCode, halContent };
+    return { headerDecl, headerExtern, gpiMacros, motionIncludes, initCode, cleanupCode, pdoReadCode, pdoWriteCode, ecThreadCode, ecThreadStartCode, ecThreadJoinCode, halContent };
 };
 
-const generateMainLoop = (projectStructure, config, boardId = null, shmEntries = [], execTimeVars = [], initCode = '', cleanupCode = '', ecPdoReadCode = '', ecPdoWriteCode = '', ecThreadCode = '', ecThreadStartCode = '', ecThreadJoinCode = '', gpiMutexEnabled = false) => {
-    const shmEnabled = shmEntries.length > 0;
+const generateMainLoop = (projectStructure, config, boardId = null, shmEnabled = false, execTimeVars = [], initCode = '', cleanupCode = '', ecPdoReadCode = '', ecPdoWriteCode = '', ecThreadCode = '', ecThreadStartCode = '', ecThreadJoinCode = '', gpiMutexEnabled = false) => {
     let mainSrc = `\n// --- DETERMINISTIC SCAN LOOP ---\n`;
 
     // --- 1. Discover task→program groupings (priority: taskConfig > res_config > fallback) ---
@@ -1303,42 +1407,6 @@ const generateMainLoop = (projectStructure, config, boardId = null, shmEntries =
         ? Math.min(...taskGroups.map(tg => tg.intervalUs))
         : Infinity;
 
-    // Per-task SHM functions — each task only touches its own programs' variables.
-    // Global vars (no prog_ prefix, not __exec_us_) go to the fastest task to avoid
-    // double-writes; program vars are filtered strictly by program name prefix.
-    if (shmEnabled) {
-        const allProgNames = taskGroups.flatMap(tg => tg.programs);
-        const isOwnedEntry = (c_symbol) =>
-            allProgNames.some(p => c_symbol.startsWith(`prog_${p}_`) || c_symbol === `__exec_us_${p}`);
-
-        taskGroups.forEach(tg => {
-            const isFastest = tg.intervalUs === fastestIntervalUs;
-            const taskEntries = shmEntries.filter(e => {
-                for (const pName of tg.programs) {
-                    if (e.c_symbol.startsWith(`prog_${pName}_`)) return true;
-                    if (e.c_symbol === `__exec_us_${pName}`) return true;
-                }
-                // Global vars (not owned by any specific program) → fastest task only
-                if (isFastest && !isOwnedEntry(e.c_symbol)) return true;
-                return false;
-            });
-
-            mainSrc += `static void plc_shm_pull_${tg.taskName}(void) {\n`;
-            mainSrc += `    if (!__plc_shm) return;\n`;
-            taskEntries.forEach(({ c_symbol, offset, size, flagOffset }) => {
-                mainSrc += `    if (__plc_shm[${flagOffset}] != 0) { memcpy((void*)&(${c_symbol}), __plc_shm + ${offset}, ${size}); }\n`;
-            });
-            mainSrc += `}\n`;
-
-            mainSrc += `static void plc_shm_sync_${tg.taskName}(void) {\n`;
-            mainSrc += `    if (!__plc_shm) return;\n`;
-            taskEntries.forEach(({ c_symbol, offset, size, flagOffset }) => {
-                mainSrc += `    if (__plc_shm[${flagOffset}] == 0) { memcpy(__plc_shm + ${offset}, (const void*)&(${c_symbol}), ${size}); }\n`;
-            });
-            mainSrc += `}\n\n`;
-        });
-    }
-
     taskGroups.forEach(tg => {
         const isIoTask = hasEc && (tg.intervalUs === fastestIntervalUs);
         mainSrc += `static void* plc_task_${tg.taskName}(void *arg) {\n`;
@@ -1353,9 +1421,9 @@ const generateMainLoop = (projectStructure, config, boardId = null, shmEntries =
         mainSrc += `        while (__next.tv_nsec >= 1000000000L) { __next.tv_sec++; __next.tv_nsec -= 1000000000L; }\n`;
         // EC PDO read — ONLY in the fastest task when no dedicated IO_Bus thread
         if (!gpiMutexEnabled && isIoTask && ecPdoReadCode) mainSrc += ecPdoReadCode;
-        // SHM pull — task-specific: only touches this task's program variables
+        // SHM pull
         if (shmEnabled) {
-            mainSrc += `        plc_shm_pull_${tg.taskName}();\n`;
+            mainSrc += `        plc_shm_pull();\n`;
         }
         // Sync us_tick to real wall-clock time so IEC timers (TON/TOF/TP) are accurate.
         // Without this, if program execution takes longer than the sleep, us_tick drifts
@@ -1379,9 +1447,9 @@ const generateMainLoop = (projectStructure, config, boardId = null, shmEntries =
                 mainSrc += `        ${pName}();\n`;
             }
         });
-        // SHM sync — task-specific: only touches this task's program variables
+        // SHM sync
         if (shmEnabled) {
-            mainSrc += `        plc_shm_sync_${tg.taskName}();\n`;
+            mainSrc += `        plc_shm_sync();\n`;
         }
         // EC PDO write — ONLY in the fastest task when no dedicated IO_Bus thread
         if (!gpiMutexEnabled && isIoTask && ecPdoWriteCode) mainSrc += ecPdoWriteCode;
@@ -2076,7 +2144,31 @@ const transpileSTLogics = (code, stdFunctions = {}, parentName = '', category = 
     //   (* block comments — single or multi-line *)
     //   // line comments
     const stripped = code.replace(/\(\*[\s\S]*?\*\)/g, '');
-    const lines = stripped.split(/\r?\n|\\n/).map(l => l.replace(/\/\/.*$/, ''));
+    // Join continuation lines: a line ending with AND/OR/,/( (after stripping comment)
+    // means the logical expression continues on the next line.  Merge them so the
+    // keyword matchers (IF…THEN, ELSIF…THEN, WHILE…DO, FOR…DO) see a single line.
+    const rawLines = stripped.split(/\r?\n|\\n/).map(l => l.replace(/\/\/.*$/, ''));
+    const lines = [];
+    let pending = '';
+    for (const raw of rawLines) {
+        const trimRaw = raw.trim();
+        if (!trimRaw) {
+            if (pending) { /* skip blank continuation lines */ }
+            else lines.push(raw);
+            continue;
+        }
+        const combined = pending ? pending + ' ' + trimRaw : raw;
+        const combinedTrim = combined.trim();
+        // Continuation: line ends with AND, OR, NOT, comma, or open-paren (after optional ;)
+        if (/\b(?:AND|OR|NOT|XOR)\s*$|[,(]\s*$/i.test(combinedTrim)) {
+            pending = combinedTrim;
+        } else {
+            lines.push(combined);
+            pending = '';
+        }
+    }
+    if (pending) lines.push(pending);
+
     let out = '';
     let indentLevel = 1; // 1 = inside function body (4 spaces)
 

@@ -294,7 +294,7 @@ const PinConfigPanel = ({ pin, board, interfaceConfig, onInterfaceConfigChange }
               const key = `${protocol}_${portId}`;
               const isOpen = openPort === key;
               const portCfg = {
-                ...getDefaultProtocolConfig(protocol, { pins: portDetails.pins }),
+                ...getDefaultProtocolConfig(protocol, portDetails),
                 ...(interfaceConfig?.[protocol]?.[portId] || {}),
                 pins: {
                   ...(portDetails.pins || {}),
@@ -324,10 +324,10 @@ const PinConfigPanel = ({ pin, board, interfaceConfig, onInterfaceConfigChange }
                       type="checkbox"
                       checked={isEnabled}
                       onChange={(e) => {
-                        e.stopPropagation();
-                        handlePortChange(protocol, portId, { ...portCfg, enabled: e.target.checked }, portOpt);
+                        const checked = e.target.checked;
+                        handlePortChange(protocol, portId, { ...portCfg, enabled: checked }, portOpt);
                       }}
-                      onClick={(e) => e.stopPropagation()}
+                      onClick={(e) => { e.stopPropagation(); e.nativeEvent?.stopImmediatePropagation?.(); }}
                       style={{ cursor: 'pointer', accentColor: color }}
                     />
                     {/* Protocol badge */}
@@ -642,7 +642,7 @@ const ProtocolPortCard = ({ board, protocol, port, value, onChange }) => {
               <FieldLabel>Device Path</FieldLabel>
               <input
                 type="text"
-                value={value.devicePath ?? port.path ?? ''}
+                value={value.devicePath !== undefined && value.devicePath !== null ? value.devicePath : (port.path || '')}
                 onChange={(e) => update({ devicePath: e.target.value })}
                 placeholder={port.path || '/dev/ttyAMA0'}
                 style={InputBaseStyle}
@@ -865,6 +865,7 @@ const BoardConfigPage = ({ boardId, interfaceConfig = {}, onInterfaceConfigChang
               </div>
               <div style={{ flex: 1, minHeight: 0, overflow: 'auto' }}>
                 <PinConfigPanel
+                  key={selectedPin ? `${selectedPin.header || ''}${selectedPin.pin}` : 'none'}
                   pin={selectedPin}
                   board={board}
                   interfaceConfig={interfaceConfig}
