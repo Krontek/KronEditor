@@ -2002,7 +2002,11 @@ function App() {
               <div style={{ height: layout.consoleHeight, display: 'flex', flexDirection: 'column' }}>
                 <OutputPanel
                   logs={logs}
-                  onClearLogs={() => setLogs([])}
+                  onClearLogs={(tab) => {
+                    if (tab === 'messages') setLogs(prev => prev.filter(l => l.type !== 'info' && l.type !== 'success'));
+                    else if (tab === 'warnings') setLogs(prev => prev.filter(l => l.type !== 'warning'));
+                    else if (tab === 'errors') setLogs(prev => prev.filter(l => l.type !== 'error'));
+                  }}
                   watchTable={watchTable}
                   onWatchTableRemove={removeFromWatchTable}
                   onWatchTableUpdate={updateWatchTableEntry}

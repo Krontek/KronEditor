@@ -63,6 +63,27 @@ const resolveExpression = (expr, projectStructure) => {
     return { liveKey: `${trimmed.replace(/\s+/g, '_')}`, varType: null };
 };
 
+// Extracts the most relevant part of a compiler/linker error message.
+const summarizeMsg = (msg) => {
+    if (!msg) return msg;
+    // "multiple definition of `X`" — keep from "multiple definition"
+    const multiDef = msg.match(/multiple definition of [`']([^`']+)[`']/);
+    if (multiDef) return `Multiple definition: ${multiDef[1]}`;
+    // "undefined reference to `X`"
+    const undefRef = msg.match(/undefined reference to [`']([^`']+)[`']/);
+    if (undefRef) return `Undefined reference: ${undefRef[1]}`;
+    // GCC-style "file:line:col: error: message" — strip leading path/line info
+    const gccMsg = msg.match(/:\s*(error|warning|note):\s*(.+)/i);
+    if (gccMsg) return `${gccMsg[1].charAt(0).toUpperCase() + gccMsg[1].slice(1)}: ${gccMsg[2].trim()}`;
+    // ld/linker errors without the gcc pattern — strip long path prefix
+    const ldMsg = msg.match(/(?:\/[^\s:]+\.(?:c|o|a|h)(?::\d+)?:\s*)+(.+)/);
+    if (ldMsg) return ldMsg[1].trim();
+    // Trim leading whitespace/path noise (lines starting with spaces or /)
+    const trimmed = msg.trim();
+    if (trimmed.length <= 120) return trimmed;
+    return trimmed.slice(0, 117) + '…';
+};
+
 const OutputPanel = ({
     logs = [],
     onClearLogs = null,
@@ -79,6 +100,7 @@ const OutputPanel = ({
     const [editingId, setEditingId] = useState(null);
     const [editValue, setEditValue] = useState('');
     const [hoveredLog, setHoveredLog] = useState(null);
+    const [popupLog, setPopupLog] = useState(null);
     const logEndRef = useRef(null);
     const editInputRef = useRef(null);
 
@@ -158,7 +180,7 @@ const OutputPanel = ({
     });
 
     return (
-        <div style={{ height: '100%', display: 'flex', flexDirection: 'column', background: '#141414' }}>
+        <div style={{ height: '100%', display: 'flex', flexDirection: 'column', background: '#141414', position: 'relative' }}>
 
             {/* ── Tab bar ── */}
             <div style={{
@@ -193,8 +215,8 @@ const OutputPanel = ({
                 {/* Clear button — right-aligned */}
                 {onClearLogs && ['messages','warnings','errors'].includes(activeTab) && (
                     <button
-                        onClick={onClearLogs}
-                        title="Clear all logs"
+                        onClick={() => onClearLogs(activeTab)}
+                        title={`Clear ${activeTab}`}
                         style={{
                             marginLeft: 'auto',
                             marginRight: 6,
@@ -242,12 +264,14 @@ const OutputPanel = ({
                             const icon  = LOG_ICONS[log.type]  || '●';
                             const bgHov = LOG_BG_HOVER[log.type] || 'rgba(200,200,200,0.05)';
                             const isHovered = hoveredLog === i;
+                            const summary = summarizeMsg(log.msg);
                             return (
                                 <div
                                     key={i}
-                                    title={log.msg}
+                                    title="Double-click to see full message"
                                     onMouseEnter={() => setHoveredLog(i)}
                                     onMouseLeave={() => setHoveredLog(null)}
+                                    onDoubleClick={() => setPopupLog(log)}
                                     style={{
                                         display: 'flex',
                                         alignItems: 'center',
@@ -276,7 +300,7 @@ const OutputPanel = ({
                                         flex: 1,
                                         lineHeight: '18px',
                                     }}>
-                                        {log.msg}
+                                        {summary}
                                     </span>
                                 </div>
                             );
@@ -425,6 +449,82 @@ const OutputPanel = ({
                             </tbody>
                         </table>
                     )}
+                </div>
+            )}
+
+            {/* Full Message Popup */}
+            {popupLog && (
+                <div
+                    onClick={() => setPopupLog(null)}
+                    style={{
+                        position: 'absolute',
+                        inset: 0,
+                        background: 'rgba(0,0,0,0.6)',
+                        display: 'flex',
+                        alignItems: 'center',
+                        justifyContent: 'center',
+                        zIndex: 200,
+                    }}
+                >
+                    <div
+                        onClick={e => e.stopPropagation()}
+                        style={{
+                            background: '#1e1e1e',
+                            border: '1px solid #3a3a3a',
+                            borderRadius: 4,
+                            maxWidth: '80%',
+                            maxHeight: '60%',
+                            display: 'flex',
+                            flexDirection: 'column',
+                            minWidth: 320,
+                        }}
+                    >
+                        <div style={{
+                            padding: '6px 12px',
+                            borderBottom: '1px solid #2a2a2a',
+                            display: 'flex',
+                            alignItems: 'center',
+                            justifyContent: 'space-between',
+                            gap: 12,
+                        }}>
+                            <span style={{
+                                color: LOG_COLORS[popupLog.type] || '#c8c8c8',
+                                fontSize: 11,
+                                fontWeight: '600',
+                                textTransform: 'uppercase',
+                                letterSpacing: '0.06em',
+                            }}>
+                                {popupLog.type}
+                            </span>
+                            <button
+                                onClick={() => setPopupLog(null)}
+                                style={{
+                                    background: 'transparent',
+                                    border: 'none',
+                                    color: '#666',
+                                    cursor: 'pointer',
+                                    fontSize: 14,
+                                    lineHeight: 1,
+                                    padding: '0 2px',
+                                }}
+                            >✕</button>
+                        </div>
+                        <pre style={{
+                            margin: 0,
+                            padding: '10px 14px',
+                            overflowY: 'auto',
+                            overflowX: 'auto',
+                            color: LOG_COLORS[popupLog.type] || '#c8c8c8',
+                            fontFamily: '"Consolas", "Cascadia Code", monospace',
+                            fontSize: 12,
+                            lineHeight: '1.6',
+                            whiteSpace: 'pre-wrap',
+                            wordBreak: 'break-word',
+                            flex: 1,
+                        }}>
+                            {popupLog.msg}
+                        </pre>
+                    </div>
                 </div>
             )}
 
