@@ -10,7 +10,7 @@ import { transpileToC } from '../services/CTranspilerService';
 const KRON_REPOS = [
     'KronStandard', 'KronControl', 'KronCompare', 'KronConverter',
     'KronMathematic', 'KronCommunication', 'KronLogic', 'KronMotion',
-    'KronEthercatMaster',
+    'KronEthercatMaster', 'KronHAL',
 ];
 
 const SettingsPage = ({ theme, setTheme, editorSettings, setEditorSettings, selectedBoard, plcAddress, setPlcAddress, sshUser: sshUserProp, setSshUser: setSshUserProp, sshPort: sshPortProp, setSshPort: setSshPortProp, isPlcConnected, setConnectionEnabled, esiLibrary = [], onLoadEsiFile, projectStructure, buses, busConfigs }) => {

@@ -879,7 +879,8 @@ ${boardDefines}${runtimePortHelpers}${customIncludes}${ecCfgEarly.motionIncludes
         ecCfg.ecThreadCode      || '',
         ecCfg.ecThreadStartCode || '',
         ecCfg.ecThreadJoinCode  || '',
-        !!ecCfg.halContent          // gpiMutexEnabled: true when IO_Bus thread owns the bus
+        !!ecCfg.halContent,         // gpiMutexEnabled: true when IO_Bus thread owns the bus
+        shmEntries
     );
     source += mainLoop.src;
     variableTable.tasks = mainLoop.programTasks.map(pt => ({
@@ -1046,15 +1047,59 @@ const generateEtherCATConfig = (buses, busConfigs, globalSimMode = false) => {
         });
         initCode += `    __ec_cfg.slaves[${si}].pdo_count = ${pdoCount};\n`;
 
-        const sdos = (slave.sdos || []).slice(0, 64);
-        sdos.forEach((sdo, di) => {
+        // Auto-generate PDO mapping SDOs from selected PDO entries.
+        // This configures 0x1600/0x1A00 (PDO objects) and 0x1C12/0x1C13 (SM assignment)
+        // so ecx_config_map_group sees the correct layout in PREOP.
+        const pdoMapSdos = [];
+        const rxPdoGroups = []; // output: master→slave
+        const txPdoGroups = []; // input:  slave→master
+        (slave.pdos || []).forEach(pdo => {
+            const sel = (pdo.entries || []).filter(e => e.selected);
+            if (sel.length === 0) return;
+            if (pdo.direction === 'output') rxPdoGroups.push({ index: pdo.index, entries: sel, fixed: pdo.fixed });
+            else                            txPdoGroups.push({ index: pdo.index, entries: sel, fixed: pdo.fixed });
+        });
+        if (rxPdoGroups.length > 0 || txPdoGroups.length > 0) {
+            // Clear sync managers first
+            pdoMapSdos.push({ index: 0x1C12, subindex: 0, value: 0, byteSize: 1 });
+            pdoMapSdos.push({ index: 0x1C13, subindex: 0, value: 0, byteSize: 1 });
+            // Configure each RxPDO object
+            for (const g of rxPdoGroups) {
+                if (g.fixed) continue;
+                pdoMapSdos.push({ index: g.index, subindex: 0, value: 0, byteSize: 1 });
+                g.entries.forEach((e, i) => {
+                    const mapping = (((e.index || 0) & 0xFFFF) << 16) | (((e.subindex || 0) & 0xFF) << 8) | ((e.bitLen || 0) & 0xFF);
+                    pdoMapSdos.push({ index: g.index, subindex: i + 1, value: mapping >>> 0, byteSize: 4 });
+                });
+                pdoMapSdos.push({ index: g.index, subindex: 0, value: g.entries.length, byteSize: 1 });
+            }
+            // Configure each TxPDO object
+            for (const g of txPdoGroups) {
+                if (g.fixed) continue;
+                pdoMapSdos.push({ index: g.index, subindex: 0, value: 0, byteSize: 1 });
+                g.entries.forEach((e, i) => {
+                    const mapping = (((e.index || 0) & 0xFFFF) << 16) | (((e.subindex || 0) & 0xFF) << 8) | ((e.bitLen || 0) & 0xFF);
+                    pdoMapSdos.push({ index: g.index, subindex: i + 1, value: mapping >>> 0, byteSize: 4 });
+                });
+                pdoMapSdos.push({ index: g.index, subindex: 0, value: g.entries.length, byteSize: 1 });
+            }
+            // Assign PDO groups to sync managers
+            rxPdoGroups.forEach((g, i) => { pdoMapSdos.push({ index: 0x1C12, subindex: i + 1, value: g.index, byteSize: 2 }); });
+            pdoMapSdos.push({ index: 0x1C12, subindex: 0, value: rxPdoGroups.length, byteSize: 1 });
+            txPdoGroups.forEach((g, i) => { pdoMapSdos.push({ index: 0x1C13, subindex: i + 1, value: g.index, byteSize: 2 }); });
+            pdoMapSdos.push({ index: 0x1C13, subindex: 0, value: txPdoGroups.length, byteSize: 1 });
+        }
+
+        const userSdos = (slave.sdos || []);
+        const allSdos = [...pdoMapSdos, ...userSdos].slice(0, 64);
+        allSdos.forEach((sdo, di) => {
             const sidx = (sdo.index || 0) >>> 0;
             initCode += `    __ec_cfg.slaves[${si}].sdo_inits[${di}].index     = 0x${sidx.toString(16).toUpperCase().padStart(4, '0')};\n`;
             initCode += `    __ec_cfg.slaves[${si}].sdo_inits[${di}].subindex  = ${(sdo.subindex || 0) & 0xFF};\n`;
             initCode += `    __ec_cfg.slaves[${si}].sdo_inits[${di}].value     = 0x${((sdo.value || 0) >>> 0).toString(16).toUpperCase().padStart(8, '0')}UL;\n`;
             initCode += `    __ec_cfg.slaves[${si}].sdo_inits[${di}].byte_size = ${Math.min(4, Math.max(1, parseInt(sdo.byteSize) || 1))};\n`;
         });
-        if (sdos.length > 0) initCode += `    __ec_cfg.slaves[${si}].sdo_count = ${sdos.length};\n`;
+        if (allSdos.length > 0) initCode += `    __ec_cfg.slaves[${si}].sdo_count = ${allSdos.length};\n`;
     });
 
     initCode += `    kron_ec_init(&__ec_cfg);\n`;
@@ -1359,7 +1404,7 @@ ${ncWriteBridge}` : ''}        /* Step 4: Propagate HW-updated staging to the ba
     return { headerDecl, headerExtern, gpiMacros, motionIncludes, initCode, cleanupCode, pdoReadCode, pdoWriteCode, ecThreadCode, ecThreadStartCode, ecThreadJoinCode, halContent };
 };
 
-const generateMainLoop = (projectStructure, config, boardId = null, shmEnabled = false, execTimeVars = [], initCode = '', cleanupCode = '', ecPdoReadCode = '', ecPdoWriteCode = '', ecThreadCode = '', ecThreadStartCode = '', ecThreadJoinCode = '', gpiMutexEnabled = false) => {
+const generateMainLoop = (projectStructure, config, boardId = null, shmEnabled = false, execTimeVars = [], initCode = '', cleanupCode = '', ecPdoReadCode = '', ecPdoWriteCode = '', ecThreadCode = '', ecThreadStartCode = '', ecThreadJoinCode = '', gpiMutexEnabled = false, shmEntries = []) => {
     let mainSrc = `\n// --- DETERMINISTIC SCAN LOOP ---\n`;
 
     // --- 1. Discover task→program groupings (priority: taskConfig > res_config > fallback) ---
@@ -1416,6 +1461,10 @@ const generateMainLoop = (projectStructure, config, boardId = null, shmEnabled =
         // (User must assign programs to tasks in Task Manager.)
     }
 
+    // Rename task threads sequentially (Task0, Task1, ...) regardless of configured names.
+    // This ensures clean, predictable thread identifiers in the generated C code.
+    taskGroups.forEach((tg, i) => { tg.taskName = `Task${i}`; });
+
     // Base tick = minimum interval across all programs (minimum 1us) — used for baremetal/Win
     const baseTickUs = programTasks.length > 0
         ? Math.max(1, Math.min(...programTasks.map(pt => pt.intervalUs)))
@@ -1460,6 +1509,26 @@ const generateMainLoop = (projectStructure, config, boardId = null, shmEnabled =
         ? Math.min(...taskGroups.map(tg => tg.intervalUs))
         : Infinity;
 
+    // Per-task SHM pull/sync functions — each task calls its own named version.
+    // All currently include the full variable set; partition per-task in future if needed.
+    if (shmEnabled && shmEntries.length > 0) {
+        taskGroups.forEach(tg => {
+            mainSrc += `static void plc_shm_pull_${tg.taskName}(void) {\n`;
+            mainSrc += `    if (!__plc_shm) return;\n`;
+            shmEntries.forEach(({ c_symbol, offset, size, flagOffset }) => {
+                mainSrc += `    if (__plc_shm[${flagOffset}] != 0) { memcpy((void*)&(${c_symbol}), __plc_shm + ${offset}, ${size}); }\n`;
+            });
+            mainSrc += `}\n`;
+            mainSrc += `static void plc_shm_sync_${tg.taskName}(void) {\n`;
+            mainSrc += `    if (!__plc_shm) return;\n`;
+            shmEntries.forEach(({ c_symbol, offset, size, flagOffset }) => {
+                mainSrc += `    if (__plc_shm[${flagOffset}] == 0) { memcpy(__plc_shm + ${offset}, (const void*)&(${c_symbol}), ${size}); }\n`;
+            });
+            mainSrc += `}\n`;
+        });
+        mainSrc += `\n`;
+    }
+
     taskGroups.forEach(tg => {
         const isIoTask = hasEc && (tg.intervalUs === fastestIntervalUs);
         mainSrc += `static void* plc_task_${tg.taskName}(void *arg) {\n`;
@@ -1474,9 +1543,9 @@ const generateMainLoop = (projectStructure, config, boardId = null, shmEnabled =
         mainSrc += `        while (__next.tv_nsec >= 1000000000L) { __next.tv_sec++; __next.tv_nsec -= 1000000000L; }\n`;
         // EC PDO read — ONLY in the fastest task when no dedicated IO_Bus thread
         if (!gpiMutexEnabled && isIoTask && ecPdoReadCode) mainSrc += ecPdoReadCode;
-        // SHM pull
+        // SHM pull — call task-specific version
         if (shmEnabled) {
-            mainSrc += `        plc_shm_pull();\n`;
+            mainSrc += `        plc_shm_pull_${tg.taskName}();\n`;
         }
         // Sync us_tick to real wall-clock time so IEC timers (TON/TOF/TP) are accurate.
         // Without this, if program execution takes longer than the sleep, us_tick drifts
@@ -1500,9 +1569,9 @@ const generateMainLoop = (projectStructure, config, boardId = null, shmEnabled =
                 mainSrc += `        ${pName}();\n`;
             }
         });
-        // SHM sync
+        // SHM sync — call task-specific version
         if (shmEnabled) {
-            mainSrc += `        plc_shm_sync();\n`;
+            mainSrc += `        plc_shm_sync_${tg.taskName}();\n`;
         }
         // EC PDO write — ONLY in the fastest task when no dedicated IO_Bus thread
         if (!gpiMutexEnabled && isIoTask && ecPdoWriteCode) mainSrc += ecPdoWriteCode;

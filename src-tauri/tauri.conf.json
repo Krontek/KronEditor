@@ -26,15 +26,7 @@
     "bundle": {
         "active": true,
         "targets": "all",
-        "resources": [
-            "resources/include/*",
-            "resources/include/soem/**",
-            "resources/arm/aarch64/*",
-            "resources/arm/armv7/*",
-            "resources/arm/CortexM/M0/*",
-            "resources/arm/CortexM/M4/*",
-            "resources/arm/CortexM/M7/*"
-        ],
+        "resources": [],
         "icon": [
             "../images/icons/32x32.png",
             "../images/icons/128x128.png",
