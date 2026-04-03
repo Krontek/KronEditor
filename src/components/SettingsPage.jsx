@@ -804,7 +804,7 @@ const SettingsPage = ({ theme, setTheme, editorSettings, setEditorSettings, sele
                             ESI Device Library
                         </h3>
                         <p style={{ color: '#888', fontSize: '12px', marginBottom: '16px' }}>
-                            ESI files are stored in <code style={{ color: '#9cdcfe' }}>~/kroneditor/esi/</code> and loaded automatically on startup.
+                            ESI files are stored in the app's local data directory (<code style={{ color: '#9cdcfe' }}>~/.local/share/com.plceditor.app/esi/</code>) and loaded automatically on startup.
                             Devices become available in the EtherCAT Master editor.
                         </p>
                         <button

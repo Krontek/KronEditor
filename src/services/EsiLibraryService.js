@@ -1,13 +1,15 @@
 /**
  * EsiLibraryService.js
- * Manages persistent ESI device library stored at ~/kroneditor/esi/
+ * Manages persistent ESI device library stored in the app's local data directory.
+ * Dev mode:     ~/.local/share/com.plceditor.app/esi/
+ * Installed:    same (AppLocalData resolves to the OS app-data folder)
  */
 
 import { readDir, mkdir, writeTextFile, readTextFile, exists, BaseDirectory } from '@tauri-apps/plugin-fs';
 import { parseEsiXml } from './EsiParser';
 
-const ESI_DIR = 'kroneditor/esi';
-const BASE    = BaseDirectory.Home;
+const ESI_DIR = 'esi';
+const BASE    = BaseDirectory.AppLocalData;
 
 async function ensureEsiDir() {
   const ok = await exists(ESI_DIR, { baseDir: BASE });

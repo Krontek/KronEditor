@@ -85,6 +85,24 @@ fn get_resource_dir(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     Ok(plain_path(&p))
 }
 
+/// Returns the canonical resources/ directory for compiled libraries and headers.
+/// In dev mode this is the project-source resources/ directory so that:
+///   - Update Library writes there
+///   - Firmware/simulation linker reads from there
+///   - Tauri bundles from there (src-tauri/resources → ../resources symlink)
+/// In production it falls back to the Tauri resource_dir.
+fn get_libraries_dir(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    if let Ok(cwd) = std::env::current_dir() {
+        if let Some(root) = std::iter::successors(Some(cwd.as_ref() as &std::path::Path), |p| p.parent())
+            .find(|p| p.join("src-tauri").exists() && p.join("resources").exists())
+        {
+            return Ok(root.join("resources"));
+        }
+    }
+    let resource_dir = get_resource_dir(app)?;
+    Ok(resource_dir.join("resources"))
+}
+
 /// Strip the \\?\ long-path UNC prefix that Windows sometimes adds.
 /// gcc does not accept this prefix in -I/-B arguments.
 #[cfg(target_os = "windows")]
@@ -323,8 +341,8 @@ fn get_standard_headers(app: tauri::AppHandle) -> Result<Vec<(String, String)>, 
         "kronhal_pico.h", "kronhal_sim.h",
     ].iter().copied().collect();
 
-    if let Ok(resource_dir) = get_resource_dir(&app) {
-        let include_dir = resource_dir.join("resources/include");
+    if let Ok(libraries_dir) = get_libraries_dir(&app) {
+        let include_dir = libraries_dir.join("include");
         // Scan top-level kron*.h / gpiod.h (non-HAL headers)
         if let Ok(entries) = fs::read_dir(&include_dir) {
             for entry in entries.flatten() {
@@ -423,16 +441,10 @@ fn create_ar_archive(output: &Path, obj_files: &[PathBuf]) -> Result<(), String>
 }
 
 fn do_update_libraries(app: &tauri::AppHandle, repos: Vec<String>) -> Result<(), String> {
-    let resource_dir = get_resource_dir(app)?;
-    let include_dir = resource_dir.join("resources/include");
+    let libraries_dir = get_libraries_dir(app)?;
+    let resource_dir  = get_resource_dir(app)?;
+    let include_dir   = libraries_dir.join("include");
     fs::create_dir_all(&include_dir).map_err(|e| e.to_string())?;
-
-    // Target directories for compiled libraries
-    struct BuildTarget {
-        name: &'static str,
-        dir: PathBuf,
-        dev_dir: Option<PathBuf>,
-    }
 
     let target_names = [
         "x86_64/linux", "x86_64/win32",
@@ -440,32 +452,11 @@ fn do_update_libraries(app: &tauri::AppHandle, repos: Vec<String>) -> Result<(),
         "arm/CortexM/M0", "arm/CortexM/M4", "arm/CortexM/M7",
     ];
 
-    let mut targets: Vec<BuildTarget> = Vec::new();
+    let mut targets: Vec<PathBuf> = Vec::new();
     for tname in &target_names {
-        let dir = resource_dir.join(format!("resources/{}", tname));
+        let dir = libraries_dir.join(tname);
         fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-        targets.push(BuildTarget { name: tname, dir, dev_dir: None });
-    }
-
-    // In dev mode, also copy to the project-root resources/ tree so files persist across builds.
-    // Walk up from cwd until we find a directory that contains BOTH "src-tauri" and "resources".
-    // This works regardless of whether cargo is invoked from the project root or from src-tauri/.
-    let mut dev_include_dir = None;
-    if let Ok(cwd) = std::env::current_dir() {
-        let project_root = std::iter::successors(Some(cwd.as_ref() as &std::path::Path), |p| p.parent())
-            .find(|p| p.join("src-tauri").exists() && p.join("resources").exists())
-            .map(|p| p.to_path_buf());
-        if let Some(root) = project_root {
-            let res = root.join("resources");
-            let i = res.join("include");
-            let _ = fs::create_dir_all(&i);
-            dev_include_dir = Some(i);
-            for t in &mut targets {
-                let d = res.join(t.name);
-                let _ = fs::create_dir_all(&d);
-                t.dev_dir = Some(d);
-            }
-        }
+        targets.push(dir);
     }
 
     let temp_base = std::env::temp_dir().join("kroneditor_libs");
@@ -506,9 +497,6 @@ fn do_update_libraries(app: &tauri::AppHandle, repos: Vec<String>) -> Result<(),
         for h_file in &h_files {
             if let Some(fname) = h_file.file_name() {
                 let _ = fs::copy(h_file, include_dir.join(fname));
-                if let Some(ref dev_inc) = dev_include_dir {
-                    let _ = fs::copy(h_file, dev_inc.join(fname));
-                }
             }
         }
         let _ = app.emit(
@@ -516,29 +504,22 @@ fn do_update_libraries(app: &tauri::AppHandle, repos: Vec<String>) -> Result<(),
             format!("[{}] Copied {} header(s)", repo_name, h_files.len()),
         );
 
-        // Each repo has exactly one main source: <reponame>.c (lowercase).
-        // Skip test.c, example.c and any other auxiliary files.
-        let lib_name = repo_name.to_lowercase();
-        let main_c = clone_dir.join(format!("{}.c", lib_name));
-        if main_c.exists() {
-            repo_sources.push((lib_name, main_c));
-        } else {
-            // Fallback: accept .c files NOT named test*.c or example*.c
-            let candidates: Vec<PathBuf> = find_files_with_ext(&clone_dir, "c")
-                .into_iter()
-                .filter(|p| {
-                    let n = p.file_name().unwrap_or_default().to_string_lossy().to_lowercase();
-                    !n.starts_with("test") && !n.starts_with("example")
-                })
-                .collect();
-            if candidates.is_empty() {
-                let _ = app.emit("library-update-progress",
-                    format!("[{}] WARN: no .c source found", repo_name));
-            }
-            for c in candidates {
-                let stem = c.file_stem().unwrap_or_default().to_string_lossy().to_string();
-                repo_sources.push((stem, c));
-            }
+        // Compile ALL non-test .c files in the repo (e.g. KronMotion has both
+        // kronmotion.c and kron_nc.c).  Each .c becomes its own lib<stem>.a.
+        let candidates: Vec<PathBuf> = find_files_with_ext(&clone_dir, "c")
+            .into_iter()
+            .filter(|p| {
+                let n = p.file_name().unwrap_or_default().to_string_lossy().to_lowercase();
+                !n.starts_with("test") && !n.starts_with("example")
+            })
+            .collect();
+        if candidates.is_empty() {
+            let _ = app.emit("library-update-progress",
+                format!("[{}] WARN: no .c source found", repo_name));
+        }
+        for c in candidates {
+            let stem = c.file_stem().unwrap_or_default().to_string_lossy().to_string();
+            repo_sources.push((stem, c));
         }
         cloned_dirs.push(clone_dir);
     }
@@ -554,19 +535,8 @@ fn do_update_libraries(app: &tauri::AppHandle, repos: Vec<String>) -> Result<(),
 
     // --- Compile for each target ---
 
-    // Pre-compute SOEM platform include paths (structure-preserved from do_build_soem)
-    // In dev mode the bundled resource_dir doesn't contain soem/ (tauri only copies flat globs);
-    // fall back to the project-root resources/include/soem/ path via dev_include_dir.
-    let soem_base = {
-        let primary = include_dir.join("soem");
-        if primary.exists() {
-            primary
-        } else if let Some(ref di) = dev_include_dir {
-            di.join("soem")
-        } else {
-            include_dir.join("soem")
-        }
-    };
+    // Pre-compute SOEM platform include paths
+    let soem_base = include_dir.join("soem");
     let soem_inc_dir     = soem_base.join("include");          // soem/include  → soem/soem.h
     let soem_osal_dir    = soem_base.join("osal");             // soem/osal/    → osal.h dispatch
     let soem_osal_linux  = soem_base.join("osal/linux");       // Linux osal
@@ -611,7 +581,6 @@ fn do_update_libraries(app: &tauri::AppHandle, repos: Vec<String>) -> Result<(),
         extra_flags: &[&str],
         ar_cmd:      &str,
         lib_dir:     &Path,
-        dev_dir:     &Option<PathBuf>,
         lib_name:    &str,
         c_file:      &Path,
     | -> Result<(), String> {
@@ -641,9 +610,6 @@ fn do_update_libraries(app: &tauri::AppHandle, repos: Vec<String>) -> Result<(),
             return Err(format!("[{}] {} archive error: {}",
                 target_tag, lib_name, String::from_utf8_lossy(&ar_out.stderr).trim()));
         }
-        if let Some(ref d) = dev_dir {
-            let _ = fs::copy(&lib_path, d.join(format!("lib{}.a", lib_name)));
-        }
         Ok(())
     };
 
@@ -656,7 +622,7 @@ fn do_update_libraries(app: &tauri::AppHandle, repos: Vec<String>) -> Result<(),
             let (ei, ef) = soem_extra(lib_name, "linux");
             match compile_one_ar(
                 "x86_64/linux", "gcc", cc_args, &ei, &ef, "ar",
-                &t.dir, &t.dev_dir, lib_name, c_file,
+                t, lib_name, c_file,
             ) {
                 Ok(()) => { let _ = app.emit("library-update-progress", format!(
                     "  [x86_64/linux] lib{}.a OK", lib_name)); }
@@ -692,7 +658,7 @@ fn do_update_libraries(app: &tauri::AppHandle, repos: Vec<String>) -> Result<(),
                 let (ei, ef) = soem_extra(lib_name, "win32");
                 match compile_one_ar(
                     "x86_64/win32", &cc, cc_args, &ei, &ef, &ar_cmd,
-                    &t.dir, &t.dev_dir, lib_name, c_file,
+                    t, lib_name, c_file,
                 ) {
                     Ok(()) => { let _ = app.emit("library-update-progress", format!(
                         "  [x86_64/win32] lib{}.a OK", lib_name)); }
@@ -720,7 +686,7 @@ fn do_update_libraries(app: &tauri::AppHandle, repos: Vec<String>) -> Result<(),
                 let (ei, ef) = soem_extra(lib_name, "linux");
                 match compile_one_ar(
                     "arm/aarch64", &cc_str, cc_args, &ei, &ef, &ar_str,
-                    &t.dir, &t.dev_dir, lib_name, c_file,
+                    t, lib_name, c_file,
                 ) {
                     Ok(()) => { let _ = app.emit("library-update-progress", format!(
                         "  [arm/aarch64] lib{}.a OK", lib_name)); }
@@ -749,7 +715,7 @@ fn do_update_libraries(app: &tauri::AppHandle, repos: Vec<String>) -> Result<(),
                 let (ei, ef) = soem_extra(lib_name, "linux");
                 match compile_one_ar(
                     "arm/armv7", &cc_str, cc_args, &ei, &ef, &ar_str,
-                    &t.dir, &t.dev_dir, lib_name, c_file,
+                    t, lib_name, c_file,
                 ) {
                     Ok(()) => { let _ = app.emit("library-update-progress", format!(
                         "  [arm/armv7] lib{}.a OK", lib_name)); }
@@ -788,7 +754,7 @@ fn do_update_libraries(app: &tauri::AppHandle, repos: Vec<String>) -> Result<(),
             let (ei, ef) = soem_extra(lib_name, "bare");
             match compile_one_ar(
                 name, &cc_str, cc_args, &ei, &ef, &ar_str,
-                &t.dir, &t.dev_dir, lib_name, c_file,
+                t, lib_name, c_file,
             ) {
                 Ok(()) => { let _ = app.emit("library-update-progress", format!(
                     "  [{}] lib{}.a OK", name, lib_name)); }
@@ -841,18 +807,6 @@ fn do_update_server(app: &tauri::AppHandle) -> Result<(), String> {
     let server_dir = resource_dir.join("resources/dist/server");
     fs::create_dir_all(&server_dir).map_err(|e| e.to_string())?;
 
-    // Dev-mode mirror
-    let mut dev_server_dir: Option<PathBuf> = None;
-    if let Ok(cwd) = std::env::current_dir() {
-        let project_root = std::iter::successors(Some(cwd.as_ref() as &std::path::Path), |p| p.parent())
-            .find(|p| p.join("src-tauri").exists() && p.join("resources").exists())
-            .map(|p| p.to_path_buf());
-        if let Some(root) = project_root {
-            let dev = root.join("resources/dist/server");
-            let _ = fs::create_dir_all(&dev);
-            dev_server_dir = Some(dev);
-        }
-    }
 
     // Check Go is available
     let _ = app.emit("server-update-progress", "Checking Go installation...");
@@ -913,11 +867,6 @@ fn do_update_server(app: &tauri::AppHandle) -> Result<(), String> {
             return Err(format!("{} build failed: {}", out_name, stderr.trim()));
         }
 
-        // Copy to dev dir too
-        if let Some(ref dev_dir) = dev_server_dir {
-            let _ = fs::copy(&out_path, dev_dir.join(out_name));
-        }
-
         let _ = app.emit("server-update-progress", format!("[{}/{}] {} built.", i + 1, targets.len(), out_name));
     }
 
@@ -963,7 +912,8 @@ fn compile_for_target(
     _do_count: Option<u8>,
     output_name: Option<String>,
 ) -> Result<String, String> {
-    let resource_dir = get_resource_dir(&app)?;
+    let resource_dir  = get_resource_dir(&app)?;
+    let libraries_dir = get_libraries_dir(&app)?;
     let build_dir = plain_path(&get_build_dir(&app)?);
 
     // Write source files
@@ -979,16 +929,7 @@ fn compile_for_target(
     let plc_c = build_dir.join("plc.c");
     let bin_name = output_name.unwrap_or_else(|| "runtime.bin".to_string());
     let out_file = build_dir.join(&bin_name);
-    let res_include = resource_dir.join("resources/include");
-
-    // In dev mode the bundled resource dir may not contain soem/ (only flat files are
-    // bundled by default).  Fall back to the project-root resources/include/soem/.
-    let project_soem_inc = std::env::current_dir().ok()
-        .and_then(|cwd| {
-            std::iter::successors(Some(cwd.as_path()), |p| p.parent())
-                .find(|p| p.join("src-tauri").exists() && p.join("resources").exists())
-                .map(|p| p.join("resources/include/soem/include"))
-        });
+    let res_include = libraries_dir.join("include");
 
     // Select cross-compiler and library directory based on board
     let (compiler, lib_dir) = if board_id.starts_with("rpi_pico") {
@@ -997,13 +938,13 @@ fn compile_for_target(
         // BeagleBone Black / Green / AI → armv7 (Cortex-A8/A15)
         (
             tc_bin(&resource_dir, "arm-linux-gnueabihf", "arm-linux-gnueabihf-gcc"),
-            resource_dir.join("resources/arm/armv7"),
+            libraries_dir.join("arm/armv7"),
         )
     } else {
         // RPi 3/4/5/Zero2W + BeagleBone AI-64 + Jetson (all aarch64 Linux) → aarch64
         (
             tc_bin(&resource_dir, "aarch64-none-linux-gnu", "aarch64-none-linux-gnu-gcc"),
-            resource_dir.join("resources/arm/aarch64"),
+            libraries_dir.join("arm/aarch64"),
         )
     };
 
@@ -1046,25 +987,8 @@ fn compile_for_target(
         })
     }).unwrap_or(false);
 
-    // SOEM requires 4 separate -I paths for the full include chain:
-    //   soem/include          → #include "soem/soem.h"
-    //   soem/osal             → #include "osal.h"       (from ec_type.h)
-    //   soem/osal/linux       → #include "osal_defs.h"  (from osal.h)
-    //   soem/oshw/linux       → #include "nicdrv.h"     (from soem.h)
-    // Prefer bundled path; fall back to project root for dev builds.
-    // project_soem_inc = .../resources/include/soem/include
-    // one .parent() → .../resources/include/soem  (the soem base dir we want)
-    let soem_base_inc = {
-        let bundled = res_include.join("soem");
-        if bundled.exists() {
-            bundled
-        } else {
-            project_soem_inc
-                .as_ref()
-                .and_then(|p| p.parent().map(|p| p.to_path_buf()))
-                .unwrap_or_else(|| res_include.join("soem"))
-        }
-    };
+    // SOEM requires 4 separate -I paths for the full include chain.
+    let soem_base_inc   = res_include.join("soem");
     let soem_inc        = soem_base_inc.join("include");
     let soem_osal       = soem_base_inc.join("osal");
     let soem_osal_linux = soem_base_inc.join("osal/linux");
@@ -1122,6 +1046,10 @@ fn compile_for_target(
     a_files.sort();
     for a in &a_files { cmd.arg(a); }
     cmd.arg("-lm").arg("-lpthread");
+
+    // Emit the full build command so the user can inspect it
+    let cmd_str = format!("{:?}", cmd);
+    let _ = app.emit("build-command", &cmd_str);
 
     let output = cmd.output()
         .map_err(|e| format!("Failed to run cross-compiler: {}", e))?;
@@ -1391,8 +1319,9 @@ fn compile_simulation(app: tauri::AppHandle) -> Result<String, String> {
     let gcc_path     = tc_bin(&resource_dir, "mingw", "gcc");
     let plc_c        = build_dir.join("plc.c");
     let plc_dll      = build_dir.join("plc.dll");
-    let res_include  = resource_dir.join("resources/include");
-    let sim_win      = resource_dir.join("resources/x86_64/win32");
+    let libraries_dir = get_libraries_dir(&app)?;
+    let res_include  = libraries_dir.join("include");
+    let sim_win      = libraries_dir.join("x86_64/win32");
 
     let gcc_bin_dir = gcc_path.parent().unwrap_or(&gcc_path);
 
@@ -1446,12 +1375,12 @@ fn compile_simulation(app: tauri::AppHandle) -> Result<String, String> {
 #[cfg(not(target_os = "windows"))]
 #[tauri::command]
 fn compile_simulation(app: tauri::AppHandle) -> Result<String, String> {
-    let resource_dir = get_resource_dir(&app)?;
-    let build_dir    = plain_path(&get_build_dir(&app)?);
-    let plc_c        = build_dir.join("plc.c");
-    let out_file     = build_dir.join(SIM_BIN);
-    let res_include  = resource_dir.join("resources/include");
-    let sim_lib      = resource_dir.join("resources/x86_64/linux");
+    let libraries_dir = get_libraries_dir(&app)?;
+    let build_dir     = plain_path(&get_build_dir(&app)?);
+    let plc_c         = build_dir.join("plc.c");
+    let out_file      = build_dir.join(SIM_BIN);
+    let res_include   = libraries_dir.join("include");
+    let sim_lib       = libraries_dir.join("x86_64/linux");
 
     let mut cmd = Command::new("gcc");
     // KRON_EC_SIM: use inline no-op stubs in kronethercatmaster.h (no SOEM linking needed for simulation)
@@ -1487,6 +1416,10 @@ fn compile_simulation(app: tauri::AppHandle) -> Result<String, String> {
         cmd.arg(a);
     }
     cmd.arg("-lm").arg("-lpthread");
+
+    // Emit the full build command so the user can inspect it
+    let cmd_str = format!("{:?}", cmd);
+    let _ = app.emit("build-command", &cmd_str);
 
     let output = cmd.output()
         .map_err(|e| format!("Failed to run gcc: {}", e))?;
@@ -1937,30 +1870,10 @@ fn simulate_st(code: String) -> Result<String, String> {
 // ---------------------------------------------------------------------------
 
 fn do_build_soem(app: &tauri::AppHandle) -> Result<(), String> {
-    let resource_dir = get_resource_dir(app)?;
-    let include_dir  = resource_dir.join("resources/include/soem");
+    let resource_dir  = get_resource_dir(app)?;
+    let libraries_dir = get_libraries_dir(app)?;
+    let include_dir   = libraries_dir.join("include/soem");
     fs::create_dir_all(&include_dir).map_err(|e| e.to_string())?;
-
-    // Dev-mode mirror directories (so files survive across Tauri rebuilds)
-    let mut dev_include_dir: Option<PathBuf> = None;
-    let mut dev_target_dirs: std::collections::HashMap<&'static str, PathBuf> = std::collections::HashMap::new();
-    if let Ok(cwd) = std::env::current_dir() {
-        let project_root = std::iter::successors(Some(cwd.as_ref() as &Path), |p| p.parent())
-            .find(|p| p.join("src-tauri").exists() && p.join("resources").exists())
-            .map(|p| p.to_path_buf());
-        if let Some(root) = project_root {
-            let res = root.join("resources");
-            let inc = res.join("include/soem");
-            let _ = fs::create_dir_all(&inc);
-            dev_include_dir = Some(inc);
-            for tname in &["x86_64/linux","x86_64/win32","arm/aarch64","arm/armv7",
-                           "arm/CortexM/M0","arm/CortexM/M4","arm/CortexM/M7"] {
-                let d = res.join(tname);
-                let _ = fs::create_dir_all(&d);
-                dev_target_dirs.insert(tname, d);
-            }
-        }
-    }
 
     let temp_dir = std::env::temp_dir().join("kroneditor_soem_build");
     let _ = fs::remove_dir_all(&temp_dir);
@@ -2126,11 +2039,6 @@ fn do_build_soem(app: &tauri::AppHandle) -> Result<(), String> {
                 let _ = fs::create_dir_all(parent);
             }
             if fs::copy(h, &dst).is_ok() { copied += 1; }
-            if let Some(ref d) = dev_include_dir {
-                let dst2 = d.join(rel);
-                if let Some(parent) = dst2.parent() { let _ = fs::create_dir_all(parent); }
-                let _ = fs::copy(h, dst2);
-            }
         }
     }
     let _ = app.emit("library-update-progress",
@@ -2143,7 +2051,6 @@ fn do_build_soem(app: &tauri::AppHandle) -> Result<(), String> {
         cc_flags:   &[&str],
         ar_cmd:     &str,
         out_dir:    &Path,
-        dev_dir:    Option<&PathBuf>,
         sources:    &[PathBuf],
         inc_dirs:   &[&Path],
     | -> Result<(), String> {
@@ -2182,9 +2089,6 @@ fn do_build_soem(app: &tauri::AppHandle) -> Result<(), String> {
         if !ar_out.status.success() {
             return Err(format!("[SOEM][{}] archive error: {}",
                 tag, String::from_utf8_lossy(&ar_out.stderr).trim()));
-        }
-        if let Some(d) = dev_dir {
-            let _ = fs::copy(&lib_path, d.join("libsoem.a"));
         }
         let _ = app.emit("library-update-progress",
             format!("[SOEM][{}] libsoem.a OK", tag));
@@ -2255,12 +2159,11 @@ fn do_build_soem(app: &tauri::AppHandle) -> Result<(), String> {
 
     // x86_64/linux
     {
-        let out_dir = resource_dir.join("resources/x86_64/linux");
-        let dev_dir = dev_target_dirs.get("x86_64/linux");
+        let out_dir = libraries_dir.join("x86_64/linux");
         let cc_flags: &[&str] = &["-O2", "-ffunction-sections", "-fdata-sections",
                                    "-DLINUX", "-pthread"];
         if let Err(e) = compile_soem_ar(
-            "x86_64/linux", "gcc", cc_flags, "ar", &out_dir, dev_dir, &linux_sources, linux_inc)
+            "x86_64/linux", "gcc", cc_flags, "ar", &out_dir, &linux_sources, linux_inc)
         {
             let _ = app.emit("library-update-progress", format!("WARN: {}", e));
         }
@@ -2282,12 +2185,11 @@ fn do_build_soem(app: &tauri::AppHandle) -> Result<(), String> {
             let _ = app.emit("library-update-progress",
                 "[SOEM][x86_64/win32] SKIP: MinGW gcc not found".to_string());
         } else {
-            let out_dir = resource_dir.join("resources/x86_64/win32");
-            let dev_dir = dev_target_dirs.get("x86_64/win32");
+            let out_dir = libraries_dir.join("x86_64/win32");
             let cc_flags: &[&str] = &["-O2", "-ffunction-sections", "-fdata-sections",
                                        "-DWIN32", "-D_WIN32"];
             if let Err(e) = compile_soem_ar(
-                "x86_64/win32", &cc, cc_flags, &ar_cmd, &out_dir, dev_dir, &win32_sources, win32_inc)
+                "x86_64/win32", &cc, cc_flags, &ar_cmd, &out_dir, &win32_sources, win32_inc)
             {
                 let _ = app.emit("library-update-progress", format!("WARN: {}", e));
             }
@@ -2302,13 +2204,12 @@ fn do_build_soem(app: &tauri::AppHandle) -> Result<(), String> {
             let _ = app.emit("library-update-progress",
                 "[SOEM][arm/aarch64] SKIP: aarch64-none-linux-gnu-gcc not found".to_string());
         } else {
-            let out_dir = resource_dir.join("resources/arm/aarch64");
-            let dev_dir = dev_target_dirs.get("arm/aarch64");
+            let out_dir = libraries_dir.join("arm/aarch64");
             let cc_flags: &[&str] = &["-O2", "-ffunction-sections", "-fdata-sections",
                                        "-DLINUX", "-pthread", "-fno-lto", "-fno-use-linker-plugin"];
             if let Err(e) = compile_soem_ar(
                 "arm/aarch64", &cc_path.to_string_lossy(), cc_flags,
-                &ar_path.to_string_lossy(), &out_dir, dev_dir, &linux_sources, linux_inc)
+                &ar_path.to_string_lossy(), &out_dir, &linux_sources, linux_inc)
             {
                 let _ = app.emit("library-update-progress", format!("WARN: {}", e));
             }
@@ -2331,14 +2232,13 @@ fn do_build_soem(app: &tauri::AppHandle) -> Result<(), String> {
             let _ = app.emit("library-update-progress",
                 "[SOEM][arm/armv7] SKIP: arm-linux-gnueabihf-gcc not found".to_string());
         } else {
-            let out_dir = resource_dir.join("resources/arm/armv7");
-            let dev_dir = dev_target_dirs.get("arm/armv7");
+            let out_dir = libraries_dir.join("arm/armv7");
             let cc_flags: &[&str] = &[
                 "-march=armv7-a", "-mfpu=vfpv3-d16", "-mfloat-abi=hard",
                 "-O2", "-ffunction-sections", "-fdata-sections", "-DLINUX", "-pthread",
                 "-fno-lto", "-fno-use-linker-plugin"];
             if let Err(e) = compile_soem_ar(
-                "arm/armv7", &cc7, cc_flags, &ar7, &out_dir, dev_dir, &linux_sources, linux_inc)
+                "arm/armv7", &cc7, cc_flags, &ar7, &out_dir, &linux_sources, linux_inc)
             {
                 let _ = app.emit("library-update-progress", format!("WARN: {}", e));
             }
@@ -2456,23 +2356,21 @@ __attribute__((weak)) int osal_thread_create_rt(void *h, int s, void *f, void *p
 
             // M0: no FPU, Thumb only
             {
-                let out_dir = resource_dir.join("resources/arm/CortexM/M0");
-                let dev_dir = dev_target_dirs.get("arm/CortexM/M0");
+                let out_dir = libraries_dir.join("arm/CortexM/M0");
                 let cc_flags: &[&str] = &[
                     "-mcpu=cortex-m0", "-mthumb",
                     "-O2", "-ffunction-sections", "-fdata-sections",
                     "-DBARE_METAL=1", "-DKRON_EC_BARE_METAL"];
                 if let Err(e) = compile_soem_ar(
                     "arm/CortexM/M0", arm_cc, cc_flags, arm_ar,
-                    &out_dir, dev_dir, &bm_sources, bm_inc_dirs)
+                    &out_dir, &bm_sources, bm_inc_dirs)
                 {
                     let _ = app.emit("library-update-progress", format!("WARN: {}", e));
                 }
             }
             // M4: FPU single-precision
             {
-                let out_dir = resource_dir.join("resources/arm/CortexM/M4");
-                let dev_dir = dev_target_dirs.get("arm/CortexM/M4");
+                let out_dir = libraries_dir.join("arm/CortexM/M4");
                 let cc_flags: &[&str] = &[
                     "-mcpu=cortex-m4", "-mthumb",
                     "-mfpu=fpv4-sp-d16", "-mfloat-abi=hard",
@@ -2480,15 +2378,14 @@ __attribute__((weak)) int osal_thread_create_rt(void *h, int s, void *f, void *p
                     "-DBARE_METAL=1", "-DKRON_EC_BARE_METAL"];
                 if let Err(e) = compile_soem_ar(
                     "arm/CortexM/M4", arm_cc, cc_flags, arm_ar,
-                    &out_dir, dev_dir, &bm_sources, bm_inc_dirs)
+                    &out_dir, &bm_sources, bm_inc_dirs)
                 {
                     let _ = app.emit("library-update-progress", format!("WARN: {}", e));
                 }
             }
             // M7: FPU double-precision
             {
-                let out_dir = resource_dir.join("resources/arm/CortexM/M7");
-                let dev_dir = dev_target_dirs.get("arm/CortexM/M7");
+                let out_dir = libraries_dir.join("arm/CortexM/M7");
                 let cc_flags: &[&str] = &[
                     "-mcpu=cortex-m7", "-mthumb",
                     "-mfpu=fpv5-d16", "-mfloat-abi=hard",
@@ -2496,7 +2393,7 @@ __attribute__((weak)) int osal_thread_create_rt(void *h, int s, void *f, void *p
                     "-DBARE_METAL=1", "-DKRON_EC_BARE_METAL"];
                 if let Err(e) = compile_soem_ar(
                     "arm/CortexM/M7", arm_cc, cc_flags, arm_ar,
-                    &out_dir, dev_dir, &bm_sources, bm_inc_dirs)
+                    &out_dir, &bm_sources, bm_inc_dirs)
                 {
                     let _ = app.emit("library-update-progress", format!("WARN: {}", e));
                 }
@@ -2550,30 +2447,10 @@ fn ec_request_state(app: tauri::AppHandle, state: String) -> Result<(), String> 
 // ---------------------------------------------------------------------------
 
 fn do_build_canopen(app: &tauri::AppHandle) -> Result<(), String> {
-    let resource_dir = get_resource_dir(app)?;
-    let include_dir  = resource_dir.join("resources/include/canopen");
+    let resource_dir  = get_resource_dir(app)?;
+    let libraries_dir = get_libraries_dir(app)?;
+    let include_dir   = libraries_dir.join("include/canopen");
     fs::create_dir_all(&include_dir).map_err(|e| e.to_string())?;
-
-    // Dev-mode mirror directories
-    let mut dev_include_dir: Option<PathBuf> = None;
-    let mut dev_target_dirs: std::collections::HashMap<&'static str, PathBuf> = std::collections::HashMap::new();
-    if let Ok(cwd) = std::env::current_dir() {
-        let project_root = std::iter::successors(Some(cwd.as_ref() as &Path), |p| p.parent())
-            .find(|p| p.join("src-tauri").exists() && p.join("resources").exists())
-            .map(|p| p.to_path_buf());
-        if let Some(root) = project_root {
-            let res = root.join("resources");
-            let inc = res.join("include/canopen");
-            let _ = fs::create_dir_all(&inc);
-            dev_include_dir = Some(inc);
-            for tname in &["x86_64/linux","x86_64/win32","arm/aarch64","arm/armv7",
-                           "arm/CortexM/M0","arm/CortexM/M4","arm/CortexM/M7"] {
-                let d = res.join(tname);
-                let _ = fs::create_dir_all(&d);
-                dev_target_dirs.insert(tname, d);
-            }
-        }
-    }
 
     let temp_dir = std::env::temp_dir().join("kroneditor_canopen_build");
     let _ = fs::remove_dir_all(&temp_dir);
@@ -2613,11 +2490,6 @@ fn do_build_canopen(app: &tauri::AppHandle) -> Result<(), String> {
             let dst = include_dir.join(rel);
             if let Some(parent) = dst.parent() { let _ = fs::create_dir_all(parent); }
             if fs::copy(h, &dst).is_ok() { copied += 1; }
-            if let Some(ref d) = dev_include_dir {
-                let dst2 = d.join(rel);
-                if let Some(p) = dst2.parent() { let _ = fs::create_dir_all(p); }
-                let _ = fs::copy(h, dst2);
-            }
         }
     }
     let _ = app.emit("library-update-progress",
@@ -2735,7 +2607,6 @@ typedef struct CO_CANmodule_t CO_CANmodule_t;\n\
         cc_flags:   &[&str],
         ar_cmd:     &str,
         out_dir:    &Path,
-        dev_dir:    Option<&PathBuf>,
         sources:    &[PathBuf],
         inc_dirs:   &[&Path],
     | -> Result<(), String> {
@@ -2775,9 +2646,6 @@ typedef struct CO_CANmodule_t CO_CANmodule_t;\n\
             return Err(format!("[CANopen][{}] archive error: {}",
                 tag, String::from_utf8_lossy(&ar_out.stderr).trim()));
         }
-        if let Some(d) = dev_dir {
-            let _ = fs::copy(&lib_path, d.join("libcanopen.a"));
-        }
         let _ = app.emit("library-update-progress",
             format!("[CANopen][{}] libcanopen.a OK", tag));
         Ok(())
@@ -2796,12 +2664,11 @@ typedef struct CO_CANmodule_t CO_CANmodule_t;\n\
 
     // x86_64/linux
     {
-        let out_dir = resource_dir.join("resources/x86_64/linux");
-        let dev_dir = dev_target_dirs.get("x86_64/linux");
+        let out_dir = libraries_dir.join("x86_64/linux");
         let cc_flags: &[&str] = &["-O2", "-ffunction-sections", "-fdata-sections",
                                    "-DLINUX", "-pthread"];
         if let Err(e) = compile_canopen_ar(
-            "x86_64/linux", "gcc", cc_flags, "ar", &out_dir, dev_dir, &linux_sources, linux_inc)
+            "x86_64/linux", "gcc", cc_flags, "ar", &out_dir, &linux_sources, linux_inc)
         {
             let _ = app.emit("library-update-progress", format!("WARN: {}", e));
         }
@@ -2821,13 +2688,12 @@ typedef struct CO_CANmodule_t CO_CANmodule_t;\n\
             let _ = app.emit("library-update-progress",
                 "[CANopen][arm/aarch64] SKIP: aarch64-none-linux-gnu-gcc not found".to_string());
         } else {
-            let out_dir = resource_dir.join("resources/arm/aarch64");
-            let dev_dir = dev_target_dirs.get("arm/aarch64");
+            let out_dir = libraries_dir.join("arm/aarch64");
             let cc_flags: &[&str] = &["-O2", "-ffunction-sections", "-fdata-sections",
                                        "-DLINUX", "-pthread", "-fno-lto", "-fno-use-linker-plugin"];
             if let Err(e) = compile_canopen_ar(
                 "arm/aarch64", &cc_path.to_string_lossy(), cc_flags,
-                &ar_path.to_string_lossy(), &out_dir, dev_dir, &linux_sources, linux_inc)
+                &ar_path.to_string_lossy(), &out_dir, &linux_sources, linux_inc)
             {
                 let _ = app.emit("library-update-progress", format!("WARN: {}", e));
             }
@@ -2850,14 +2716,13 @@ typedef struct CO_CANmodule_t CO_CANmodule_t;\n\
             let _ = app.emit("library-update-progress",
                 "[CANopen][arm/armv7] SKIP: arm-linux-gnueabihf-gcc not found".to_string());
         } else {
-            let out_dir = resource_dir.join("resources/arm/armv7");
-            let dev_dir = dev_target_dirs.get("arm/armv7");
+            let out_dir = libraries_dir.join("arm/armv7");
             let cc_flags: &[&str] = &[
                 "-march=armv7-a", "-mfpu=vfpv3-d16", "-mfloat-abi=hard",
                 "-O2", "-ffunction-sections", "-fdata-sections", "-DLINUX", "-pthread",
                 "-fno-lto", "-fno-use-linker-plugin"];
             if let Err(e) = compile_canopen_ar(
-                "arm/armv7", &cc7, cc_flags, &ar7, &out_dir, dev_dir, &linux_sources, linux_inc)
+                "arm/armv7", &cc7, cc_flags, &ar7, &out_dir, &linux_sources, linux_inc)
             {
                 let _ = app.emit("library-update-progress", format!("WARN: {}", e));
             }
@@ -2889,11 +2754,10 @@ typedef struct CO_CANmodule_t CO_CANmodule_t;\n\
                     "-O2", "-ffunction-sections", "-fdata-sections", "-DBARE_METAL=1"]),
             ];
             for (m_tag, cc_flags) in targets {
-                let out_dir = resource_dir.join(format!("resources/{}", m_tag));
-                let dev_dir = dev_target_dirs.get(m_tag);
+                let out_dir = libraries_dir.join(m_tag);
                 if let Err(e) = compile_canopen_ar(
                     m_tag, arm_cc, cc_flags, arm_ar,
-                    &out_dir, dev_dir, &bm_sources, bm_inc)
+                    &out_dir, &bm_sources, bm_inc)
                 {
                     let _ = app.emit("library-update-progress", format!("WARN: {}", e));
                 }

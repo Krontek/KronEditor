@@ -243,8 +243,13 @@ const ST_KEYWORDS_LOWER = new Set([
     'gt','ge','eq','ne','le','lt',
     'byte_to_uint','byte_to_int','byte_to_dint','byte_to_real',
     'int_to_real','real_to_int','dint_to_real','real_to_dint',
-    'bool_to_int','int_to_bool','norm_x','scale_x',
+    'uint_to_real','real_to_uint','lint_to_real','real_to_lint',
+    'bool_to_int','int_to_bool','bool_to_uint','uint_to_bool',
+    'norm_x','scale_x',
     'int_to_uint','uint_to_int','dint_to_int','int_to_dint',
+    'uint_to_dint','dint_to_uint','lint_to_dint','dint_to_lint',
+    'uint_to_lint','int_to_lint','word_to_uint','uint_to_word',
+    'dword_to_udint','udint_to_dword',
     'uart_receive','uart_send',
 ]);
 
@@ -257,7 +262,8 @@ export const validateProjectST = (projectStructure, stdFunctionNames = []) => {
     const errors = [];
     const stdLower = new Set(stdFunctionNames.map(n => n.toLowerCase()));
     const globalVarNames = new Set(
-        (projectStructure?.global?.variables || []).map(v => (v.name || '').toLowerCase())
+        (projectStructure?.resources?.find(r => r.type === 'RESOURCE_EDITOR')?.content?.globalVars || [])
+            .map(v => (v.name || '').toLowerCase())
     );
     const dataTypeNames = new Set(
         (projectStructure?.dataTypes || []).map(dt => (dt.name || '').toLowerCase())
@@ -1227,22 +1233,10 @@ extern KRON_Process_Image __gpi;
     // NC Engine stubs — provided inline so the build succeeds when libkronmotion
     // does not yet export NC_Init / NC_ProcessOne.  The weak attribute lets a real
     // library implementation take precedence if it is ever linked (GCC/Clang only).
-    const ncStubs = hasAxes
-        ? `\n/* NC Engine stubs — weak symbols, overridden by libkronmotion when available */\n` +
-          `#if defined(__GNUC__) || defined(__clang__)\n` +
-          `__attribute__((weak)) void NC_Init(NC_AXIS *nc, AXIS_REF *ref) {\n` +
-          `    if (!nc || !ref) return;\n` +
-          `    memset(&nc->priv, 0, sizeof(nc->priv));\n` +
-          `    nc->ref = ref;\n` +
-          `}\n` +
-          `__attribute__((weak)) void NC_ProcessOne(NC_AXIS *nc, float dt) {\n` +
-          `    (void)nc; (void)dt;\n` +
-          `}\n` +
-          `#else\n` +
-          `void NC_Init(NC_AXIS *nc, AXIS_REF *ref) { if(nc && ref) { memset(&nc->priv,0,sizeof(nc->priv)); nc->ref=ref; } }\n` +
-          `void NC_ProcessOne(NC_AXIS *nc, float dt) { (void)nc; (void)dt; }\n` +
-          `#endif\n`
-        : '';
+    // NC_Init and NC_ProcessOne are provided by libkronmotion.a — no inline
+    // stubs needed.  Using extern declarations so the linker pulls the real
+    // implementations from the archive (weak stubs would prevent this).
+    const ncStubs = '';
     const headerDecl =
 `\n#if defined(__linux__)\n` +
 `KRON_Process_Image            __gpi_hw;\n` +
@@ -1683,6 +1677,7 @@ const FB_TRIGGER_PIN = {
     'MC_Home': 'Execute', 'MC_Stop': 'Execute', 'MC_Halt': 'Execute',
     'MC_MoveAbsolute': 'Execute', 'MC_MoveRelative': 'Execute',
     'MC_MoveAdditive': 'Execute', 'MC_MoveVelocity': 'Execute',
+    'MC_MoveSuperimposed': 'Execute', 'MC_HaltSuperimposed': 'Execute',
     'MC_MoveContinuousAbsolute': 'Execute', 'MC_MoveContinuousRelative': 'Execute',
     'MC_SetPosition': 'Execute', 'MC_SetOverride': 'Enable',
     'MC_Reset': 'Execute',
@@ -1725,6 +1720,7 @@ const FB_Q_OUTPUT = {
     'MC_Home': 'Done', 'MC_Stop': 'Done', 'MC_Halt': 'Done',
     'MC_MoveAbsolute': 'Done', 'MC_MoveRelative': 'Done',
     'MC_MoveAdditive': 'Done', 'MC_MoveVelocity': 'InVelocity',
+    'MC_MoveSuperimposed': 'Done', 'MC_HaltSuperimposed': 'Done',
     'MC_MoveContinuousAbsolute': 'InEndVelocity', 'MC_MoveContinuousRelative': 'InEndVelocity',
     'MC_SetPosition': 'Done', 'MC_SetOverride': 'Enabled',
     'MC_Reset': 'Done',
@@ -1925,12 +1921,14 @@ const FB_OUTPUTS = {
     // Motion control
     'MC_Power': ['Status', 'Valid', 'Error', 'ErrorID'],
     'MC_Home': ['Done', 'Busy', 'Active', 'CommandAborted', 'Error', 'ErrorID'],
-    'MC_Stop': ['Done', 'Busy', 'CommandAborted', 'Error', 'ErrorID'],
+    'MC_Stop': ['Done', 'Busy', 'Active', 'CommandAborted', 'Error', 'ErrorID'],
     'MC_Halt': ['Done', 'Busy', 'Active', 'CommandAborted', 'Error', 'ErrorID'],
     'MC_MoveAbsolute': ['Done', 'Busy', 'Active', 'CommandAborted', 'Error', 'ErrorID'],
     'MC_MoveRelative': ['Done', 'Busy', 'Active', 'CommandAborted', 'Error', 'ErrorID'],
     'MC_MoveAdditive': ['Done', 'Busy', 'Active', 'CommandAborted', 'Error', 'ErrorID'],
     'MC_MoveVelocity': ['InVelocity', 'Busy', 'Active', 'CommandAborted', 'Error', 'ErrorID'],
+    'MC_MoveSuperimposed': ['Done', 'Busy', 'Active', 'CommandAborted', 'Error', 'ErrorID'],
+    'MC_HaltSuperimposed': ['Done', 'Busy', 'Active', 'CommandAborted', 'Error', 'ErrorID'],
     'MC_MoveContinuousAbsolute': ['InEndVelocity', 'Busy', 'Active', 'CommandAborted', 'Error', 'ErrorID'],
     'MC_MoveContinuousRelative': ['InEndVelocity', 'Busy', 'Active', 'CommandAborted', 'Error', 'ErrorID'],
     'MC_SetPosition': ['Done', 'Busy', 'Error', 'ErrorID'],
@@ -2049,15 +2047,17 @@ const FB_INPUTS = {
     'EC_WriteSDO':       ['Execute', 'SlaveAddress', 'Index', 'SubIndex', 'ByteSize', 'Value'],
     // Motion control — Axis parameter is NOT listed here (passed separately as 2nd arg to _Call)
     'MC_Power': ['Enable', 'EnablePositive', 'EnableNegative'],
-    'MC_Home': ['Execute', 'Position'],
+    'MC_Home': ['Execute', 'Position', 'HomingMode'],
     'MC_Stop': ['Execute', 'Deceleration', 'Jerk'],
-    'MC_Halt': ['Execute', 'Deceleration', 'Jerk'],
-    'MC_MoveAbsolute': ['Execute', 'Position', 'Velocity', 'Acceleration', 'Deceleration'],
-    'MC_MoveRelative': ['Execute', 'Distance', 'Velocity', 'Acceleration', 'Deceleration'],
-    'MC_MoveAdditive': ['Execute', 'Distance', 'Velocity', 'Acceleration', 'Deceleration'],
-    'MC_MoveVelocity': ['Execute', 'Velocity', 'Acceleration', 'Deceleration'],
-    'MC_MoveContinuousAbsolute': ['Execute', 'Position', 'EndVelocity', 'Velocity', 'Acceleration', 'Deceleration'],
-    'MC_MoveContinuousRelative': ['Execute', 'Distance', 'EndVelocity', 'Velocity', 'Acceleration', 'Deceleration'],
+    'MC_Halt': ['Execute', 'Deceleration', 'Jerk', 'BufferMode'],
+    'MC_MoveAbsolute': ['Execute', 'ContinuousUpdate', 'Position', 'Velocity', 'Acceleration', 'Deceleration', 'Jerk', 'BufferMode'],
+    'MC_MoveRelative': ['Execute', 'ContinuousUpdate', 'Distance', 'Velocity', 'Acceleration', 'Deceleration', 'Jerk', 'BufferMode'],
+    'MC_MoveAdditive': ['Execute', 'ContinuousUpdate', 'Distance', 'Velocity', 'Acceleration', 'Deceleration', 'Jerk', 'BufferMode'],
+    'MC_MoveVelocity': ['Execute', 'ContinuousUpdate', 'Velocity', 'Acceleration', 'Deceleration', 'Jerk', 'Direction', 'BufferMode'],
+    'MC_MoveSuperimposed': ['Execute', 'Distance', 'VelocityDiff', 'AccelerationDiff', 'DecelerationDiff', 'JerkDiff'],
+    'MC_HaltSuperimposed': ['Execute', 'Deceleration', 'Jerk'],
+    'MC_MoveContinuousAbsolute': ['Execute', 'Position', 'EndVelocity', 'Velocity', 'Acceleration', 'Deceleration', 'Jerk'],
+    'MC_MoveContinuousRelative': ['Execute', 'Distance', 'EndVelocity', 'Velocity', 'Acceleration', 'Deceleration', 'Jerk'],
     'MC_SetPosition': ['Execute', 'Position', 'Relative'],
     'MC_SetOverride': ['Enable', 'VelFactor', 'AccFactor', 'JerkFactor'],
     'MC_Reset': ['Execute'],
@@ -2083,6 +2083,7 @@ const MOTION_FB_AXIS_PARAM = new Set([
     'MC_Power', 'MC_Home', 'MC_Stop', 'MC_Halt',
     'MC_MoveAbsolute', 'MC_MoveRelative', 'MC_MoveAdditive',
     'MC_MoveVelocity', 'MC_MoveContinuousAbsolute', 'MC_MoveContinuousRelative',
+    'MC_MoveSuperimposed', 'MC_HaltSuperimposed',
     'MC_SetPosition', 'MC_SetOverride', 'MC_Reset',
     'MC_ReadActualPosition', 'MC_ReadActualVelocity', 'MC_ReadActualTorque',
     'MC_ReadStatus', 'MC_ReadMotionState', 'MC_ReadAxisInfo', 'MC_ReadAxisError',
@@ -2138,10 +2139,28 @@ const transpileSTLogics = (code, stdFunctions = {}, parentName = '', category = 
     const stripped = code
         .replace(/\(\*[\s\S]*?\*\)/g, '')
         .replace(/\bVAR\b[\s\S]*?\bEND_VAR\b\s*;?/gi, '');
+
+    // Expand inline control-flow: insert newlines so that keywords that the
+    // line-oriented matchers below expect at end-of-line are actually there.
+    // e.g.  IF x THEN y := 1; ELSIF z THEN y := 2; END_IF;
+    //   →   IF x THEN\ny := 1;\nELSIF z THEN\ny := 2;\nEND_IF;
+    const normalized = stripped
+        // After THEN/DO — insert newline when something follows on the same line
+        .replace(/\bTHEN\b[ \t]*(?=[^\r\n])/gi, 'THEN\n')
+        .replace(/\bDO\b[ \t]*(?=[^\r\n])/gi, 'DO\n')
+        // Before ELSIF / ELSE / END_xxx / UNTIL — ensure they start on own line
+        .replace(/[ \t]*\bELSIF\b/gi, '\nELSIF')
+        .replace(/[ \t]*\bELSE\b(?!\s*IF\b)[ \t]*/gi, '\nELSE\n')
+        .replace(/[ \t]*\bEND_IF\b/gi, '\nEND_IF')
+        .replace(/[ \t]*\bEND_FOR\b/gi, '\nEND_FOR')
+        .replace(/[ \t]*\bEND_WHILE\b/gi, '\nEND_WHILE')
+        .replace(/[ \t]*\bEND_REPEAT\b/gi, '\nEND_REPEAT')
+        .replace(/[ \t]*\bUNTIL\b/gi, '\nUNTIL');
+
     // Join continuation lines: a line ending with AND/OR/,/( (after stripping comment)
     // means the logical expression continues on the next line.  Merge them so the
     // keyword matchers (IF…THEN, ELSIF…THEN, WHILE…DO, FOR…DO) see a single line.
-    const rawLines = stripped.split(/\r?\n|\\n/).map(l => l.replace(/\/\/.*$/, ''));
+    const rawLines = normalized.split(/\r?\n|\\n/).map(l => l.replace(/\/\/.*$/, ''));
     const lines = [];
     let pending = '';
     for (const raw of rawLines) {
@@ -2808,10 +2827,25 @@ const transpileLDLogics = (rungs, stdFunctions = {}, parentName = '', category =
                 });
                 }
 
-                // Step 3: set the trigger (power-flow) input — always from inExpr
+                // Step 3: set the trigger (power-flow) input
+                // If the user typed a variable name into the trigger pin field (e.g. "SWB_State"
+                // for Execute), AND it with the rung power flow so the FB sees the actual
+                // signal transitions (rising/falling edge) instead of a constant true.
                 const triggerPin = FB_TRIGGER_PIN[type] || (!isUserDefinedFB && !FB_INPUTS[type] && inputPins.length > 0 ? inputPins[0] : null);
                 if (triggerPin) {
-                    out += `    ${callTarget}.${cStructPin(type, triggerPin)} = ${inExpr};\n`;
+                    let trigExpr = inExpr;
+                    const userTrigVal = data.values?.[triggerPin];
+                    if (userTrigVal && userTrigVal !== '') {
+                        const resolvedTrig = resolveInputPinValue(type, triggerPin, userTrigVal, data.customData);
+                        if (resolvedTrig !== null && resolvedTrig !== undefined
+                            && resolvedTrig !== 'true' && resolvedTrig !== 'false') {
+                            // AND user value with power flow; simplify if power is just 'true'
+                            trigExpr = (inExpr === 'true' || inExpr === '(true)')
+                                ? resolvedTrig
+                                : `(${inExpr}) && ${resolvedTrig}`;
+                        }
+                    }
+                    out += `    ${callTarget}.${cStructPin(type, triggerPin)} = ${trigExpr};\n`;
                 }
                 // User-defined FBs always execute every scan (they have no implicit EN/ENO);
                 // power flow only controls downstream energization. Standard FBs without a

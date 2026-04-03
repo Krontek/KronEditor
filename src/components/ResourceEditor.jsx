@@ -10,8 +10,9 @@ const ResourceEditor = ({ content, onContentChange, availablePrograms = [], deri
         onContentChange({ ...content, globalVars: newVars });
     };
 
-    const handleUpdateVar = (id, updatedObj) => {
-        const newVars = (content.globalVars || []).map(v => v.id === id ? { ...v, ...updatedObj } : v);
+    const handleUpdateVar = (id, fieldOrObj, value) => {
+        const patch = (typeof fieldOrObj === 'string') ? { [fieldOrObj]: value } : fieldOrObj;
+        const newVars = (content.globalVars || []).map(v => v.id === id ? { ...v, ...patch } : v);
         onContentChange({ ...content, globalVars: newVars });
     };
 

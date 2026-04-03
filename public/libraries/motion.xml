@@ -1,13 +1,19 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <Library>
   <Category name="MOTION">
-    <!-- 3.1  MC_Power — Enable / Disable power stage (PLCopen TC2 Part 1 v2.0) -->
-    <Block type="MC_Power" description="Enable axis power stage" class="FunctionBlock">
+
+    <!-- ═══════════════════════════════════════════════════════════════════
+         ADMINISTRATIVE
+         PLCopen TC2 Part 1 v2.0
+         ═══════════════════════════════════════════════════════════════════ -->
+
+    <!-- MC_Power — Enable / Disable axis power stage -->
+    <Block type="MC_Power" description="Enable / disable axis power stage" class="FunctionBlock">
       <Inputs>
         <Variable name="Axis"           type="AXIS_REF" />
-        <Variable name="Enable"         type="BOOL"     default="FALSE" />
-        <Variable name="EnablePositive" type="BOOL"     default="TRUE" />
-        <Variable name="EnableNegative" type="BOOL"     default="TRUE" />
+        <Variable name="Enable"         type="BOOL"  default="FALSE" />
+        <Variable name="EnablePositive" type="BOOL"  default="TRUE"  />
+        <Variable name="EnableNegative" type="BOOL"  default="TRUE"  />
       </Inputs>
       <Outputs>
         <Variable name="Status"  type="BOOL" />
@@ -17,12 +23,48 @@
       </Outputs>
     </Block>
 
-    <!-- 3.2  MC_Home -->
-    <Block type="MC_Home" description="Execute homing sequence" class="FunctionBlock">
+    <!-- MC_Reset — Clear axis fault, return to Standstill -->
+    <Block type="MC_Reset" description="Reset axis from ErrorStop state" class="FunctionBlock">
       <Inputs>
-        <Variable name="Axis"     type="AXIS_REF" />
-        <Variable name="Execute"  type="BOOL"  default="FALSE" />
-        <Variable name="Position" type="REAL"  default="0.0" />
+        <Variable name="Axis"    type="AXIS_REF" />
+        <Variable name="Execute" type="BOOL" default="FALSE" />
+      </Inputs>
+      <Outputs>
+        <Variable name="Done"    type="BOOL" />
+        <Variable name="Busy"    type="BOOL" />
+        <Variable name="Error"   type="BOOL" />
+        <Variable name="ErrorID" type="WORD" />
+      </Outputs>
+    </Block>
+
+    <!-- MC_SetOverride — Scale velocity / acceleration / jerk at runtime -->
+    <Block type="MC_SetOverride" description="Scale velocity, acceleration and jerk factors" class="FunctionBlock">
+      <Inputs>
+        <Variable name="Axis"       type="AXIS_REF" />
+        <Variable name="Enable"     type="BOOL" default="FALSE" />
+        <Variable name="VelFactor"  type="REAL" default="1.0" />
+        <Variable name="AccFactor"  type="REAL" default="1.0" />
+        <Variable name="JerkFactor" type="REAL" default="1.0" />
+      </Inputs>
+      <Outputs>
+        <Variable name="Enabled"  type="BOOL" />
+        <Variable name="Busy"     type="BOOL" />
+        <Variable name="Error"    type="BOOL" />
+        <Variable name="ErrorID"  type="WORD" />
+      </Outputs>
+    </Block>
+
+    <!-- ═══════════════════════════════════════════════════════════════════
+         STOP / HALT
+         ═══════════════════════════════════════════════════════════════════ -->
+
+    <!-- MC_Stop — Highest-priority controlled stop; holds axis in Stopping -->
+    <Block type="MC_Stop" description="Controlled emergency stop (highest priority)" class="FunctionBlock">
+      <Inputs>
+        <Variable name="Axis"         type="AXIS_REF" />
+        <Variable name="Execute"      type="BOOL" default="FALSE" />
+        <Variable name="Deceleration" type="REAL" default="1000.0" />
+        <Variable name="Jerk"         type="REAL" default="0.0" />
       </Inputs>
       <Outputs>
         <Variable name="Done"           type="BOOL" />
@@ -34,30 +76,14 @@
       </Outputs>
     </Block>
 
-    <!-- 3.3  MC_Stop -->
-    <Block type="MC_Stop" description="Controlled emergency stop" class="FunctionBlock">
-      <Inputs>
-        <Variable name="Axis"         type="AXIS_REF" />
-        <Variable name="Execute"      type="BOOL"  default="FALSE" />
-        <Variable name="Deceleration" type="REAL"  default="100.0" />
-        <Variable name="Jerk"         type="REAL"  default="0.0" />
-      </Inputs>
-      <Outputs>
-        <Variable name="Done"           type="BOOL" />
-        <Variable name="Busy"           type="BOOL" />
-        <Variable name="CommandAborted" type="BOOL" />
-        <Variable name="Error"          type="BOOL" />
-        <Variable name="ErrorID"        type="WORD" />
-      </Outputs>
-    </Block>
-
-    <!-- 3.4  MC_Halt -->
+    <!-- MC_Halt — Controlled stop to Standstill (lower priority than MC_Stop) -->
     <Block type="MC_Halt" description="Controlled stop to Standstill" class="FunctionBlock">
       <Inputs>
         <Variable name="Axis"         type="AXIS_REF" />
-        <Variable name="Execute"      type="BOOL"  default="FALSE" />
-        <Variable name="Deceleration" type="REAL"  default="100.0" />
-        <Variable name="Jerk"         type="REAL"  default="0.0" />
+        <Variable name="Execute"      type="BOOL" default="FALSE" />
+        <Variable name="Deceleration" type="REAL" default="500.0" />
+        <Variable name="Jerk"         type="REAL" default="0.0" />
+        <Variable name="BufferMode"   type="DINT" default="0" />
       </Inputs>
       <Outputs>
         <Variable name="Done"           type="BOOL" />
@@ -69,15 +95,17 @@
       </Outputs>
     </Block>
 
-    <!-- 3.5  MC_MoveAbsolute -->
-    <Block type="MC_MoveAbsolute" description="Move to absolute position" class="FunctionBlock">
+    <!-- ═══════════════════════════════════════════════════════════════════
+         HOMING
+         ═══════════════════════════════════════════════════════════════════ -->
+
+    <!-- MC_Home — Execute homing sequence, set axis position reference -->
+    <Block type="MC_Home" description="Execute homing sequence and set position reference" class="FunctionBlock">
       <Inputs>
-        <Variable name="Axis"         type="AXIS_REF" />
-        <Variable name="Execute"      type="BOOL"  default="FALSE" />
-        <Variable name="Position"     type="REAL"  default="0.0" />
-        <Variable name="Velocity"     type="REAL"  default="10.0" />
-        <Variable name="Acceleration" type="REAL"  default="100.0" />
-        <Variable name="Deceleration" type="REAL"  default="100.0" />
+        <Variable name="Axis"        type="AXIS_REF" />
+        <Variable name="Execute"     type="BOOL" default="FALSE" />
+        <Variable name="Position"    type="REAL" default="0.0" />
+        <Variable name="HomingMode"  type="DINT" default="0" />
       </Inputs>
       <Outputs>
         <Variable name="Done"           type="BOOL" />
@@ -89,15 +117,22 @@
       </Outputs>
     </Block>
 
-    <!-- 3.6  MC_MoveRelative -->
-    <Block type="MC_MoveRelative" description="Move by relative distance" class="FunctionBlock">
+    <!-- ═══════════════════════════════════════════════════════════════════
+         POINT-TO-POINT MOTION
+         ═══════════════════════════════════════════════════════════════════ -->
+
+    <!-- MC_MoveAbsolute — Move to absolute target position -->
+    <Block type="MC_MoveAbsolute" description="Move to absolute target position with S-curve profile" class="FunctionBlock">
       <Inputs>
-        <Variable name="Axis"         type="AXIS_REF" />
-        <Variable name="Execute"      type="BOOL"  default="FALSE" />
-        <Variable name="Distance"     type="REAL"  default="0.0" />
-        <Variable name="Velocity"     type="REAL"  default="10.0" />
-        <Variable name="Acceleration" type="REAL"  default="100.0" />
-        <Variable name="Deceleration" type="REAL"  default="100.0" />
+        <Variable name="Axis"             type="AXIS_REF" />
+        <Variable name="Execute"          type="BOOL" default="FALSE" />
+        <Variable name="ContinuousUpdate" type="BOOL" default="FALSE" />
+        <Variable name="Position"         type="REAL" default="0.0" />
+        <Variable name="Velocity"     type="REAL" default="100.0" />
+        <Variable name="Acceleration" type="REAL" default="500.0" />
+        <Variable name="Deceleration" type="REAL" default="500.0" />
+        <Variable name="Jerk"         type="REAL" default="0.0" />
+        <Variable name="BufferMode"   type="DINT" default="0" />
       </Inputs>
       <Outputs>
         <Variable name="Done"           type="BOOL" />
@@ -109,14 +144,69 @@
       </Outputs>
     </Block>
 
-    <!-- 3.9  MC_MoveVelocity -->
-    <Block type="MC_MoveVelocity" description="Continuous velocity motion" class="FunctionBlock">
+    <!-- MC_MoveRelative — Move by relative distance -->
+    <Block type="MC_MoveRelative" description="Move by relative distance with S-curve profile" class="FunctionBlock">
       <Inputs>
-        <Variable name="Axis"         type="AXIS_REF" />
-        <Variable name="Execute"      type="BOOL"  default="FALSE" />
-        <Variable name="Velocity"     type="REAL"  default="10.0" />
-        <Variable name="Acceleration" type="REAL"  default="100.0" />
-        <Variable name="Deceleration" type="REAL"  default="100.0" />
+        <Variable name="Axis"             type="AXIS_REF" />
+        <Variable name="Execute"          type="BOOL" default="FALSE" />
+        <Variable name="ContinuousUpdate" type="BOOL" default="FALSE" />
+        <Variable name="Distance"         type="REAL" default="0.0" />
+        <Variable name="Velocity"     type="REAL" default="100.0" />
+        <Variable name="Acceleration" type="REAL" default="500.0" />
+        <Variable name="Deceleration" type="REAL" default="500.0" />
+        <Variable name="Jerk"         type="REAL" default="0.0" />
+        <Variable name="BufferMode"   type="DINT" default="0" />
+      </Inputs>
+      <Outputs>
+        <Variable name="Done"           type="BOOL" />
+        <Variable name="Busy"           type="BOOL" />
+        <Variable name="Active"         type="BOOL" />
+        <Variable name="CommandAborted" type="BOOL" />
+        <Variable name="Error"          type="BOOL" />
+        <Variable name="ErrorID"        type="WORD" />
+      </Outputs>
+    </Block>
+
+    <!-- MC_MoveAdditive — Add incremental move on top of current motion -->
+    <Block type="MC_MoveAdditive" description="Add incremental distance to current motion target" class="FunctionBlock">
+      <Inputs>
+        <Variable name="Axis"             type="AXIS_REF" />
+        <Variable name="Execute"          type="BOOL" default="FALSE" />
+        <Variable name="ContinuousUpdate" type="BOOL" default="FALSE" />
+        <Variable name="Distance"         type="REAL" default="0.0" />
+        <Variable name="Velocity"     type="REAL" default="100.0" />
+        <Variable name="Acceleration" type="REAL" default="500.0" />
+        <Variable name="Deceleration" type="REAL" default="500.0" />
+        <Variable name="Jerk"         type="REAL" default="0.0" />
+        <Variable name="BufferMode"   type="DINT" default="0" />
+      </Inputs>
+      <Outputs>
+        <Variable name="Done"           type="BOOL" />
+        <Variable name="Busy"           type="BOOL" />
+        <Variable name="Active"         type="BOOL" />
+        <Variable name="CommandAborted" type="BOOL" />
+        <Variable name="Error"          type="BOOL" />
+        <Variable name="ErrorID"        type="WORD" />
+      </Outputs>
+    </Block>
+
+    <!-- ═══════════════════════════════════════════════════════════════════
+         VELOCITY MOTION
+         ═══════════════════════════════════════════════════════════════════ -->
+
+    <!-- MC_MoveVelocity — Continuous velocity motion (no position target) -->
+    <!-- Direction: 1=Positive, -1=Negative, 0=CurrentDirection, 2=Fastest -->
+    <Block type="MC_MoveVelocity" description="Continuous velocity motion (no position target)" class="FunctionBlock">
+      <Inputs>
+        <Variable name="Axis"             type="AXIS_REF" />
+        <Variable name="Execute"          type="BOOL" default="FALSE" />
+        <Variable name="ContinuousUpdate" type="BOOL" default="FALSE" />
+        <Variable name="Velocity"         type="REAL" default="100.0" />
+        <Variable name="Acceleration" type="REAL" default="500.0" />
+        <Variable name="Deceleration" type="REAL" default="500.0" />
+        <Variable name="Jerk"         type="REAL" default="0.0" />
+        <Variable name="Direction"    type="DINT" default="1" />
+        <Variable name="BufferMode"   type="DINT" default="0" />
       </Inputs>
       <Outputs>
         <Variable name="InVelocity"     type="BOOL" />
@@ -128,22 +218,51 @@
       </Outputs>
     </Block>
 
-    <!-- 3.31  MC_Reset -->
-    <Block type="MC_Reset" description="Reset axis from ErrorStop" class="FunctionBlock">
+    <!-- MC_MoveSuperimposed — Superimposed relative move on top of running motion -->
+    <Block type="MC_MoveSuperimposed" description="Superimposed relative move on top of running motion" class="FunctionBlock">
       <Inputs>
-        <Variable name="Axis"    type="AXIS_REF" />
-        <Variable name="Execute" type="BOOL"  default="FALSE" />
+        <Variable name="Axis"                type="AXIS_REF" />
+        <Variable name="Execute"             type="BOOL" default="FALSE" />
+        <Variable name="Distance"            type="REAL" default="0.0" />
+        <Variable name="VelocityDiff"        type="REAL" default="10.0" />
+        <Variable name="AccelerationDiff"    type="REAL" default="100.0" />
+        <Variable name="DecelerationDiff"    type="REAL" default="100.0" />
+        <Variable name="JerkDiff"            type="REAL" default="0.0" />
       </Inputs>
       <Outputs>
-        <Variable name="Done"    type="BOOL" />
-        <Variable name="Busy"    type="BOOL" />
-        <Variable name="Error"   type="BOOL" />
-        <Variable name="ErrorID" type="WORD" />
+        <Variable name="Done"           type="BOOL" />
+        <Variable name="Busy"           type="BOOL" />
+        <Variable name="Active"         type="BOOL" />
+        <Variable name="CommandAborted" type="BOOL" />
+        <Variable name="Error"          type="BOOL" />
+        <Variable name="ErrorID"        type="WORD" />
       </Outputs>
     </Block>
 
-    <!-- Read / Diagnostic blocks -->
-    <Block type="MC_ReadActualPosition" description="Read actual axis position" class="FunctionBlock">
+    <!-- MC_HaltSuperimposed — Cancel superimposed move -->
+    <Block type="MC_HaltSuperimposed" description="Cancel superimposed move, return to base motion" class="FunctionBlock">
+      <Inputs>
+        <Variable name="Axis"         type="AXIS_REF" />
+        <Variable name="Execute"      type="BOOL" default="FALSE" />
+        <Variable name="Deceleration" type="REAL" default="500.0" />
+        <Variable name="Jerk"         type="REAL" default="0.0" />
+      </Inputs>
+      <Outputs>
+        <Variable name="Done"           type="BOOL" />
+        <Variable name="Busy"           type="BOOL" />
+        <Variable name="Active"         type="BOOL" />
+        <Variable name="CommandAborted" type="BOOL" />
+        <Variable name="Error"          type="BOOL" />
+        <Variable name="ErrorID"        type="WORD" />
+      </Outputs>
+    </Block>
+
+    <!-- ═══════════════════════════════════════════════════════════════════
+         READ / DIAGNOSTIC
+         ═══════════════════════════════════════════════════════════════════ -->
+
+    <!-- MC_ReadActualPosition — Read current actual position -->
+    <Block type="MC_ReadActualPosition" description="Read axis actual position" class="FunctionBlock">
       <Inputs>
         <Variable name="Axis"   type="AXIS_REF" />
         <Variable name="Enable" type="BOOL" default="FALSE" />
@@ -157,7 +276,8 @@
       </Outputs>
     </Block>
 
-    <Block type="MC_ReadActualVelocity" description="Read actual axis velocity" class="FunctionBlock">
+    <!-- MC_ReadActualVelocity — Read current actual velocity -->
+    <Block type="MC_ReadActualVelocity" description="Read axis actual velocity" class="FunctionBlock">
       <Inputs>
         <Variable name="Axis"   type="AXIS_REF" />
         <Variable name="Enable" type="BOOL" default="FALSE" />
@@ -171,7 +291,8 @@
       </Outputs>
     </Block>
 
-    <Block type="MC_ReadStatus" description="Read axis state diagram status" class="FunctionBlock">
+    <!-- MC_ReadStatus — Read axis PLCopen state diagram status flags -->
+    <Block type="MC_ReadStatus" description="Read axis state diagram status flags" class="FunctionBlock">
       <Inputs>
         <Variable name="Axis"   type="AXIS_REF" />
         <Variable name="Enable" type="BOOL" default="FALSE" />
@@ -192,7 +313,8 @@
       </Outputs>
     </Block>
 
-    <Block type="MC_ReadAxisError" description="Read axis-level error code" class="FunctionBlock">
+    <!-- MC_ReadAxisError — Read axis-level error code -->
+    <Block type="MC_ReadAxisError" description="Read axis error code" class="FunctionBlock">
       <Inputs>
         <Variable name="Axis"   type="AXIS_REF" />
         <Variable name="Enable" type="BOOL" default="FALSE" />
@@ -206,20 +328,5 @@
       </Outputs>
     </Block>
 
-    <Block type="MC_SetOverride" description="Set velocity/acceleration override" class="FunctionBlock">
-      <Inputs>
-        <Variable name="Axis"       type="AXIS_REF" />
-        <Variable name="Enable"     type="BOOL"  default="FALSE" />
-        <Variable name="VelFactor"  type="REAL"  default="1.0" />
-        <Variable name="AccFactor"  type="REAL"  default="1.0" />
-        <Variable name="JerkFactor" type="REAL"  default="1.0" />
-      </Inputs>
-      <Outputs>
-        <Variable name="Enabled"  type="BOOL" />
-        <Variable name="Busy"     type="BOOL" />
-        <Variable name="Error"    type="BOOL" />
-        <Variable name="ErrorID"  type="WORD" />
-      </Outputs>
-    </Block>
   </Category>
 </Library>

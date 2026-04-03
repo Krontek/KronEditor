@@ -199,26 +199,41 @@ export const LIBRARY_TREE = [
       {
         id: 'motion_admin',
         title: 'Administrative',
-        fromLibrary: ['MC_Power', 'MC_Stop']
+        fromLibrary: ['MC_Power', 'MC_Reset', 'MC_SetOverride']
       },
       {
-        id: 'motion_p2p',
-        title: 'Point-to-Point',
-        fromLibrary: ['MC_MoveAbsolute', 'MC_MoveRelative']
+        id: 'motion_stop',
+        title: 'Stop / Halt',
+        fromLibrary: ['MC_Stop', 'MC_Halt']
       },
       {
         id: 'motion_homing',
         title: 'Homing',
-        items: [
-          { blockType: 'MC_Home', label: 'MC_Home', desc: 'Homing Sequence' }
-        ]
+        fromLibrary: ['MC_Home']
       },
       {
-        id: 'motion_multi',
-        title: 'Multi-Axis',
-        items: [
-          { blockType: 'MC_GearIn', label: 'MC_GearIn', desc: 'Electronic Gearing' },
-          { blockType: 'MC_CamIn',  label: 'MC_CamIn',  desc: 'Electronic Cam'     }
+        id: 'motion_p2p',
+        title: 'Point-to-Point',
+        fromLibrary: ['MC_MoveAbsolute', 'MC_MoveRelative', 'MC_MoveAdditive']
+      },
+      {
+        id: 'motion_vel',
+        title: 'Velocity',
+        fromLibrary: ['MC_MoveVelocity']
+      },
+      {
+        id: 'motion_superimposed',
+        title: 'Superimposed',
+        fromLibrary: ['MC_MoveSuperimposed', 'MC_HaltSuperimposed']
+      },
+      {
+        id: 'motion_read',
+        title: 'Read / Diagnostic',
+        fromLibrary: [
+          'MC_ReadActualPosition',
+          'MC_ReadActualVelocity',
+          'MC_ReadStatus',
+          'MC_ReadAxisError'
         ]
       }
     ]

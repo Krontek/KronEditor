@@ -18,6 +18,9 @@
             "allow": [
                 {
                     "path": "$HOME/**"
+                },
+                {
+                    "path": "$APPLOCALDATA/**"
                 }
             ]
         },

@@ -199,8 +199,13 @@ const EditorPane = ({
         // standard functions — conversion
         'byte_to_uint', 'byte_to_int', 'byte_to_dint', 'byte_to_real',
         'int_to_real', 'real_to_int', 'dint_to_real', 'real_to_dint',
-        'bool_to_int', 'int_to_bool', 'norm_x', 'scale_x',
+        'uint_to_real', 'real_to_uint', 'lint_to_real', 'real_to_lint',
+        'bool_to_int', 'int_to_bool', 'bool_to_uint', 'uint_to_bool',
+        'norm_x', 'scale_x',
         'int_to_uint', 'uint_to_int', 'dint_to_int', 'int_to_dint',
+        'uint_to_dint', 'dint_to_uint', 'lint_to_dint', 'dint_to_lint',
+        'uint_to_lint', 'int_to_lint', 'word_to_uint', 'uint_to_word',
+        'dword_to_udint', 'udint_to_dword',
         // HAL block types (used as FB instance type names in expressions)
         'uart_receive', 'uart_send',
       ]);
@@ -629,7 +634,8 @@ const EditorPane = ({
             type: dragData.customData?.name || dragData.blockType,
             location: '',
             initialValue: '',
-            description: 'FB Instance'
+            description: '',
+            _isInstance: true
           };
           handleAddVar(newVar);
         }

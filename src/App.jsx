@@ -637,6 +637,17 @@ function App() {
     return () => { if (unlisten) unlisten(); };
   }, []);
 
+  // --- Build Command Listener (shows gcc command in log panel) ---
+  useEffect(() => {
+    let unlisten = null;
+    import('@tauri-apps/api/event').then(({ listen }) => {
+      listen('build-command', (event) => {
+        addLog('info', `Build command: ${event.payload}`);
+      }).then(f => unlisten = f);
+    });
+    return () => { if (unlisten) unlisten(); };
+  }, []);
+
   // --- Live Variable Listener ---
   const [liveVariables, setLiveVariables] = useState({});
   const liveVarsRef = React.useRef(liveVariables);
