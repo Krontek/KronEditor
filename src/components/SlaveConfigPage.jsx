@@ -66,8 +66,10 @@ export default function SlaveConfigPage({ slave, onChange, onAddGlobalVars, isRu
     enabled: true,
     name: `Axis_${slave.position || 1}`,
     axisNo: 0,
-    encoderResolution: 10000,
     gearRatio: 1,
+    encoderType: 'incremental',
+    singleTurnBits: 13,
+    multiTurnBits: 12,
     simMode: false,
   });
 
@@ -75,9 +77,9 @@ export default function SlaveConfigPage({ slave, onChange, onAddGlobalVars, isRu
     onChange?.({ ...slave, axisRef: { ...defaultAxisRef(), ...slave.axisRef, [field]: value } });
 
   const axisCfg = { ...defaultAxisRef(), ...(slave.axisRef || {}) };
-  const encRes = parseFloat(axisCfg.encoderResolution);
+  const encRes = Math.pow(2, parseInt(axisCfg.singleTurnBits) || 13);
   const gRatio = parseFloat(axisCfg.gearRatio);
-  const countsPerUnit = (encRes > 0 && gRatio > 0) ? encRes / gRatio : encRes || 10000;
+  const countsPerUnit = (encRes > 0 && gRatio > 0) ? encRes / gRatio : encRes;
 
   const handleImportFromEsi = (device) => {
     onChange?.({
@@ -352,19 +354,41 @@ export default function SlaveConfigPage({ slave, onChange, onAddGlobalVars, isRu
                     </span>
                   </div>
                   <div style={S.row}>
-                    <span style={S.label}>Encoder Resolution</span>
-                    <input type="number" min={1} style={{ ...S.input, maxWidth: 120 }}
-                      value={axisCfg.encoderResolution ?? 10000} disabled={isRunning}
-                      onChange={e => updateAxis('encoderResolution', parseFloat(e.target.value) || 10000)} />
-                    <span style={{ color: '#555', fontSize: 10 }}>counts per motor revolution</span>
-                  </div>
-                  <div style={S.row}>
                     <span style={S.label}>Gear Ratio</span>
                     <input type="number" min={0.000001} step="any" style={{ ...S.input, maxWidth: 120 }}
                       value={axisCfg.gearRatio ?? 1} disabled={isRunning}
                       onChange={e => updateAxis('gearRatio', parseFloat(e.target.value) || 1)} />
                     <span style={{ color: '#555', fontSize: 10 }}>user units per motor revolution (e.g. 5 = 1 rev → 5 mm)</span>
                   </div>
+                  <div style={S.row}>
+                    <span style={S.label}>Encoder Type</span>
+                    <select style={{ ...S.input, maxWidth: 200 }}
+                      value={axisCfg.encoderType || 'incremental'} disabled={isRunning}
+                      onChange={e => updateAxis('encoderType', e.target.value)}>
+                      <option value="incremental">Incremental</option>
+                      <option value="absolute_st">Absolute (Single-Turn)</option>
+                      <option value="absolute_mt">Absolute (Multi-Turn)</option>
+                    </select>
+                    <span style={{ color: '#555', fontSize: 10 }}>
+                      {axisCfg.encoderType === 'incremental' ? 'Requires homing after power-on' : 'Auto-homed at power-on'}
+                    </span>
+                  </div>
+                  <div style={S.row}>
+                    <span style={S.label}>Single-Turn Bits</span>
+                    <input type="number" min={1} max={32} style={{ ...S.input, maxWidth: 80 }}
+                      value={axisCfg.singleTurnBits ?? 13} disabled={isRunning}
+                      onChange={e => updateAxis('singleTurnBits', parseInt(e.target.value) || 13)} />
+                    <span style={{ color: '#555', fontSize: 10 }}>{Math.pow(2, axisCfg.singleTurnBits ?? 13)} counts/rev</span>
+                  </div>
+                  {axisCfg.encoderType === 'absolute_mt' && (
+                    <div style={S.row}>
+                      <span style={S.label}>Multi-Turn Bits</span>
+                      <input type="number" min={1} max={32} style={{ ...S.input, maxWidth: 80 }}
+                        value={axisCfg.multiTurnBits ?? 12} disabled={isRunning}
+                        onChange={e => updateAxis('multiTurnBits', parseInt(e.target.value) || 12)} />
+                      <span style={{ color: '#555', fontSize: 10 }}>{Math.pow(2, axisCfg.multiTurnBits ?? 12)} revolutions range</span>
+                    </div>
+                  )}
                   <div style={{ ...S.row, color: '#4ec9b0', fontSize: 10, fontFamily: 'monospace' }}>
                     counts/unit = {(encRes / gRatio).toFixed(2)} &nbsp;|&nbsp; vel_raw/unit = {(encRes / gRatio).toFixed(2)} counts/s per u/s
                   </div>
@@ -380,8 +404,10 @@ export default function SlaveConfigPage({ slave, onChange, onAddGlobalVars, isRu
                   <div style={{ marginTop: 12, background: '#1a1a1a', borderRadius: 4, padding: '8px 12px', fontFamily: 'monospace', fontSize: 10, color: '#6a9955', lineHeight: 1.6 }}>
                     <div style={{ color: '#555', marginBottom: 4 }}>// Generated in plc.c PLC_Init():</div>
                     <div style={{ color: '#ce9178' }}>
-                      {slave.axisRef.name || `Axis_${slave.position || 1}`}.EncoderResolution = {axisCfg.encoderResolution ?? 10000}f;<br />
                       {slave.axisRef.name || `Axis_${slave.position || 1}`}.GearRatio = {axisCfg.gearRatio ?? 1}f;<br />
+                      {slave.axisRef.name || `Axis_${slave.position || 1}`}.EncoderType = {
+                        ({ incremental: 'KRON_ENC_INCREMENTAL', absolute_st: 'KRON_ENC_ABSOLUTE_ST', absolute_mt: 'KRON_ENC_ABSOLUTE_MT' })[axisCfg.encoderType] || 'KRON_ENC_INCREMENTAL'
+                      };<br />
                       Kron_PI.servo[{slave.axisRef.axisNo ?? 0}].counts_per_unit = {countsPerUnit.toFixed(2)}f;<br />
                       Kron_PI.servo[{slave.axisRef.axisNo ?? 0}].vel_raw_per_unit = {countsPerUnit.toFixed(2)}f;
                     </div>

@@ -1253,24 +1253,31 @@ extern KRON_Process_Image __gpi;
         axisSlaves.forEach(({ slave }, i) => {
             const axisName = (slave.axisRef.name || `Axis_${slave.position}`).replace(/[^A-Za-z0-9_]/g, '_');
             const axisNo   = Math.max(0, parseInt(slave.axisRef.axisNo) || 0);
-            const encoderResolution = parseFloat(slave.axisRef.encoderResolution);
+            const stBits   = parseInt(slave.axisRef.singleTurnBits) || 13;
+            const encRes   = Math.pow(2, stBits);   // 2^singleTurnBits = counts per rev
             const gearRatio         = parseFloat(slave.axisRef.gearRatio);
-            const encRes = Number.isFinite(encoderResolution) && encoderResolution > 0 ? encoderResolution : 10000;
-            const gRatio = Number.isFinite(gearRatio)         && gearRatio > 0         ? gearRatio         : 1;
+            const gRatio = Number.isFinite(gearRatio) && gearRatio > 0 ? gearRatio : 1;
             // counts_per_unit = encoder counts per motor rev / user units per motor rev
-            // Example: 10000 counts/rev, gear ratio 5 (1 rev = 5 mm) → 10000/5 = 2000 counts/mm
+            // Example: 2^13 = 8192 counts/rev, gear ratio 5 (1 rev = 5 mm) → 8192/5 = 1638.4 counts/mm
             const cpu = encRes / gRatio;
             // vel_raw_per_unit: drive reports velocity in counts/s — same ratio applies
             const vpu = cpu;
             const sim = (globalSimMode || slave.axisRef.simMode) ? 'true' : 'false';
             // AXIS_REF_Init zeroes the struct and sets AxisNo, slot, VelFactor=1, AccFactor=1
             axisInitCode += `    AXIS_REF_Init(&${axisName}, ${axisNo}, &Kron_PI.servo[${axisNo}]);\n`;
+            const encTypeMap = { incremental: 'KRON_ENC_INCREMENTAL', absolute_st: 'KRON_ENC_ABSOLUTE_ST', absolute_mt: 'KRON_ENC_ABSOLUTE_MT' };
+            const encType = encTypeMap[slave.axisRef.encoderType] || 'KRON_ENC_INCREMENTAL';
             axisInitCode += `    ${axisName}.Simulation        = ${sim};\n`;
-            axisInitCode += `    ${axisName}.EncoderResolution = ${floatLit(encRes)};\n`;
             axisInitCode += `    ${axisName}.GearRatio         = ${floatLit(gRatio)};\n`;
+            axisInitCode += `    ${axisName}.EncoderType       = ${encType};\n`;
             // Scaling factors on the servo slot (set after AXIS_REF_Init so slot is valid)
             axisInitCode += `    Kron_PI.servo[${axisNo}].counts_per_unit   = ${floatLit(cpu)};\n`;
             axisInitCode += `    Kron_PI.servo[${axisNo}].vel_raw_per_unit  = ${floatLit(vpu)};\n`;
+            axisInitCode += `    Kron_PI.servo[${axisNo}].encoder_type        = ${encType};\n`;
+            axisInitCode += `    Kron_PI.servo[${axisNo}].enc_single_turn_bits = ${stBits}u;\n`;
+            if (slave.axisRef.encoderType === 'absolute_mt') {
+                axisInitCode += `    Kron_PI.servo[${axisNo}].enc_multi_turn_bits  = ${parseInt(slave.axisRef.multiTurnBits) || 12}u;\n`;
+            }
             axisInitCode += `    Kron_PI.servo[${axisNo}].present           = !${sim};\n`;
             // NC engine private state
             axisInitCode += `    NC_Init(&g_NC_Axes[${i}], &${axisName});\n`;

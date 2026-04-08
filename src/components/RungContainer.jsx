@@ -915,13 +915,14 @@ const BlockNode = ({ id, data, selected }) => {
               <div key={handleId} style={{ position: 'relative', display: 'flex', alignItems: 'center', height: 20 }}>
                 {/* External Input Field (outside block, on left) */}
                 {!connected && (
-                  <div style={{
+                  <div className="nopan nowheel" style={{
                     position: 'absolute',
                     right: '100%',
                     marginRight: 15,
                     display: 'flex',
                     flexDirection: 'column',
                     alignItems: 'flex-end',
+                    pointerEvents: 'auto',
                     transform: (liveVariables && val && valVarDef) ? 'translateY(8px)' : 'none',
                     transition: 'transform 0.2s ease'
                   }}>
@@ -980,11 +981,12 @@ const BlockNode = ({ id, data, selected }) => {
 
                     <input
                       type="text"
-                      className="nodrag"
+                      className="nodrag nopan nowheel"
                       value={localPinValues[pin.name] !== undefined ? localPinValues[pin.name] : (val || '')}
                       list={data.readOnly ? undefined : getPinSuggestionList(pin)}
                       readOnly={!!data.readOnly}
                       onDoubleClick={(e) => e.stopPropagation()}
+                      onMouseDown={(e) => e.stopPropagation()}
                       onClick={(e) => {
                         e.stopPropagation();
                         if (!data.readOnly || !data.onForceWrite) return;
@@ -1119,13 +1121,14 @@ const BlockNode = ({ id, data, selected }) => {
 
                 {/* Edit-mode variable assignment field (Always show when not connected) */}
                 {!connected && (
-                  <div style={{
+                  <div className="nopan nowheel" style={{
                     position: 'absolute',
                     left: '100%',
                     marginLeft: 15,
                     display: 'flex',
                     flexDirection: 'column',
                     alignItems: 'flex-start',
+                    pointerEvents: 'auto',
                     transform: (lv && val && outVarDef) ? 'translateY(8px)' : 'none',
                     transition: 'transform 0.2s ease'
                   }}>
@@ -1154,11 +1157,12 @@ const BlockNode = ({ id, data, selected }) => {
 
                     <input
                       type="text"
-                      className="nodrag"
+                      className="nodrag nopan nowheel"
                       value={localPinValues[pin.name] !== undefined ? localPinValues[pin.name] : val}
                       list={data.readOnly ? undefined : getPinSuggestionList(pin)}
                       readOnly={!!data.readOnly}
                       onDoubleClick={(e) => e.stopPropagation()}
+                      onMouseDown={(e) => e.stopPropagation()}
                       onChange={(e) => {
                         if (data.readOnly) return;
                         const rawValue = e.target.value;

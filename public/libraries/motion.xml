@@ -291,6 +291,21 @@
       </Outputs>
     </Block>
 
+    <!-- MC_ReadActualTorque — Read current actual torque -->
+    <Block type="MC_ReadActualTorque" description="Read axis actual torque (% of rated)" class="FunctionBlock">
+      <Inputs>
+        <Variable name="Axis"   type="AXIS_REF" />
+        <Variable name="Enable" type="BOOL" default="FALSE" />
+      </Inputs>
+      <Outputs>
+        <Variable name="Valid"    type="BOOL" />
+        <Variable name="Busy"     type="BOOL" />
+        <Variable name="Error"    type="BOOL" />
+        <Variable name="ErrorID"  type="WORD" />
+        <Variable name="Torque"   type="REAL" />
+      </Outputs>
+    </Block>
+
     <!-- MC_ReadStatus — Read axis PLCopen state diagram status flags -->
     <Block type="MC_ReadStatus" description="Read axis state diagram status flags" class="FunctionBlock">
       <Inputs>
@@ -313,6 +328,49 @@
       </Outputs>
     </Block>
 
+    <!-- MC_ReadMotionState — Read current motion dynamics -->
+    <Block type="MC_ReadMotionState" description="Read axis motion dynamics (accel, decel, direction)" class="FunctionBlock">
+      <Inputs>
+        <Variable name="Axis"   type="AXIS_REF" />
+        <Variable name="Enable" type="BOOL" default="FALSE" />
+        <Variable name="Source" type="DINT" default="0" />
+      </Inputs>
+      <Outputs>
+        <Variable name="Valid"              type="BOOL" />
+        <Variable name="Busy"               type="BOOL" />
+        <Variable name="Error"              type="BOOL" />
+        <Variable name="ErrorID"            type="WORD" />
+        <Variable name="ConstantVelocity"   type="BOOL" />
+        <Variable name="Accelerating"       type="BOOL" />
+        <Variable name="Decelerating"       type="BOOL" />
+        <Variable name="DirectionPositive"  type="BOOL" />
+        <Variable name="DirectionNegative"  type="BOOL" />
+      </Outputs>
+    </Block>
+
+    <!-- MC_ReadAxisInfo — Read comprehensive axis information -->
+    <Block type="MC_ReadAxisInfo" description="Read axis info (homed, limits, simulation, power)" class="FunctionBlock">
+      <Inputs>
+        <Variable name="Axis"   type="AXIS_REF" />
+        <Variable name="Enable" type="BOOL" default="FALSE" />
+      </Inputs>
+      <Outputs>
+        <Variable name="Valid"              type="BOOL" />
+        <Variable name="Busy"               type="BOOL" />
+        <Variable name="Error"              type="BOOL" />
+        <Variable name="ErrorID"            type="WORD" />
+        <Variable name="HomeAbsSwitch"      type="BOOL" />
+        <Variable name="LimitSwitchPos"     type="BOOL" />
+        <Variable name="LimitSwitchNeg"     type="BOOL" />
+        <Variable name="Simulation"         type="BOOL" />
+        <Variable name="CommunicationReady" type="BOOL" />
+        <Variable name="ReadyForPowerOn"    type="BOOL" />
+        <Variable name="PowerOn"            type="BOOL" />
+        <Variable name="IsHomed"            type="BOOL" />
+        <Variable name="AxisWarning"        type="BOOL" />
+      </Outputs>
+    </Block>
+
     <!-- MC_ReadAxisError — Read axis-level error code -->
     <Block type="MC_ReadAxisError" description="Read axis error code" class="FunctionBlock">
       <Inputs>
@@ -325,6 +383,147 @@
         <Variable name="Error"       type="BOOL" />
         <Variable name="ErrorID"     type="WORD" />
         <Variable name="AxisErrorID" type="WORD" />
+      </Outputs>
+    </Block>
+
+    <!-- ═══════════════════════════════════════════════════════════════════
+         PARAMETER READ / WRITE
+         ═══════════════════════════════════════════════════════════════════ -->
+
+    <!-- MC_ReadParameter — Read numeric axis parameter by number -->
+    <Block type="MC_ReadParameter" description="Read numeric axis parameter by number" class="FunctionBlock">
+      <Inputs>
+        <Variable name="Axis"            type="AXIS_REF" />
+        <Variable name="Enable"          type="BOOL" default="FALSE" />
+        <Variable name="ParameterNumber" type="INT"  default="0" />
+      </Inputs>
+      <Outputs>
+        <Variable name="Valid"    type="BOOL" />
+        <Variable name="Busy"     type="BOOL" />
+        <Variable name="Error"    type="BOOL" />
+        <Variable name="ErrorID"  type="WORD" />
+        <Variable name="Value"    type="REAL" />
+      </Outputs>
+    </Block>
+
+    <!-- MC_ReadBoolParameter — Read boolean axis parameter by number -->
+    <Block type="MC_ReadBoolParameter" description="Read boolean axis parameter by number" class="FunctionBlock">
+      <Inputs>
+        <Variable name="Axis"            type="AXIS_REF" />
+        <Variable name="Enable"          type="BOOL" default="FALSE" />
+        <Variable name="ParameterNumber" type="INT"  default="0" />
+      </Inputs>
+      <Outputs>
+        <Variable name="Valid"    type="BOOL" />
+        <Variable name="Busy"     type="BOOL" />
+        <Variable name="Error"    type="BOOL" />
+        <Variable name="ErrorID"  type="WORD" />
+        <Variable name="Value"    type="BOOL" />
+      </Outputs>
+    </Block>
+
+    <!-- MC_WriteParameter — Write numeric axis parameter by number -->
+    <Block type="MC_WriteParameter" description="Write numeric axis parameter by number" class="FunctionBlock">
+      <Inputs>
+        <Variable name="Axis"            type="AXIS_REF" />
+        <Variable name="Execute"         type="BOOL" default="FALSE" />
+        <Variable name="ParameterNumber" type="INT"  default="0" />
+        <Variable name="Value"           type="REAL" default="0.0" />
+      </Inputs>
+      <Outputs>
+        <Variable name="Done"    type="BOOL" />
+        <Variable name="Busy"    type="BOOL" />
+        <Variable name="Error"   type="BOOL" />
+        <Variable name="ErrorID" type="WORD" />
+      </Outputs>
+    </Block>
+
+    <!-- MC_WriteBoolParameter — Write boolean axis parameter by number -->
+    <Block type="MC_WriteBoolParameter" description="Write boolean axis parameter by number" class="FunctionBlock">
+      <Inputs>
+        <Variable name="Axis"            type="AXIS_REF" />
+        <Variable name="Execute"         type="BOOL" default="FALSE" />
+        <Variable name="ParameterNumber" type="INT"  default="0" />
+        <Variable name="Value"           type="BOOL" default="FALSE" />
+      </Inputs>
+      <Outputs>
+        <Variable name="Done"    type="BOOL" />
+        <Variable name="Busy"    type="BOOL" />
+        <Variable name="Error"   type="BOOL" />
+        <Variable name="ErrorID" type="WORD" />
+      </Outputs>
+    </Block>
+
+    <!-- ═══════════════════════════════════════════════════════════════════
+         SET POSITION
+         ═══════════════════════════════════════════════════════════════════ -->
+
+    <!-- MC_SetPosition — Set / shift axis position reference -->
+    <Block type="MC_SetPosition" description="Set or shift axis position reference value" class="FunctionBlock">
+      <Inputs>
+        <Variable name="Axis"     type="AXIS_REF" />
+        <Variable name="Execute"  type="BOOL" default="FALSE" />
+        <Variable name="Position" type="REAL" default="0.0" />
+        <Variable name="Relative" type="BOOL" default="FALSE" />
+      </Inputs>
+      <Outputs>
+        <Variable name="Done"    type="BOOL" />
+        <Variable name="Busy"    type="BOOL" />
+        <Variable name="Error"   type="BOOL" />
+        <Variable name="ErrorID" type="WORD" />
+      </Outputs>
+    </Block>
+
+    <!-- ═══════════════════════════════════════════════════════════════════
+         CONTINUOUS MOTION
+         ═══════════════════════════════════════════════════════════════════ -->
+
+    <!-- MC_MoveContinuousAbsolute — Move to absolute position with non-zero end velocity -->
+    <Block type="MC_MoveContinuousAbsolute" description="Move to absolute position with non-zero end velocity" class="FunctionBlock">
+      <Inputs>
+        <Variable name="Axis"             type="AXIS_REF" />
+        <Variable name="Execute"          type="BOOL" default="FALSE" />
+        <Variable name="ContinuousUpdate" type="BOOL" default="FALSE" />
+        <Variable name="Position"         type="REAL" default="0.0" />
+        <Variable name="EndVelocity"      type="REAL" default="0.0" />
+        <Variable name="Velocity"         type="REAL" default="100.0" />
+        <Variable name="Acceleration"     type="REAL" default="500.0" />
+        <Variable name="Deceleration"     type="REAL" default="500.0" />
+        <Variable name="Jerk"             type="REAL" default="0.0" />
+        <Variable name="Direction"        type="DINT" default="1" />
+        <Variable name="BufferMode"       type="DINT" default="0" />
+      </Inputs>
+      <Outputs>
+        <Variable name="InEndVelocity"  type="BOOL" />
+        <Variable name="Busy"           type="BOOL" />
+        <Variable name="Active"         type="BOOL" />
+        <Variable name="CommandAborted" type="BOOL" />
+        <Variable name="Error"          type="BOOL" />
+        <Variable name="ErrorID"        type="WORD" />
+      </Outputs>
+    </Block>
+
+    <!-- MC_MoveContinuousRelative — Move by relative distance with non-zero end velocity -->
+    <Block type="MC_MoveContinuousRelative" description="Move by relative distance with non-zero end velocity" class="FunctionBlock">
+      <Inputs>
+        <Variable name="Axis"             type="AXIS_REF" />
+        <Variable name="Execute"          type="BOOL" default="FALSE" />
+        <Variable name="ContinuousUpdate" type="BOOL" default="FALSE" />
+        <Variable name="Distance"         type="REAL" default="0.0" />
+        <Variable name="EndVelocity"      type="REAL" default="0.0" />
+        <Variable name="Velocity"         type="REAL" default="100.0" />
+        <Variable name="Acceleration"     type="REAL" default="500.0" />
+        <Variable name="Deceleration"     type="REAL" default="500.0" />
+        <Variable name="Jerk"             type="REAL" default="0.0" />
+        <Variable name="BufferMode"       type="DINT" default="0" />
+      </Inputs>
+      <Outputs>
+        <Variable name="InEndVelocity"  type="BOOL" />
+        <Variable name="Busy"           type="BOOL" />
+        <Variable name="Active"         type="BOOL" />
+        <Variable name="CommandAborted" type="BOOL" />
+        <Variable name="Error"          type="BOOL" />
+        <Variable name="ErrorID"        type="WORD" />
       </Outputs>
     </Block>
 

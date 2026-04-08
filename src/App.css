@@ -210,6 +210,11 @@ body {
   cursor: default !important;
 }
 
+/* Allow FB pin input fields to overflow outside node bounding box */
+.react-flow__node {
+  overflow: visible !important;
+}
+
 .react-flow__node.draggable {
   cursor: default !important;
 }
