@@ -539,7 +539,7 @@ ${boardDefines}${runtimePortHelpers}${customIncludes}${ecCfgEarly.motionIncludes
             // Debug: top-level entry (scalar types get a SHM slot)
             const gShmSlot = !isUserType ? tryAssignShm(v.type, v.name) : {};
             variableTable.debugDefaults[`prog__${v.name}`] = {
-                type: v.type, c_symbol: v.name, defaultValue: gInitVal, ...gShmSlot
+                type: v.type, c_symbol: v.name, defaultValue: gInitVal, address: v.address || '', ...gShmSlot
             };
             // Debug: expand array elements and struct members for monitoring
             const dtDef = dataTypeDefs[v.type];
@@ -553,7 +553,7 @@ ${boardDefines}${runtimePortHelpers}${customIncludes}${ecCfgEarly.motionIncludes
                         variableTable.debugDefaults[`prog__${v.name}[${i}]`] = {
                             type: baseType, c_symbol: elemCSym,
                             base_symbol: v.name, byte_offset: i * elemSize,
-                            defaultValue: 0, ...elemShmSlot
+                            defaultValue: 0, address: v.address || '', ...elemShmSlot
                         };
                     }
                 });
@@ -565,7 +565,7 @@ ${boardDefines}${runtimePortHelpers}${customIncludes}${ecCfgEarly.motionIncludes
                     variableTable.debugDefaults[`prog__${v.name}.${member.name}`] = {
                         type: member.type, c_symbol: memCSym,
                         base_symbol: v.name, byte_offset: memberOffset,
-                        defaultValue: 0, ...memShmSlot
+                        defaultValue: 0, address: v.address || '', ...memShmSlot
                     };
                     memberOffset += IEC_TYPE_SIZES[member.type.toUpperCase()] || 0;
                 });
@@ -575,7 +575,7 @@ ${boardDefines}${runtimePortHelpers}${customIncludes}${ecCfgEarly.motionIncludes
                     const memShmSlot = tryAssignShm(field.type, memCSym);
                     variableTable.debugDefaults[`prog__${v.name}.${field.name}`] = {
                         type: field.type, c_symbol: memCSym,
-                        base_symbol: v.name, defaultValue: 0, ...memShmSlot
+                        base_symbol: v.name, defaultValue: 0, address: v.address || '', ...memShmSlot
                     };
                 });
             }
@@ -698,7 +698,7 @@ ${boardDefines}${runtimePortHelpers}${customIncludes}${ecCfgEarly.motionIncludes
                 // Debug: top-level entry (non-FB scalars get a SHM slot)
                 const vShmSlot = !isFB ? tryAssignShm(vType, cSym) : {};
                 variableTable.debugDefaults[`prog_${progName}_${vName}`] = {
-                    type: vType, c_symbol: cSym, defaultValue: initVal, ...vShmSlot
+                    type: vType, c_symbol: cSym, defaultValue: initVal, address: v.address || '', ...vShmSlot
                 };
                 // Debug: expand array elements and struct members
                 if (!isFB) {
@@ -713,7 +713,7 @@ ${boardDefines}${runtimePortHelpers}${customIncludes}${ecCfgEarly.motionIncludes
                                 variableTable.debugDefaults[`prog_${progName}_${vName}[${i}]`] = {
                                     type: baseType, c_symbol: elemCSym,
                                     base_symbol: cSym, byte_offset: i * elemSize,
-                                    defaultValue: 0, ...elemShmSlot
+                                    defaultValue: 0, address: v.address || '', ...elemShmSlot
                                 };
                             }
                         });
@@ -725,7 +725,7 @@ ${boardDefines}${runtimePortHelpers}${customIncludes}${ecCfgEarly.motionIncludes
                             variableTable.debugDefaults[`prog_${progName}_${vName}.${member.name}`] = {
                                 type: member.type, c_symbol: memCSym,
                                 base_symbol: cSym, byte_offset: memberOffset,
-                                defaultValue: 0, ...memShmSlot
+                                defaultValue: 0, address: v.address || '', ...memShmSlot
                             };
                             memberOffset += IEC_TYPE_SIZES[member.type.toUpperCase()] || 0;
                         });
@@ -831,6 +831,8 @@ ${boardDefines}${runtimePortHelpers}${customIncludes}${ecCfgEarly.motionIncludes
             size: info.size,
             type: IEC_TO_SERVER_TYPE[info.type?.toUpperCase()] ?? 'int32',
             force_flag_offset: info.force_flag_offset,
+            address: info.address || '',
+            initial_value: info.defaultValue,
         }));
 
     // --- 6. SHARED MEMORY SYNC (Linux only) ---

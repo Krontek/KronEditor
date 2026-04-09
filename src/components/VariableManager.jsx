@@ -7,6 +7,34 @@ import { blockConfig } from './RungContainer';
 
 const ALL_CLASSES = ['Local', 'Global', 'Input', 'Output', 'InOut', 'Temp'];
 
+// IEC 61131-3 memory address formatting
+const IEC_TYPE_PREFIX = {
+  'BOOL': 'X', 'BYTE': 'B', 'SINT': 'B', 'USINT': 'B',
+  'INT': 'W', 'UINT': 'W', 'WORD': 'W',
+  'DINT': 'D', 'UDINT': 'D', 'DWORD': 'D', 'REAL': 'D', 'TIME': 'D',
+  'LINT': 'L', 'ULINT': 'L', 'LWORD': 'L', 'LREAL': 'L',
+};
+
+// Convert a number input to IEC address based on variable type
+// e.g. type=BOOL, num=1 → %MX0.1; type=INT, num=10 → %MW10
+function formatIECAddress(input, varType) {
+  const trimmed = (input || '').trim();
+  if (!trimmed) return '';
+  // If already IEC format, accept as-is
+  if (trimmed.startsWith('%')) return trimmed.toUpperCase();
+  // Try as number
+  const num = parseInt(trimmed, 10);
+  if (isNaN(num) || num < 0) return trimmed;
+  const prefix = IEC_TYPE_PREFIX[(varType || '').toUpperCase()] || 'W';
+  if (prefix === 'X') {
+    // Bit addressing: byte.bit
+    const byte_ = Math.floor(num / 8);
+    const bit = num % 8;
+    return `%MX${byte_}.${bit}`;
+  }
+  return `%M${prefix}${num}`;
+}
+
 const InsertZoneRow = ({ colSpan, onInsert }) => {
   const [hovered, setHovered] = useState(false);
   return (
@@ -201,7 +229,8 @@ const VariableManager = ({
       class: allowedClasses[0] || 'Local',
       type: 'BOOL',
       initialValue: '',
-      description: ''
+      description: '',
+      address: ''
     }, insertAfterIndex);
   };
 
@@ -327,7 +356,7 @@ const VariableManager = ({
   const isComplexType = (typeName) => dataTypes.some(dt => dt.name === typeName && (dt.type === 'Array' || dt.type === 'Structure'));
 
   const showClass = allowedClasses.some(c => c === 'Input' || c === 'Output' || c === 'InOut');
-  const colCount = 5 + (liveVariables ? 1 : 0) + (showClass ? 1 : 0);
+  const colCount = 6 + (liveVariables ? 1 : 0) + (showClass ? 1 : 0);
 
   const CLASS_COLORS = {
     Input:  { bg: '#0e4f7a', border: '#1177bb', text: '#6dbfff' },
@@ -358,6 +387,7 @@ const VariableManager = ({
                 </th>
               )}
               <th style={{ padding: '5px', borderBottom: '1px solid #444' }}>{t('tables.description')}</th>
+              <th style={{ padding: '5px', borderBottom: '1px solid #444', minWidth: '80px' }} title="IEC address — expose via REST API">Address</th>
               <th style={{ padding: '5px', borderBottom: '1px solid #444', width: 28 }}></th>
             </tr>
           </thead>
@@ -478,6 +508,17 @@ const VariableManager = ({
                   )}
                   <td style={{ padding: '5px' }}>
                     <EditableCell value={v.description} onCommit={(val) => !disabled && onUpdate && onUpdate(v.id, 'description', val)} />
+                  </td>
+                  <td style={{ padding: '3px' }}>
+                    <EditableCell
+                      value={v.address || ''}
+                      onCommit={(val) => {
+                        if (disabled || isSimulationMode) return;
+                        const formatted = formatIECAddress(val, v.type);
+                        if (onUpdate) onUpdate(v.id, 'address', formatted);
+                      }}
+                      placeholder="%MW0"
+                    />
                   </td>
                   <td style={{ padding: '3px', textAlign: 'center' }}>
                     <button

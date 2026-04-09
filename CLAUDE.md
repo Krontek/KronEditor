@@ -23,6 +23,7 @@ When uncertain about requirements, architecture decisions, or implementation dir
 - **Backend**: Tauri v2 (Rust), IPC via `invoke` + Tauri events
 - **PLC languages**: IEC 61131-3 LD + ST → transpiled to C → compiled with GCC (`x86_64-linux-gnu`)
 - **Simulation**: compiled binary + shared memory, managed by Rust
+- **Deployment Server**: Go (KronServer) — ConnectRPC/gRPC agent for PLC runtime deployment, shared memory IPC, HMI serving
 
 ---
 
@@ -75,6 +76,19 @@ src-tauri/
     lib/                    Prebuilt .a libraries (do not edit)
 
 public/libraries/           XML block library definitions loaded by LibraryService.js
+
+KronServer/ (/home/fehim/Documents/KronServer/)
+  main.go                   Entry point: CLI flags, logger, manager init, graceful shutdown
+  server.go                 HTTP server: ConnectRPC routes, deploy endpoints, CORS, h2c
+  service.go                PLCService RPC impl (Start/Stop/WriteVar/ClearAllForces/StreamVars)
+  ipc.go                    Shared memory (mmap) IPC: variable read/write, force flags, type decoding
+  process.go                PLC runtime process lifecycle: start, SIGTERM/SIGKILL, log redirect
+  auth.go                   Authentication: SHA-256 passwords, sessions (8h TTL), 4-tier RBAC
+  hmi.go                    HMI layout management: XML/JSON import, per-page permissions, web routes
+  build.sh                  Cross-compilation: ARM32, ARM64, x86_64 (CGO_ENABLED=0, static)
+  proto/plc/v1/plc.proto    Protobuf service & message definitions
+  gen/plc/v1/               Generated protobuf + ConnectRPC handler code
+  dist/                     Compiled binaries output
 
 KrontekLibraries/           SOURCE OF TRUTH for all .c/.h files
   KronHAL/kronhal.h         Master HAL header
@@ -286,3 +300,118 @@ All have `Axis` (AXIS_REF) as first input pin.
 - Master config: `EtherCATEditor.jsx` + `deviceCodegen.js`
 - Slave config: `SlaveConfigPage.jsx` + `EsiLibraryService.js`
 - C generation: `KRON_EC_Config` struct + `ethercat_master_config.h`
+
+---
+
+## KronServer — PLC Deployment & Debug Agent
+
+Source: `/home/fehim/Documents/KronServer/`
+
+### Overview
+Go-based agent that deploys compiled PLC runtime binaries to target hardware, manages runtime lifecycle, and provides live variable streaming via shared memory IPC. Serves HMI web interface with role-based access control.
+
+### Technology
+- **Language**: Go 1.25 — fully static binaries (`CGO_ENABLED=0`)
+- **RPC**: ConnectRPC (supports Connect, gRPC, gRPC-Web protocols)
+- **Serialization**: Protocol Buffers (`proto/plc/v1/plc.proto`)
+- **IPC**: `mmap` on `/dev/shm/<name>` — zero-CGO shared memory with PLC runtime
+- **Build targets**: ARM32 (RPi 32-bit), ARM64 (RPi 64-bit, Jetson), x86_64
+
+### ConnectRPC Service (`/plc.v1.PLCService/`)
+| RPC | Description |
+|-----|-------------|
+| `Start` | Launch PLC runtime binary, returns PID |
+| `Stop` | Graceful SIGTERM (5s) → SIGKILL |
+| `WriteVar` | Force-write variable value to shared memory |
+| `ClearAllForces` | Remove all force flags |
+| `StreamVars` | Server-stream all variables every 50ms |
+
+### HTTP Endpoints
+- `POST /deploy/runtime` — upload PLC runtime binary (128 MB max, atomic write)
+- `POST /deploy/variable-table` — upload `variable_table.json`
+- `GET /status` — JSON status report
+- `GET /stream/vars` — SSE variable stream
+
+### Shared Memory IPC (`ipc.go`)
+- Variable table loaded from `variable_table.json` (name, offset, type, size, force_flag_offset)
+- Supported types: `bool`, `int8/16/32/64`, `uint8/16/32/64`, `float32/64`
+- Little-endian decoding, bounds checking, duplicate detection
+
+### HMI & Auth (`hmi.go`, `auth.go`)
+- 4-tier RBAC: Viewer → Operator → Maintainer → Admin
+- SHA-256 password hashing with per-user salt
+- Session tokens: 64-byte random hex, 8h TTL
+- HMI layout: XML or JSON import, per-page read/write permissions
+- Persisted at `deploy-dir/hmi_layout.json`
+
+### CLI Flags
+```
+-addr        :7070          Listen address
+-deploy-dir  /opt/plc       Working directory for binaries & logs
+-shm-name    plc_runtime    Shared memory name under /dev/shm
+-shm-size    65536          Shared memory size (bytes)
+-log-level   info           debug|info|warn|error
+```
+
+### Runtime Artifacts
+- `deploy-dir/runtime.bin` — compiled PLC binary
+- `deploy-dir/variable_table.json` — variable symbol table
+- `deploy-dir/hmi_layout.json` — persisted HMI config
+- `deploy-dir/logs/runtime_*_{stdout,stderr}.log` — process logs
+
+### Addressed Variables & REST API
+
+Variables get an IEC address in the VariableManager "Address" column (e.g. `%MW0`, `%MX0.1`, `%MD10`). Non-empty address = variable is exposed via REST API. Input: user can type a plain number (`1`) and it auto-formats to IEC based on type (BOOL→`%MX0.1`, INT→`%MW1`, DINT/REAL→`%MD1`, LREAL→`%ML1`). Or user can type full IEC address directly.
+
+**IEC address prefix logic** (`formatIECAddress` in VariableManager.jsx):
+- `BOOL` → `%MX{byte}.{bit}` (e.g. address 9 = byte 1, bit 1 → `%MX1.1`)
+- `BYTE/SINT/USINT` → `%MB{n}`
+- `INT/UINT/WORD` → `%MW{n}`
+- `DINT/UDINT/DWORD/REAL/TIME` → `%MD{n}`
+- `LINT/ULINT/LWORD/LREAL` → `%ML{n}`
+
+**Password**: Single API password set in SettingsPage → Connection tab. Hashed (SHA-256 with 16-byte salt) and embedded in `variable_table.json` as `api_password_hash` + `api_password_salt` during Build & Send. Empty = API disabled.
+
+**variable_table.json extended format**:
+```json
+{
+  "variables": [
+    { "name": "prog__motor_speed", "offset": 0, "type": "float32", "size": 4,
+      "force_flag_offset": 32768, "address": "%MD0", "initial_value": 0.0 },
+    { "name": "prog__pump_on", "offset": 4, "type": "bool", "size": 1,
+      "force_flag_offset": 32769, "address": "%MX0.4", "initial_value": true }
+  ],
+  "api_password_hash": "a1b2c3...",
+  "api_password_salt": "d4e5f6..."
+}
+```
+
+**Initial values**: `WriteInitialValues()` is called before runtime Start. Writes `initial_value` from variable_table.json to SHM so variables start at their configured defaults on every restart.
+
+**REST API Endpoints** (`api.go`):
+| Method | Path | Auth | Description |
+|--------|------|------|-------------|
+| POST | `/api/v1/auth` | No | `{"password":"..."}` → `{"token":"..."}` |
+| GET | `/api/v1/variables` | Bearer token | All addressed variables |
+| GET | `/api/v1/variables/{name}` | Bearer token | Single addressed variable + address field |
+| POST | `/api/v1/variables/{name}` | Bearer token | Write value |
+| GET | `/api/v1/stream` | Bearer token | SSE stream (addressed only, 50ms) |
+| POST | `/api/v1/forces/clear` | Bearer token | Clear force flags |
+
+**Key files**:
+- Editor: `VariableManager.jsx` (`formatIECAddress`), `CTranspilerService.js` (propagation), `App.jsx` (password hash)
+- Server: `ipc.go` (`ReadAddressedVariables`, `CheckAPIPassword`, `WriteInitialValues`), `api.go` (REST endpoints)
+
+### AutoRun
+
+**Editor**: AutoRun toggle button in toolbar (green = ON, grey = OFF). Persisted in project XML.
+
+**Deploy**: `POST /deploy/config` sends `{"auto_run": true/false}` → server saves to `deploy-dir/runtime_config.json`.
+
+**Server startup**: If `auto_run=true` in `runtime_config.json`, server calls `WriteInitialValues()` then starts the runtime automatically.
+
+**Editor on connect**: Every 10s status check parses `/status` JSON. If `running: true` and editor doesn't think it's running → attaches as if Start was pressed (creates PLCClient, starts stream, sets `isRunning=true`). If `running: false` and editor thinks it's running → detects crash, sets `isRunning=false`.
+
+**`/status` response** now includes `auto_run: bool`.
+
+**`/deploy/config` endpoint**: `POST /deploy/config` — no auth required (same trust level as other deploy endpoints). Saves `runtime_config.json`.

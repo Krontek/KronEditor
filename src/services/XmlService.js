@@ -20,6 +20,12 @@ export const exportProjectToXml = (projectStructure, boardId, connectionSettings
     if (connectionSettings.sshPort) {
         root.setAttribute("sshPort", connectionSettings.sshPort);
     }
+    if (connectionSettings.apiPassword) {
+        root.setAttribute("apiPassword", connectionSettings.apiPassword);
+    }
+    if (connectionSettings.autoRun) {
+        root.setAttribute("autoRun", "true");
+    }
 
     const createSection = (name, items) => {
         const section = doc.createElement(name);
@@ -104,6 +110,8 @@ export const importProjectFromXml = (xmlString) => {
         const plcAddress = doc.documentElement.getAttribute("plcAddress") || null;
         const sshUser = doc.documentElement.getAttribute("sshUser") || null;
         const sshPort = doc.documentElement.getAttribute("sshPort") || null;
+        const apiPassword = doc.documentElement.getAttribute("apiPassword") || null;
+        const autoRun = doc.documentElement.getAttribute("autoRun") === "true";
 
         const parseSection = (sectionName, key) => {
             const section = doc.getElementsByTagName(sectionName)[0];
@@ -184,7 +192,7 @@ export const importProjectFromXml = (xmlString) => {
             try { hmiLayout = JSON.parse(hmiSection.textContent); } catch (e) { /* ignore */ }
         }
 
-        return { projectStructure, boardId, plcAddress, sshUser, sshPort, buses, busConfigs, watchTable, hmiLayout };
+        return { projectStructure, boardId, plcAddress, sshUser, sshPort, apiPassword, autoRun, buses, busConfigs, watchTable, hmiLayout };
     } catch (e) {
         console.error("Critical Import Error:", e);
         return null;

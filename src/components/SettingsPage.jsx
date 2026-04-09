@@ -13,7 +13,7 @@ const KRON_REPOS = [
     'KronEthercatMaster', 'KronHAL',
 ];
 
-const SettingsPage = ({ theme, setTheme, editorSettings, setEditorSettings, selectedBoard, plcAddress, setPlcAddress, sshUser: sshUserProp, setSshUser: setSshUserProp, sshPort: sshPortProp, setSshPort: setSshPortProp, isPlcConnected, setConnectionEnabled, esiLibrary = [], onLoadEsiFile, projectStructure, buses, busConfigs }) => {
+const SettingsPage = ({ theme, setTheme, editorSettings, setEditorSettings, selectedBoard, plcAddress, setPlcAddress, sshUser: sshUserProp, setSshUser: setSshUserProp, sshPort: sshPortProp, setSshPort: setSshPortProp, apiPassword, setApiPassword, isPlcConnected, setConnectionEnabled, esiLibrary = [], onLoadEsiFile, projectStructure, buses, busConfigs }) => {
     const { t, i18n } = useTranslation();
     const [activeTab, setActiveTab] = useState('general');
     const [isUpdating, setIsUpdating] = useState(false);
@@ -597,6 +597,26 @@ const SettingsPage = ({ theme, setTheme, editorSettings, setEditorSettings, sele
                                     }}
                                 />
                             </div>
+                        </div>
+
+                        {/* API Password */}
+                        <div style={{ marginBottom: '16px' }}>
+                            <label style={{ display: 'block', marginBottom: '6px', color: '#ccc', fontSize: '13px' }}>
+                                API Password
+                            </label>
+                            <input
+                                type="password"
+                                value={apiPassword || ''}
+                                onChange={(e) => { if (setApiPassword) setApiPassword(e.target.value); }}
+                                placeholder="REST API password"
+                                style={{
+                                    width: '100%', padding: '8px', background: '#252526', color: '#fff',
+                                    border: '1px solid #444', borderRadius: '4px', boxSizing: 'border-box'
+                                }}
+                            />
+                            <span style={{ fontSize: '11px', color: '#888', marginTop: '4px', display: 'block' }}>
+                                Password for external REST API access to addressed variables. Leave empty to disable API.
+                            </span>
                         </div>
 
                         <button

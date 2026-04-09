@@ -153,6 +153,8 @@ function App() {
   const [plcAddress, setPlcAddress] = useState(() => localStorage.getItem('plcAddress') || '');
   const [sshUser, setSshUser] = useState(() => localStorage.getItem('sshUser') || 'pi');
   const [sshPort, setSshPort] = useState(() => localStorage.getItem('sshPort') || '22');
+  const [apiPassword, setApiPassword] = useState('');
+  const [autoRun, setAutoRun] = useState(false);
   const [isDeployed, setIsDeployed] = useState(false);
   const [isDirty, setIsDirty] = useState(false);
   const isDirtyRef = React.useRef(false);
@@ -205,7 +207,33 @@ function App() {
     }
     const checkStatus = () => {
       invoke('check_server_status', { serverAddr: plcAddress })
-        .then(() => setIsPlcConnected(true))
+        .then((jsonStr) => {
+          setIsPlcConnected(true);
+          try {
+            const status = JSON.parse(jsonStr);
+            // If runtime is already running (e.g. AutoRun) and editor is not tracking it yet,
+            // sync the running state so the editor shows it as running.
+            if (status.running && !isRunning && !isSimulationMode) {
+              // Ensure a PLCClient exists to stream data from the already-running runtime.
+              if (!plcClientRef.current) {
+                plcClientRef.current = new PLCClient(plcAddress);
+              }
+              setIsRunning(true);
+              addLog('info', 'Runtime already running (AutoRun). Attaching stream...');
+              // Start variable stream to receive live data from already-running runtime.
+              if (remoteVarKeysRef.current.length > 0 && !plcClientRef.current.isStreaming) {
+                stopStreamRef.current = plcClientRef.current.streamVars(
+                  (vars) => { Object.assign(liveVarsRef.current, vars); liveVarsDirtyRef.current = true; },
+                  (err) => addLog('error', `Stream error: ${err.message}`),
+                );
+              }
+            } else if (!status.running && isRunning && !isSimulationMode) {
+              // Runtime stopped externally (e.g. crash) — reflect in editor.
+              setIsRunning(false);
+              if (stopStreamRef.current) { stopStreamRef.current(); stopStreamRef.current = null; }
+            }
+          } catch (_) { /* ignore parse errors */ }
+        })
         .catch(() => {
           // Don't mark disconnected while a stream is active (server is clearly alive)
           if (!plcClientRef.current?.isStreaming) {
@@ -216,7 +244,8 @@ function App() {
     checkStatus();
     const interval = setInterval(checkStatus, 10000);
     return () => clearInterval(interval);
-  }, [plcAddress, connectionEnabled]);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [plcAddress, connectionEnabled, isRunning, isSimulationMode]);
 
   // --- isDirty: mark dirty only when LOGIC changes after deployment (not positions/layout) ---
   const computeLogicFingerprint = (s) => {
@@ -702,7 +731,7 @@ function App() {
         filePath += '.xml';
       }
 
-      const xmlContent = exportProjectToXml(projectStructure, selectedBoard, { plcAddress, sshUser, sshPort }, buses, busConfigs, watchTable, hmiLayout);
+      const xmlContent = exportProjectToXml(projectStructure, selectedBoard, { plcAddress, sshUser, sshPort, apiPassword, autoRun }, buses, busConfigs, watchTable, hmiLayout);
       await writeTextFile(filePath, xmlContent);
 
       hasUnsavedRef.current = false;
@@ -720,7 +749,7 @@ function App() {
     }
 
     try {
-      const xmlContent = exportProjectToXml(projectStructure, selectedBoard, { plcAddress, sshUser, sshPort }, buses, busConfigs, watchTable, hmiLayout);
+      const xmlContent = exportProjectToXml(projectStructure, selectedBoard, { plcAddress, sshUser, sshPort, apiPassword, autoRun }, buses, busConfigs, watchTable, hmiLayout);
       await writeTextFile(currentFilePath, xmlContent);
       hasUnsavedRef.current = false;
       addLog('success', t('logs.projectSaved', { path: currentFilePath }) || `Project saved to ${currentFilePath} `);
@@ -838,7 +867,7 @@ function App() {
     try {
       const result = importProjectFromXml(content);
       if (result) {
-        const { projectStructure: newStructure, boardId, plcAddress: savedAddr, sshUser: savedSshUser, sshPort: savedSshPort } = result;
+        const { projectStructure: newStructure, boardId, plcAddress: savedAddr, sshUser: savedSshUser, sshPort: savedSshPort, apiPassword: savedApiPassword, autoRun: savedAutoRun } = result;
         // Ensure Configuration Resource Exists
         if (!newStructure.resources || newStructure.resources.length === 0) {
           newStructure.resources = [
@@ -887,6 +916,12 @@ function App() {
         if (savedSshPort) {
           setSshPort(savedSshPort);
           localStorage.setItem('sshPort', savedSshPort);
+        }
+        if (savedApiPassword) {
+          setApiPassword(savedApiPassword);
+        }
+        if (savedAutoRun !== undefined) {
+          setAutoRun(savedAutoRun);
         }
 
         addLog('success', t('logs.projectLoaded', { path: filePath }) || `Project loaded from ${filePath} `);
@@ -1179,6 +1214,17 @@ function App() {
       const standardHeaders = await invoke('get_standard_headers').catch(() => []);
       const cCode = transpileToC(projectStructure, standardHeaders, selectedBoard, false, buses, busConfigs);
 
+      // Inject API password hash into variable table
+      if (apiPassword) {
+        const saltBytes = crypto.getRandomValues(new Uint8Array(16));
+        const saltHex = Array.from(saltBytes).map(b => b.toString(16).padStart(2, '0')).join('');
+        const data = new TextEncoder().encode(saltHex + ':' + apiPassword);
+        const hashBuffer = await crypto.subtle.digest('SHA-256', data);
+        const hashHex = Array.from(new Uint8Array(hashBuffer)).map(b => b.toString(16).padStart(2, '0')).join('');
+        cCode.variableTable.api_password_hash = hashHex;
+        cCode.variableTable.api_password_salt = saltHex;
+      }
+
       addLog('info', 'Cross-compiling for target...');
       await invoke('compile_for_target', {
         header: cCode.header,
@@ -1214,6 +1260,17 @@ function App() {
         }
       } catch (hmiErr) {
         addLog('warning', `HMI layout deploy skipped: ${hmiErr.message}`);
+      }
+
+      // Deploy autorun config
+      try {
+        await fetch(`http://${plcAddress}/deploy/config`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ auto_run: autoRun }),
+        });
+      } catch (cfgErr) {
+        addLog('warning', `AutoRun config deploy skipped: ${cfgErr.message}`);
       }
 
       setIsDeployed(true);
@@ -1791,6 +1848,23 @@ function App() {
               ⏹ {t('actions.stop')}
             </button>
 
+            {/* AutoRun toggle */}
+            <button
+              className="toolbar-btn"
+              onClick={() => setAutoRun(!autoRun)}
+              title="AutoRun: automatically start runtime on PLC boot"
+              style={{
+                opacity: 1,
+                background: autoRun ? '#1b5e20' : 'transparent',
+                border: autoRun ? '1px solid #4caf50' : '1px solid #555',
+                color: autoRun ? '#81c784' : '#888',
+                fontSize: '11px',
+                padding: '3px 8px',
+              }}
+            >
+              {autoRun ? 'AutoRun ON' : 'AutoRun OFF'}
+            </button>
+
             {/* Connection indicator */}
             {plcAddress && (
               <button
@@ -1918,6 +1992,8 @@ function App() {
                       setSshUser={setSshUser}
                       sshPort={sshPort}
                       setSshPort={setSshPort}
+                      apiPassword={apiPassword}
+                      setApiPassword={setApiPassword}
                       isPlcConnected={isPlcConnected}
                       setConnectionEnabled={setConnectionEnabled}
                       esiLibrary={esiLibrary}
