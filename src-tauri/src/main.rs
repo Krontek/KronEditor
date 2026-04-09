@@ -376,6 +376,104 @@ fn get_libraries_dir(app: &tauri::AppHandle) -> Result<PathBuf, String> {
         .ok_or_else(|| "Cannot locate resources directory".to_string())
 }
 
+fn mingw_sysroot_has_headers(resource_dir: &Path) -> bool {
+    let sysroot = llvm_sysroot_dir(resource_dir, "x86_64-w64-mingw32");
+    let windows_candidates = [
+        sysroot.join("x86_64-w64-mingw32/include/windows.h"),
+        sysroot.join("generic-w64-mingw32/include/windows.h"),
+        sysroot.join("include/windows.h"),
+    ];
+    let stdio_candidates = [
+        sysroot.join("x86_64-w64-mingw32/include/stdio.h"),
+        sysroot.join("generic-w64-mingw32/include/stdio.h"),
+        sysroot.join("include/stdio.h"),
+    ];
+    windows_candidates.iter().any(|p| p.exists())
+        && stdio_candidates.iter().any(|p| p.exists())
+}
+
+fn repair_mingw_sysroot_if_needed(app: &tauri::AppHandle, resource_dir: &Path) -> Result<(), String> {
+    if mingw_sysroot_has_headers(resource_dir) {
+        return Ok(());
+    }
+
+    let _ = app.emit(
+        "library-update-progress",
+        "[win32] Missing MinGW headers in sysroot. Repairing x86_64-w64-mingw32...".to_string(),
+    );
+
+    let src_tauri_dir = find_src_tauri_dir()
+        .ok_or_else(|| "Cannot locate src-tauri directory to run setup_toolchain.py".to_string())?;
+    let project_root = src_tauri_dir
+        .parent()
+        .ok_or_else(|| "Cannot locate project root from src-tauri".to_string())?;
+    let setup_script = project_root.join("setup_toolchain.py");
+    if !setup_script.exists() {
+        return Err(format!(
+            "setup_toolchain.py not found at {}",
+            setup_script.display()
+        ));
+    }
+
+    let run_setup = |force_download: bool| -> Result<(), String> {
+        let mut common_args = vec![
+            setup_script.as_os_str().to_owned(),
+            "--only".into(),
+            "x86_64-w64-mingw32".into(),
+            "--force".into(),
+        ];
+        if force_download {
+            common_args.push("--force-download".into());
+        }
+
+        let mut cmd = Command::new("python3");
+        for a in &common_args {
+            cmd.arg(a);
+        }
+        let out = cmd.output().or_else(|_| {
+            let mut fallback = Command::new("python");
+            for a in &common_args {
+                fallback.arg(a);
+            }
+            fallback.output()
+        }).map_err(|e| format!("Failed to launch Python for toolchain setup: {}", e))?;
+
+        if out.status.success() {
+            Ok(())
+        } else {
+            Err(format!(
+                "setup_toolchain.py failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            ))
+        }
+    };
+
+    // First pass: reuse cache. Second pass: force fresh download if still incomplete.
+    run_setup(false)?;
+    if mingw_sysroot_has_headers(resource_dir) {
+        let _ = app.emit(
+            "library-update-progress",
+            "[win32] MinGW sysroot repaired from cache.".to_string(),
+        );
+        return Ok(());
+    }
+
+    let _ = app.emit(
+        "library-update-progress",
+        "[win32] Headers still missing after cache restore. Forcing re-download...".to_string(),
+    );
+    run_setup(true)?;
+    if mingw_sysroot_has_headers(resource_dir) {
+        let _ = app.emit(
+            "library-update-progress",
+            "[win32] MinGW sysroot repaired after re-download.".to_string(),
+        );
+        Ok(())
+    } else {
+        Err("MinGW sysroot repair completed, but windows.h/stdio.h are still missing".to_string())
+    }
+}
+
 /// Strip the \\?\ long-path UNC prefix that Windows sometimes adds.
 /// gcc does not accept this prefix in -I/-B arguments.
 #[cfg(target_os = "windows")]
@@ -683,17 +781,24 @@ fn do_update_libraries(app: &tauri::AppHandle, repos: Vec<String>) -> Result<(),
         .ok_or_else(|| "Cannot find parent of resources root".to_string())?
         .to_path_buf();
 
+    // Ensure Windows cross sysroot is healthy before any win32 compilation.
+    repair_mingw_sysroot_if_needed(app, &resource_dir)?;
+
     let target_names = [
         "x86_64/linux", "x86_64/win32",
         "arm/aarch64", "arm/armv7",
         "arm/CortexM/M0", "arm/CortexM/M4", "arm/CortexM/M7",
     ];
 
-    // --- Clean old .a files from all target dirs ---
-    let _ = app.emit("library-update-progress", "Cleaning old .a files...".to_string());
+    // --- Clean old headers and .a files from all target dirs ---
+    let _ = app.emit("library-update-progress", "Cleaning old headers and .a files...".to_string());
     for tname in &target_names {
-        let dir = resource_target_lib_dir(&resources_root, tname);
-        if let Ok(entries) = fs::read_dir(&dir) {
+        let include_dir = resource_target_include_dir(&resources_root, tname);
+        let _ = fs::remove_dir_all(&include_dir);
+        let _ = fs::create_dir_all(&include_dir);
+
+        let lib_dir = resource_target_lib_dir(&resources_root, tname);
+        if let Ok(entries) = fs::read_dir(&lib_dir) {
             for e in entries.flatten() {
                 if e.path().extension().map_or(false, |x| x == "a") {
                     let _ = fs::remove_file(e.path());
@@ -809,18 +914,26 @@ fn do_update_libraries(app: &tauri::AppHandle, repos: Vec<String>) -> Result<(),
                 if is_hal { " → include/HAL/" } else { " → include/" }),
         );
 
-        // Compile ALL non-test .c files in the repo (e.g. KronMotion has both
-        // kronmotion.c and kron_nc.c).  Each .c becomes its own lib<stem>.a.
-        let candidates: Vec<PathBuf> = find_files_with_ext(&clone_dir, "c")
-            .into_iter()
-            .filter(|p| {
-                let n = p.file_name().unwrap_or_default().to_string_lossy().to_lowercase();
-                !n.starts_with("test") && !n.starts_with("example")
-            })
-            .collect();
-        if candidates.is_empty() {
+        let is_hal_repo = repo_name.eq_ignore_ascii_case("kronhal");
+
+        // Build libraries from top-level .c files only.
+        // This intentionally ignores subdirectories/CMake layouts and keeps
+        // the existing clang/ar compilation flow.
+        let mut candidates: Vec<PathBuf> = Vec::new();
+        if let Ok(entries) = fs::read_dir(&clone_dir) {
+            for entry in entries.flatten() {
+                let p = entry.path();
+                if p.is_file() && p.extension().and_then(|e| e.to_str()) == Some("c") {
+                    let n = p.file_name().unwrap_or_default().to_string_lossy().to_lowercase();
+                    if !n.starts_with("test") && !n.starts_with("example") && n != "debug.c" {
+                        candidates.push(p);
+                    }
+                }
+            }
+        }
+        if candidates.is_empty() && !is_hal_repo {
             let _ = app.emit("library-update-progress",
-                format!("[{}] WARN: no .c source found", repo_name));
+                format!("[{}] WARN: no top-level .c source found", repo_name));
         }
         for c in candidates {
             let stem = c.file_stem().unwrap_or_default().to_string_lossy().to_string();
@@ -839,6 +952,29 @@ fn do_update_libraries(app: &tauri::AppHandle, repos: Vec<String>) -> Result<(),
     }
 
     // --- Compile for each target ---
+    let mut build_errors: Vec<String> = Vec::new();
+    let mut required_repo_archives: Vec<String> = repo_sources
+        .iter()
+        .map(|(lib_name, _)| format!("lib{}.a", lib_name))
+        .collect();
+    required_repo_archives.sort();
+    required_repo_archives.dedup();
+
+    let verify_required_archives = |target_tag: &str, lib_dirs: &[PathBuf]| -> Vec<String> {
+        if lib_dirs.is_empty() {
+            return vec![format!("[{}] no output lib directory configured", target_tag)];
+        }
+        required_repo_archives
+            .iter()
+            .filter_map(|archive| {
+                if lib_dirs[0].join(archive).exists() {
+                    None
+                } else {
+                    Some(format!("[{}] missing required archive {}", target_tag, archive))
+                }
+            })
+            .collect()
+    };
 
     // Pre-compute SOEM platform include paths
     let soem_base = include_dir.join("soem");
@@ -948,15 +1084,23 @@ fn do_update_libraries(app: &tauri::AppHandle, repos: Vec<String>) -> Result<(),
                     ) {
                         Ok(()) => { let _ = app.emit("library-update-progress", format!(
                             "  [x86_64/linux] lib{}.a OK", lib_name)); }
-                        Err(e) => { let _ = app.emit("library-update-progress",
-                            format!("  [x86_64/linux] {}", e)); }
+                        Err(e) => {
+                            let _ = app.emit("library-update-progress",
+                                format!("  [x86_64/linux] {}", e));
+                            build_errors.push(e);
+                        }
                     }
                 }
             }
             Err(e) => {
                 let _ = app.emit("library-update-progress",
                     format!("  [x86_64/linux] SKIP: {}", e));
+                build_errors.push(format!("[x86_64/linux] toolchain unavailable: {}", e));
             }
+        }
+        for msg in verify_required_archives("x86_64/linux", &targets[0]) {
+            let _ = app.emit("library-update-progress", format!("  [x86_64/linux] {}", msg));
+            build_errors.push(msg);
         }
     }
 
@@ -974,15 +1118,23 @@ fn do_update_libraries(app: &tauri::AppHandle, repos: Vec<String>) -> Result<(),
                     ) {
                         Ok(()) => { let _ = app.emit("library-update-progress", format!(
                             "  [x86_64/win32] lib{}.a OK", lib_name)); }
-                        Err(e) => { let _ = app.emit("library-update-progress",
-                            format!("  [x86_64/win32] {}", e)); }
+                        Err(e) => {
+                            let _ = app.emit("library-update-progress",
+                                format!("  [x86_64/win32] {}", e));
+                            build_errors.push(e);
+                        }
                     }
                 }
             }
             Err(e) => {
                 let _ = app.emit("library-update-progress",
                     format!("  [x86_64/win32] SKIP: {}", e));
+                build_errors.push(format!("[x86_64/win32] toolchain unavailable: {}", e));
             }
+        }
+        for msg in verify_required_archives("x86_64/win32", &targets[1]) {
+            let _ = app.emit("library-update-progress", format!("  [x86_64/win32] {}", msg));
+            build_errors.push(msg);
         }
     }
 
@@ -1000,15 +1152,23 @@ fn do_update_libraries(app: &tauri::AppHandle, repos: Vec<String>) -> Result<(),
                     ) {
                         Ok(()) => { let _ = app.emit("library-update-progress", format!(
                             "  [arm/aarch64] lib{}.a OK", lib_name)); }
-                        Err(e) => { let _ = app.emit("library-update-progress",
-                            format!("  [arm/aarch64] {}", e)); }
+                        Err(e) => {
+                            let _ = app.emit("library-update-progress",
+                                format!("  [arm/aarch64] {}", e));
+                            build_errors.push(e);
+                        }
                     }
                 }
             }
             Err(e) => {
                 let _ = app.emit("library-update-progress",
                     format!("  [arm/aarch64] SKIP: {}", e));
+                build_errors.push(format!("[arm/aarch64] toolchain unavailable: {}", e));
             }
+        }
+        for msg in verify_required_archives("arm/aarch64", &targets[2]) {
+            let _ = app.emit("library-update-progress", format!("  [arm/aarch64] {}", msg));
+            build_errors.push(msg);
         }
     }
 
@@ -1026,15 +1186,23 @@ fn do_update_libraries(app: &tauri::AppHandle, repos: Vec<String>) -> Result<(),
                     ) {
                         Ok(()) => { let _ = app.emit("library-update-progress", format!(
                             "  [arm/armv7] lib{}.a OK", lib_name)); }
-                        Err(e) => { let _ = app.emit("library-update-progress",
-                            format!("  [arm/armv7] {}", e)); }
+                        Err(e) => {
+                            let _ = app.emit("library-update-progress",
+                                format!("  [arm/armv7] {}", e));
+                            build_errors.push(e);
+                        }
                     }
                 }
             }
             Err(e) => {
                 let _ = app.emit("library-update-progress",
                     format!("  [arm/armv7] SKIP: {}", e));
+                build_errors.push(format!("[arm/armv7] toolchain unavailable: {}", e));
             }
+        }
+        for msg in verify_required_archives("arm/armv7", &targets[3]) {
+            let _ = app.emit("library-update-progress", format!("  [arm/armv7] {}", msg));
+            build_errors.push(msg);
         }
     }
 
@@ -1062,17 +1230,43 @@ fn do_update_libraries(app: &tauri::AppHandle, repos: Vec<String>) -> Result<(),
                     ) {
                         Ok(()) => { let _ = app.emit("library-update-progress", format!(
                             "  [{}] lib{}.a OK", name, lib_name)); }
-                        Err(e) => { let _ = app.emit("library-update-progress",
-                            format!("  [{}] {}", name, e)); }
+                        Err(e) => {
+                            let _ = app.emit("library-update-progress",
+                                format!("  [{}] {}", name, e));
+                            build_errors.push(e);
+                        }
                     }
+                }
+                for msg in verify_required_archives(name, &targets[*idx]) {
+                    let _ = app.emit("library-update-progress", format!("  [{}] {}", name, msg));
+                    build_errors.push(msg);
                 }
             }
         }
         Err(e) => {
-            for (name, _, _) in arm_targets {
+            for (name, idx, _) in arm_targets {
                 let _ = app.emit("library-update-progress",
                     format!("  [{}] SKIP: {}", name, e));
+                build_errors.push(format!("[{}] toolchain unavailable: {}", name, e));
+                for msg in verify_required_archives(name, &targets[*idx]) {
+                    let _ = app.emit("library-update-progress", format!("  [{}] {}", name, msg));
+                    build_errors.push(msg);
+                }
             }
+        }
+    }
+
+    // SOEM is required on hosted targets for EtherCAT-enabled builds.
+    for (tag, idx) in [
+        ("x86_64/linux", 0usize),
+        ("x86_64/win32", 1usize),
+        ("arm/aarch64", 2usize),
+        ("arm/armv7", 3usize),
+    ] {
+        if !targets[idx].is_empty() && !targets[idx][0].join("libsoem.a").exists() {
+            let msg = format!("[{}] missing required archive libsoem.a", tag);
+            let _ = app.emit("library-update-progress", format!("  [{}] {}", tag, msg));
+            build_errors.push(msg);
         }
     }
 
@@ -1083,6 +1277,8 @@ fn do_update_libraries(app: &tauri::AppHandle, repos: Vec<String>) -> Result<(),
         }
     }
     let _ = fs::remove_dir_all(&temp_base);
+
+    errors.extend(build_errors);
 
     if errors.is_empty() {
         Ok(())

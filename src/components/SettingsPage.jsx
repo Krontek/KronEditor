@@ -608,7 +608,7 @@ const SettingsPage = ({ theme, setTheme, editorSettings, setEditorSettings, sele
                                 type="password"
                                 value={apiPassword || ''}
                                 onChange={(e) => { if (setApiPassword) setApiPassword(e.target.value); }}
-                                placeholder="REST API password"
+                                placeholder="Default: krontek"
                                 style={{
                                     width: '100%', padding: '8px', background: '#252526', color: '#fff',
                                     border: '1px solid #444', borderRadius: '4px', boxSizing: 'border-box'

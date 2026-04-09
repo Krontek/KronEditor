@@ -153,7 +153,7 @@ function App() {
   const [plcAddress, setPlcAddress] = useState(() => localStorage.getItem('plcAddress') || '');
   const [sshUser, setSshUser] = useState(() => localStorage.getItem('sshUser') || 'pi');
   const [sshPort, setSshPort] = useState(() => localStorage.getItem('sshPort') || '22');
-  const [apiPassword, setApiPassword] = useState('');
+  const [apiPassword, setApiPassword] = useState('krontek');
   const [autoRun, setAutoRun] = useState(false);
   const [isDeployed, setIsDeployed] = useState(false);
   const [isDirty, setIsDirty] = useState(false);
@@ -917,9 +917,7 @@ function App() {
           setSshPort(savedSshPort);
           localStorage.setItem('sshPort', savedSshPort);
         }
-        if (savedApiPassword) {
-          setApiPassword(savedApiPassword);
-        }
+        setApiPassword(savedApiPassword || 'krontek');
         if (savedAutoRun !== undefined) {
           setAutoRun(savedAutoRun);
         }

@@ -206,6 +206,8 @@ const VariableManager = ({
   const [complexPopup, setComplexPopup] = useState(null); // { variable, anchorRect }
   const [ctxMenu, setCtxMenu] = useState(null); // { x, y, variable }
   const ctxMenuRef = useRef(null);
+  const [addrWarning, setAddrWarning] = useState(null); // { msg, x, y }
+  const addrWarnTimer = useRef(null);
 
   useEffect(() => {
     if (!ctxMenu) return;
@@ -386,8 +388,8 @@ const VariableManager = ({
                   Live Value {onForceWrite && <span style={{ color: '#888', fontSize: 10, fontWeight: 'normal' }}>(click to set)</span>}
                 </th>
               )}
-              <th style={{ padding: '5px', borderBottom: '1px solid #444' }}>{t('tables.description')}</th>
               <th style={{ padding: '5px', borderBottom: '1px solid #444', minWidth: '80px' }} title="IEC address — expose via REST API">Address</th>
+              <th style={{ padding: '5px', borderBottom: '1px solid #444' }}>{t('tables.description')}</th>
               <th style={{ padding: '5px', borderBottom: '1px solid #444', width: 28 }}></th>
             </tr>
           </thead>
@@ -506,19 +508,29 @@ const VariableManager = ({
                       </span>
                     </td>
                   )}
-                  <td style={{ padding: '5px' }}>
-                    <EditableCell value={v.description} onCommit={(val) => !disabled && onUpdate && onUpdate(v.id, 'description', val)} />
-                  </td>
                   <td style={{ padding: '3px' }}>
                     <EditableCell
                       value={v.address || ''}
-                      onCommit={(val) => {
+                      onCommit={(val, e) => {
                         if (disabled || isSimulationMode) return;
                         const formatted = formatIECAddress(val, v.type);
+                        if (formatted) {
+                          const allVars = [...variables, ...globalVars];
+                          const dup = allVars.find(other => other.id !== v.id && other.address && other.address === formatted);
+                          if (dup) {
+                            if (addrWarnTimer.current) clearTimeout(addrWarnTimer.current);
+                            setAddrWarning(`"${formatted}" is already used by "${dup.name}"`);
+                            addrWarnTimer.current = setTimeout(() => setAddrWarning(null), 500);
+                            return;
+                          }
+                        }
                         if (onUpdate) onUpdate(v.id, 'address', formatted);
                       }}
-                      placeholder="%MW0"
+                      placeholder=""
                     />
+                  </td>
+                  <td style={{ padding: '5px' }}>
+                    <EditableCell value={v.description} onCommit={(val) => !disabled && onUpdate && onUpdate(v.id, 'description', val)} />
                   </td>
                   <td style={{ padding: '3px', textAlign: 'center' }}>
                     <button
@@ -639,6 +651,28 @@ const VariableManager = ({
           >
             <span style={{ fontSize: 13 }}>📋</span> Copy Name
           </div>
+        </div>
+      )}
+
+      {/* Duplicate address warning popup */}
+      {addrWarning && (
+        <div style={{
+          position: 'fixed',
+          bottom: 32,
+          left: '50%',
+          transform: 'translateX(-50%)',
+          background: '#b71c1c',
+          color: '#fff',
+          padding: '7px 18px',
+          borderRadius: 6,
+          fontSize: 12,
+          fontWeight: 'bold',
+          boxShadow: '0 4px 16px rgba(0,0,0,0.6)',
+          zIndex: 99999,
+          pointerEvents: 'none',
+          whiteSpace: 'nowrap',
+        }}>
+          {addrWarning}
         </div>
       )}
     </div>
