@@ -428,6 +428,7 @@ export const transpileToC = (projectStructure, standardHeaders = [], boardId = n
 #include <stdbool.h>
 #include <string.h>
 #include <stdlib.h>
+#include <math.h>
 ${boardDefines}${runtimePortHelpers}${customIncludes}${ecCfgEarly.motionIncludes ? ecCfgEarly.motionIncludes + '\n' : ''}extern volatile uint64_t us_tick;
 
 `;
@@ -633,7 +634,8 @@ ${boardDefines}${runtimePortHelpers}${customIncludes}${ecCfgEarly.motionIncludes
     }
 
     // Collect global variable names (used by LD transpiler to skip prog_ prefix)
-    const globalVarNames = (config?.content?.globalVars || [])
+    const globalVarsList = (config?.content?.globalVars || []);
+    const globalVarNames = globalVarsList
         .map(v => (v.name || '').trim().replace(/\s+/g, '_'));
 
     if (ecCfgEarly.headerExtern) {
@@ -659,14 +661,14 @@ ${boardDefines}${runtimePortHelpers}${customIncludes}${ecCfgEarly.motionIncludes
     if (projectStructure.functions) {
         header += `// --- FUNCTIONS ---\n`;
         projectStructure.functions.forEach(fn => {
-            header += transpilePOUSource(fn, 'function', stdFunctions, fn.name, globalVarNames);
+            header += transpilePOUSource(fn, 'function', stdFunctions, fn.name, globalVarNames, null, globalVarsList);
         });
     }
 
     if (projectStructure.functionBlocks) {
         header += `// --- FUNCTION BLOCKS ---\n`;
         projectStructure.functionBlocks.forEach(fb => {
-            header += transpilePOUSource(fb, 'function_block', stdFunctions, fb.name, globalVarNames);
+            header += transpilePOUSource(fb, 'function_block', stdFunctions, fb.name, globalVarNames, null, globalVarsList);
         });
     }
 
@@ -794,7 +796,7 @@ ${boardDefines}${runtimePortHelpers}${customIncludes}${ecCfgEarly.motionIncludes
                 // C compiler emits an error, forcing the user to add them.
             }
 
-            header += transpilePOUSource(prog, 'program', stdFunctions, progName, globalVarNames, inputShadowMap);
+            header += transpilePOUSource(prog, 'program', stdFunctions, progName, globalVarNames, inputShadowMap, globalVarsList);
         });
     }
 
@@ -1668,7 +1670,7 @@ const generateMainLoop = (projectStructure, config, boardId = null, shmEnabled =
     return { src: mainSrc, programTasks, baseTickUs };
 };
 
-const transpilePOUSource = (pou, category, stdFunctions = {}, parentName = '', globalVarNames = [], inputShadowMap = null) => {
+const transpilePOUSource = (pou, category, stdFunctions = {}, parentName = '', globalVarNames = [], inputShadowMap = null, globalVarsList = []) => {
     let src = ``;
     let safeName = (pou.name || '').trim().replace(/\s+/g, '_');
     let sig = `static inline void ${safeName}()`;
@@ -1681,6 +1683,33 @@ const transpilePOUSource = (pou, category, stdFunctions = {}, parentName = '', g
     }
 
     src += `${sig} {\n`;
+
+    // Build C-symbol → IEC-type map for LD type inference (REAL detection)
+    const buildCSymTypeMap = () => {
+        const map = {};
+        // Global vars: C symbol = variable name unchanged
+        globalVarsList.forEach(v => {
+            const vName = (v.name || '').trim().replace(/\s+/g, '_');
+            if (vName) map[vName] = v.type;
+        });
+        // Local POU variables
+        (pou.content.variables || []).forEach(v => {
+            const vName = (v.name || '').trim().replace(/\s+/g, '_');
+            if (!vName) return;
+            let cSym;
+            if (globalVarNames.includes(vName)) {
+                cSym = vName;
+            } else if (category === 'program') {
+                cSym = `prog_${safeName}_${vName}`;
+            } else if (category === 'function_block') {
+                cSym = `instance->${vName}`;
+            } else {
+                cSym = vName;
+            }
+            map[cSym] = v.type;
+        });
+        return map;
+    };
 
     if (pou.type === 'ST') {
         // Build variable name map: IEC identifier → C symbol
@@ -1703,7 +1732,7 @@ const transpilePOUSource = (pou, category, stdFunctions = {}, parentName = '', g
         });
         src += transpileSTLogics(pou.content.code, stdFunctions, parentName, category, varMap);
     } else if (pou.type === 'LD') {
-        src += transpileLDLogics(pou.content.rungs, stdFunctions, safeName, category, globalVarNames, inputShadowMap);
+        src += transpileLDLogics(pou.content.rungs, stdFunctions, safeName, category, globalVarNames, inputShadowMap, 0, buildCSymTypeMap());
     } else if (pou.type === 'SCL') {
         // SCL: mixed LD/ST per rung. Each rung carries a `lang` field ('LD' or 'ST').
         let sclLdRungIdx = 0;
@@ -1725,7 +1754,7 @@ const transpilePOUSource = (pou, category, stdFunctions = {}, parentName = '', g
             } else {
                 // Default: treat as LD rung
                 src += `    // SCL rung [LD]\n`;
-                src += transpileLDLogics([rung], stdFunctions, safeName, category, globalVarNames, inputShadowMap, sclLdRungIdx);
+                src += transpileLDLogics([rung], stdFunctions, safeName, category, globalVarNames, inputShadowMap, sclLdRungIdx, buildCSymTypeMap());
                 sclLdRungIdx++;
             }
         });
@@ -2015,7 +2044,7 @@ const FB_OUTPUTS = {
     // Motion control
     'MC_Power': ['Status', 'Valid', 'Error', 'ErrorID'],
     'MC_Home': ['Done', 'Busy', 'Active', 'CommandAborted', 'Error', 'ErrorID'],
-    'MC_Stop': ['Done', 'Busy', 'Active', 'CommandAborted', 'Error', 'ErrorID'],
+    'MC_Stop': ['Done', 'Busy', 'CommandAborted', 'Error', 'ErrorID'],
     'MC_Halt': ['Done', 'Busy', 'Active', 'CommandAborted', 'Error', 'ErrorID'],
     'MC_MoveAbsolute': ['Done', 'Busy', 'Active', 'CommandAborted', 'Error', 'ErrorID'],
     'MC_MoveRelative': ['Done', 'Busy', 'Active', 'CommandAborted', 'Error', 'ErrorID'],
@@ -2048,7 +2077,8 @@ _CONV_TYPES.forEach(src => _CONV_TYPES.forEach(dst => {
 }));
 
 // ── Math FB blocks: use struct-based _Call from kronmath.h ──
-// All integer-only, no EN/ENO fields. Struct type names may differ from block type.
+// Integer structs by default; _REAL variants used when inputs are REAL/LREAL.
+// No EN/ENO fields. Struct type names may differ from block type.
 const MATH_FB_BLOCKS = new Set([
     'ADD', 'SUB', 'MUL', 'DIV', 'MOD', 'MOVE', 'ABS',
     'SQRT', 'EXPT', 'NEG', 'AVG',
@@ -2527,10 +2557,19 @@ const transpileSTLogics = (code, stdFunctions = {}, parentName = '', category = 
     return out || `    // ST parsing placeholder\n`;
 };
 
-const transpileLDLogics = (rungs, stdFunctions = {}, parentName = '', category = 'program', globalVarNames = [], inputShadowMap = null, rungIdxOffset = 0) => {
+const transpileLDLogics = (rungs, stdFunctions = {}, parentName = '', category = 'program', globalVarNames = [], inputShadowMap = null, rungIdxOffset = 0, cSymTypeMap = {}) => {
     if (!rungs || rungs.length === 0) return `    // LD Implementation Empty\n`;
 
     let out = '';
+
+    // Returns true if a C expression represents a REAL (float) value:
+    // either a float literal (contains decimal point) or a REAL/LREAL variable.
+    const isRealExpr = (val) => {
+        if (!val) return false;
+        if (/^-?[0-9]*\.[0-9]+([eE][+-]?[0-9]+)?$/.test(val)) return true;
+        if (/^-?[0-9]+\.[0-9]*([eE][+-]?[0-9]+)?$/.test(val)) return true;
+        return ['REAL', 'LREAL'].includes(cSymTypeMap[val]);
+    };
 
     // Resolve a variable/signal name to its C symbol, respecting scope.
     // Handles simple names, array elements (var[idx]), struct members (var.member).
@@ -2712,6 +2751,9 @@ const transpileLDLogics = (rungs, stdFunctions = {}, parentName = '', category =
         const sortedIndex = {};
         sorted.forEach((id, idx) => { sortedIndex[id] = idx; });
 
+        // Tracks which sorted block indices use REAL inline mode (for source-ref resolution)
+        const realInlineBlocks = new Set();
+
         // Build power-flow (inExpr) for a block:
         //   Contact / Coil use handle id "in"
         //   FB trigger input uses "in_<triggerPinName>" (e.g. in_CU, in_IN, in_CLK)
@@ -2813,7 +2855,12 @@ const transpileLDLogics = (rungs, stdFunctions = {}, parentName = '', category =
                             const srcType = srcBlock?.type || srcBlock?.data?.type || '';
                             const srcInstName = (srcBlock?.data?.instanceName || srcType || '');
                             if (isInlineMathType(srcType) && MATH_FB_BLOCKS.has(srcType)) {
-                                argValues[pinName] = `_m_r${rungIdx}_b${sortedIndex[c.source]}.${sp.slice(4)}`;
+                                const srcIdx = sortedIndex[c.source];
+                                if (realInlineBlocks.has(srcIdx)) {
+                                    argValues[pinName] = `_m_r${rungIdx}_b${srcIdx}_rout`;
+                                } else {
+                                    argValues[pinName] = `_m_r${rungIdx}_b${srcIdx}.${sp.slice(4)}`;
+                                }
                             } else {
                                 argValues[pinName] = `${getCallTarget(srcInstName)}.${sp.slice(4)}`;
                             }
@@ -2828,37 +2875,76 @@ const transpileLDLogics = (rungs, stdFunctions = {}, parentName = '', category =
 
                 if (MATH_FB_BLOCKS.has(type)) {
                     // ── Math FB: local struct + _Call (kronmath.h) ──
-                    // New kronmath.h: no EN/ENO fields, integer-only structs
-                    const structType = MATH_FB_STRUCT[type] || type;
-                    const callFn = `${structType === type ? type : structType.replace('_FB', '')}_Call`;
-                    const localVar = `_m_r${rungIdx}_b${idx}`;
-                    const pinMap = MATH_FB_PIN_MAP[type] || {};
+                    // When inputs are REAL/LREAL or float literals, emit inline C expressions
+                    // (no struct needed — uses C operators and standard math functions).
+                    const inputVals = dataInputPins.map(pin => argValues[pin] || '0');
+                    const outRawCheck = data.values?.OUT;
+                    const outVarCheck = outRawCheck ? (outRawCheck + '').replace(/[🌍🏠⊞⊡⊟]/g, '').trim() : '';
+                    const outCSym = outVarCheck ? resolveVar(outVarCheck) : null;
+                    const useReal = inputVals.some(isRealExpr) ||
+                        (outCSym && ['REAL', 'LREAL'].includes(cSymTypeMap[outCSym]));
 
-                    out += `    ${structType} ${localVar} = {0};\n`;
                     out += `    ${bOut} = ${inExpr};\n`;
-                    out += `    if (${bOut}) {\n`;
 
-                    if (MATH_FB_ARRAY_INPUT.has(type)) {
-                        // Array-input blocks: IN[0]=val1, IN[1]=val2, N=count
-                        dataInputPins.forEach((pin, i) => {
-                            out += `    ${localVar}.IN[${i}] = ${argValues[pin] || '0'};\n`;
-                        });
-                        out += `    ${localVar}.N = ${dataInputPins.length};\n`;
+                    if (useReal) {
+                        // ── Inline REAL path: no struct, emit C float expressions ──
+                        realInlineBlocks.add(idx);
+                        const localRout = `_m_r${rungIdx}_b${idx}_rout`;
+                        const fv = (v) => `(float)(${v})`;  // cast helper
+                        let realExpr = '0.0f';
+                        if (MATH_FB_ARRAY_INPUT.has(type)) {
+                            // ADD, MUL, AVG — multi-input
+                            const fVals = inputVals.map(fv);
+                            if (type === 'ADD') realExpr = fVals.join(' + ');
+                            else if (type === 'MUL') realExpr = fVals.join(' * ');
+                            else if (type === 'AVG') realExpr = `(${fVals.join(' + ')}) / ${inputVals.length}.0f`;
+                        } else {
+                            const a = fv(inputVals[0] || '0');
+                            const b = fv(inputVals[1] || '0');
+                            if (type === 'SUB')  realExpr = `${a} - ${b}`;
+                            else if (type === 'DIV')  realExpr = `(${b} != 0.0f) ? (${a} / ${b}) : 0.0f`;
+                            else if (type === 'MOD')  realExpr = `(${b} != 0.0f) ? fmodf(${a}, ${b}) : 0.0f`;
+                            else if (type === 'MOVE') realExpr = a;
+                            else if (type === 'NEG')  realExpr = `-${a}`;
+                            else if (type === 'ABS')  realExpr = `(${a} < 0.0f ? -${a} : ${a})`;
+                            else if (type === 'SQRT') realExpr = `(${a} >= 0.0f ? sqrtf(${a}) : 0.0f)`;
+                            else if (type === 'EXPT') realExpr = `powf(${a}, ${b})`;
+                        }
+                        out += `    float ${localRout} = 0.0f;\n`;
+                        out += `    if (${bOut}) {\n`;
+                        out += `        ${localRout} = ${realExpr};\n`;
+                        if (outVarCheck && validIdPattern.test(outVarCheck)) {
+                            out += `        ${resolveVar(outVarCheck)} = ${localRout};\n`;
+                        }
+                        out += `    }\n`;
                     } else {
-                        dataInputPins.forEach(pin => {
-                            const structPin = pinMap[pin] || pin;
-                            out += `    ${localVar}.${structPin} = ${argValues[pin] || '0'};\n`;
-                        });
-                    }
-                    out += `    ${callFn}(&${localVar});\n`;
+                        // ── Integer path: struct + _Call (kronmath.h) ──
+                        const structType = MATH_FB_STRUCT[type] || type;
+                        const callFn = `${structType === type ? type : structType.replace('_FB', '')}_Call`;
+                        const localVar = `_m_r${rungIdx}_b${idx}`;
+                        const pinMap = MATH_FB_PIN_MAP[type] || {};
 
-                    // OUT assignment
-                    const outRaw = data.values?.OUT;
-                    const outVar = outRaw ? (outRaw + '').replace(/[🌍🏠⊞⊡⊟]/g, '').trim() : '';
-                    if (outVar && validIdPattern.test(outVar)) {
-                        out += `    ${resolveVar(outVar)} = ${localVar}.OUT;\n`;
+                        out += `    ${structType} ${localVar} = {0};\n`;
+                        out += `    if (${bOut}) {\n`;
+
+                        if (MATH_FB_ARRAY_INPUT.has(type)) {
+                            dataInputPins.forEach((pin, i) => {
+                                out += `    ${localVar}.IN[${i}] = ${argValues[pin] || '0'};\n`;
+                            });
+                            out += `    ${localVar}.N = ${dataInputPins.length};\n`;
+                        } else {
+                            dataInputPins.forEach(pin => {
+                                const structPin = pinMap[pin] || pin;
+                                out += `    ${localVar}.${structPin} = ${argValues[pin] || '0'};\n`;
+                            });
+                        }
+                        out += `    ${callFn}(&${localVar});\n`;
+
+                        if (outVarCheck && validIdPattern.test(outVarCheck)) {
+                            out += `    ${resolveVar(outVarCheck)} = ${localVar}.OUT;\n`;
+                        }
+                        out += `    }\n`;
                     }
-                    out += `    }\n`;
 
                     // ENO write-back (power-flow passthrough)
                     const enoRaw = data.values?.ENO;
@@ -2946,6 +3032,8 @@ const transpileLDLogics = (rungs, stdFunctions = {}, parentName = '', category =
                         if (outputPinNames.has(pinName)) return; // handled post-call
                         if (FB_TRIGGER_PIN[type] && pinName === FB_TRIGGER_PIN[type]) return; // overwritten by power flow in step 3
                         if (MOTION_FB_AXIS_PARAM.has(type) && pinName === 'Axis') return; // passed as 2nd call param
+                        // Skip pins not in inputPins (e.g. old output pins removed from the standard)
+                        if (inputPins.length > 0 && !inputPins.includes(pinName) && !isUserDefinedFB) return;
                         const cPin = cStructPin(type, pinName);
                         const shadowSym = inputShadowMap?.get(`${safeInst}_${pinName}`);
                         if (shadowSym) {
@@ -3013,7 +3101,10 @@ const transpileLDLogics = (rungs, stdFunctions = {}, parentName = '', category =
                             // Inline math blocks use a local variable, not a persistent instance
                             let srcRef;
                             if (isInlineMathType(srcType) && MATH_FB_BLOCKS.has(srcType)) {
-                                srcRef = `_m_r${rungIdx}_b${sortedIndex[c.source]}.${sp.slice(4)}`;
+                                const srcIdx = sortedIndex[c.source];
+                                srcRef = realInlineBlocks.has(srcIdx)
+                                    ? `_m_r${rungIdx}_b${srcIdx}_rout`
+                                    : `_m_r${rungIdx}_b${srcIdx}.${sp.slice(4)}`;
                             } else {
                                 srcRef = `${getCallTarget(srcInstName)}.${sp.slice(4)}`;
                             }

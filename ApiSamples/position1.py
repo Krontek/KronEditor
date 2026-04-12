@@ -3,15 +3,16 @@ position1.py — KronServer Position Control GUI
 ===============================================
 %MX0.0  BOOL  — Axis power enable
 %MX0.1  BOOL  — Axis reset (MC_Reset)
-%MX0.2  BOOL  — MoveAbsolute execute trigger
-%MD1    REAL  — Target position setpoint
-%MD2    REAL  — Actual position feedback
+%MX0.2  BOOL  — Position trigger
+%MD1    REAL  — Target position command (-10.000 .. 10.000)
+%MD2    REAL  — Position feedback
 
 Kullanım: python3 position1.py
 """
 
 import json
 import threading
+import time
 import tkinter as tk
 from tkinter import messagebox
 import urllib.request
@@ -193,18 +194,18 @@ class PositionApp(tk.Tk):
         sf = tk.Frame(main, bg=BG)
         sf.pack(pady=(0, 10))
 
-        tk.Label(sf, text="Target Position  (%MD1)", bg=BG, fg=TEXT_DIM,
+        tk.Label(sf, text="Target Position  (-10.000 .. 10.000)  (%MD1)", bg=BG, fg=TEXT_DIM,
                  font=("Consolas", 10)).pack()
 
-        self.lbl_target = tk.Label(sf, text="0.00", bg=BG, fg=ACCENT,
+        self.lbl_target = tk.Label(sf, text="0.000", bg=BG, fg=ACCENT,
                                     font=("Consolas", 22, "bold"))
         self.lbl_target.pack(pady=2)
 
         tick_row = tk.Frame(sf, bg=BG)
         tick_row.pack()
-        tk.Label(tick_row, text="-100", bg=BG, fg=TEXT_DIM,
+        tk.Label(tick_row, text="-10", bg=BG, fg=TEXT_DIM,
                  font=("Consolas", 9)).pack(side=tk.LEFT)
-        self.slider = tk.Scale(sf, from_=-100, to=100, orient=tk.HORIZONTAL,
+        self.slider = tk.Scale(sf, from_=-10, to=10, orient=tk.HORIZONTAL,
                                 resolution=0.001, length=400,
                                 bg=BG, fg=TEXT, troughcolor=BG3,
                                 highlightthickness=0, bd=0,
@@ -212,26 +213,26 @@ class PositionApp(tk.Tk):
                                 showvalue=False, command=self._on_slider)
         self.slider.set(0)
         self.slider.pack()
-        tk.Label(tick_row, text="+100", bg=BG, fg=TEXT_DIM,
+        tk.Label(tick_row, text="+10", bg=BG, fg=TEXT_DIM,
                  font=("Consolas", 9)).pack(side=tk.RIGHT)
 
         # Tick marks
         self._draw_ticks(sf)
 
-        # MoveAbsolute toggle button
-        self.btn_trigger = tk.Button(main, text="▶  MoveAbsolute  OFF  (%MX0.2)",
+        # Position trigger button
+        self.btn_trigger = tk.Button(main, text="▶  POSITION TRIGGER  (%MX0.2)",
                                       bg="#1a2a3a", fg=TEXT_DIM,
                                       relief=tk.FLAT, font=("Consolas", 11, "bold"),
                                       pady=7, padx=20, cursor="hand2",
                                       state=tk.DISABLED,
-                                      command=self._toggle_move)
+                                      command=self._pulse_move)
         self.btn_trigger.pack(pady=(4, 20))
 
         # Feedback
         fb = tk.Frame(main, bg=BG2, padx=20, pady=14, relief=tk.FLAT)
         fb.pack(fill=tk.X)
 
-        tk.Label(fb, text="Actual Position  (%MD2)", bg=BG2, fg=TEXT_DIM,
+        tk.Label(fb, text="Position Feedback  (%MD2)", bg=BG2, fg=TEXT_DIM,
                  font=("Consolas", 10)).pack()
         self.lbl_feedback = tk.Label(fb, text="—", bg=BG2, fg=GREEN,
                                       font=("Consolas", 28, "bold"))
@@ -246,11 +247,11 @@ class PositionApp(tk.Tk):
         canvas = tk.Canvas(parent, bg=BG, height=14, width=400,
                            highlightthickness=0, bd=0)
         canvas.pack()
-        for val in range(-100, 101, 10):
-            x = int((val + 100) / 200 * 400)
-            h = 8 if val % 50 == 0 else 4
+        for val in range(-10, 11, 1):
+            x = int((val + 10) / 20 * 400)
+            h = 8 if val % 5 == 0 else 4
             canvas.create_line(x, 0, x, h, fill=BORDER)
-            if val % 50 == 0:
+            if val % 5 == 0:
                 canvas.create_text(x, 13, text=str(val), fill=TEXT_DIM,
                                    font=("Consolas", 8), anchor="s")
 
@@ -341,24 +342,31 @@ class PositionApp(tk.Tk):
         else:
             self.btn_reset.config(text="RESET OFF", bg="#3a3a00", fg=YELLOW)
 
-    # ── MoveAbsolute toggle ───────────────────────────────────────────────────
+    # ── Position trigger ──────────────────────────────────────────────────────
 
-    def _toggle_move(self):
-        new_state = not self._move_on
+    def _pulse_move(self):
         name = self._names.get(TRIGGER_ADDR.upper())
         if not name:
             return
-        threading.Thread(target=self._do_write,
-                         args=(name, new_state, lambda: self._set_move_ui(new_state)),
-                         daemon=True).start()
+        threading.Thread(target=self._do_pulse_move, args=(name,), daemon=True).start()
+
+    def _do_pulse_move(self, name):
+        try:
+            self.client.write(name, True)
+            self.after(0, self._set_move_ui, True)
+            time.sleep(0.12)
+            self.client.write(name, False)
+            self.after(0, self._set_move_ui, False)
+        except Exception as e:
+            self.after(0, self._log, f"Write error: {e}")
 
     def _set_move_ui(self, on: bool):
         self._move_on = on
         if on:
-            self.btn_trigger.config(text="▶  MoveAbsolute  ON   (%MX0.2)",
+            self.btn_trigger.config(text="▶  POSITION TRIGGER  ACTIVE  (%MX0.2)",
                                     bg="#003a1a", fg=GREEN)
         else:
-            self.btn_trigger.config(text="▶  MoveAbsolute  OFF  (%MX0.2)",
+            self.btn_trigger.config(text="▶  POSITION TRIGGER  (%MX0.2)",
                                     bg="#1a2a3a", fg=TEXT_DIM)
 
     # ── Stream ────────────────────────────────────────────────────────────────
@@ -383,7 +391,7 @@ class PositionApp(tk.Tk):
         if fb_name and fb_name in flat:
             val = flat[fb_name]
             try:
-                self.lbl_feedback.config(text=f"{float(val):.4f}")
+                self.lbl_feedback.config(text=f"{float(val):.3f}")
             except Exception:
                 self.lbl_feedback.config(text=str(val))
 

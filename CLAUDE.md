@@ -262,6 +262,26 @@ Notes:
 - Trig typedefs uppercase (`SIN`, `COS`, `TAN`, etc.) to avoid libc conflict
 - `standardfunction.c`: GT_Call uses `GT *inst` (not `GT_BLOCK *inst`)
 
+### Adding or Removing Pins from a Block
+
+When adding or removing input/output pins from **any** standard FB (motion, HAL, standard library, etc.), **all five locations** must be updated together:
+
+| Location | What to change |
+|----------|---------------|
+| `KrontekLibraries/…/header.h` | Add/remove the field from the C struct (canonical source) |
+| `src-tauri/resources/*/include/header.h` | Sync — copy updated header to all 7–8 target directories |
+| `public/libraries/*.xml` | Add/remove the `<Variable>` entry under `<Inputs>` or `<Outputs>` |
+| `FB_INPUTS[type]` in `CTranspilerService.js` | Update the ordered input pin list (drives pre-call assignments) |
+| `FB_OUTPUTS[type]` in `CTranspilerService.js` | Update the output pin list (drives shadow var declaration + write-back) |
+
+**Rules:**
+- `FB_OUTPUTS` is the single source of truth for code generation — if a pin is NOT listed here, no shadow var is declared and no write-back code is emitted.
+- `FB_INPUTS` drives Step 1 input assignment. Any `data.values` entry whose key is not in `FB_INPUTS` is silently skipped (safe guard for stale project data).
+- Always verify pins against the PLCopen / vendor spec before adding them. Example: `MC_Stop` has **no** `Active` output per PLCopen TC2 v2.0 — only `Done, Busy, CommandAborted, Error, ErrorID`.
+- `MC_Halt`, `MC_MoveAbsolute`, etc. **do** have `Active`.
+- After removing a pin, existing projects may still have it in `data.values` — this is harmless because of the guard above.
+- The XML file controls what the LD editor UI shows to the user; the JS constants control what C code is generated. They must stay in sync.
+
 ### Toolbox 3-Level Hierarchy
 **`src/utils/libraryTree.js`** — `LIBRARY_TREE` static definition:
 - 9 top-level categories, each with subcategories

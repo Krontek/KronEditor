@@ -69,7 +69,6 @@
       <Outputs>
         <Variable name="Done"           type="BOOL" />
         <Variable name="Busy"           type="BOOL" />
-        <Variable name="Active"         type="BOOL" />
         <Variable name="CommandAborted" type="BOOL" />
         <Variable name="Error"          type="BOOL" />
         <Variable name="ErrorID"        type="WORD" />
