@@ -1,0 +1,62 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  KronCommunication — Error Code Catalog
+  Per-block error codes for industrial communication protocol function blocks.
+  ErrorCode field (uint8_t): 0 = no error, positive values = error codes.
+  MODBUS blocks also have ExceptionCode (uint8_t) for Modbus-specific exceptions.
+-->
+<error_codes library="KronCommunication">
+
+  <block type="MODBUS_RTU_MASTER">
+    <error code="1" name="ERR_TIMEOUT" text="No response from slave within Timeout period" />
+    <error code="2" name="ERR_CRC" text="CRC mismatch in received response" />
+    <error code="3" name="ERR_FRAME" text="Malformed response frame" />
+    <error code="4" name="ERR_EXCEPTION" text="Modbus exception received (check ExceptionCode)" />
+    <error code="5" name="ERR_OVERFLOW" text="Response data exceeds buffer capacity" />
+    <error code="7" name="ERR_HARDWARE" text="UART peripheral fault" />
+    <error code="8" name="ERR_BUSY" text="Previous request still pending" />
+    <error code="9" name="ERR_INVALID_PARAM" text="Invalid slave address, function code, or quantity" />
+  </block>
+
+  <block type="MODBUS_RTU_SLAVE">
+    <error code="2" name="ERR_CRC" text="CRC mismatch in received request" />
+    <error code="3" name="ERR_FRAME" text="Malformed request frame" />
+    <error code="5" name="ERR_OVERFLOW" text="Request data exceeds data model capacity" />
+    <error code="7" name="ERR_HARDWARE" text="UART peripheral fault" />
+    <error code="9" name="ERR_INVALID_PARAM" text="Invalid configuration parameters" />
+  </block>
+
+  <block type="MODBUS_TCP_CLIENT">
+    <error code="1" name="ERR_TIMEOUT" text="No response from server within Timeout period" />
+    <error code="3" name="ERR_FRAME" text="Malformed TCP response (MBAP header mismatch)" />
+    <error code="4" name="ERR_EXCEPTION" text="Modbus exception received (check ExceptionCode)" />
+    <error code="5" name="ERR_OVERFLOW" text="Response data exceeds buffer capacity" />
+    <error code="6" name="ERR_NOT_CONNECTED" text="TCP connection not established" />
+    <error code="7" name="ERR_HARDWARE" text="Network interface fault" />
+    <error code="8" name="ERR_BUSY" text="Previous request still pending" />
+    <error code="9" name="ERR_INVALID_PARAM" text="Invalid unit ID, function code, or quantity" />
+  </block>
+
+  <block type="MQTT_CLIENT">
+    <error code="1" name="ERR_TIMEOUT" text="Broker connection or publish timeout" />
+    <error code="5" name="ERR_OVERFLOW" text="Message payload exceeds buffer capacity" />
+    <error code="6" name="ERR_NOT_CONNECTED" text="MQTT broker not connected" />
+    <error code="7" name="ERR_HARDWARE" text="Network interface fault" />
+    <error code="9" name="ERR_INVALID_PARAM" text="Invalid topic, QoS, or broker address" />
+  </block>
+
+  <block type="CAN_NODE">
+    <error code="1" name="ERR_TIMEOUT" text="CAN message receive timeout" />
+    <error code="5" name="ERR_OVERFLOW" text="CAN TX/RX buffer overflow" />
+    <error code="7" name="ERR_HARDWARE" text="CAN bus hardware fault (bus-off, error passive)" />
+    <error code="9" name="ERR_INVALID_PARAM" text="Invalid CAN ID, DLC, or bus configuration" />
+  </block>
+
+  <block type="UART">
+    <error code="1" name="ERR_TIMEOUT" text="UART receive timeout" />
+    <error code="5" name="ERR_OVERFLOW" text="UART receive buffer overflow" />
+    <error code="7" name="ERR_HARDWARE" text="UART peripheral fault (framing, parity, overrun)" />
+    <error code="9" name="ERR_INVALID_PARAM" text="Invalid baud rate or port configuration" />
+  </block>
+
+</error_codes>

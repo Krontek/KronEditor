@@ -1,5 +1,6 @@
-import { useState, useRef, useEffect } from 'react';
+import { useState, useRef, useEffect, useCallback } from 'react';
 import ForceWriteModal from './common/ForceWriteModal';
+import { ErrorCodeService } from '../services/ErrorCodeService';
 
 const LOG_COLORS = {
     info:    '#c8c8c8',
@@ -392,6 +393,7 @@ const OutputPanel = ({
     liveVariables = null,
     isRunning = false,
     projectStructure = null,
+    errorCodeService = null,
 }) => {
     const [activeTab, setActiveTab] = useState('messages');
     const [forceModal, setForceModal] = useState(null);
@@ -400,6 +402,7 @@ const OutputPanel = ({
     const [hoveredLog, setHoveredLog] = useState(null);
     const [popupLog, setPopupLog] = useState(null);
     const [pickerOpen, setPickerOpen] = useState(false);
+    const [errorTooltip, setErrorTooltip] = useState(null);
     const logEndRef = useRef(null);
     const editInputRef = useRef(null);
     const addBtnRef = useRef(null);
@@ -758,7 +761,24 @@ const OutputPanel = ({
                                             <td style={{ padding: '3px 10px', color: isInvalid ? '#f14c4c' : '#b07040', whiteSpace: 'nowrap' }}>
                                                 {entry.varType || '—'}
                                             </td>
-                                            <td style={{ padding: '3px 10px' }}>
+                                            <td style={{ padding: '3px 10px', position: 'relative' }}
+                                                onMouseEnter={(e) => {
+                                                    if (!errorCodeService || !hasVal || isInvalid) return;
+                                                    const numVal = typeof val === 'number' ? val : parseInt(val);
+                                                    if (!numVal || numVal === 0) return;
+                                                    const errField = ErrorCodeService.getErrorFieldName(entry.displayName);
+                                                    if (!errField) return;
+                                                    const blockType = ErrorCodeService.resolveBlockType(entry.liveKey, errField, projectStructure);
+                                                    if (!blockType) return;
+                                                    const info = errorCodeService.lookup(blockType, numVal);
+                                                    if (!info) return;
+                                                    const rect = e.currentTarget.getBoundingClientRect();
+                                                    setErrorTooltip({ x: rect.left, y: rect.top - 4, text: `[${info.name}] ${info.text}`, entryId: entry.id });
+                                                }}
+                                                onMouseLeave={() => {
+                                                    if (errorTooltip?.entryId === entry.id) setErrorTooltip(null);
+                                                }}
+                                            >
                                                 <span style={{
                                                     color: isInvalid ? '#f14c4c' : hasVal ? '#4ec9b0' : '#3a3a3a',
                                                     fontWeight: hasVal && !isInvalid ? '700' : '400',
@@ -808,6 +828,31 @@ const OutputPanel = ({
                             </tbody>
                         </table>
                     )}
+                </div>
+            )}
+
+            {/* Error Code Tooltip */}
+            {errorTooltip && (
+                <div style={{
+                    position: 'fixed',
+                    left: errorTooltip.x,
+                    top: errorTooltip.y,
+                    transform: 'translateY(-100%)',
+                    background: '#2d2d2d',
+                    border: '1px solid #555',
+                    borderRadius: 4,
+                    padding: '5px 10px',
+                    color: '#f0a050',
+                    fontSize: 11,
+                    fontFamily: '"Consolas", "Cascadia Code", monospace',
+                    maxWidth: 400,
+                    zIndex: 9999,
+                    pointerEvents: 'none',
+                    boxShadow: '0 3px 12px rgba(0,0,0,0.5)',
+                    whiteSpace: 'pre-wrap',
+                    wordBreak: 'break-word',
+                }}>
+                    {errorTooltip.text}
                 </div>
             )}
 

@@ -27,6 +27,7 @@ import EnumTypeEditor from './components/EnumTypeEditor';
 import { useTranslation } from 'react-i18next';
 import { exportProjectToXml, importProjectFromXml } from './services/XmlService';
 import { libraryService } from './services/LibraryService'; // Import Service
+import { errorCodeService } from './services/ErrorCodeService';
 import { loadAllEsiDevices, saveEsiFile } from './services/EsiLibraryService';
 import { open, save, ask } from '@tauri-apps/plugin-dialog';
 import { readTextFile, writeTextFile } from '@tauri-apps/plugin-fs';
@@ -52,6 +53,10 @@ function App() {
   // Load ESI device library from ~/kroneditor/esi/ on startup
   useEffect(() => {
     loadAllEsiDevices().then(setEsiLibrary).catch(() => {});
+  }, []);
+
+  useEffect(() => {
+    errorCodeService.load().catch(err => console.warn('Error codes load failed:', err));
   }, []);
 
   useEffect(() => {
@@ -2100,6 +2105,7 @@ function App() {
                   liveVariables={liveVariables}
                   isRunning={isRunning}
                   projectStructure={projectStructure}
+                  errorCodeService={errorCodeService}
                 />
               </div>
 

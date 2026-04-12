@@ -13,7 +13,7 @@ All code must be written in English. Comments, variable names, function names, s
 - `src-tauri/target/release/resources/include/kronec.c` is a stale stub — never edit it.
 
 ### Communication
-When uncertain about requirements, architecture decisions, or implementation direction, **stop and ask** before proceeding.
+When uncertain about requirements, architecture decisions, or implementation direction, **always ask first** before proceeding. If you have questions, ask them **before** making any changes — never start implementing and ask later.
 
 ---
 

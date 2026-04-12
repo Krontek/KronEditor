@@ -1,0 +1,169 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  KronHAL — Error Code Catalog
+  Per-block error codes for Hardware Abstraction Layer function blocks.
+  ERR_ID field (int8_t): 0 = no error, positive values = error codes.
+  Channel-based blocks (PWM0, SPI0_Transfer, etc.) share the base block's error table.
+-->
+<error_codes library="KronHAL">
+
+  <block type="GPIO_Read">
+    <error code="1" name="ERR_INVALID_PIN" text="Invalid or unsupported GPIO pin number" />
+    <error code="3" name="ERR_IO" text="GPIO read I/O error" />
+  </block>
+
+  <block type="GPIO_Write">
+    <error code="1" name="ERR_INVALID_PIN" text="Invalid or unsupported GPIO pin number" />
+    <error code="3" name="ERR_IO" text="GPIO write I/O error" />
+  </block>
+
+  <block type="GPIO_SetMode">
+    <error code="1" name="ERR_INVALID_PIN" text="Invalid GPIO pin or unsupported mode" />
+    <error code="3" name="ERR_IO" text="GPIO mode set I/O error" />
+  </block>
+
+  <!-- PWM: channel-based (PWM0..PWM7 share HAL_PWM) -->
+  <block type="HAL_PWM">
+    <error code="1" name="ERR_INVALID_CHANNEL" text="Invalid or unsupported PWM channel index" />
+    <error code="3" name="ERR_IO" text="PWM hardware I/O error" />
+  </block>
+
+  <!-- SPI: channel-based (SPI0_Transfer..SPI3_Transfer share HAL_SPI) -->
+  <block type="HAL_SPI">
+    <error code="1" name="ERR_INVALID_CS" text="Invalid chip-select or SPI channel index" />
+    <error code="2" name="ERR_INIT" text="SPI device open failed" />
+    <error code="3" name="ERR_IO" text="SPI transfer I/O error" />
+  </block>
+
+  <!-- SPI Burst Transfer -->
+  <block type="HAL_SPI_BurstTransfer">
+    <error code="1" name="ERR_INVALID_PARAM" text="Invalid CS, mode, LEN, or NULL buffer" />
+    <error code="2" name="ERR_INIT" text="SPI device open failed" />
+    <error code="3" name="ERR_IO" text="SPI burst transfer I/O error" />
+  </block>
+
+  <!-- I2C Read: channel-based (I2C0_Read..I2C3_Read share HAL_I2C_Read) -->
+  <block type="HAL_I2C_Read">
+    <error code="1" name="ERR_INVALID_ADDR" text="Invalid I2C address or channel index" />
+    <error code="2" name="ERR_INIT" text="I2C bus open failed" />
+    <error code="3" name="ERR_IO" text="I2C read I/O error" />
+  </block>
+
+  <!-- I2C Write: channel-based -->
+  <block type="HAL_I2C_Write">
+    <error code="1" name="ERR_INVALID_ADDR" text="Invalid I2C address or channel index" />
+    <error code="2" name="ERR_INIT" text="I2C bus open failed" />
+    <error code="3" name="ERR_IO" text="I2C write I/O error" />
+  </block>
+
+  <!-- I2C Burst Read -->
+  <block type="HAL_I2C_BurstRead">
+    <error code="1" name="ERR_INVALID_PARAM" text="NULL buffer, invalid LEN, or bad I2C address" />
+    <error code="2" name="ERR_INIT" text="I2C bus open failed" />
+    <error code="3" name="ERR_IO" text="I2C burst read I/O error" />
+  </block>
+
+  <!-- I2C Burst Write -->
+  <block type="HAL_I2C_BurstWrite">
+    <error code="1" name="ERR_INVALID_PARAM" text="NULL buffer, invalid LEN, or bad I2C address" />
+    <error code="2" name="ERR_INIT" text="I2C bus open failed" />
+    <error code="3" name="ERR_IO" text="I2C burst write I/O error" />
+  </block>
+
+  <!-- UART Send: channel-based (UART0_Send..UART5_Send share HAL_UART_Send) -->
+  <block type="HAL_UART_Send">
+    <error code="1" name="ERR_INVALID_PORT" text="Invalid or disabled UART port" />
+    <error code="2" name="ERR_INIT" text="UART port open failed" />
+    <error code="3" name="ERR_IO" text="UART send I/O error" />
+  </block>
+
+  <!-- UART Receive: channel-based -->
+  <block type="HAL_UART_Receive">
+    <error code="1" name="ERR_INVALID_PORT" text="Invalid or disabled UART port" />
+    <error code="2" name="ERR_INIT" text="UART port open failed" />
+    <error code="3" name="ERR_IO" text="UART receive I/O error or timeout" />
+  </block>
+
+  <!-- USB Send: channel-based (USB0_Send..USB4_Send share HAL_USB_Send) -->
+  <block type="HAL_USB_Send">
+    <error code="1" name="ERR_INVALID_PORT" text="Invalid or disabled USB port" />
+    <error code="2" name="ERR_INIT" text="USB port open failed" />
+    <error code="3" name="ERR_IO" text="USB send I/O error" />
+  </block>
+
+  <!-- USB Receive: channel-based -->
+  <block type="HAL_USB_Receive">
+    <error code="1" name="ERR_INVALID_PORT" text="Invalid or disabled USB port" />
+    <error code="2" name="ERR_INIT" text="USB port open failed" />
+    <error code="3" name="ERR_IO" text="USB receive I/O error or timeout" />
+  </block>
+
+  <!-- ADC Read: channel-based (ADC0_Read..ADC6_Read share HAL_ADC_Read) -->
+  <block type="HAL_ADC_Read">
+    <error code="1" name="ERR_INVALID_CHANNEL" text="Invalid or unsupported ADC channel" />
+    <error code="3" name="ERR_IO" text="ADC read hardware error" />
+  </block>
+
+  <!-- CAN Send: channel-based (CAN0_Send..CAN1_Send share HAL_CAN_Send) -->
+  <block type="HAL_CAN_Send">
+    <error code="1" name="ERR_INVALID_BUS" text="Invalid CAN bus index" />
+    <error code="2" name="ERR_INIT" text="CAN device open failed" />
+    <error code="3" name="ERR_IO" text="CAN send I/O error" />
+  </block>
+
+  <!-- CAN Receive: channel-based -->
+  <block type="HAL_CAN_Receive">
+    <error code="1" name="ERR_INVALID_BUS" text="Invalid CAN bus index" />
+    <error code="2" name="ERR_INIT" text="CAN device open failed" />
+    <error code="3" name="ERR_IO" text="CAN receive I/O error" />
+  </block>
+
+  <!-- PRU Execute: channel-based -->
+  <block type="HAL_PRU_Execute">
+    <error code="1" name="ERR_INVALID_PRU" text="Invalid PRU unit index" />
+    <error code="2" name="ERR_INIT" text="PRU device open failed" />
+    <error code="3" name="ERR_IO" text="PRU execution error" />
+  </block>
+
+  <!-- PCM Output (static) -->
+  <block type="PCM_Output">
+    <error code="1" name="ERR_INVALID_RATE" text="Invalid or unsupported sample rate" />
+    <error code="2" name="ERR_INIT" text="PCM device open failed" />
+    <error code="3" name="ERR_IO" text="PCM output I/O error" />
+  </block>
+
+  <!-- PCM Input (static) -->
+  <block type="PCM_Input">
+    <error code="1" name="ERR_INVALID_RATE" text="Invalid or unsupported sample rate" />
+    <error code="2" name="ERR_INIT" text="PCM device open failed" />
+    <error code="3" name="ERR_IO" text="PCM input I/O error" />
+  </block>
+
+  <!-- Grove Digital -->
+  <block type="Grove_DigitalRead">
+    <error code="1" name="ERR_INVALID_PORT" text="Invalid Grove port number" />
+    <error code="3" name="ERR_IO" text="Grove digital read hardware error" />
+  </block>
+
+  <block type="Grove_DigitalWrite">
+    <error code="1" name="ERR_INVALID_PORT" text="Invalid Grove port number" />
+    <error code="3" name="ERR_IO" text="Grove digital write hardware error" />
+  </block>
+
+  <block type="Grove_AnalogRead">
+    <error code="1" name="ERR_INVALID_PORT" text="Invalid Grove port number" />
+    <error code="3" name="ERR_IO" text="Grove analog read hardware error" />
+  </block>
+
+  <!-- Isolated Digital I/O -->
+  <block type="HAL_DI_Read">
+    <error code="1" name="ERR_INVALID_CHANNEL" text="Invalid isolated DI channel" />
+    <error code="3" name="ERR_IO" text="Isolated DI read hardware error" />
+  </block>
+
+  <block type="HAL_DO_Write">
+    <error code="1" name="ERR_INVALID_CHANNEL" text="Invalid isolated DO channel" />
+    <error code="3" name="ERR_IO" text="Isolated DO write hardware error" />
+  </block>
+
+</error_codes>
