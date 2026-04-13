@@ -2071,6 +2071,7 @@ function App() {
                           onForceWrite={isRunning ? handleForceWrite : null}
                           onAddToWatchTable={addToWatchTable}
                           hwPortVars={hwPortVars}
+                          errorCodeService={errorCodeService}
                         />
                       )}
                     </div>

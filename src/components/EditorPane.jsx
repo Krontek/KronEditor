@@ -24,6 +24,7 @@ const EditorPane = ({
   onForceWrite = null,
   onAddToWatchTable = null,
   hwPortVars = [],
+  errorCodeService = null,
 }) => {
   // --- STATE MANAGEMENT ---
   // We use separate state checks to ensure safety
@@ -744,6 +745,7 @@ const EditorPane = ({
             onForceWrite={onForceWrite}
             programType={fileType}
             hwPortVars={hwPortVars}
+            errorCodeService={errorCodeService}
           />
         ) : fileType === 'ST' ? (
           <div

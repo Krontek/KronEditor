@@ -270,7 +270,7 @@ const InsertZone = ({ onInsert, onPaste, canPaste, disabled }) => {
  * - When a rung moves, everything inside moves with it
  */
 
-const RungEditorNew = ({ variables, setVariables, rungs, setRungs, availableBlocks, globalVars = [], dataTypes = [], liveVariables = null, parentName = "", readOnly = false, onForceWrite = null, programType = 'LD', hwPortVars = [] }) => {
+const RungEditorNew = ({ variables, setVariables, rungs, setRungs, availableBlocks, globalVars = [], dataTypes = [], liveVariables = null, parentName = "", readOnly = false, onForceWrite = null, programType = 'LD', hwPortVars = [], errorCodeService = null }) => {
   // Undo/Redo history - each snapshot stores { rungs, variables } pair
   const historyRef = useRef([{
     rungs: JSON.parse(JSON.stringify(rungs)),
@@ -1275,6 +1275,7 @@ const RungEditorNew = ({ variables, setVariables, rungs, setRungs, availableBloc
                       readOnly={readOnly}
                       onForceWrite={onForceWrite}
                       hwPortVars={hwPortVars}
+                      errorCodeService={errorCodeService}
                       onFocusRung={() => {
                         if (readOnly) return;
                         selectedNodeRef.current = null;

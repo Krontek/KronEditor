@@ -520,7 +520,7 @@ const VariableManager = ({
                           if (dup) {
                             if (addrWarnTimer.current) clearTimeout(addrWarnTimer.current);
                             setAddrWarning(`"${formatted}" is already used by "${dup.name}"`);
-                            addrWarnTimer.current = setTimeout(() => setAddrWarning(null), 500);
+                            addrWarnTimer.current = setTimeout(() => setAddrWarning(null), 2000);
                             return;
                           }
                         }

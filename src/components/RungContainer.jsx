@@ -1,6 +1,7 @@
 import React, { useState, useCallback, useRef, useEffect } from 'react';
 import ForceWriteModal from './common/ForceWriteModal';
 import { formatTimeUs } from '../utils/plcStandards';
+import { ErrorCodeService } from '../services/ErrorCodeService';
 import ReactFlow, {
   ReactFlowProvider,
   addEdge,
@@ -443,7 +444,7 @@ const getSymbolPath = (type, subType) => {
 const BlockNode = ({ id, data, selected }) => {
   const { setNodes } = useReactFlow();
   const edges = useEdges();
-  const { variables = [], globalVars = [], dataTypes = [], liveVariables = null } = data; // Receive vars from data context
+  const { variables = [], globalVars = [], dataTypes = [], liveVariables = null, errorCodeService = null } = data; // Receive vars from data context
 
   // Build map of array type names → their definitions for validation
   const arrayTypeMap = React.useMemo(() => {
@@ -1133,27 +1134,38 @@ const BlockNode = ({ id, data, selected }) => {
                     transition: 'transform 0.2s ease'
                   }}>
                     {/* Live value badge (simulation mode) - Positioned above the input if a variable is assigned, or in place of it if not */}
-                    {(lv && (!val || outVarDef)) && (
-                      <span style={{
-                        position: 'absolute',
-                        top: val ? -15 : 0, // Move above if there is text, otherwise overlay
-                        left: 0,
-                        minWidth: 36,
-                        fontSize: 9,
-                        background: hasLive ? 'rgba(0,230,118,0.12)' : 'transparent',
-                        border: `1px solid ${hasLive ? 'rgba(0,230,118,0.4)' : '#444'}`,
-                        color: hasLive ? '#00e676' : '#555',
-                        padding: '0px 3px',
-                        borderRadius: 2,
-                        fontFamily: 'Consolas, monospace',
-                        textAlign: 'center',
-                        pointerEvents: 'none',
-                        zIndex: 10,
-                        whiteSpace: 'nowrap'
-                      }}>
-                        {hasLive ? liveDisplay : '---'}
-                      </span>
-                    )}
+                    {(lv && (!val || outVarDef)) && (() => {
+                      const isErrorPin = ErrorCodeService.getErrorFieldName(pin.name) !== null;
+                      const numericVal = hasLive ? Number(outLiveVal) : 0;
+                      const errInfo = (isErrorPin && errorCodeService && numericVal !== 0)
+                        ? errorCodeService.lookup(data.type, numericVal)
+                        : null;
+                      const isError = isErrorPin && numericVal !== 0;
+                      return (
+                        <span
+                          title={errInfo ? `[${errInfo.name}] ${errInfo.text}` : undefined}
+                          style={{
+                            position: 'absolute',
+                            top: val ? -15 : 0,
+                            left: 0,
+                            minWidth: 36,
+                            fontSize: 9,
+                            background: isError ? 'rgba(255,23,68,0.15)' : (hasLive ? 'rgba(0,230,118,0.12)' : 'transparent'),
+                            border: `1px solid ${isError ? 'rgba(255,23,68,0.5)' : (hasLive ? 'rgba(0,230,118,0.4)' : '#444')}`,
+                            color: isError ? '#ff1744' : (hasLive ? '#00e676' : '#555'),
+                            padding: '0px 3px',
+                            borderRadius: 2,
+                            fontFamily: 'Consolas, monospace',
+                            textAlign: 'center',
+                            pointerEvents: errInfo ? 'auto' : 'none',
+                            zIndex: 10,
+                            whiteSpace: 'nowrap',
+                            cursor: errInfo ? 'help' : 'default'
+                          }}>
+                          {hasLive ? liveDisplay : '---'}
+                        </span>
+                      );
+                    })()}
 
                     <input
                       type="text"
@@ -1241,6 +1253,7 @@ const RungContainer = ({
   hwPortVars = [],
   isFocused = false,
   onFocusRung,
+  errorCodeService = null,
 
 }) => {
   const containerRef = useRef(null);
@@ -1355,13 +1368,14 @@ const RungContainer = ({
           liveVariables: liveVariables, // Pass online mode data mapping
           parentName: parentName,
           readOnly: readOnly,
-          hwPortVars: hwPortVars
+          hwPortVars: hwPortVars,
+          errorCodeService: errorCodeService
         },
         draggable: !readOnly,
         selected: !!selectedMap[block.id],
       };
     });
-  }, [getBlockHeight, variables, globalVars, dataTypes, parentName, readOnly, hwPortVars]);
+  }, [getBlockHeight, variables, globalVars, dataTypes, parentName, readOnly, hwPortVars, errorCodeService]);
 
   const [nodes, setNodes, onNodesChange] = useNodesState([
     ...createTerminalNodes(containerWidth),
