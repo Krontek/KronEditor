@@ -753,7 +753,37 @@ fn get_standard_headers(app: tauri::AppHandle) -> Result<Vec<(String, String)>, 
 // update_libraries
 // ---------------------------------------------------------------------------
 
-
+/// Copy every file from `src` into `dst`, preserving relative structure.
+/// Only overwrites files that differ (by size) to avoid unnecessary writes.
+/// Does NOT delete files in `dst` that no longer exist in `src`.
+fn sync_dir_from_clone(src: &Path, dst: &Path, app: &tauri::AppHandle) {
+    if let Ok(entries) = fs::read_dir(src) {
+        for entry in entries.flatten() {
+            let src_path = entry.path();
+            let name = entry.file_name();
+            if src_path.is_dir() {
+                let dst_sub = dst.join(&name);
+                let _ = fs::create_dir_all(&dst_sub);
+                sync_dir_from_clone(&src_path, &dst_sub, app);
+            } else {
+                let dst_path = dst.join(&name);
+                // Skip binary / build artifacts; only sync source and headers
+                let ext = src_path.extension().and_then(|e| e.to_str()).unwrap_or("");
+                if !matches!(ext, "c" | "h" | "cpp" | "hpp" | "txt" | "md" | "cmake" | "xml") {
+                    continue;
+                }
+                let needs_copy = dst_path.metadata().map(|m| m.len()).ok()
+                    != src_path.metadata().map(|m| m.len()).ok();
+                if needs_copy {
+                    if let Err(e) = fs::copy(&src_path, &dst_path) {
+                        let _ = app.emit("library-update-progress",
+                            format!("  WARN: sync {} → {}: {}", src_path.display(), dst_path.display(), e));
+                    }
+                }
+            }
+        }
+    }
+}
 
 fn find_files_with_ext(dir: &Path, ext: &str) -> Vec<PathBuf> {
     let mut result = Vec::new();
@@ -839,58 +869,42 @@ fn do_update_libraries(app: &tauri::AppHandle, repos: Vec<String>) -> Result<(),
     let local_libs_base: Option<PathBuf> = find_src_tauri_dir()
         .and_then(|st| st.parent()?.parent().map(|d| d.join("KrontekLibraries")));
 
-    // --- Clone all repos, gather headers and sources ---
+    // --- Clone all repos from GitHub, gather headers and sources ---
+    // Always clone fresh from GitHub so the build always uses the latest
+    // published source. Local KrontekLibraries/ edits are NOT picked up here;
+    // this guarantees a clean, reproducible build.
     let mut repo_sources: Vec<(String, PathBuf)> = Vec::new(); // (lib_name, c_file)
     let mut cloned_dirs:  Vec<PathBuf>            = Vec::new();
 
     for repo_name in &repos {
-        // Prefer local KrontekLibraries/<RepoName> over GitHub clone so that
-        // uncommitted local edits are picked up immediately.
-        let local_dir = local_libs_base.as_ref().map(|b| b.join(repo_name));
-        let source_dir: PathBuf = if let Some(ref ld) = local_dir {
-            if ld.is_dir() {
+        let clone_dir = temp_base.join(repo_name);
+        let repo_url  = format!("https://github.com/Krontek/{}.git", repo_name);
+        let _ = app.emit("library-update-progress",
+            format!("[{}] Cloning from GitHub...", repo_name));
+        let clone_out = std::process::Command::new("git")
+            .args(["clone", "--depth=1", "--quiet", &repo_url])
+            .arg(&clone_dir)
+            .output()
+            .map_err(|e| format!("git not found: {}", e))?;
+        if !clone_out.status.success() {
+            let msg = format!("[{}] Clone failed: {}", repo_name,
+                String::from_utf8_lossy(&clone_out.stderr).trim());
+            let _ = app.emit("library-update-progress", format!("ERROR: {}", msg));
+            errors.push(msg);
+            continue;
+        }
+
+        // After cloning, sync the local KrontekLibraries/<RepoName> directory
+        // so that local source files stay up-to-date with the GitHub version.
+        if let Some(local_dir) = local_libs_base.as_ref().map(|b| b.join(repo_name)) {
+            if local_dir.is_dir() {
                 let _ = app.emit("library-update-progress",
-                    format!("[{}] Using local source: {}", repo_name, ld.display()));
-                ld.clone()
-            } else {
-                // Fall back to GitHub clone
-                let clone_dir = temp_base.join(repo_name);
-                let repo_url = format!("https://github.com/Krontek/{}.git", repo_name);
-                let _ = app.emit("library-update-progress", format!("[{}] Cloning from GitHub...", repo_name));
-                let clone_out = std::process::Command::new("git")
-                    .args(["clone", "--depth=1", "--quiet", &repo_url])
-                    .arg(&clone_dir)
-                    .output()
-                    .map_err(|e| format!("git not found: {}", e))?;
-                if !clone_out.status.success() {
-                    let msg = format!("[{}] Clone failed: {}", repo_name,
-                        String::from_utf8_lossy(&clone_out.stderr).trim());
-                    let _ = app.emit("library-update-progress", format!("ERROR: {}", msg));
-                    errors.push(msg);
-                    continue;
-                }
-                clone_dir
+                    format!("[{}] Syncing local KrontekLibraries/{}/...", repo_name, repo_name));
+                sync_dir_from_clone(&clone_dir, &local_dir, app);
             }
-        } else {
-            // No local base found — clone from GitHub
-            let clone_dir = temp_base.join(repo_name);
-            let repo_url = format!("https://github.com/Krontek/{}.git", repo_name);
-            let _ = app.emit("library-update-progress", format!("[{}] Cloning from GitHub...", repo_name));
-            let clone_out = std::process::Command::new("git")
-                .args(["clone", "--depth=1", "--quiet", &repo_url])
-                .arg(&clone_dir)
-                .output()
-                .map_err(|e| format!("git not found: {}", e))?;
-            if !clone_out.status.success() {
-                let msg = format!("[{}] Clone failed: {}", repo_name,
-                    String::from_utf8_lossy(&clone_out.stderr).trim());
-                let _ = app.emit("library-update-progress", format!("ERROR: {}", msg));
-                errors.push(msg);
-                continue;
-            }
-            clone_dir
-        };
-        let clone_dir = source_dir;
+        }
+
+        let clone_dir = clone_dir;
 
         // Copy .h files into all out_dirs' include/
         // KronHAL headers go into include/HAL/, all others go into include/ flat.
