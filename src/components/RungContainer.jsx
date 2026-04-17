@@ -1259,21 +1259,29 @@ const RungContainer = ({
   const containerRef = useRef(null);
   const [containerWidth, setContainerWidth] = React.useState(800);
 
+  // ── Virtual canvas scaling ──
+  // All block positions live in a virtual coordinate system of REFERENCE_WIDTH.
+  // ReactFlow zoom maps this virtual space to the actual container width.
+  const REFERENCE_WIDTH = 1200;
+
+  const scaleFactor = React.useMemo(() => {
+    return Math.max(containerWidth, 200) / REFERENCE_WIDTH;
+  }, [containerWidth]);
+
   // ── Rubber band selection state ──
-  const [rubberBand, setRubberBand] = useState(null); // { startX, startY, currentX, currentY }
+  const [rubberBand, setRubberBand] = useState(null); // { startX, startY, currentX, currentY } (in flow/virtual coords)
   const [rubberBandListening, setRubberBandListening] = useState(false); // triggers effect to attach listeners
   const rubberBandRef = useRef(null);
   const isRubberBandingRef = useRef(false);
 
-  // Rung bounds — recalculated when containerWidth changes
+  // Rung bounds — fixed in virtual coordinate system
   const RUNG_BOUNDS = React.useMemo(() => {
-    const safeWidth = Math.max(containerWidth, 200);
     return {
       minX: 30,
-      maxX: safeWidth - 30,
-      height: 150 // Use constant logic
+      maxX: REFERENCE_WIDTH - 30,
+      height: 150
     };
-  }, [containerWidth]);
+  }, []);
 
   // Track container width
   React.useEffect(() => {
@@ -1291,6 +1299,12 @@ const RungContainer = ({
   const LEFT_LINE_X = 12;
   const MIN_RUNG_HEIGHT = 150;
 
+  // Helper to get block width in virtual coords
+  const getBlockWidth = useCallback((type) => {
+    if (type === 'Contact' || type === 'Coil') return 27;
+    return 140;
+  }, []);
+
   // Helper to calculate block height (no cap — rung expands to fit)
   // customData is passed for HAL/board blocks whose pins aren't in blockConfig.
   const getBlockHeight = useCallback((type, customData) => {
@@ -1307,20 +1321,21 @@ const RungContainer = ({
     return 46 + (rows * 30);
   }, []);
 
-  // Dynamic rung height: expand to fit the tallest block (+ 20px padding)
+  // Dynamic rung height: expand to fit the bottom edge of the lowest block
   const RUNG_HEIGHT = React.useMemo(() => {
-    const maxBlock = rung.blocks.reduce((max, b) => {
-      return Math.max(max, getBlockHeight(b.data?.type || b.type, b.data?.customData));
+    const maxBottomEdge = rung.blocks.reduce((max, b) => {
+      const bh = getBlockHeight(b.data?.type || b.type, b.data?.customData);
+      const bottomY = (b.position?.y || 0) + bh;
+      return Math.max(max, bottomY);
     }, 0);
-    return Math.max(MIN_RUNG_HEIGHT, maxBlock + 20);
+    return Math.max(MIN_RUNG_HEIGHT, maxBottomEdge + 20);
   }, [rung.blocks, getBlockHeight]);
 
   const MIDDLE_Y = RUNG_HEIGHT / 2;
 
-  const createTerminalNodes = useCallback((width) => {
-    const safeWidth = Math.max(width, 200);
-    // Right Rail Center: width - 10px (margin) - 2px (half line width) = width - 12
-    const rightLineX = safeWidth - 12;
+  const createTerminalNodes = useCallback(() => {
+    // Terminal positions in virtual coordinate system (REFERENCE_WIDTH)
+    const rightLineX = REFERENCE_WIDTH - 12;
 
     return [
       {
@@ -1345,6 +1360,14 @@ const RungContainer = ({
   }, [LEFT_LINE_X, MIDDLE_Y]);
 
   const mapBlocksToNodes = useCallback((blocks, selectedMap = {}, draggingMap = {}, prevNodes = []) => {
+    // Legacy normalization: if any block exceeds REFERENCE_WIDTH bounds,
+    // proportionally scale all X positions to fit within the virtual canvas.
+    const maxBlockX = blocks.length > 0
+      ? Math.max(...blocks.map(b => (b.position?.x || 0) + (b.type === 'Contact' || b.type === 'Coil' || b.data?.type === 'Contact' || b.data?.type === 'Coil' ? 27 : 140)))
+      : 0;
+    const needsNormalization = maxBlockX > REFERENCE_WIDTH - 20;
+    const normalizeScale = needsNormalization ? (REFERENCE_WIDTH - 50) / maxBlockX : 1;
+
     return blocks.map(block => {
       // If node is currently being dragged, preserve its local state completely
       if (draggingMap[block.id]) {
@@ -1352,20 +1375,28 @@ const RungContainer = ({
         if (prev) return prev;
       }
 
+      // Apply normalization to position if needed
+      const position = needsNormalization
+        ? {
+            x: Math.max(RUNG_BOUNDS.minX, Math.round((block.position?.x || 0) * normalizeScale / 10) * 10),
+            y: block.position?.y || 0
+          }
+        : (block.position || { x: 30, y: 0 });
+
       return {
         id: block.id,
         type: 'blockNode',
-        position: block.position,
+        position,
         data: {
           ...block.data,
           type: block.data.label || block.type,
           values: block.data.values || {},
           onUpdate: (id, val) => onUpdateBlockRef.current(id, val),
           onForceWrite: (key, val) => onForceWriteRef.current?.(key, val),
-          variables: variables, // Pass to node data
-          globalVars: globalVars, // Pass to node data
+          variables: variables,
+          globalVars: globalVars,
           dataTypes: dataTypes,
-          liveVariables: liveVariables, // Pass online mode data mapping
+          liveVariables: liveVariables,
           parentName: parentName,
           readOnly: readOnly,
           hwPortVars: hwPortVars,
@@ -1375,10 +1406,10 @@ const RungContainer = ({
         selected: !!selectedMap[block.id],
       };
     });
-  }, [getBlockHeight, variables, globalVars, dataTypes, parentName, readOnly, hwPortVars, errorCodeService]);
+  }, [getBlockHeight, variables, globalVars, dataTypes, parentName, readOnly, hwPortVars, errorCodeService, RUNG_BOUNDS]);
 
   const [nodes, setNodes, onNodesChange] = useNodesState([
-    ...createTerminalNodes(containerWidth),
+    ...createTerminalNodes(),
     ...mapBlocksToNodes(rung.blocks)
   ]);
 
@@ -1411,17 +1442,30 @@ const RungContainer = ({
     return () => window.removeEventListener('keydown', handleKeyDown);
   }, [nodes, liveVariables, parentName, onForceWrite]);
 
-  // Wrap onNodesChange to add position control
+  // Wrap onNodesChange to clamp block positions inside the rung
   const handleNodesChange = useCallback((changes) => {
     const constrainedChanges = changes.map(change => {
       // Leave terminal nodes unchanged
       if (change.id === 'terminal_left_middle' || change.id === 'terminal_right_middle') {
         return change;
       }
+      // Clamp position changes (during drag) to keep blocks fully inside rung bounds
+      if (change.type === 'position' && change.position) {
+        // Look up block type to get its dimensions
+        const block = rung.blocks.find(b => b.id === change.id);
+        const blockType = block?.data?.label || block?.data?.type || block?.type || 'Contact';
+        const bw = getBlockWidth(blockType);
+        const bh = getBlockHeight(blockType, block?.data?.customData);
+        const maxX = RUNG_BOUNDS.maxX - bw;
+        const maxY = Math.max(0, RUNG_HEIGHT - bh);
+        const x = Math.max(RUNG_BOUNDS.minX, Math.min(maxX, change.position.x));
+        const y = Math.max(0, Math.min(maxY, change.position.y));
+        return { ...change, position: { x, y } };
+      }
       return change;
     });
     onNodesChange(constrainedChanges);
-  }, [onNodesChange]);
+  }, [onNodesChange, RUNG_BOUNDS, rung.blocks, getBlockWidth, getBlockHeight, RUNG_HEIGHT]);
 
 
 
@@ -1532,11 +1576,11 @@ const RungContainer = ({
       }
 
       return [
-        ...createTerminalNodes(containerWidth),
+        ...createTerminalNodes(),
         ...mapBlocksToNodes(rung.blocks, selectedMap, draggingMap, prevNodes)
       ];
     });
-  }, [rung.blocks, setNodes, containerWidth, createTerminalNodes, mapBlocksToNodes]);
+  }, [rung.blocks, setNodes, createTerminalNodes, mapBlocksToNodes]);
 
   // Lightweight liveVariables update — only refreshes node.data.liveVariables without
   // rebuilding all nodes from scratch, preventing unnecessary block re-renders
@@ -1702,18 +1746,17 @@ const RungContainer = ({
   const { screenToFlowPosition, getNode, setViewport } = useReactFlow();
   const connectionEndPositionRef = useRef(null);
 
-  // Viewport'u sabit tut
+  // Keep viewport in sync with scale factor
   React.useEffect(() => {
-    setViewport({ x: 0, y: 0, zoom: 1 }, { duration: 0 });
-  }, [setViewport]);
+    setViewport({ x: 0, y: 0, zoom: scaleFactor }, { duration: 0 });
+  }, [setViewport, scaleFactor]);
 
 
 
   // Check proximity to power rails and snap connection to terminal node
   const checkAndSnapToTerminal = useCallback((connection, endPosition = null) => {
-    const safeWidth = Math.max(containerWidth, 200);
-    const RIGHT_LINE_X_CALC = safeWidth - 12;
-    const SNAP_THRESHOLD = 80;
+    const RIGHT_LINE_X_CALC = REFERENCE_WIDTH - 12;
+    const SNAP_THRESHOLD = 80; // in virtual coords — scales proportionally with zoom
 
     let finalConnection = { ...connection };
 
@@ -1785,12 +1828,12 @@ const RungContainer = ({
     }
 
     return finalConnection;
-  }, [getNode, containerWidth]);
+  }, [getNode]);
 
   const onConnectStart = useCallback((_event, _handles) => {
     connectionEndPositionRef.current = null;
-    setViewport({ x: 0, y: 0, zoom: 1 }, { duration: 0 });
-  }, [setViewport]);
+    setViewport({ x: 0, y: 0, zoom: scaleFactor }, { duration: 0 });
+  }, [setViewport, scaleFactor]);
 
   const onConnectEnd = useCallback((event) => {
     if (event && 'clientX' in event && 'clientY' in event) {
@@ -1857,18 +1900,19 @@ const RungContainer = ({
       y: event.clientY
     });
 
-    // Clamp drop position
-    const height = getBlockHeight(blockType);
+    // Clamp drop position accounting for block dimensions
+    const bw = getBlockWidth(blockType);
+    const bh = getBlockHeight(blockType);
 
-    // Strict Clamping to CURRENT height with Grid Snap Logic [10, 10]
-    const maxAllowedY = Math.max(0, RUNG_HEIGHT - height - 5);
+    // Strict Clamping with Grid Snap Logic [10, 10]
+    const maxAllowedY = Math.max(0, RUNG_HEIGHT - bh - 5);
     const maxGridY = Math.floor(maxAllowedY / 10) * 10;
 
-    // First calculate Raw Snap, then Clamp
     const rawSnappedY = Math.round(position.y / 10) * 10;
     const constrainedY = Math.max(0, Math.min(maxGridY, rawSnappedY));
 
-    const constrainedX = Math.max(RUNG_BOUNDS.minX, Math.min(RUNG_BOUNDS.maxX, position.x));
+    const maxAllowedX = RUNG_BOUNDS.maxX - bw;
+    const constrainedX = Math.max(RUNG_BOUNDS.minX, Math.min(maxAllowedX, position.x));
     const snappedX = Math.round(constrainedX / 10) * 10;
 
     const clampedPosition = {
@@ -1962,8 +2006,16 @@ const RungContainer = ({
 
   const onNodeDragStop = useCallback((_event, node) => {
     if (node.id === 'terminal_left_middle' || node.id === 'terminal_right_middle') return;
-    onUpdateBlockPosition(node.id, node.position);
-  }, [onUpdateBlockPosition]);
+    // Clamp final position accounting for block dimensions
+    const blockType = node.data?.type || node.data?.label || 'Contact';
+    const bw = getBlockWidth(blockType);
+    const bh = getBlockHeight(blockType, node.data?.customData);
+    const clampedPos = {
+      x: Math.max(RUNG_BOUNDS.minX, Math.min(RUNG_BOUNDS.maxX - bw, node.position.x)),
+      y: Math.max(0, Math.min(Math.max(0, RUNG_HEIGHT - bh), node.position.y))
+    };
+    onUpdateBlockPosition(node.id, clampedPos);
+  }, [onUpdateBlockPosition, RUNG_BOUNDS, getBlockWidth, getBlockHeight, RUNG_HEIGHT]);
 
   // ── Rubber Band Selection (Right-click drag) ──
   // Returns the bounding box of a node using its position and calculated dimensions
@@ -2048,14 +2100,15 @@ const RungContainer = ({
     const rect = containerRef.current?.getBoundingClientRect();
     if (!rect) return;
 
-    const startX = e.clientX - rect.left;
-    const startY = e.clientY - rect.top;
+    // Convert screen coords to virtual/flow coords
+    const startX = (e.clientX - rect.left) / scaleFactor;
+    const startY = (e.clientY - rect.top) / scaleFactor;
 
     // Store pending start, don't activate rubber band yet (wait for threshold)
     rubberBandPendingRef.current = { startX, startY, clientX: e.clientX, clientY: e.clientY };
     isRubberBandingRef.current = false;
     setRubberBandListening(true);
-  }, [readOnly]);
+  }, [readOnly, scaleFactor]);
 
   const handleRubberBandMouseMove = useCallback((e) => {
     // Check if we have a pending start but haven't crossed threshold yet
@@ -2082,8 +2135,9 @@ const RungContainer = ({
     const rect = containerRef.current?.getBoundingClientRect();
     if (!rect) return;
 
-    const currentX = e.clientX - rect.left;
-    const currentY = e.clientY - rect.top;
+    // Convert screen coords to virtual/flow coords
+    const currentX = (e.clientX - rect.left) / scaleFactor;
+    const currentY = (e.clientY - rect.top) / scaleFactor;
 
     const updatedBand = { ...rubberBandRef.current, currentX, currentY };
     rubberBandRef.current = updatedBand;
@@ -2091,7 +2145,7 @@ const RungContainer = ({
 
     // Real-time selection
     applyRubberBandSelection(updatedBand);
-  }, [applyRubberBandSelection, setNodes, onSelectBlock]);
+  }, [applyRubberBandSelection, setNodes, onSelectBlock, scaleFactor]);
 
   const handleRubberBandMouseUp = useCallback((_e) => {
     // If pending but never crossed threshold = just a click on empty space → deselect all
@@ -2137,17 +2191,17 @@ const RungContainer = ({
     }
   }, [rubberBandListening, handleRubberBandMouseMove, handleRubberBandMouseUp]);
 
-  // Compute rubber band visual rect
+  // Compute rubber band visual rect (convert flow coords back to screen coords for rendering)
   const rubberBandStyle = React.useMemo(() => {
     if (!rubberBand) return null;
     const { startX, startY, currentX, currentY } = rubberBand;
-    const left = Math.min(startX, currentX);
-    const top = Math.min(startY, currentY);
-    const width = Math.abs(currentX - startX);
-    const height = Math.abs(currentY - startY);
+    const left = Math.min(startX, currentX) * scaleFactor;
+    const top = Math.min(startY, currentY) * scaleFactor;
+    const width = Math.abs(currentX - startX) * scaleFactor;
+    const height = Math.abs(currentY - startY) * scaleFactor;
     const isRightToLeft = currentX < startX;
     return { left, top, width, height, isRightToLeft };
-  }, [rubberBand]);
+  }, [rubberBand, scaleFactor]);
 
   return (
     <div style={{
@@ -2260,7 +2314,7 @@ const RungContainer = ({
         onMouseDown={handleRubberBandMouseDown}
         style={{
           width: '100%',
-          height: RUNG_HEIGHT,
+          height: Math.ceil(RUNG_HEIGHT * scaleFactor),
           background: '#1e1e1e',
           position: 'relative',
           border: '1px dashed #444',
@@ -2269,10 +2323,10 @@ const RungContainer = ({
         }}
       // Handlers moved back to ReactFlow for better integration
       >
-        {/* Terminal Çizgileri Arka Planda */}
+        {/* Terminal lines — positioned proportionally to match virtual canvas */}
         <div style={{
           position: 'absolute',
-          left: 10,
+          left: Math.round(LEFT_LINE_X * scaleFactor - 2),
           top: 0,
           bottom: 0,
           width: 4,
@@ -2283,7 +2337,7 @@ const RungContainer = ({
 
         <div style={{
           position: 'absolute',
-          right: 10,
+          right: Math.round(12 * scaleFactor - 2),
           top: 0,
           bottom: 0,
           width: 4,
@@ -2334,8 +2388,8 @@ const RungContainer = ({
           onNodeDoubleClick={onNodeDoubleClick}
           snapToGrid={true}
           snapGrid={[10, 10]}
-          minZoom={1}
-          maxZoom={1}
+          minZoom={0.1}
+          maxZoom={5}
           fitView={false}
           attributionPosition="top-left"
           proOptions={{ hideAttribution: true }}
@@ -2355,7 +2409,7 @@ const RungContainer = ({
           nodesSelectable={true}
           deleteKeyCode={readOnly ? null : ['Backspace', 'Delete']}
           multiSelectionKeyCode={readOnly ? null : ['Meta', 'Ctrl']}
-          defaultViewport={{ x: 0, y: 0, zoom: 1 }}
+          defaultViewport={{ x: 0, y: 0, zoom: scaleFactor }}
         />
       </div>
     </div>

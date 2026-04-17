@@ -45,7 +45,52 @@ No proprietary runtime. No license fees. The compiled output is plain C.
 
 ## Getting Started
 
-**Prerequisites:** Node.js 18+, Rust stable, [Tauri v2 system deps](https://v2.tauri.app/start/prerequisites/)
+### Prerequisites
+
+#### Common (all platforms)
+
+| Tool | Version | Install |
+|---|---|---|
+| [Rust](https://rustup.rs/) | stable | `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \| sh` |
+| Node.js | 18+ | [nodejs.org](https://nodejs.org/) or your package manager |
+| Python | 3.8+ | used by `setup_toolchain.py` to download Clang + sysroots |
+
+#### Linux — system libraries (Tauri + WebKit)
+
+**Arch / CachyOS / Manjaro**
+```bash
+sudo pacman -S webkit2gtk-4.1 gtk3 libappindicator-gtk3 librsvg \
+               libxml2 base-devel curl wget file openssl patchelf
+```
+
+**Ubuntu / Debian**
+```bash
+sudo apt install libwebkit2gtk-4.1-dev libgtk-3-dev \
+                 libayatana-appindicator3-dev librsvg2-dev \
+                 libxml2-dev patchelf curl wget file libssl-dev build-essential
+```
+
+**Fedora**
+```bash
+sudo dnf install webkit2gtk4.1-devel gtk3-devel \
+                 libappindicator-gtk3-devel librsvg2-devel \
+                 libxml2-devel patchelf curl wget file openssl-devel
+```
+
+#### Windows
+
+- [Visual Studio Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/) with **Desktop development with C++** workload
+- WebView2 runtime — pre-installed on Windows 10 (1803+) and Windows 11; otherwise install from [microsoft.com](https://developer.microsoft.com/en-us/microsoft-edge/webview2/)
+
+#### macOS
+
+```bash
+xcode-select --install
+```
+
+---
+
+### Build
 
 ```bash
 git clone https://github.com/Krontek/KronEditor.git
@@ -60,7 +105,7 @@ npm run build:windows  # Windows installer (cross-compiled)
 npm run build          # All platforms
 ```
 
-Cross-compilation toolchains (LLVM/Clang, arm-none-eabi, aarch64-linux-gnu, MinGW) are downloaded automatically on first build.
+Cross-compilation toolchains (LLVM/Clang 21, arm-none-eabi, aarch64-linux-gnu, arm-linux-gnueabihf, MinGW sysroot) are downloaded automatically on first build via `setup_toolchain.py`. Subsequent builds skip the download if toolchains are already present.
 
 ## Architecture
 

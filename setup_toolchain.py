@@ -846,6 +846,53 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def patch_lld_libxml2(root: Path) -> None:
+    """On Linux, LLVM releases link ld.lld/lld-link against libxml2.so.2.
+    Modern distros (libxml2 >= 2.12) ship libxml2.so.16 instead.
+    Use patchelf to rewrite the NEEDED entry so the binaries load correctly."""
+    targets = ["ld.lld", "lld-link"]
+    old_soname = "libxml2.so.2"
+    new_soname = "libxml2.so.16"
+
+    # Only patch if the new soname actually exists on this system
+    import ctypes.util
+    if not ctypes.util.find_library("xml2"):
+        return
+    found_new = any(
+        Path(p).exists()
+        for p in ["/usr/lib/libxml2.so.16", "/usr/lib64/libxml2.so.16",
+                  "/lib/x86_64-linux-gnu/libxml2.so.16"]
+    )
+    if not found_new:
+        return
+
+    patchelf = shutil.which("patchelf")
+    if not patchelf:
+        log("WARN: patchelf not found — skipping libxml2 SONAME patch for ld.lld. "
+            "Install patchelf if linking fails with 'libxml2.so.2: cannot open shared object file'.")
+        return
+
+    for name in targets:
+        binary = root / "bin" / name
+        if not binary.exists():
+            continue
+        try:
+            import subprocess as _sp
+            result = _sp.run(
+                ["patchelf", "--print-needed", str(binary)],
+                capture_output=True, text=True,
+            )
+            if old_soname not in result.stdout:
+                continue
+            _sp.run(
+                ["patchelf", "--replace-needed", old_soname, new_soname, str(binary)],
+                check=True,
+            )
+            log(f"Patched {name}: {old_soname} → {new_soname}")
+        except Exception as exc:
+            log(f"WARN: could not patch {name}: {exc}")
+
+
 def main() -> int:
     args = parse_args()
     host_os, host_arch = detect_host(args.host)
@@ -902,6 +949,9 @@ def main() -> int:
             harvest_mingw_sysroot(root, cache_dir, args.force, args.force_download)
         if "simulation_env" in wanted:
             write_simulation_env(root, args.force)
+
+    if host_os == "linux":
+        patch_lld_libxml2(root)
 
     write_command_templates(root)
     write_manifest(root, host_os, host_arch)

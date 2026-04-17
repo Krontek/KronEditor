@@ -36,21 +36,32 @@ const SIM_BIN: &str = "simulation";
 // ---------------------------------------------------------------------------
 // Toolchain path helpers
 //
-// Layout (host-OS separated, no symlinks):
+// Layout (LLVM/Clang + sysroot harvest via setup_toolchain.py):
 //   toolchains/
-//     linux/
-//       aarch64-none-linux-gnu/   RPi 3/4/5/Zero2W + BB AI-64  (aarch64)
-//       arm-linux-gnueabihf/      BB Black/Green/AI              (armv7)
-//       arm-none-eabi/            RPi Pico/Pico W                (Cortex-M)
-//     windows/
-//       aarch64-none-linux-gnu/   same targets, Windows-hosted
-//       arm-linux-gnueabihf/      same
-//       arm-none-eabi/            same
-//       mingw/                    simulation on Windows (.dll)
+//     bin/         clang, llvm-ar, lld, ...
+//     lib/clang/   Clang resource dir (built-in headers)
+//     sysroots/
+//       arm-none-eabi/
+//       aarch64-linux-gnu/
+//       arm-linux-gnueabihf/
+//       x86_64-linux-gnu/
+//       x86_64-w64-mingw32/
+//       simulation_env/
 // ---------------------------------------------------------------------------
 
 /// Root directory for the LLVM/sysroot toolchain bundle.
+///
+/// In debug builds the toolchains live in `src-tauri/toolchains/` (the source
+/// tree) so we resolve them via CARGO_MANIFEST_DIR baked in at compile time.
+/// In release builds they are bundled as Tauri resources next to the binary.
 fn llvm_toolchain_dir(resource_dir: &Path) -> PathBuf {
+    #[cfg(debug_assertions)]
+    {
+        let dev = Path::new(env!("CARGO_MANIFEST_DIR")).join("toolchains");
+        if dev.exists() {
+            return dev;
+        }
+    }
     resource_dir.join("toolchains")
 }
 
@@ -2509,47 +2520,57 @@ fn do_build_soem(app: &tauri::AppHandle) -> Result<(), String> {
             let _ = app.emit("library-update-progress",
                 "[SOEM] ec_options.h generated via cmake".to_string());
         } else {
-            // cmake not available or generated file missing — write hardcoded defaults
-            // These match SOEM v2.0.0 CMakeLists.txt default values
+            // cmake not available or generated file missing — write hardcoded defaults.
+            // Values match SOEM v2.0.0 CMakeLists.txt defaults exactly.
+            // EC_BUFSIZE is intentionally (EC_MAXECATFRAME): that macro is defined
+            // in ec_type.h (included after ec_options.h), so the preprocessor
+            // resolves it lazily at the point of use — this matches what cmake generates.
             let default_content = "\
-/* ec_options.h — auto-generated defaults (cmake not available) */\n\
-#ifndef EC_OPTIONS_H\n\
-#define EC_OPTIONS_H\n\
+/* ec_options.h — generated defaults matching SOEM v2.0.0 CMakeLists.txt */\n\
+#ifndef _ec_options_\n\
+#define _ec_options_\n\
 \n\
-/** Maximum number of slaves */\n\
-#define EC_MAXSLAVE          200\n\
-/** Maximum number of groups */\n\
-#define EC_MAXGROUP          2\n\
-/** Maximum number of IO segments per group */\n\
-#define EC_MAXIOSEGMENTS     64\n\
-/** Maximum mailbox size */\n\
-#define EC_MAXMBX            0x400\n\
-/** Size of EEPROM bitmap */\n\
-#define EC_MAXEEPBITMAP      128\n\
-/** Size of EEPROM buffer */\n\
-#define EC_MAXEEPBUF         (EC_MAXEEPBITMAP * 2)\n\
-/** Maximum entries in Object Description list */\n\
-#define EC_MAXODLIST         1024\n\
-/** Maximum number of SyncManagers */\n\
-#define EC_MAXSM             8\n\
-/** Maximum number of FMMU entries */\n\
-#define EC_MAXFMMU           4\n\
-/** Maximum number of process data frames */\n\
-#define EC_MAXBUF            16\n\
-/** Maximum number of lost EtherCAT frames */\n\
-#define EC_MAXLOST           2\n\
-/** Maximum burst reads */\n\
-#define EC_MAXBURSTREADS     15\n\
-/** Timeout value for safe mode in microseconds */\n\
-#define EC_TIMEOUTSAFE       20000\n\
-/** Timeout return in microseconds */\n\
-#define EC_TIMEOUTRET        2000\n\
-/** Monitor timeout in ms */\n\
-#define EC_TIMEOUTMON        500\n\
-/** Log level (0=off, 3=verbose) */\n\
-#define EC_LOG_LEVEL         3\n\
+#ifdef __cplusplus\n\
+extern \"C\" {\n\
+#endif\n\
 \n\
-#endif /* EC_OPTIONS_H */\n";
+#define EC_BUFSIZE             (EC_MAXECATFRAME)\n\
+#define EC_MAXBUF              16\n\
+#define EC_MAXEEPBITMAP        128\n\
+#define EC_MAXEEPBUF           (EC_MAXEEPBITMAP << 5)\n\
+#define EC_LOGGROUPOFFSET      16\n\
+#define EC_MAXELIST            64\n\
+#define EC_MAXNAME             40\n\
+#define EC_MAXSLAVE            200\n\
+#define EC_MAXGROUP            2\n\
+#define EC_MAXIOSEGMENTS       64\n\
+#define EC_MAXMBX              1486\n\
+#define EC_MBXPOOLSIZE         32\n\
+#define EC_MAXEEPDO            0x200\n\
+#define EC_MAXSM               8\n\
+#define EC_MAXFMMU             4\n\
+#define EC_MAXLEN_ADAPTERNAME  128\n\
+#define EC_MAX_MAPT            1\n\
+#define EC_MAXODLIST           1024\n\
+#define EC_MAXOELIST           256\n\
+#define EC_SOE_MAXNAME         60\n\
+#define EC_SOE_MAXMAPPING      64\n\
+#define EC_TIMEOUTRET          2000\n\
+#define EC_TIMEOUTRET3         (EC_TIMEOUTRET * 3)\n\
+#define EC_TIMEOUTSAFE         20000\n\
+#define EC_TIMEOUTEEP          20000\n\
+#define EC_TIMEOUTTXM          20000\n\
+#define EC_TIMEOUTRXM          700000\n\
+#define EC_TIMEOUTSTATE        2000000\n\
+#define EC_DEFAULTRETRIES      3\n\
+#define EC_PRIMARY_MAC_ARRAY   {0x0101, 0x0101, 0x0101}\n\
+#define EC_SECONDARY_MAC_ARRAY {0x0404, 0x0404, 0x0404}\n\
+\n\
+#ifdef __cplusplus\n\
+}\n\
+#endif\n\
+\n\
+#endif /* _ec_options_ */\n";
             let _ = fs::write(&ec_options_dst, default_content);
             let _ = app.emit("library-update-progress",
                 "[SOEM] ec_options.h written with default values (cmake not found)".to_string());
