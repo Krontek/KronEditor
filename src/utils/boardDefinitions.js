@@ -1,7 +1,7 @@
 // Board definitions for KronEditor
 // Each board family contains variants with hardware specs and pinout data
 
-// Standard 40-pin Raspberry Pi GPIO Header (shared by Pi 3B, 3B+, 4B, 5, Zero 2W)
+// Standard 40-pin Raspberry Pi GPIO Header (shared by Pi 3B, 3B+, 4B, Zero 2W)
 const RPI_40PIN_HEADER = [
   { pin: 1,  name: '3V3',      type: 'power',  color: '#ff6b35' },
   { pin: 2,  name: '5V',       type: 'power',  color: '#ff0000' },
@@ -38,6 +38,56 @@ const RPI_40PIN_HEADER = [
   { pin: 33, name: 'GPIO13',   type: 'gpio',   alt: 'PWM1', color: '#4caf50' },
   { pin: 34, name: 'GND',      type: 'ground', color: '#333333' },
   { pin: 35, name: 'GPIO19',   type: 'gpio',   alt: 'PCM_FS / SPI1 MISO', color: '#4caf50' },
+  { pin: 36, name: 'GPIO16',   type: 'gpio',   alt: 'SPI1 CE2', color: '#4caf50' },
+  { pin: 37, name: 'GPIO26',   type: 'gpio',   alt: '', color: '#4caf50' },
+  { pin: 38, name: 'GPIO20',   type: 'gpio',   alt: 'SPI1 MOSI', color: '#4caf50' },
+  { pin: 39, name: 'GND',      type: 'ground', color: '#333333' },
+  { pin: 40, name: 'GPIO21',   type: 'gpio',   alt: 'SPI1 SCLK', color: '#4caf50' },
+];
+
+// Raspberry Pi 5 40-pin GPIO Header — RP1 I/O controller.
+// PWM: 2 logical channels (PWM0, PWM1). Each channel can be routed to
+// exactly one of two candidate GPIOs, so PWM0 is EITHER on GPIO12 OR on
+// GPIO18, and PWM1 is EITHER on GPIO13 OR on GPIO19 — never both at
+// once. The HAL picks the routing selected via /boot/firmware/config.txt
+// (dtoverlay=pwm-2chan). Pin labels list both candidates so the user can
+// see the options without implying simultaneous availability.
+const RPI5_40PIN_HEADER = [
+  { pin: 1,  name: '3V3',      type: 'power',  color: '#ff6b35' },
+  { pin: 2,  name: '5V',       type: 'power',  color: '#ff0000' },
+  { pin: 3,  name: 'GPIO2',    type: 'gpio',   alt: 'SDA1 (I2C)', color: '#4a90d9' },
+  { pin: 4,  name: '5V',       type: 'power',  color: '#ff0000' },
+  { pin: 5,  name: 'GPIO3',    type: 'gpio',   alt: 'SCL1 (I2C)', color: '#4a90d9' },
+  { pin: 6,  name: 'GND',      type: 'ground', color: '#333333' },
+  { pin: 7,  name: 'GPIO4',    type: 'gpio',   alt: 'GPCLK0', color: '#4caf50' },
+  { pin: 8,  name: 'GPIO14',   type: 'gpio',   alt: 'TXD (UART)', color: '#9c27b0' },
+  { pin: 9,  name: 'GND',      type: 'ground', color: '#333333' },
+  { pin: 10, name: 'GPIO15',   type: 'gpio',   alt: 'RXD (UART)', color: '#9c27b0' },
+  { pin: 11, name: 'GPIO17',   type: 'gpio',   alt: '', color: '#4caf50' },
+  { pin: 12, name: 'GPIO18',   type: 'gpio',   alt: 'PCM_CLK / PWM0 (alt)', color: '#4caf50' },
+  { pin: 13, name: 'GPIO27',   type: 'gpio',   alt: '', color: '#4caf50' },
+  { pin: 14, name: 'GND',      type: 'ground', color: '#333333' },
+  { pin: 15, name: 'GPIO22',   type: 'gpio',   alt: '', color: '#4caf50' },
+  { pin: 16, name: 'GPIO23',   type: 'gpio',   alt: '', color: '#4caf50' },
+  { pin: 17, name: '3V3',      type: 'power',  color: '#ff6b35' },
+  { pin: 18, name: 'GPIO24',   type: 'gpio',   alt: '', color: '#4caf50' },
+  { pin: 19, name: 'GPIO10',   type: 'gpio',   alt: 'MOSI (SPI0)', color: '#ff9800' },
+  { pin: 20, name: 'GND',      type: 'ground', color: '#333333' },
+  { pin: 21, name: 'GPIO9',    type: 'gpio',   alt: 'MISO (SPI0)', color: '#ff9800' },
+  { pin: 22, name: 'GPIO25',   type: 'gpio',   alt: '', color: '#4caf50' },
+  { pin: 23, name: 'GPIO11',   type: 'gpio',   alt: 'SCLK (SPI0)', color: '#ff9800' },
+  { pin: 24, name: 'GPIO8',    type: 'gpio',   alt: 'CE0 (SPI0)', color: '#ff9800' },
+  { pin: 25, name: 'GND',      type: 'ground', color: '#333333' },
+  { pin: 26, name: 'GPIO7',    type: 'gpio',   alt: 'CE1 (SPI0)', color: '#ff9800' },
+  { pin: 27, name: 'ID_SD',    type: 'special', alt: 'EEPROM SDA', color: '#607d8b' },
+  { pin: 28, name: 'ID_SC',    type: 'special', alt: 'EEPROM SCL', color: '#607d8b' },
+  { pin: 29, name: 'GPIO5',    type: 'gpio',   alt: '', color: '#4caf50' },
+  { pin: 30, name: 'GND',      type: 'ground', color: '#333333' },
+  { pin: 31, name: 'GPIO6',    type: 'gpio',   alt: '', color: '#4caf50' },
+  { pin: 32, name: 'GPIO12',   type: 'gpio',   alt: 'PWM0 (default)', color: '#4caf50' },
+  { pin: 33, name: 'GPIO13',   type: 'gpio',   alt: 'PWM1 (default)', color: '#4caf50' },
+  { pin: 34, name: 'GND',      type: 'ground', color: '#333333' },
+  { pin: 35, name: 'GPIO19',   type: 'gpio',   alt: 'PCM_FS / PWM1 (alt)', color: '#4caf50' },
   { pin: 36, name: 'GPIO16',   type: 'gpio',   alt: 'SPI1 CE2', color: '#4caf50' },
   { pin: 37, name: 'GPIO26',   type: 'gpio',   alt: '', color: '#4caf50' },
   { pin: 38, name: 'GPIO20',   type: 'gpio',   alt: 'SPI1 MOSI', color: '#4caf50' },
@@ -251,7 +301,7 @@ export const BOARD_FAMILIES = [
         gpio: 40,
         usb: '2x USB 3.0, 2x USB 2.0',
         display: '2x micro HDMI (4Kp60)',
-        pinout: RPI_40PIN_HEADER,
+        pinout: RPI5_40PIN_HEADER,
         pinLayout: 'rpi40',
         interfaces: ['GPIO', 'I2C', 'SPI', 'UART', 'PWM', 'PCM', 'USB'],
         usbPorts: [

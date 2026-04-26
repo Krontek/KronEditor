@@ -27,6 +27,22 @@ When uncertain about requirements, architecture decisions, or implementation dir
 
 ---
 
+## Build Output Location
+
+The compiled PLC artifacts (Build & Send target output) are written to:
+`~/.local/share/com.plceditor.app/build/`
+(absolute: `/home/fehim/.local/share/com.plceditor.app/build/`)
+
+Files generated there:
+- `plc.c` / `plc.h` — transpiled C output (CTranspilerService.js result)
+- `kron_hal.h` — auto-generated process image / HAL glue
+- `runtime.bin` — compiled binary (cross-compiled for the selected board family)
+- `variables.json` — symbol table for SHM offsets, addressed vars, password hashes
+
+Use this directory when verifying transpiler output or diagnosing runtime behavior.
+
+---
+
 ## Key Directories
 
 ```

@@ -15,8 +15,12 @@ const isPicoBoard = (boardId) => boardId?.startsWith('rpi_pico');
 
 const BOARD_CHANNELS = {
   // Raspberry Pi (full-size boards)
-  rpi_5:        { PWM: 4, SPI: 2, I2C: 2, UART: 5, USB: 4 },
-  rpi_4b:       { PWM: 4, SPI: 2, I2C: 2, UART: 5, USB: 4 },
+  // Pi 5 (RP1) has 4 physical PWM lines but only 2 routable channels —
+  // each channel (PWM0 / PWM1) drives exactly one GPIO at a time.
+  rpi_5:        { PWM: 2, SPI: 2, I2C: 2, UART: 5, USB: 4 },
+  // Pi 4 / BCM2711: 2 PWM channels (PWM0 on GPIO12/18, PWM1 on GPIO13/19),
+  // mutually exclusive per channel.
+  rpi_4b:       { PWM: 2, SPI: 2, I2C: 2, UART: 5, USB: 4 },
   rpi_3b_plus:  { PWM: 2, SPI: 2, I2C: 1, UART: 1, USB: 4 },
   rpi_3b:       { PWM: 2, SPI: 2, I2C: 1, UART: 1, USB: 4 },
   rpi_zero_2w:  { PWM: 2, SPI: 2, I2C: 1, UART: 1, USB: 1 },
@@ -49,9 +53,9 @@ const INTERFACE_BLOCKS = {
       {
         blockType: 'GPIO_Read',
         label: 'GPIO_Read',
-        desc: 'Read digital value from a GPIO pin',
+        desc: 'Read digital value from a GPIO pin (PIN = physical header pin, e.g. 11 = Pi GPIO17)',
         inputs: [
-          { name: 'PIN', type: 'INT', default: '0' },
+          { name: 'PIN', type: 'INT', default: '11' },
           { name: 'EN', type: 'BOOL', default: 'TRUE' },
         ],
         outputs: [
@@ -63,9 +67,9 @@ const INTERFACE_BLOCKS = {
       {
         blockType: 'GPIO_Write',
         label: 'GPIO_Write',
-        desc: 'Write digital value to a GPIO pin',
+        desc: 'Write digital value to a GPIO pin (PIN = physical header pin, e.g. 11 = Pi GPIO17)',
         inputs: [
-          { name: 'PIN', type: 'INT', default: '0' },
+          { name: 'PIN', type: 'INT', default: '11' },
           { name: 'VALUE', type: 'BOOL', default: 'FALSE' },
           { name: 'EN', type: 'BOOL', default: 'TRUE' },
         ],
@@ -78,10 +82,10 @@ const INTERFACE_BLOCKS = {
       {
         blockType: 'GPIO_SetMode',
         label: 'GPIO_SetMode',
-        desc: 'Configure GPIO pin as INPUT or OUTPUT',
+        desc: 'Configure GPIO pin as INPUT (MODE=0) or OUTPUT (MODE=1). PIN = physical header pin',
         inputs: [
-          { name: 'PIN', type: 'INT', default: '0' },
-          { name: 'MODE', type: 'INT', default: '0' },
+          { name: 'PIN', type: 'INT', default: '11' },
+          { name: 'MODE', type: 'INT', default: '1' },
           { name: 'EN', type: 'BOOL', default: 'TRUE' },
         ],
         outputs: [

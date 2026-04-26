@@ -4,6 +4,8 @@ import ForceWriteModal from './common/ForceWriteModal';
 import { useTranslation } from 'react-i18next';
 import { formatTimeUs } from '../utils/plcStandards';
 import { blockConfig } from './RungContainer';
+import { writeClipboard, readClipboard, useKronClipboard, CLIP_KIND } from '../utils/kronClipboard';
+import { setEditorScope, getEditorScope, EDITOR_SCOPE } from '../utils/editorScope';
 
 const ALL_CLASSES = ['Local', 'Global', 'Input', 'Output', 'InOut', 'Temp'];
 
@@ -240,6 +242,69 @@ const VariableManager = ({
     if (selectedId && onDelete) { onDelete(selectedId); setSelectedId(null); }
   };
 
+  // ── Cross-instance variable clipboard ─────────────────────────────────────
+  const clipboardEntry = useKronClipboard();
+  const canPasteVariable = clipboardEntry?.kind === CLIP_KIND.VARIABLE;
+
+  const copyVariable = (variable) => {
+    if (!variable) return;
+    writeClipboard(CLIP_KIND.VARIABLE, JSON.parse(JSON.stringify(variable)));
+  };
+
+  const uniqueVarName = (base) => {
+    const existing = new Set([...variables, ...globalVars].map(v => v.name));
+    const root = base.replace(/_copy\d*$/, '');
+    if (!existing.has(base)) return base;
+    let n = 1;
+    while (existing.has(`${root}_copy${n}`)) n++;
+    return `${root}_copy${n}`;
+  };
+
+  const pasteVariableAt = async (insertAfterIndex) => {
+    if (disabled || isSimulationMode) return;
+    const clip = await readClipboard();
+    if (!clip || clip.kind !== CLIP_KIND.VARIABLE || !onAdd) return;
+    const src = clip.payload;
+    const cls = allowedClasses.includes(src.class) ? src.class : (allowedClasses[0] || 'Local');
+    onAdd({
+      id: `${Date.now()}_${Math.random()}`,
+      name: uniqueVarName(src.name || 'Var0'),
+      class: cls,
+      type: src.type || 'BOOL',
+      initialValue: src.initialValue || '',
+      description: src.description || '',
+      // Address is a hardware-unique identifier — dropping it on paste
+      // prevents silent duplicate-address warnings.
+      address: '',
+    }, insertAfterIndex);
+  };
+
+  // Ctrl+C / Ctrl+V — scoped to the variable table so it does not race
+  // with sidebar or LD editor handlers on the shared OS clipboard.
+  useEffect(() => {
+    const handler = async (e) => {
+      if (!(e.ctrlKey || e.metaKey)) return;
+      const ae = document.activeElement;
+      if (ae && (
+        (ae.tagName === 'INPUT' && ae.type === 'text') ||
+        ae.tagName === 'TEXTAREA' ||
+        ae.closest?.('.monaco-editor')
+      )) return;
+      const scope = getEditorScope();
+      if (scope !== EDITOR_SCOPE.VARIABLES) return;
+      const key = e.key.toLowerCase();
+      if (key === 'c') {
+        const v = variables.find(x => x.id === selectedId);
+        if (v) { e.preventDefault(); copyVariable(v); }
+      } else if (key === 'v') {
+        e.preventDefault();
+        await pasteVariableAt(variables.length - 1);
+      }
+    };
+    window.addEventListener('keydown', handler);
+    return () => window.removeEventListener('keydown', handler);
+  }, [selectedId, variables, globalVars, allowedClasses, disabled, isSimulationMode, onAdd]);
+
   const validateAndSaveName = (id, newName) => {
     const trimmed = newName.trim();
     if (!trimmed) return;
@@ -372,7 +437,10 @@ const VariableManager = ({
   // ── Render ────────────────────────────────────────────────────────────────
 
   return (
-    <div style={{ height: '100%', display: 'flex', flexDirection: 'column', background: '#252526', borderBottom: '2px solid #007acc' }}>
+    <div
+      onMouseDown={() => setEditorScope(EDITOR_SCOPE.VARIABLES)}
+      style={{ height: '100%', display: 'flex', flexDirection: 'column', background: '#252526', borderBottom: '2px solid #007acc' }}
+    >
 
       {/* Table */}
       <div style={{ flex: 1, overflow: 'auto' }}>
@@ -644,12 +712,30 @@ const VariableManager = ({
           )}
           <div style={{ height: 1, background: '#444', margin: '2px 0' }} />
           <div
+            onClick={() => { copyVariable(ctxMenu.variable); setCtxMenu(null); }}
+            style={{ padding: '7px 14px', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 8 }}
+            onMouseEnter={e => e.currentTarget.style.background = '#3a3a3a'}
+            onMouseLeave={e => e.currentTarget.style.background = 'transparent'}
+          >
+            <span style={{ fontSize: 13 }}>📋</span> Copy Variable
+          </div>
+          {canPasteVariable && !disabled && !isSimulationMode && (
+            <div
+              onClick={() => { pasteVariableAt(variables.findIndex(v => v.id === ctxMenu.variable.id)); setCtxMenu(null); }}
+              style={{ padding: '7px 14px', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 8 }}
+              onMouseEnter={e => e.currentTarget.style.background = '#3a3a3a'}
+              onMouseLeave={e => e.currentTarget.style.background = 'transparent'}
+            >
+              <span style={{ fontSize: 13 }}>📄</span> Paste Variable
+            </div>
+          )}
+          <div
             onClick={() => { navigator.clipboard?.writeText(ctxMenu.variable.name); setCtxMenu(null); }}
             style={{ padding: '7px 14px', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 8 }}
             onMouseEnter={e => e.currentTarget.style.background = '#3a3a3a'}
             onMouseLeave={e => e.currentTarget.style.background = 'transparent'}
           >
-            <span style={{ fontSize: 13 }}>📋</span> Copy Name
+            <span style={{ fontSize: 13 }}>✍</span> Copy Name
           </div>
         </div>
       )}

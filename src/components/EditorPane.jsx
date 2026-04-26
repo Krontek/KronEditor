@@ -185,6 +185,7 @@ const EditorPane = ({
         // types
         'bool', 'int', 'uint', 'dint', 'udint', 'lint', 'ulint',
         'real', 'lreal', 'time', 'string', 'byte', 'word', 'dword', 'lword',
+        'sint', 'usint', 'pointer',
         // standard FBs
         'ton', 'tof', 'tp', 'tonr',
         'ctu', 'ctd', 'ctud',
@@ -197,38 +198,45 @@ const EditorPane = ({
         'max', 'min', 'limit', 'sel', 'mux', 'move',
         // standard functions — comparison
         'gt', 'ge', 'eq', 'ne', 'le', 'lt',
-        // standard functions — conversion
-        'byte_to_uint', 'byte_to_int', 'byte_to_dint', 'byte_to_real',
-        'int_to_real', 'real_to_int', 'dint_to_real', 'real_to_dint',
-        'uint_to_real', 'real_to_uint', 'lint_to_real', 'real_to_lint',
-        'bool_to_int', 'int_to_bool', 'bool_to_uint', 'uint_to_bool',
+        // standard functions — range / scaling
         'norm_x', 'scale_x',
-        'int_to_uint', 'uint_to_int', 'dint_to_int', 'int_to_dint',
-        'uint_to_dint', 'dint_to_uint', 'lint_to_dint', 'dint_to_lint',
-        'uint_to_lint', 'int_to_lint', 'word_to_uint', 'uint_to_word',
-        'dword_to_udint', 'udint_to_dword',
+        // pointer / address-of helpers
+        'adr', 'null',
         // HAL block types (used as FB instance type names in expressions)
         'uart_receive', 'uart_send', 'usb_receive', 'usb_send',
+        'i2c_writeread', 'spi_transfer',
       ]);
 
+      // IEC 61131-3 type-conversion functions are stateless and inlined by the
+      // transpiler (DINT_TO_BYTE → KRON_INT32_TO_BYTE). Validator should accept
+      // any TYPE_TO_TYPE pair without listing all 90+ combinations.
+      const TYPE_NAMES = '(?:BOOL|BYTE|WORD|DWORD|LWORD|SINT|USINT|INT|UINT|DINT|UDINT|LINT|ULINT|REAL|LREAL)';
+      const conversionPattern = new RegExp(`^${TYPE_NAMES}_TO_${TYPE_NAMES}$`, 'i');
+
       lines.forEach((rawLine, i) => {
-        // Strip single-line comments before scanning
-        const line = rawLine.replace(/\/\/.*$/, '').replace(/\(\*.*?\*\)/g, '');
+        // Strip single-line comments and IEC typed-radix integer literals
+        // (16#FE, 2#1010, 8#777) before scanning. Replace with same-length
+        // spaces so column numbers in markers remain accurate.
+        const line = rawLine
+          .replace(/\/\/.*$/, '')
+          .replace(/\(\*.*?\*\)/g, '')
+          .replace(/\b\d+#[0-9A-Fa-f_]+\b/g, m => ' '.repeat(m.length));
         const regex = /\b[a-zA-Z_][a-zA-Z0-9_]*\b/g;
         let match;
         while ((match = regex.exec(line)) !== null) {
           if (match.index > 0 && line[match.index - 1] === '.') continue;
           const word = match[0];
-          if (!allowedLower.has(word.toLowerCase()) && isNaN(word)) {
-            markers.push({
-              severity: monacoInstance.MarkerSeverity.Error,
-              message: `Undefined identifier: '${word}'`,
-              startLineNumber: i + 1,
-              startColumn: match.index + 1,
-              endLineNumber: i + 1,
-              endColumn: match.index + 1 + word.length
-            });
-          }
+          if (allowedLower.has(word.toLowerCase())) continue;
+          if (conversionPattern.test(word)) continue;
+          if (!isNaN(word)) continue;
+          markers.push({
+            severity: monacoInstance.MarkerSeverity.Error,
+            message: `Undefined identifier: '${word}'`,
+            startLineNumber: i + 1,
+            startColumn: match.index + 1,
+            endLineNumber: i + 1,
+            endColumn: match.index + 1 + word.length
+          });
         }
       });
       monacoInstance.editor.setModelMarkers(model, 'owner', markers);
@@ -244,7 +252,7 @@ const EditorPane = ({
           ...globalVars.map(v => v.name)
         ]);
 
-        lines.forEach((line) => {
+        lines.forEach((line, i) => {
           const regex = /\b[a-zA-Z_][a-zA-Z0-9_]*\b/g;
           let match;
           while ((match = regex.exec(line)) !== null) {

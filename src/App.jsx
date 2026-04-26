@@ -1522,7 +1522,10 @@ function App() {
     });
   };
 
-  // Paste a sidebar item (deep-copied) at a given index within a category
+  // Paste a sidebar item (deep-copied) at a given index within a category.
+  // When the payload carries a `_globalsBundle` (POU copied from another
+  // editor instance), merge any missing globals into the resources table
+  // so the pasted POU keeps compiling against the expected symbols.
   const handlePasteItem = (category, newItem, insertIndex) => {
     // Ensure unique name
     const existingNames = new Set(projectStructure[category].map(i => i.name));
@@ -1532,7 +1535,9 @@ function App() {
       name = `${newItem.name.replace(/_copy\d*$/, '')}_copy${counter}`;
       counter++;
     }
-    const item = { ...newItem, name };
+    const { _globalsBundle, ...rest } = newItem;
+    const item = { ...rest, name };
+    const mergedGlobalNames = [];
     setProjectStructure(prev => {
       const items = [...prev[category]];
       if (insertIndex !== null && insertIndex !== undefined && insertIndex >= 0 && insertIndex <= items.length) {
@@ -1540,11 +1545,38 @@ function App() {
       } else {
         items.push(item);
       }
-      return { ...prev, [category]: items };
+      const next = { ...prev, [category]: items };
+
+      if (Array.isArray(_globalsBundle) && _globalsBundle.length > 0) {
+        const resources = (prev.resources || []).map(r => {
+          if (r.type !== 'RESOURCE_EDITOR') return r;
+          const existing = r.content?.globalVars || [];
+          const existingByName = new Map(existing.map(v => [v.name, v]));
+          const toAdd = [];
+          _globalsBundle.forEach(g => {
+            if (!g || !g.name) return;
+            const match = existingByName.get(g.name);
+            // Only add when missing. When a global with the same name
+            // already exists we keep the destination project's copy,
+            // even if the type differs, to avoid silently overwriting.
+            if (!match) {
+              toAdd.push({ ...g, id: `var_${Date.now()}_${Math.random()}` });
+              mergedGlobalNames.push(g.name);
+            }
+          });
+          if (!toAdd.length) return r;
+          return { ...r, content: { ...r.content, globalVars: [...existing, ...toAdd] } };
+        });
+        next.resources = resources;
+      }
+      return next;
     });
     setActiveId(item.id);
     openTab(item.id, item.name, getItemIcon(category, item.type));
-    addLog('info', `Pasted ${category} item: ${item.name}`);
+    const logMsg = mergedGlobalNames.length
+      ? `Pasted ${category} item: ${item.name} (merged globals: ${mergedGlobalNames.join(', ')})`
+      : `Pasted ${category} item: ${item.name}`;
+    addLog('info', logMsg);
   };
 
   const handleEditItemDetails = (category, id) => {

@@ -6,6 +6,8 @@ import BlockSettingsModal from './BlockSettingsModal';
 import ForceWriteModal from './common/ForceWriteModal';
 import DragDropManager from '../utils/DragDropManager';
 import { registerIECSTLanguage } from '../utils/iecSTLanguage';
+import { writeClipboard, readClipboard, useKronClipboard, CLIP_KIND } from '../utils/kronClipboard';
+import { setEditorScope, getEditorScope, EDITOR_SCOPE } from '../utils/editorScope';
 
 // IEC ST identifier validation for SCL inline editors.
 // Returns Monaco markers for undeclared identifiers.
@@ -16,22 +18,21 @@ const ST_ALWAYS_ALLOWED = new Set([
   'true','false','and','or','not','xor','mod',
   'bool','int','uint','dint','udint','lint','ulint',
   'real','lreal','time','string','byte','word','dword','lword',
+  'sint','usint','pointer',
   'ton','tof','tp','tonr','ctu','ctd','ctud','sr','rs','r_trig','f_trig',
   'shl','shr','rol','ror','band','bor','bxor','bnot',
   'add','sub','mul','div','abs','sqrt','expt','sin','cos','tan','asin','acos','atan',
   'max','min','limit','sel','mux','move',
   'gt','ge','eq','ne','le','lt',
-  'byte_to_uint','byte_to_int','byte_to_dint','byte_to_real',
-  'int_to_real','real_to_int','dint_to_real','real_to_dint',
-  'uint_to_real','real_to_uint','lint_to_real','real_to_lint',
-  'bool_to_int','int_to_bool','bool_to_uint','uint_to_bool',
   'norm_x','scale_x',
-  'int_to_uint','uint_to_int','dint_to_int','int_to_dint',
-  'uint_to_dint','dint_to_uint','lint_to_dint','dint_to_lint',
-  'uint_to_lint','int_to_lint','word_to_uint','uint_to_word',
-  'dword_to_udint','udint_to_dword',
+  'adr','null',
   'uart_receive','uart_send','usb_receive','usb_send',
+  'i2c_writeread','spi_transfer',
 ]);
+
+// IEC type-conversion functions are stateless and inlined by the transpiler.
+// Accept any TYPE_TO_TYPE pair without listing all 90+ combinations.
+const ST_CONVERSION_REGEX = /^(?:BOOL|BYTE|WORD|DWORD|LWORD|SINT|USINT|INT|UINT|DINT|UDINT|LINT|ULINT|REAL|LREAL)_TO_(?:BOOL|BYTE|WORD|DWORD|LWORD|SINT|USINT|INT|UINT|DINT|UDINT|LINT|ULINT|REAL|LREAL)$/i;
 
 function validateSCLCode(code, variables, globalVars, monaco, model) {
   const allowed = new Set(ST_ALWAYS_ALLOWED);
@@ -43,22 +44,29 @@ function validateSCLCode(code, variables, globalVars, monaco, model) {
   const strippedCode = (code || '').replace(/\(\*[\s\S]*?\*\)/g, match => '\n'.repeat((match.match(/\n/g) || []).length));
   const lines = strippedCode.split('\n');
   lines.forEach((rawLine, i) => {
-    const line = rawLine.replace(/\/\/.*$/, '').replace(/\(\*.*?\*\)/g, '');
+    // Strip single-line comments and IEC typed-radix integer literals
+    // (16#FE, 2#1010, 8#777). Replace literals with same-length spaces so
+    // marker columns stay accurate.
+    const line = rawLine
+      .replace(/\/\/.*$/, '')
+      .replace(/\(\*.*?\*\)/g, '')
+      .replace(/\b\d+#[0-9A-Fa-f_]+\b/g, m => ' '.repeat(m.length));
     const regex = /\b[a-zA-Z_][a-zA-Z0-9_]*\b/g;
     let match;
     while ((match = regex.exec(line)) !== null) {
       if (match.index > 0 && line[match.index - 1] === '.') continue;
       const word = match[0];
-      if (!allowed.has(word.toLowerCase()) && isNaN(word)) {
-        markers.push({
-          severity: monaco.MarkerSeverity.Error,
-          message: `Undefined identifier: '${word}'`,
-          startLineNumber: i + 1,
-          startColumn: match.index + 1,
-          endLineNumber: i + 1,
-          endColumn: match.index + 1 + word.length,
-        });
-      }
+      if (allowed.has(word.toLowerCase())) continue;
+      if (ST_CONVERSION_REGEX.test(word)) continue;
+      if (!isNaN(word)) continue;
+      markers.push({
+        severity: monaco.MarkerSeverity.Error,
+        message: `Undefined identifier: '${word}'`,
+        startLineNumber: i + 1,
+        startColumn: match.index + 1,
+        endLineNumber: i + 1,
+        endColumn: match.index + 1 + word.length,
+      });
     }
   });
   monaco.editor.setModelMarkers(model, 'scl-owner', markers);
@@ -333,34 +341,53 @@ const RungEditorNew = ({ variables, setVariables, rungs, setRungs, availableBloc
     }
   }, [setRungs, setVariables]);
 
-  // Keyboard Shortcuts for Undo/Redo/Copy/Paste
+  // Keyboard Shortcuts for Undo/Redo/Copy/Paste — clipboard is OS-backed
+  // so blocks/rungs can be pasted between separate editor windows.
   const selectedNodeRef = useRef(null);
-  const clipboardRef = useRef(null);
-  const [clipboardType, setClipboardType] = useState(null); // 'rung' | 'block' | null
+  const clipboardEntry = useKronClipboard();
+  const canPasteRung = clipboardEntry?.kind === CLIP_KIND.RUNG;
 
   const handleCopy = useCallback(() => {
     if (readOnly) return;
     // Block-level copy (only when a block is selected and no rung is focused)
     if (selectedNodeRef.current && !focusedRungId) {
-      clipboardRef.current = { type: 'block', rungId: selectedNodeRef.current.rungId, payload: JSON.parse(JSON.stringify(selectedNodeRef.current)) };
-      setClipboardType('block');
+      const block = JSON.parse(JSON.stringify(selectedNodeRef.current));
+      const srcRungId = selectedNodeRef.current.rungId;
+      // Include the variable definition for an FB instance so cross-instance
+      // paste can recreate the supporting variable entry.
+      let instanceVar = null;
+      if (block?.data?.instanceName) {
+        const v = variables.find(x => x.name === block.data.instanceName);
+        if (v) instanceVar = JSON.parse(JSON.stringify(v));
+      }
+      writeClipboard(CLIP_KIND.BLOCK, block, { rungId: srcRungId, instanceVar });
       return;
     }
     // Rung-level copy (only when a rung is focused and no block is selected)
     if (focusedRungId && !selectedNodeRef.current) {
       const rung = rungs.find(r => r.id === focusedRungId);
       if (rung) {
-        clipboardRef.current = { type: 'rung', payload: JSON.parse(JSON.stringify(rung)) };
-        setClipboardType('rung');
+        const payload = JSON.parse(JSON.stringify(rung));
+        // Bundle variable definitions for every FB instance referenced
+        // in the rung so cross-instance paste can recreate them.
+        const fbNames = new Set(
+          (payload.blocks || [])
+            .filter(b => b.data?.instanceName && b.data?.type !== 'Contact' && b.data?.type !== 'Coil')
+            .map(b => b.data.instanceName)
+        );
+        const instanceVars = variables.filter(v => fbNames.has(v.name))
+          .map(v => JSON.parse(JSON.stringify(v)));
+        writeClipboard(CLIP_KIND.RUNG, payload, { instanceVars });
       }
     }
-  }, [readOnly, focusedRungId, rungs]);
+  }, [readOnly, focusedRungId, rungs, variables]);
 
-  const handlePaste = useCallback(() => {
-    if (readOnly || !clipboardRef.current) return;
-    const clip = clipboardRef.current;
+  const handlePaste = useCallback(async () => {
+    if (readOnly) return;
+    const clip = await readClipboard();
+    if (!clip) return;
 
-    if (clip.type === 'rung') {
+    if (clip.kind === CLIP_KIND.RUNG) {
       // ── Rung paste ─────────────────────────────────────
       const src = clip.payload;
       const idMap = {};
@@ -383,16 +410,25 @@ const RungEditorNew = ({ variables, setVariables, rungs, setRungs, availableBloc
         blocks: newBlocks,
         connections: newConns,
       };
-      // FB instance variables for copied blocks
-      const fbBlocks = newBlocks.filter(b => b.data?.type !== 'Contact' && b.data?.type !== 'Coil' && b.data?.instanceName);
+      // FB instance variables for copied blocks. When the rung comes from
+      // another editor window, `variables` will not contain the source's
+      // entries, so we also look them up in clip.meta.instanceVars.
+      const bundledVars = clip.meta?.instanceVars || [];
+      const fbBlocks = newBlocks
+        .map((b, i) => ({ b, orig: src.blocks[i] }))
+        .filter(({ b }) => b.data?.type !== 'Contact' && b.data?.type !== 'Coil' && b.data?.instanceName);
       if (fbBlocks.length) {
         setVariables(prev => {
           const names = new Set(prev.map(v => v.name));
           const extra = [];
-          fbBlocks.forEach(b => {
-            if (!names.has(b.data.instanceName)) {
-              const orig = prev.find(v => v.name === src.blocks.find(ob => ob.id === Object.keys(idMap).find(k => idMap[k] === b.id))?.data?.instanceName);
-              if (orig) extra.push({ ...orig, id: `var_${Date.now()}_${Math.random()}`, name: b.data.instanceName });
+          fbBlocks.forEach(({ b, orig }) => {
+            if (names.has(b.data.instanceName)) return;
+            const srcName = orig?.data?.instanceName;
+            const def = prev.find(v => v.name === srcName)
+              || bundledVars.find(v => v.name === srcName);
+            if (def) {
+              extra.push({ ...def, id: `var_${Date.now()}_${Math.random()}`, name: b.data.instanceName });
+              names.add(b.data.instanceName);
             }
           });
           return extra.length ? [...prev, ...extra] : prev;
@@ -409,36 +445,44 @@ const RungEditorNew = ({ variables, setVariables, rungs, setRungs, availableBloc
       return;
     }
 
+    if (clip.kind !== CLIP_KIND.BLOCK) return;
+
     // ── Block paste ─────────────────────────────────────
-    // Block can only be pasted into the same rung it was copied from
+    // Prefer the source rung if it still exists; otherwise drop the block
+    // into the focused rung or the last rung. This lets block paste work
+    // across editor instances where the original rungId is unknown.
     const copied = clip.payload;
-    const sourceRungId = clip.rungId || copied.rungId;
-    if (!sourceRungId) return;
-    let targetRungId = sourceRungId;
-    
+    const sourceRungId = clip.meta?.rungId;
+    const bundledInstanceVar = clip.meta?.instanceVar || null;
+    let targetRungId = sourceRungId && rungs.some(r => r.id === sourceRungId)
+      ? sourceRungId
+      : (focusedRungId || rungs[rungs.length - 1]?.id);
+    if (!targetRungId) return;
+
     setRungs(prevRungs => {
       const targetRung = prevRungs.find(r => r.id === targetRungId);
       if (!targetRung) return prevRungs;
-      
+
       const newBlockId = `node_${Date.now()}_${Math.random()}`;
       const newPosition = {
         x: (copied.position?.x || 0) + 20,
         y: (copied.position?.y || 0) + 20
       };
-      
+
       const newBlock = {
         ...copied,
         id: newBlockId,
         position: newPosition,
         selected: true,
       };
-      
+
       if (newBlock.data.type !== 'Contact' && newBlock.data.type !== 'Coil') {
           newBlock.data.instanceName = `${newBlock.data.instanceName}_copy`;
           setVariables(prevVars => {
              const newVars = [...prevVars];
              if(!newVars.some(v => v.name === newBlock.data.instanceName)) {
-                const varDef = prevVars.find(v => v.name === copied.data.instanceName);
+                const varDef = prevVars.find(v => v.name === copied.data.instanceName)
+                  || (bundledInstanceVar && bundledInstanceVar.name === copied.data.instanceName ? bundledInstanceVar : null);
                 if(varDef) {
                    newVars.push({ ...varDef, id: `var_${Date.now()}`, name: newBlock.data.instanceName });
                 }
@@ -456,13 +500,13 @@ const RungEditorNew = ({ variables, setVariables, rungs, setRungs, availableBloc
         }
         return r;
       });
-      
+
       setTimeout(() => setVariables(v => { saveHistory(newRungs, v); return v; }), 0);
       return newRungs;
     });
 
     selectedNodeRef.current = { rungId: targetRungId, ...copied, selected: true };
-    
+
   }, [readOnly, focusedRungId, setRungs, setVariables, saveHistory, rungs]);
 
   useEffect(() => {
@@ -479,6 +523,7 @@ const RungEditorNew = ({ variables, setVariables, rungs, setRungs, availableBloc
 
       if (e.ctrlKey || e.metaKey) {
         const key = e.key.toLowerCase();
+        const scope = getEditorScope();
         if (key === 'z') {
           e.preventDefault();
           e.stopPropagation();
@@ -488,9 +533,12 @@ const RungEditorNew = ({ variables, setVariables, rungs, setRungs, availableBloc
             undo();
           }
         } else if (key === 'c') {
+          if (scope && scope !== EDITOR_SCOPE.LD) return;
+          if (!selectedNodeRef.current && !focusedRungId) return;
           e.preventDefault();
           handleCopy();
         } else if (key === 'v') {
+          if (scope && scope !== EDITOR_SCOPE.LD) return;
           e.preventDefault();
           handlePaste();
         }
@@ -597,9 +645,12 @@ const RungEditorNew = ({ variables, setVariables, rungs, setRungs, availableBloc
   }, [editingBlock, updateBlockData]);
 
   // Paste rung at a specific position (called from InsertZone paste button)
-  const pasteRungAt = useCallback((targetId, before) => {
-    if (readOnly || !clipboardRef.current || clipboardRef.current.type !== 'rung') return;
-    const src = clipboardRef.current.payload;
+  const pasteRungAt = useCallback(async (targetId, before) => {
+    if (readOnly) return;
+    const clip = await readClipboard();
+    if (!clip || clip.kind !== CLIP_KIND.RUNG) return;
+    const src = clip.payload;
+    const bundledVars = clip.meta?.instanceVars || [];
     const idMap = {};
     const ts = Date.now();
     const newBlocks = src.blocks.map((b, i) => {
@@ -626,11 +677,15 @@ const RungEditorNew = ({ variables, setVariables, rungs, setRungs, availableBloc
         const names = new Set(prev.map(v => v.name));
         const extra = [];
         fbBlocks.forEach(b => {
-          if (!names.has(b.data.instanceName)) {
-            const origBlockId = Object.keys(idMap).find(k => idMap[k] === b.id);
-            const origBlock = src.blocks.find(ob => ob.id === origBlockId);
-            const orig = prev.find(v => v.name === origBlock?.data?.instanceName);
-            if (orig) extra.push({ ...orig, id: `var_${Date.now()}_${Math.random()}`, name: b.data.instanceName });
+          if (names.has(b.data.instanceName)) return;
+          const origBlockId = Object.keys(idMap).find(k => idMap[k] === b.id);
+          const origBlock = src.blocks.find(ob => ob.id === origBlockId);
+          const srcName = origBlock?.data?.instanceName;
+          const orig = prev.find(v => v.name === srcName)
+            || bundledVars.find(v => v.name === srcName);
+          if (orig) {
+            extra.push({ ...orig, id: `var_${Date.now()}_${Math.random()}`, name: b.data.instanceName });
+            names.add(b.data.instanceName);
           }
         });
         return extra.length ? [...prev, ...extra] : prev;
@@ -1118,7 +1173,10 @@ const RungEditorNew = ({ variables, setVariables, rungs, setRungs, availableBloc
   const uniqueTypes = Object.keys(varsByType).filter(t => t !== 'ANY');
 
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', width: '100%', height: '100%', background: '#1e1e1e' }}>
+    <div
+      onMouseDown={() => setEditorScope(EDITOR_SCOPE.LD)}
+      style={{ display: 'flex', flexDirection: 'column', width: '100%', height: '100%', background: '#1e1e1e' }}
+    >
 
       {/* Type-Specific Datalists */}
       {uniqueTypes.map(type => (
@@ -1152,7 +1210,7 @@ const RungEditorNew = ({ variables, setVariables, rungs, setRungs, availableBloc
       {/* RUNGS AREA */}
       <div style={{ flex: 1, overflowY: 'auto', padding: '12px', background: '#1e1e1e', minHeight: 0 }}>
         <div style={{ display: 'flex', flexDirection: 'column' }}>
-          <InsertZone onInsert={() => addRung(rungs[0]?.id, true)} onPaste={() => pasteRungAt(rungs[0]?.id, true)} canPaste={clipboardType === 'rung'} disabled={readOnly || draggedRungIndex !== null} />
+          <InsertZone onInsert={() => addRung(rungs[0]?.id, true)} onPaste={() => pasteRungAt(rungs[0]?.id, true)} canPaste={canPasteRung} disabled={readOnly || draggedRungIndex !== null} />
           {rungs.map((rung, index) => (
             <div key={rung.id}>
               {/* Drag drop indicator above */}
@@ -1287,7 +1345,7 @@ const RungEditorNew = ({ variables, setVariables, rungs, setRungs, availableBloc
                 </ErrorBoundary>
               </div>
               {index < rungs.length - 1 && (
-                <InsertZone onInsert={() => addRung(rung.id, false)} onPaste={() => pasteRungAt(rung.id, false)} canPaste={clipboardType === 'rung'} disabled={readOnly || draggedRungIndex !== null} />
+                <InsertZone onInsert={() => addRung(rung.id, false)} onPaste={() => pasteRungAt(rung.id, false)} canPaste={canPasteRung} disabled={readOnly || draggedRungIndex !== null} />
               )}
             </div>
           ))}

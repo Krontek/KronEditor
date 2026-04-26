@@ -239,23 +239,23 @@ const ST_KEYWORDS_LOWER = new Set([
     'true','false','and','or','not','xor','mod',
     'bool','int','uint','dint','udint','lint','ulint',
     'real','lreal','time','string','byte','word','dword','lword',
+    'sint','usint','pointer',
     'ton','tof','tp','tonr','ctu','ctd','ctud','sr','rs','r_trig','f_trig',
     'shl','shr','rol','ror','band','bor','bxor','bnot',
     'add','sub','mul','div','abs','sqrt','expt','sin','cos','tan','asin','acos','atan',
     'max','min','limit','sel','mux','move',
     'gt','ge','eq','ne','le','lt',
-    'byte_to_uint','byte_to_int','byte_to_dint','byte_to_real',
-    'int_to_real','real_to_int','dint_to_real','real_to_dint',
-    'uint_to_real','real_to_uint','lint_to_real','real_to_lint',
-    'bool_to_int','int_to_bool','bool_to_uint','uint_to_bool',
     'norm_x','scale_x',
-    'int_to_uint','uint_to_int','dint_to_int','int_to_dint',
-    'uint_to_dint','dint_to_uint','lint_to_dint','dint_to_lint',
-    'uint_to_lint','int_to_lint','word_to_uint','uint_to_word',
-    'dword_to_udint','udint_to_dword',
+    'adr','null',
     'uart_receive','uart_send',
     'usb_receive','usb_send',
+    'i2c_writeread','spi_transfer',
 ]);
+
+// IEC 61131-3 type-conversion functions (X_TO_Y) are stateless and inlined by
+// the transpiler. The validator accepts any TYPE_TO_TYPE pair to avoid hard-
+// coding all 90+ combinations.
+const ST_CONVERSION_REGEX = /^(?:BOOL|BYTE|WORD|DWORD|LWORD|SINT|USINT|INT|UINT|DINT|UDINT|LINT|ULINT|REAL|LREAL)_TO_(?:BOOL|BYTE|WORD|DWORD|LWORD|SINT|USINT|INT|UINT|DINT|UDINT|LINT|ULINT|REAL|LREAL)$/i;
 
 /**
  * Validate all ST/SCL code in the project before compilation.
@@ -278,7 +278,13 @@ export const validateProjectST = (projectStructure, stdFunctionNames = []) => {
         const stripped = (code || '').replace(/\(\*[\s\S]*?\*\)/g, match => '\n'.repeat((match.match(/\n/g) || []).length));
         const lines = stripped.split('\n');
         lines.forEach((rawLine, i) => {
-            const line = rawLine.replace(/\/\/.*$/, '').replace(/\(\*.*?\*\)/g, '');
+            // Strip single-line comments and IEC typed-radix integer literals
+            // (16#FE, 2#1010, 8#777). Replace with same-length spaces so column
+            // numbers in error reports stay accurate.
+            const line = rawLine
+                .replace(/\/\/.*$/, '')
+                .replace(/\(\*.*?\*\)/g, '')
+                .replace(/\b\d+#[0-9A-Fa-f_]+\b/g, m => ' '.repeat(m.length));
             const regex = /\b[a-zA-Z_][a-zA-Z0-9_]*\b/g;
             let match;
             while ((match = regex.exec(line)) !== null) {
@@ -286,11 +292,14 @@ export const validateProjectST = (projectStructure, stdFunctionNames = []) => {
                 if (match.index > 0 && line[match.index - 1] === '.') continue;
                 const word = match[0];
                 const lower = word.toLowerCase();
-                if (!ST_KEYWORDS_LOWER.has(lower) && !stdLower.has(lower) &&
-                    !globalVarNames.has(lower) && !dataTypeNames.has(lower) &&
-                    !varNames.has(lower) && isNaN(word)) {
-                    errors.push({ context: contextLabel, line: i + 1, column: match.index + 1, word });
-                }
+                if (ST_KEYWORDS_LOWER.has(lower)) continue;
+                if (stdLower.has(lower)) continue;
+                if (globalVarNames.has(lower)) continue;
+                if (dataTypeNames.has(lower)) continue;
+                if (varNames.has(lower)) continue;
+                if (ST_CONVERSION_REGEX.test(word)) continue;
+                if (!isNaN(word)) continue;
+                errors.push({ context: contextLabel, line: i + 1, column: match.index + 1, word });
             }
         });
     };
@@ -1954,7 +1963,10 @@ const collectInputShadowVars = (rungs, progName) => {
                         initVal = parseFloat(cleanVal);
                     } else if (isBooleanLiteral(cleanVal)) {
                         initStr = normalizeBooleanLiteral(cleanVal) || 'false';
-                        initVal = initStr === 'true' ? 1 : 0;
+                        // BOOL shadow values must be real JS booleans: KronServer
+                        // unmarshals WriteVar into a Go bool, and variable_table.json's
+                        // initial_value must also be true/false for the same reason.
+                        initVal = initStr === 'true';
                     }
                 }
                 vars.push({ symbol: sym, type: iecType, instName, editorPin, initStr, initVal });
@@ -2273,6 +2285,11 @@ const transpileSTLogics = (code, stdFunctions = {}, parentName = '', category = 
     // e.g.  IF x THEN y := 1; ELSIF z THEN y := 2; END_IF;
     //   →   IF x THEN\ny := 1;\nELSIF z THEN\ny := 2;\nEND_IF;
     const normalized = stripped
+        // CASE label with a control-flow keyword body — split the body to a new
+        // line so the IF / CASE / WHILE / FOR / REPEAT line-matcher sees it.
+        // Without this, "1: IF foo THEN ..." is taken as a single expression by
+        // the case-label handler and IF/THEN leak into the C output.
+        .replace(/^([\d ,\.\t]+:)[ \t]+(?=(?:IF|CASE|WHILE|FOR|REPEAT)\b)/gim, '$1\n')
         // After THEN/DO/OF — insert newline when something follows on the same line
         .replace(/\bTHEN\b[ \t]*(?=[^\r\n])/gi, 'THEN\n')
         .replace(/\bDO\b[ \t]*(?=[^\r\n])/gi, 'DO\n')
@@ -2314,8 +2331,18 @@ const transpileSTLogics = (code, stdFunctions = {}, parentName = '', category = 
 
     let out = '';
     let indentLevel = 1; // 1 = inside function body (4 spaces)
-    let inCaseBlock = false;
-    let caseBodyOpen = false;
+    // Block nesting stack — each entry represents an open control structure.
+    // Used to disambiguate ELSE: only treat as switch `default:` when the
+    // innermost open block is a CASE. ELSE inside an IF nested in a CASE is
+    // the IF's else branch, not the case's default.
+    // Frames: { kind: 'CASE' | 'IF' | 'FOR' | 'WHILE' | 'REPEAT', ... }
+    // CASE frames also carry { caseBodyOpen, hasDefault } so END_CASE knows
+    // whether to emit a fallback `default: break;` (skipped when user already
+    // wrote ELSE inside the CASE).
+    const blockStack = [];
+    const topKind = () => (blockStack.length ? blockStack[blockStack.length - 1].kind : null);
+    const topFrame = () => blockStack[blockStack.length - 1];
+    const popIfTop = (kind) => { if (topKind() === kind) blockStack.pop(); };
 
     const indent = () => '    '.repeat(indentLevel);
 
@@ -2383,32 +2410,40 @@ const transpileSTLogics = (code, stdFunctions = {}, parentName = '', category = 
         if (caseOfMatch) {
             out += `${indent()}switch (${transformExpr(caseOfMatch[1])}) {\n`;
             indentLevel++;
-            inCaseBlock = true;
-            caseBodyOpen = false;
+            blockStack.push({ kind: 'CASE', caseBodyOpen: false, hasDefault: false });
             return;
         }
 
         // ── END_CASE ─────────────────────────────────────────────────────
         if (/^END_CASE\s*;?$/i.test(trimmed)) {
-            if (caseBodyOpen) {
-                out += `${indent()}break;\n`;
+            const frame = topFrame();
+            if (frame && frame.kind === 'CASE') {
+                if (frame.caseBodyOpen) {
+                    out += `${indent()}break;\n`;
+                    indentLevel = Math.max(1, indentLevel - 1);
+                }
+                // Only emit fallback default if user did not already write ELSE
+                if (!frame.hasDefault) {
+                    out += `${indent()}default: break;\n`;
+                }
                 indentLevel = Math.max(1, indentLevel - 1);
+                out += `${indent()}}\n`;
+                blockStack.pop();
             }
-            out += `${indent()}default: break;\n`;
-            indentLevel = Math.max(1, indentLevel - 1);
-            out += `${indent()}}\n`;
-            inCaseBlock = false;
-            caseBodyOpen = false;
             return;
         }
 
         // ── Case label(s): n: or n1,n2: or n1..n2: ───────────────────────
-        if (inCaseBlock) {
+        // Only valid when the innermost open block is the CASE itself — a
+        // case label inside a nested IF/FOR/WHILE is a syntax error in IEC
+        // and we should not treat it as one here.
+        if (topKind() === 'CASE') {
+            const frame = topFrame();
             const caseLabelMatch = trimmed.match(/^([\d\s,\.]+)\s*:\s*(.*)/);
             if (caseLabelMatch) {
                 const labelPart = caseLabelMatch[1].trim();
                 const bodyPart  = caseLabelMatch[2].trim();
-                if (caseBodyOpen) {
+                if (frame.caseBodyOpen) {
                     out += `${indent()}break;\n`;
                     indentLevel = Math.max(1, indentLevel - 1);
                 }
@@ -2423,7 +2458,7 @@ const transpileSTLogics = (code, stdFunctions = {}, parentName = '', category = 
                     }
                 });
                 indentLevel++;
-                caseBodyOpen = true;
+                frame.caseBodyOpen = true;
                 if (bodyPart && bodyPart !== ';') {
                     let cl = transformExpr(bodyPart);
                     if (!cl.endsWith(';')) cl += ';';
@@ -2431,15 +2466,16 @@ const transpileSTLogics = (code, stdFunctions = {}, parentName = '', category = 
                 }
                 return;
             }
-            // ELSE inside CASE → default:
+            // ELSE inside CASE (at the case's direct level) → default:
             if (/^ELSE\s*:?\s*/i.test(trimmed)) {
-                if (caseBodyOpen) {
+                if (frame.caseBodyOpen) {
                     out += `${indent()}break;\n`;
                     indentLevel = Math.max(1, indentLevel - 1);
                 }
                 out += `${indent()}default:\n`;
                 indentLevel++;
-                caseBodyOpen = true;
+                frame.caseBodyOpen = true;
+                frame.hasDefault = true;
                 const elseBody = trimmed.replace(/^ELSE\s*:?\s*/i, '').trim();
                 if (elseBody && elseBody !== ';') {
                     let cl = transformExpr(elseBody);
@@ -2454,16 +2490,19 @@ const transpileSTLogics = (code, stdFunctions = {}, parentName = '', category = 
         if (/^END_IF\s*;?$/i.test(trimmed)) {
             indentLevel = Math.max(1, indentLevel - 1);
             out += `${indent()}}\n`;
+            popIfTop('IF');
             return;
         }
         if (/^END_FOR\s*;?$/i.test(trimmed)) {
             indentLevel = Math.max(1, indentLevel - 1);
             out += `${indent()}}\n`;
+            popIfTop('FOR');
             return;
         }
         if (/^END_WHILE\s*;?$/i.test(trimmed)) {
             indentLevel = Math.max(1, indentLevel - 1);
             out += `${indent()}}\n`;
+            popIfTop('WHILE');
             return;
         }
 
@@ -2489,6 +2528,7 @@ const transpileSTLogics = (code, stdFunctions = {}, parentName = '', category = 
         if (ifMatch) {
             out += `${indent()}if (${transformExpr(ifMatch[1])}) {\n`;
             indentLevel++;
+            blockStack.push({ kind: 'IF' });
             return;
         }
 
@@ -2499,6 +2539,7 @@ const transpileSTLogics = (code, stdFunctions = {}, parentName = '', category = 
             const cv = varMap[vn] || vn;
             out += `${indent()}for (${cv} = ${transformExpr(start)}; ${cv} <= ${transformExpr(end)}; ${cv} += ${transformExpr(step)}) {\n`;
             indentLevel++;
+            blockStack.push({ kind: 'FOR' });
             return;
         }
 
@@ -2509,6 +2550,7 @@ const transpileSTLogics = (code, stdFunctions = {}, parentName = '', category = 
             const cv = varMap[vn] || vn;
             out += `${indent()}for (${cv} = ${transformExpr(start)}; ${cv} <= ${transformExpr(end)}; ${cv}++) {\n`;
             indentLevel++;
+            blockStack.push({ kind: 'FOR' });
             return;
         }
 
@@ -2517,6 +2559,7 @@ const transpileSTLogics = (code, stdFunctions = {}, parentName = '', category = 
         if (whileMatch) {
             out += `${indent()}while (${transformExpr(whileMatch[1])}) {\n`;
             indentLevel++;
+            blockStack.push({ kind: 'WHILE' });
             return;
         }
 
@@ -2524,6 +2567,7 @@ const transpileSTLogics = (code, stdFunctions = {}, parentName = '', category = 
         if (/^REPEAT\s*;?\s*$/i.test(trimmed)) {
             out += `${indent()}do {\n`;
             indentLevel++;
+            blockStack.push({ kind: 'REPEAT' });
             return;
         }
 
@@ -2532,6 +2576,7 @@ const transpileSTLogics = (code, stdFunctions = {}, parentName = '', category = 
         if (untilMatch) {
             indentLevel = Math.max(1, indentLevel - 1);
             out += `${indent()}} while (!(${transformExpr(untilMatch[1])}));\n`;
+            popIfTop('REPEAT');
             return;
         }
 

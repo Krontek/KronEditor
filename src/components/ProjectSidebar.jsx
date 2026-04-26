@@ -3,6 +3,32 @@ import { useTranslation } from 'react-i18next';
 import { ask } from '@tauri-apps/plugin-dialog';
 import { getBoardById } from '../utils/boardDefinitions';
 import EtherCATIconSrc from '../assets/icons/ethercat.png';
+import {
+    writeClipboard, readClipboard, refreshClipboard, useKronClipboard, CLIP_KIND,
+} from '../utils/kronClipboard';
+import { setEditorScope, getEditorScope, EDITOR_SCOPE } from '../utils/editorScope';
+
+// Collects every string token from an object graph (POU content) and
+// intersects with a list of global variables to decide which globals
+// should travel alongside a copied POU. This is a lexical heuristic —
+// false positives are harmless (globals are only merged on paste if
+// they are missing in the destination project).
+const collectTokens = (node, out) => {
+    if (node == null) return;
+    if (typeof node === 'string') {
+        node.split(/[^A-Za-z0-9_]+/).forEach(tok => { if (tok) out.add(tok); });
+        return;
+    }
+    if (Array.isArray(node)) { node.forEach(n => collectTokens(n, out)); return; }
+    if (typeof node === 'object') { Object.values(node).forEach(v => collectTokens(v, out)); }
+};
+
+const bundleReferencedGlobals = (pou, globalVars) => {
+    if (!Array.isArray(globalVars) || globalVars.length === 0) return [];
+    const tokens = new Set();
+    collectTokens(pou.content, tokens);
+    return globalVars.filter(g => g && g.name && tokens.has(g.name));
+};
 
 const EMPTY_IMG = new Image();
 EMPTY_IMG.src = 'data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7';
@@ -201,9 +227,12 @@ const ProjectSidebar = ({
     const [dragEnabled, setDragEnabled] = useState(false);
     const [dragOverIndex, setDragOverIndex] = useState(null);
 
-    /* Clipboard */
-    const clipboardRef = useRef(null);
-    const [clipboardCategory, setClipboardCategory] = useState(null);
+    /* Clipboard — backed by OS clipboard so POUs can be pasted across
+       separate editor instances. `clipboardEntry` is null when the
+       clipboard holds non-KronEditor content or a non-POU payload. */
+    const clipboardEntry = useKronClipboard();
+    const clipboardCategory =
+        clipboardEntry?.kind === CLIP_KIND.POU ? clipboardEntry.meta?.category : null;
 
     /* Context menu */
     const [ctxMenu, setCtxMenu] = useState(null); // { x, y, items }
@@ -212,14 +241,20 @@ const ProjectSidebar = ({
     const openCtx = (e, items) => {
         e.preventDefault();
         e.stopPropagation();
+        // Refresh so the menu reflects what is actually on the clipboard
+        // right now, even if focus/visibility events were missed.
+        refreshClipboard();
         setCtxMenu({ x: e.clientX, y: e.clientY, items });
     };
 
+    const globalVars = projectStructure.resources?.find(r => r.type === 'RESOURCE_EDITOR')?.content?.globalVars || [];
+
     /* ── Clipboard helpers ── */
     const copyItem = useCallback((category, item) => {
-        clipboardRef.current = { category, payload: JSON.parse(JSON.stringify(item)) };
-        setClipboardCategory(category);
-    }, []);
+        const payload = JSON.parse(JSON.stringify(item));
+        const globalsBundle = bundleReferencedGlobals(payload, globalVars);
+        writeClipboard(CLIP_KIND.POU, payload, { category, globalsBundle });
+    }, [globalVars]);
 
     const handleSidebarCopy = useCallback(() => {
         if (isRunning || !activeId) return;
@@ -229,29 +264,38 @@ const ProjectSidebar = ({
         }
     }, [isRunning, activeId, projectStructure, copyItem]);
 
-    const handleSidebarPaste = useCallback((targetCategory, insertIndex) => {
-        if (isRunning || !clipboardRef.current) return;
-        const clip = clipboardRef.current;
-        if (clip.category !== targetCategory) return;
+    const handleSidebarPaste = useCallback(async (targetCategory, insertIndex) => {
+        if (isRunning) return;
+        const clip = await readClipboard();
+        if (!clip || clip.kind !== CLIP_KIND.POU) return;
+        if (clip.meta?.category !== targetCategory) return;
         const src = clip.payload;
         const ts = Date.now();
         const newItem = {
             ...src, id: `${targetCategory}_${ts}`,
             name: `${src.name}_copy`,
             content: JSON.parse(JSON.stringify(src.content || {})),
+            _globalsBundle: clip.meta?.globalsBundle || [],
         };
         onPasteItem?.(targetCategory, newItem, insertIndex);
     }, [isRunning, onPasteItem]);
 
-    /* Ctrl+C / Ctrl+V */
+    /* Ctrl+C / Ctrl+V — only act when the sidebar owns the interaction
+       scope, so copy/paste in the LD editor or variable table does not
+       race with sidebar handlers on the shared system clipboard. */
     useEffect(() => {
-        const handler = (e) => {
+        const handler = async (e) => {
             if (document.activeElement?.tagName === 'INPUT' || document.activeElement?.tagName === 'TEXTAREA') return;
             if (!(e.ctrlKey || e.metaKey)) return;
-            if (e.key.toLowerCase() === 'c') handleSidebarCopy();
-            else if (e.key.toLowerCase() === 'v') {
-                if (!clipboardRef.current) return;
-                const cat = clipboardRef.current.category;
+            const scope = getEditorScope();
+            if (scope && scope !== EDITOR_SCOPE.SIDEBAR) return;
+            const key = e.key.toLowerCase();
+            if (key === 'c') handleSidebarCopy();
+            else if (key === 'v') {
+                const clip = await readClipboard();
+                if (!clip || clip.kind !== CLIP_KIND.POU) return;
+                const cat = clip.meta?.category;
+                if (!cat) return;
                 handleSidebarPaste(cat, projectStructure[cat]?.length || 0);
             }
         };
@@ -491,7 +535,10 @@ const ProjectSidebar = ({
     const globalItem = projectStructure.resources?.[0];
 
     return (
-        <div style={{ height: '100%', overflowY: 'auto', background: '#252526', borderRight: '1px solid #333', display: 'flex', flexDirection: 'column' }}>
+        <div
+            onMouseDown={() => setEditorScope(EDITOR_SCOPE.SIDEBAR)}
+            style={{ height: '100%', overflowY: 'auto', background: '#252526', borderRight: '1px solid #333', display: 'flex', flexDirection: 'column' }}
+        >
 
             {/* ── Device root node ── */}
             <TreeNode
