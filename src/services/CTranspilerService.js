@@ -697,8 +697,35 @@ ${boardDefines}${runtimePortHelpers}${customIncludes}${ecCfgEarly.motionIncludes
                 if (isFB) {
                     header += `${vType} prog_${progName}_inst_${vName};\n`;
                 } else {
-                    // Global internal variables for simple programs
-                    header += `${mapType(vType)} prog_${progName}_${vName};\n`;
+                    // Program-local variables — emit initial value when the user
+                    // provided one in the Variable Manager. Without this, scalar
+                    // POU vars default to 0 even if Variable Manager shows e.g.
+                    // `state := 90` or `pca_dev_addr := 16#40`, which silently
+                    // breaks state machines that rely on a non-zero start state.
+                    const isUserType = !!dataTypeDefs[vType];
+                    let initStr = '';
+                    if (!isUserType && v.initialValue !== undefined && v.initialValue !== null && v.initialValue !== '') {
+                        if (vType === 'STRING') {
+                            initStr = ` = "${v.initialValue}"`;
+                        } else if (vType === 'BOOL') {
+                            const b = String(v.initialValue).trim().toLowerCase();
+                            initStr = ` = ${(b === 'true' || b === '1') ? 'true' : 'false'}`;
+                        } else {
+                            // Numeric — accept C decimal/hex (`64`, `0x40`) or IEC
+                            // typed-radix (`16#40`, `2#1010`) and translate the
+                            // latter to C syntax so the generated C compiles.
+                            const raw = String(v.initialValue).trim();
+                            const cVal = raw.replace(/\b(\d+)#([0-9A-Fa-f_]+)\b/g, (_, base, digits) => {
+                                const cleaned = digits.replace(/_/g, '');
+                                if (base === '16') return `0x${cleaned}`;
+                                if (base === '2')  return `0b${cleaned}`; // GCC extension
+                                if (base === '8')  return `0${cleaned}`;
+                                return parseInt(cleaned, parseInt(base, 10)).toString();
+                            });
+                            initStr = ` = ${cVal}`;
+                        }
+                    }
+                    header += `${mapType(vType)} prog_${progName}_${vName}${initStr};\n`;
                 }
 
                 const cSym = isFB ? `prog_${progName}_inst_${vName}` : `prog_${progName}_${vName}`;

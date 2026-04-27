@@ -303,13 +303,22 @@ const ProjectSidebar = ({
         return () => window.removeEventListener('keydown', handler);
     }, [handleSidebarCopy, handleSidebarPaste, projectStructure]);
 
-    /* ── Delete with confirm ── */
+    /* ── Delete with confirm ──
+       Tauri's `ask` rejects silently when the dialog:allow-ask capability is
+       missing or when its IPC call fails for any other reason. Falling back
+       to the webview's built-in `window.confirm` keeps deletion functional
+       regardless of capability state, which prevents the menu from appearing
+       to do nothing on click. */
     const handleDelete = useCallback(async (category, item) => {
         if (isRunning) return;
-        const confirmed = await ask(
-            t('messages.confirmDelete', { name: item.name }),
-            { title: t('common.delete'), type: 'warning' }
-        );
+        const message = t('messages.confirmDelete', { name: item.name }) || `Delete "${item.name}"?`;
+        let confirmed = false;
+        try {
+            confirmed = await ask(message, { title: t('common.delete') || 'Delete', kind: 'warning' });
+        } catch (err) {
+            console.warn('Tauri ask() failed, falling back to window.confirm:', err);
+            confirmed = window.confirm(message);
+        }
         if (confirmed) onDeleteItem(category, item.id);
     }, [isRunning, onDeleteItem, t]);
 

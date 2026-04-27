@@ -203,7 +203,10 @@ const VariableManager = ({
   projectStructure = null
 }) => {
   const { t } = useTranslation();
-  const [selectedId, setSelectedId] = useState(null);
+  // Multi-select: set of selected variable ids. anchorId is the last clicked
+  // row used as the pivot for Shift-range selection.
+  const [selectedIds, setSelectedIds] = useState(() => new Set());
+  const [anchorId, setAnchorId] = useState(null);
   const [forceModal, setForceModal] = useState(null); // { varName, varType, liveKey, liveVal }
   const [complexPopup, setComplexPopup] = useState(null); // { variable, anchorRect }
   const [ctxMenu, setCtxMenu] = useState(null); // { x, y, variable }
@@ -239,24 +242,55 @@ const VariableManager = ({
   };
 
   const handleRemoveClick = () => {
-    if (selectedId && onDelete) { onDelete(selectedId); setSelectedId(null); }
+    if (!onDelete || selectedIds.size === 0) return;
+    // Delete in reverse order so earlier indices stay valid for the parent.
+    const toDelete = variables.filter(v => selectedIds.has(v.id)).map(v => v.id);
+    toDelete.forEach(id => onDelete(id));
+    setSelectedIds(new Set());
+    setAnchorId(null);
+  };
+
+  // ── Row selection (single / Ctrl-toggle / Shift-range) ────────────────────
+  const handleRowSelect = (id, e) => {
+    if (e.shiftKey && anchorId) {
+      const fromIdx = variables.findIndex(v => v.id === anchorId);
+      const toIdx   = variables.findIndex(v => v.id === id);
+      if (fromIdx >= 0 && toIdx >= 0) {
+        const [a, b] = fromIdx <= toIdx ? [fromIdx, toIdx] : [toIdx, fromIdx];
+        const next = new Set(selectedIds);
+        for (let k = a; k <= b; k++) next.add(variables[k].id);
+        setSelectedIds(next);
+        return;
+      }
+    }
+    if (e.ctrlKey || e.metaKey) {
+      const next = new Set(selectedIds);
+      if (next.has(id)) next.delete(id); else next.add(id);
+      setSelectedIds(next);
+      setAnchorId(id);
+      return;
+    }
+    setSelectedIds(new Set([id]));
+    setAnchorId(id);
   };
 
   // ── Cross-instance variable clipboard ─────────────────────────────────────
   const clipboardEntry = useKronClipboard();
   const canPasteVariable = clipboardEntry?.kind === CLIP_KIND.VARIABLE;
 
-  const copyVariable = (variable) => {
-    if (!variable) return;
-    writeClipboard(CLIP_KIND.VARIABLE, JSON.parse(JSON.stringify(variable)));
+  // Payload is always an array of variables; legacy single-object payloads
+  // are normalized to a one-element array on read.
+  const copyVariables = (vars) => {
+    if (!vars || vars.length === 0) return;
+    const list = vars.map(v => JSON.parse(JSON.stringify(v)));
+    writeClipboard(CLIP_KIND.VARIABLE, list);
   };
 
-  const uniqueVarName = (base) => {
-    const existing = new Set([...variables, ...globalVars].map(v => v.name));
-    const root = base.replace(/_copy\d*$/, '');
-    if (!existing.has(base)) return base;
+  const uniqueVarName = (base, taken) => {
+    const root = String(base || 'Var0').replace(/_copy\d*$/, '');
+    if (!taken.has(base)) return base;
     let n = 1;
-    while (existing.has(`${root}_copy${n}`)) n++;
+    while (taken.has(`${root}_copy${n}`)) n++;
     return `${root}_copy${n}`;
   };
 
@@ -264,19 +298,26 @@ const VariableManager = ({
     if (disabled || isSimulationMode) return;
     const clip = await readClipboard();
     if (!clip || clip.kind !== CLIP_KIND.VARIABLE || !onAdd) return;
-    const src = clip.payload;
-    const cls = allowedClasses.includes(src.class) ? src.class : (allowedClasses[0] || 'Local');
-    onAdd({
-      id: `${Date.now()}_${Math.random()}`,
-      name: uniqueVarName(src.name || 'Var0'),
-      class: cls,
-      type: src.type || 'BOOL',
-      initialValue: src.initialValue || '',
-      description: src.description || '',
-      // Address is a hardware-unique identifier — dropping it on paste
-      // prevents silent duplicate-address warnings.
-      address: '',
-    }, insertAfterIndex);
+    // Accept both array (multi) and legacy single-object payloads
+    const list = Array.isArray(clip.payload) ? clip.payload : [clip.payload];
+    if (list.length === 0) return;
+    // Track names taken so far; updates as we add each pasted variable.
+    const taken = new Set([...variables, ...globalVars].map(v => v.name));
+    list.forEach((src, i) => {
+      const cls = allowedClasses.includes(src.class) ? src.class : (allowedClasses[0] || 'Local');
+      const name = uniqueVarName(src.name || 'Var0', taken);
+      taken.add(name);
+      onAdd({
+        id: `${Date.now()}_${Math.random()}_${i}`,
+        name,
+        class: cls,
+        type: src.type || 'BOOL',
+        initialValue: src.initialValue || '',
+        description: src.description || '',
+        // Address is hardware-unique — dropped on paste to avoid duplicates.
+        address: '',
+      }, insertAfterIndex + i);
+    });
   };
 
   // Ctrl+C / Ctrl+V — scoped to the variable table so it does not race
@@ -294,16 +335,22 @@ const VariableManager = ({
       if (scope !== EDITOR_SCOPE.VARIABLES) return;
       const key = e.key.toLowerCase();
       if (key === 'c') {
-        const v = variables.find(x => x.id === selectedId);
-        if (v) { e.preventDefault(); copyVariable(v); }
+        // Preserve table order for the copied set.
+        const list = variables.filter(v => selectedIds.has(v.id));
+        if (list.length > 0) { e.preventDefault(); copyVariables(list); }
       } else if (key === 'v') {
         e.preventDefault();
         await pasteVariableAt(variables.length - 1);
+      } else if (key === 'a') {
+        // Select all variables in the current scope.
+        e.preventDefault();
+        setSelectedIds(new Set(variables.map(v => v.id)));
+        setAnchorId(variables[variables.length - 1]?.id || null);
       }
     };
     window.addEventListener('keydown', handler);
     return () => window.removeEventListener('keydown', handler);
-  }, [selectedId, variables, globalVars, allowedClasses, disabled, isSimulationMode, onAdd]);
+  }, [selectedIds, variables, globalVars, allowedClasses, disabled, isSimulationMode, onAdd]);
 
   const validateAndSaveName = (id, newName) => {
     const trimmed = newName.trim();
@@ -348,7 +395,13 @@ const VariableManager = ({
     e.preventDefault();
     e.stopPropagation();
     setCtxMenu({ x: e.clientX, y: e.clientY, variable: v });
-    setSelectedId(v.id);
+    // If the right-clicked row is not already part of the selection,
+    // make it the only selected row. Otherwise preserve the multi-selection
+    // so context-menu actions operate on the whole set.
+    if (!selectedIds.has(v.id)) {
+      setSelectedIds(new Set([v.id]));
+      setAnchorId(v.id);
+    }
   };
 
   const getLiveValue = (varName) => {
@@ -472,9 +525,9 @@ const VariableManager = ({
               return (
                 <React.Fragment key={v.id}>
                 <tr
-                  onClick={() => setSelectedId(v.id)}
+                  onClick={(e) => handleRowSelect(v.id, e)}
                   onContextMenu={(e) => handleContextMenu(e, v)}
-                  style={{ borderBottom: '1px solid #333', background: selectedId === v.id ? '#0d47a1' : 'transparent', cursor: 'pointer' }}
+                  style={{ borderBottom: '1px solid #333', background: selectedIds.has(v.id) ? '#0d47a1' : 'transparent', cursor: 'pointer' }}
                 >
                   <td style={{ padding: '5px' }}>
                     <EditableCell value={v.name} onCommit={(val) => !isSimulationMode && !disabled && validateAndSaveName(v.id, val)} />
@@ -602,7 +655,7 @@ const VariableManager = ({
                   </td>
                   <td style={{ padding: '3px', textAlign: 'center' }}>
                     <button
-                      onClick={(e) => { e.stopPropagation(); if (!disabled && !isSimulationMode && onDelete) { onDelete(v.id); setSelectedId(null); } }}
+                      onClick={(e) => { e.stopPropagation(); if (!disabled && !isSimulationMode && onDelete) { onDelete(v.id); setSelectedIds(prev => { const n = new Set(prev); n.delete(v.id); return n; }); } }}
                       disabled={disabled || isSimulationMode}
                       title={t('common.delete')}
                       style={{ background: 'transparent', border: 'none', color: disabled || isSimulationMode ? '#444' : '#c62828', cursor: disabled || isSimulationMode ? 'default' : 'pointer', fontSize: 13, padding: '1px 3px', lineHeight: 1 }}
@@ -712,12 +765,23 @@ const VariableManager = ({
           )}
           <div style={{ height: 1, background: '#444', margin: '2px 0' }} />
           <div
-            onClick={() => { copyVariable(ctxMenu.variable); setCtxMenu(null); }}
+            onClick={() => {
+              // If the right-clicked row is part of a multi-selection, copy
+              // all selected variables (in table order). Otherwise just this one.
+              const list = selectedIds.has(ctxMenu.variable.id)
+                ? variables.filter(v => selectedIds.has(v.id))
+                : [ctxMenu.variable];
+              copyVariables(list);
+              setCtxMenu(null);
+            }}
             style={{ padding: '7px 14px', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 8 }}
             onMouseEnter={e => e.currentTarget.style.background = '#3a3a3a'}
             onMouseLeave={e => e.currentTarget.style.background = 'transparent'}
           >
-            <span style={{ fontSize: 13 }}>📋</span> Copy Variable
+            <span style={{ fontSize: 13 }}>📋</span>
+            {selectedIds.size > 1 && selectedIds.has(ctxMenu.variable.id)
+              ? `Copy ${selectedIds.size} Variables`
+              : 'Copy Variable'}
           </div>
           {canPasteVariable && !disabled && !isSimulationMode && (
             <div
@@ -726,7 +790,10 @@ const VariableManager = ({
               onMouseEnter={e => e.currentTarget.style.background = '#3a3a3a'}
               onMouseLeave={e => e.currentTarget.style.background = 'transparent'}
             >
-              <span style={{ fontSize: 13 }}>📄</span> Paste Variable
+              <span style={{ fontSize: 13 }}>📄</span>
+              {Array.isArray(clipboardEntry?.payload) && clipboardEntry.payload.length > 1
+                ? `Paste ${clipboardEntry.payload.length} Variables`
+                : 'Paste Variable'}
             </div>
           )}
           <div
