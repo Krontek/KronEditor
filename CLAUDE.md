@@ -15,6 +15,9 @@ All code must be written in English. Comments, variable names, function names, s
 ### Communication
 When uncertain about requirements, architecture decisions, or implementation direction, **always ask first** before proceeding. If you have questions, ask them **before** making any changes — never start implementing and ask later.
 
+### Self-Update of This File
+After every prompt, before ending your turn, briefly evaluate whether anything **durable** was learned that future sessions need to know — a new transpiler rule, a HAL behavior, a build-pipeline quirk, a non-obvious workaround. If yes, update this CLAUDE.md in the same turn. Do **not** record session-specific debugging details, in-progress task state, or things already derivable from the code. Only persist facts that would surprise a future Claude reading the codebase cold.
+
 ---
 
 ## Technology Stack
@@ -166,10 +169,16 @@ All 3 `transpileToC` call sites in `App.jsx` pass `buses` and `busConfigs` as ar
 | IEC ST | C |
 |--------|---|
 | `:=` | `=` |
-| `AND` | `&&` |
-| `OR` | `\|\|` |
-| `NOT` | `!` |
+| `AND` | `&&` (logical) |
+| `OR` | `\|\|` (logical) |
+| `NOT` | `!` (logical) |
+| `XOR` | `^` |
+| `BAND` | `&` (bitwise — vendor extension) |
+| `BOR` | `\|` (bitwise — vendor extension) |
+| `BXOR` | `^` (bitwise — vendor extension) |
+| `BNOT` | `~` (bitwise — vendor extension) |
 | `MOD` | `%` |
+| `ABS(x)` | macro `((x) < 0 ? -(x) : (x))` defined in plc.h prelude — works for REAL and integer; argument is evaluated twice, so don't pass side-effecting expressions |
 | `IF/THEN … ELSIF … ELSE … END_IF` | `if { } else if { } else { }` |
 | `FOR i := s TO e BY b DO … END_FOR` | `for (…)` |
 | `WHILE … DO … END_WHILE` | `while (…)` |
@@ -177,7 +186,12 @@ All 3 `transpileToC` call sites in `App.jsx` pass `buses` and `busConfigs` as ar
 | `EXIT` | `break` |
 | `RETURN` | `return` |
 
-Line splitting: `/\r?\n|\\n/` (handles both real and escaped newlines)
+**The transpiler is NOT type-aware on `AND`/`OR`** — they always emit logical `&&`/`||`. To do bitwise masking on integer/byte values, use `BAND`/`BOR`/`BXOR`/`BNOT`. Mixing `AND` with integer operands produces silent wrong results (compiler warns `-Wconstant-logical-operand` only when an operand is a literal).
+
+### ST Transpilation — Line Handling
+- Raw line split: `/\r?\n|\\n/` (handles both real and escaped newlines).
+- **Continuation merge**: lines ending with `AND`/`OR`/`NOT`/`XOR`, an arithmetic operator (`+ - * /`), a comparison operator (`< > <= >= <>` or bare `=`), `,`, or `(` are merged with the next line. `:=` is excluded so trailing assignments don't accidentally swallow the next statement.
+- **CASE label + body split**: a numeric label followed by an inline body on the same line (e.g. `1:  init_wait(IN := TRUE, PT := T#30ms);`) is automatically split into two lines so the body still passes through the full statement pipeline (FB-call detection, etc.). Without this split, named-arg FB calls inside CASE labels would be mangled into invalid C.
 
 ### LD Transpilation — Data Structures
 ```js
@@ -211,6 +225,20 @@ Every hardware block: **struct + `_Call` function**
 - Generic struct (in transpiled C): `UART_Send`, `USB_Receive`
 - Channel dispatch: `UART0_Send_Call(inst)` → `HAL_UART_Send_Call(inst, 0)`
 - Both `KrontekLibraries/KronHAL/kronhal.h` and `src-tauri/resources/.../kronhal.h` must stay in sync.
+
+### USB_Send vs USB_Receive Paradigms (different on purpose)
+
+| Block | Trigger pin | Done/Ready pin | Buffer pin | Length pin |
+|-------|-------------|----------------|------------|-----------|
+| `USB_Send` | `Execute` (rising edge — like a one-shot transfer) | `Done`, `Busy`, `Error` | `pTxBuffer` | `Length` |
+| `USB_Receive` | `Enable` (continuous level — drains all available bytes each call) | `NewData`, `Error` | `pRxBuffer` | `MaxSize` (capacity) + `ReceivedLength` (output, actual bytes read) |
+
+`USB_Receive_Call` loops up to `MaxSize` byte-reads in a single PLC scan — when the OS read returns no byte the loop breaks. So one `Enable=TRUE` per scan drains the kernel tty buffer. **No edge-cycling required.**
+
+### USB DTR Handling
+`_*_usb_open()` (rpi/jetson/bb) drops DTR low after `tcsetattr` via `ioctl(fd, TIOCMBIC, &TIOCM_DTR)`. This is required for motor-controlled USB devices like RPLIDAR A1M8 (DTR-high = motor-off; without this the motor stalls a few hundred ms after `open()` and the data stream stops).
+
+**Side effect**: Arduino/ESP32 boards with a DTR-driven auto-reset line will be held in reset while the PLC runtime keeps the port open. If a future board needs DTR-high default behavior, refactor this into an explicit HAL block (`USB_DTR_Set` etc.) instead of a per-port flag.
 
 ---
 

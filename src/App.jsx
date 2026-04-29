@@ -21,6 +21,7 @@ import VisualizationEditor from './components/visualization/VisualizationEditor'
 import { getBoardById } from './utils/boardDefinitions';
 import { getBoardFamilyDefine } from './utils/devicePortMapping';
 import { buildHardwarePortVars } from './utils/hwPortVars';
+import { getBoardLibraryTree } from './utils/boardLibraryBlocks';
 import ArrayTypeEditor from './components/ArrayTypeEditor';
 import StructureTypeEditor from './components/StructureTypeEditor';
 import EnumTypeEditor from './components/EnumTypeEditor';
@@ -1173,7 +1174,7 @@ function App() {
 
   const handleBuild = async () => {
     if (!checkTaskAssignments()) return;
-    const stErrors = validateProjectST(projectStructure);
+    const stErrors = validateProjectST(projectStructure, [], hwPortVars);
     if (stErrors.length > 0) {
       stErrors.forEach(e => addLog('error', `[${e.context}] Line ${e.line}:${e.column} — Undefined identifier: '${e.word}'`));
       addLog('error', `Build aborted: ${stErrors.length} ST validation error(s). Fix before building.`);
@@ -1204,7 +1205,7 @@ function App() {
       addLog('error', 'Cannot Build & Send: not connected to PLC server.');
       return;
     }
-    const stErrors = validateProjectST(projectStructure);
+    const stErrors = validateProjectST(projectStructure, [], hwPortVars);
     if (stErrors.length > 0) {
       stErrors.forEach(e => addLog('error', `[${e.context}] Line ${e.line}:${e.column} — Undefined identifier: '${e.word}'`));
       addLog('error', `Build aborted: ${stErrors.length} ST validation error(s). Fix before building.`);
@@ -1657,6 +1658,36 @@ function App() {
     [deviceInterfaceConfig, selectedBoard]
   );
 
+  const boardBlocks = useMemo(() => {
+    if (!selectedBoard) return [];
+    const COMM_PROTO_BLOCKS = {
+      UART: ['UART_Send', 'UART_Receive'],
+      I2C:  ['I2C_WriteRead'],
+      SPI:  ['SPI_Transfer'],
+      USB:  ['USB_Send', 'USB_Receive'],
+    };
+    const out = [];
+    for (const sub of getBoardLibraryTree(selectedBoard)) {
+      for (const item of (sub.items || [])) {
+        if (!item?.blockType) continue;
+        out.push({ name: item.blockType, category: `Hardware / ${sub.title}` });
+      }
+    }
+    for (const proto of ['UART', 'I2C', 'SPI', 'USB']) {
+      const ports = deviceInterfaceConfig[proto];
+      if (!ports || !Object.values(ports).some(p => p?.enabled)) continue;
+      for (const blockType of COMM_PROTO_BLOCKS[proto]) {
+        out.push({ name: blockType, category: `Hardware / ${proto}` });
+      }
+    }
+    const seen = new Set();
+    return out.filter(b => {
+      if (seen.has(b.name)) return false;
+      seen.add(b.name);
+      return true;
+    });
+  }, [selectedBoard, deviceInterfaceConfig]);
+
   const handleDeviceInterfaceConfigChange = useCallback((nextConfig) => {
     setProjectStructure(prev => ({
       ...prev,
@@ -1741,19 +1772,19 @@ function App() {
   // functionBlocks: all functions + preceding FBs + library
   // programs: all
   const getAvailableBlocks = () => {
-    if (!activeItem) return [...projectStructure.functionBlocks, ...projectStructure.functions, ...parsedBlocks];
+    if (!activeItem) return [...projectStructure.functionBlocks, ...projectStructure.functions, ...parsedBlocks, ...boardBlocks];
     const cat = activeItem.category;
     if (cat === 'functions') {
       const idx = projectStructure.functions.findIndex(f => f.id === activeItem.id);
       const prevFunctions = idx >= 0 ? projectStructure.functions.slice(0, idx) : projectStructure.functions;
-      return [...prevFunctions, ...parsedBlocks];
+      return [...prevFunctions, ...parsedBlocks, ...boardBlocks];
     } else if (cat === 'functionBlocks') {
       const idx = projectStructure.functionBlocks.findIndex(fb => fb.id === activeItem.id);
       const prevFBs = idx >= 0 ? projectStructure.functionBlocks.slice(0, idx) : projectStructure.functionBlocks;
-      return [...prevFBs, ...projectStructure.functions, ...parsedBlocks];
+      return [...prevFBs, ...projectStructure.functions, ...parsedBlocks, ...boardBlocks];
     }
     // programs and others: all
-    return [...projectStructure.functionBlocks, ...projectStructure.functions, ...parsedBlocks];
+    return [...projectStructure.functionBlocks, ...projectStructure.functions, ...parsedBlocks, ...boardBlocks];
   };
 
   return (

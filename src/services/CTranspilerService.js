@@ -262,7 +262,7 @@ const ST_CONVERSION_REGEX = /^(?:BOOL|BYTE|WORD|DWORD|LWORD|SINT|USINT|INT|UINT|
  * Returns an array of { program, rung, line, column, word } error objects.
  * Errors indicate identifiers not found in variable tables or known functions.
  */
-export const validateProjectST = (projectStructure, stdFunctionNames = []) => {
+export const validateProjectST = (projectStructure, stdFunctionNames = [], hwPortVars = []) => {
     const errors = [];
     const stdLower = new Set(stdFunctionNames.map(n => n.toLowerCase()));
     const globalVarNames = new Set(
@@ -272,34 +272,62 @@ export const validateProjectST = (projectStructure, stdFunctionNames = []) => {
     const dataTypeNames = new Set(
         (projectStructure?.dataTypes || []).map(dt => (dt.name || '').toLowerCase())
     );
+    const hwPortNames = new Set(
+        (hwPortVars || []).map(v => (v.name || '').toLowerCase())
+    );
 
     const validateCode = (code, varNames, contextLabel) => {
         // Strip multi-line (* block comments *) preserving line count, then split
         const stripped = (code || '').replace(/\(\*[\s\S]*?\*\)/g, match => '\n'.repeat((match.match(/\n/g) || []).length));
         const lines = stripped.split('\n');
+        // Parenthesis nesting tracked across the whole POU — multi-line FB calls
+        // span newlines, so we cannot reset depth per line.
+        let depth = 0;
         lines.forEach((rawLine, i) => {
-            // Strip single-line comments and IEC typed-radix integer literals
-            // (16#FE, 2#1010, 8#777). Replace with same-length spaces so column
-            // numbers in error reports stay accurate.
+            // Strip:
+            //   - single-line comments
+            //   - in-line (* ... *) block comments
+            //   - typed-radix integer literals (16#FE, 2#1010, 8#777)
+            //   - IEC time/date/datetime literals (T#5ms, TIME#1h30m, D#2026-01-01,
+            //     DT#2026-01-01-12:00:00, TOD#13:45:00.123)
+            // Replace with same-length spaces so column numbers in errors stay accurate.
             const line = rawLine
                 .replace(/\/\/.*$/, '')
                 .replace(/\(\*.*?\*\)/g, '')
-                .replace(/\b\d+#[0-9A-Fa-f_]+\b/g, m => ' '.repeat(m.length));
+                .replace(/\b\d+#[0-9A-Fa-f_]+\b/g, m => ' '.repeat(m.length))
+                .replace(/\b(?:T|TIME|LTIME|D|DATE|LDATE|DT|LDT|TOD|LTOD)#[A-Za-z0-9_.:\-]+/gi,
+                         m => ' '.repeat(m.length));
             const regex = /\b[a-zA-Z_][a-zA-Z0-9_]*\b/g;
+            let scanIdx = 0;
             let match;
             while ((match = regex.exec(line)) !== null) {
+                for (let k = scanIdx; k < match.index; k++) {
+                    if (line[k] === '(') depth++;
+                    else if (line[k] === ')' && depth > 0) depth--;
+                }
+                scanIdx = regex.lastIndex;
+
                 // Skip member access identifiers (e.g. .NewData in UART_Receive1.NewData)
                 if (match.index > 0 && line[match.index - 1] === '.') continue;
                 const word = match[0];
                 const lower = word.toLowerCase();
+                // Inside an FB-call argument list, an identifier directly followed by
+                // ':=' is a parameter NAME (Execute, Port_ID, IN, PT, …), not a var.
+                if (depth > 0 && /^\s*:=/.test(line.slice(regex.lastIndex))) continue;
                 if (ST_KEYWORDS_LOWER.has(lower)) continue;
                 if (stdLower.has(lower)) continue;
                 if (globalVarNames.has(lower)) continue;
                 if (dataTypeNames.has(lower)) continue;
+                if (hwPortNames.has(lower)) continue;
                 if (varNames.has(lower)) continue;
                 if (ST_CONVERSION_REGEX.test(word)) continue;
                 if (!isNaN(word)) continue;
                 errors.push({ context: contextLabel, line: i + 1, column: match.index + 1, word });
+            }
+            // Count parens trailing the last identifier so depth stays correct on the next line
+            for (let k = scanIdx; k < line.length; k++) {
+                if (line[k] === '(') depth++;
+                else if (line[k] === ')' && depth > 0) depth--;
             }
         });
     };
@@ -438,6 +466,11 @@ export const transpileToC = (projectStructure, standardHeaders = [], boardId = n
 #include <string.h>
 #include <stdlib.h>
 #include <math.h>
+
+#ifndef ABS
+#define ABS(x) ((x) < 0 ? -(x) : (x))
+#endif
+
 ${boardDefines}${runtimePortHelpers}${customIncludes}${ecCfgEarly.motionIncludes ? ecCfgEarly.motionIncludes + '\n' : ''}extern volatile uint64_t us_tick;
 
 `;
@@ -1750,9 +1783,11 @@ const transpilePOUSource = (pou, category, stdFunctions = {}, parentName = '', g
     if (pou.type === 'ST') {
         // Build variable name map: IEC identifier → C symbol
         const varMap = {};
+        const varTypeMap = {};
         (pou.content.variables || []).forEach(v => {
             const vName = (v.name || '').trim().replace(/\s+/g, '_');
             if (!vName) return;
+            varTypeMap[vName] = v.type;
             if (globalVarNames.includes(vName)) {
                 varMap[vName] = vName; // global vars: no prefix
             } else if (category === 'program') {
@@ -1766,7 +1801,7 @@ const transpilePOUSource = (pou, category, stdFunctions = {}, parentName = '', g
                 varMap[vName] = vName;
             }
         });
-        src += transpileSTLogics(pou.content.code, stdFunctions, parentName, category, varMap);
+        src += transpileSTLogics(pou.content.code, stdFunctions, parentName, category, varMap, varTypeMap);
     } else if (pou.type === 'LD') {
         src += transpileLDLogics(pou.content.rungs, stdFunctions, safeName, category, globalVarNames, inputShadowMap, 0, buildCSymTypeMap());
     } else if (pou.type === 'SCL') {
@@ -1775,9 +1810,11 @@ const transpilePOUSource = (pou, category, stdFunctions = {}, parentName = '', g
         (pou.content.rungs || []).forEach(rung => {
             if (rung.lang === 'ST') {
                 const varMap = {};
+                const varTypeMap = {};
                 (pou.content.variables || []).forEach(v => {
                     const vName = (v.name || '').trim().replace(/\s+/g, '_');
                     if (!vName) return;
+                    varTypeMap[vName] = v.type;
                     if (globalVarNames.includes(vName)) { varMap[vName] = vName; }
                     else if (category === 'program') {
                         const isFB = stdFunctions[v.type] !== undefined || HAL_BLOCK_TYPES.has(v.type) || (v.type in FB_TRIGGER_PIN && !isInlineMathType(v.type));
@@ -1786,7 +1823,7 @@ const transpilePOUSource = (pou, category, stdFunctions = {}, parentName = '', g
                     else { varMap[vName] = vName; }
                 });
                 src += `    // SCL rung [ST]\n`;
-                src += transpileSTLogics(rung.code || '', stdFunctions, parentName, category, varMap);
+                src += transpileSTLogics(rung.code || '', stdFunctions, parentName, category, varMap, varTypeMap);
             } else {
                 // Default: treat as LD rung
                 src += `    // SCL rung [LD]\n`;
@@ -2259,8 +2296,43 @@ const FB_C_PIN_NAME = {
     'CTU':  { 'R': 'RESET' },
     'CTUD': { 'R': 'RESET' },
 };
-// Returns the C struct member name for a given editor pin name and block type
-const cStructPin = (blockType, editorPin) => FB_C_PIN_NAME[blockType]?.[editorPin] ?? editorPin;
+// Returns the C struct member name for a given editor pin name and block type.
+// Lookup is case-insensitive; the original-case canonical pin from FB_C_PIN_NAME
+// (or the user's spelling, when unknown) is returned.
+const cStructPin = (blockType, editorPin) => {
+    const map = FB_C_PIN_NAME[blockType];
+    if (!map) return editorPin;
+    if (map[editorPin] !== undefined) return map[editorPin];
+    const lower = String(editorPin).toLowerCase();
+    for (const k of Object.keys(map)) {
+        if (k.toLowerCase() === lower) return map[k];
+    }
+    return editorPin;
+};
+
+// Canonicalize a pin name to the case used in the FB's C struct definition.
+// IEC ST is case-insensitive, but the generated C is not — `bno.execute` is a
+// compile error when the struct field is `Execute`. Falls back to the user's
+// spelling for unknown FB types or unlisted pins.
+const canonicalPinName = (fbType, userPin) => {
+    if (!fbType || !userPin) return userPin;
+    const lower = String(userPin).toLowerCase();
+    const trigger = FB_TRIGGER_PIN[fbType];
+    if (trigger && trigger.toLowerCase() === lower) return trigger;
+    const inputs = FB_INPUT_TYPES[fbType];
+    if (inputs) {
+        for (const k of Object.keys(inputs)) {
+            if (k.toLowerCase() === lower) return k;
+        }
+    }
+    const outputs = FB_OUTPUTS[fbType];
+    if (outputs) {
+        for (const k of outputs) {
+            if (k.toLowerCase() === lower) return k;
+        }
+    }
+    return userPin;
+};
 
 // IEC type of each non-trigger input pin for standard FBs (for input shadow var generation)
 const FB_INPUT_TYPES = {
@@ -2296,7 +2368,7 @@ _CONV_TYPES.forEach(src => _CONV_TYPES.forEach(dst => {
     if (src !== dst) FB_INPUTS[`${src}_TO_${dst}`] = ['EN', 'IN'];
 }));
 
-const transpileSTLogics = (code, stdFunctions = {}, parentName = '', category = 'program', varMap = {}) => {
+const transpileSTLogics = (code, stdFunctions = {}, parentName = '', category = 'program', varMap = {}, varTypeMap = {}) => {
     if (!code) return `    // ST Implementation Empty\n`;
 
     // Strip IEC 61131-3 comments and VAR…END_VAR blocks before splitting:
@@ -2329,11 +2401,16 @@ const transpileSTLogics = (code, stdFunctions = {}, parentName = '', category = 
         .replace(/[ \t]*\bEND_WHILE\b/gi, '\nEND_WHILE')
         .replace(/[ \t]*\bEND_REPEAT\b/gi, '\nEND_REPEAT')
         .replace(/[ \t]*\bEND_CASE\b/gi, '\nEND_CASE')
-        .replace(/[ \t]*\bUNTIL\b/gi, '\nUNTIL');
+        .replace(/[ \t]*\bUNTIL\b/gi, '\nUNTIL')
+        // Split `; <control keyword>` so a control keyword always starts on its own line
+        // (handles cases like `x := 1; IF cond THEN` left over after block-comment removal).
+        .replace(/;[ \t]*(?=(?:IF|CASE|FOR|WHILE|REPEAT|RETURN|EXIT)\b)/gi, ';\n');
 
-    // Join continuation lines: a line ending with AND/OR/,/( (after stripping comment)
-    // means the logical expression continues on the next line.  Merge them so the
-    // keyword matchers (IF…THEN, ELSIF…THEN, WHILE…DO, FOR…DO) see a single line.
+    // Join continuation lines: a line ending with AND/OR/NOT/XOR, an arithmetic
+    // operator (+ - * /), a comparison operator (< > <= >= <>), comma, or
+    // open-paren (after stripping comment) means the expression continues on
+    // the next line.  Merge them so the keyword matchers (IF…THEN, ELSIF…THEN,
+    // WHILE…DO, FOR…DO) see a single line.
     const rawLines = normalized.split(/\r?\n|\\n/).map(l => l.replace(/\/\/.*$/, ''));
     const lines = [];
     let pending = '';
@@ -2346,8 +2423,14 @@ const transpileSTLogics = (code, stdFunctions = {}, parentName = '', category = 
         }
         const combined = pending ? pending + ' ' + trimRaw : raw;
         const combinedTrim = combined.trim();
-        // Continuation: line ends with AND, OR, NOT, comma, or open-paren (after optional ;)
-        if (/\b(?:AND|OR|NOT|XOR)\s*$|[,(]\s*$/i.test(combinedTrim)) {
+        // Continuation: line ends with logical/arithmetic/comparison operator, comma, or open-paren.
+        // `:=` is excluded so an assignment line on its own doesn't accidentally swallow the next line.
+        const endsWithContinuation =
+            /\b(?:AND|OR|NOT|XOR)\s*$/i.test(combinedTrim) ||
+            /[,(+\-*/]\s*$/.test(combinedTrim) ||
+            (/(?:<=|>=|<>|<|>)\s*$/.test(combinedTrim)) ||
+            (/(?<![:<>!=])=\s*$/.test(combinedTrim));
+        if (endsWithContinuation) {
             pending = combinedTrim;
         } else {
             lines.push(combined);
@@ -2355,6 +2438,28 @@ const transpileSTLogics = (code, stdFunctions = {}, parentName = '', category = 
         }
     }
     if (pending) lines.push(pending);
+
+    // Split numeric CASE labels that share a line with their body, e.g.:
+    //   `1: init_wait(IN := TRUE, PT := T#30ms);`
+    // becomes two separate lines so the body goes through the full statement
+    // pipeline (FB-call detection, etc.) instead of being dumped raw into
+    // transformExpr (which would mangle `:=` into `=` inside named args).
+    {
+        const expanded = [];
+        for (const ln of lines) {
+            const t = ln.trim();
+            const m = t.match(/^(\d[\d\s,\.]*)\s*:\s*(.+)$/);
+            const body = m && m[2].trim();
+            if (m && body && body !== ';') {
+                expanded.push(m[1].trim() + ':');
+                expanded.push(body);
+            } else {
+                expanded.push(ln);
+            }
+        }
+        lines.length = 0;
+        for (const ln of expanded) lines.push(ln);
+    }
 
     let out = '';
     let indentLevel = 1; // 1 = inside function body (4 spaces)
@@ -2384,22 +2489,43 @@ const transpileSTLogics = (code, stdFunctions = {}, parentName = '', category = 
     };
 
     const transformExpr = (expr) => {
-        let result = expr
+        // Protect string and wstring literals from substitution. IEC uses single
+        // quotes for STRING and double quotes for WSTRING. We escape them out,
+        // perform all transformations, and splice back at the end so AND/OR/MOD
+        // keywords or commas inside string content stay intact.
+        const stringTokens = [];
+        let work = String(expr).replace(/'(?:[^'\\]|\\.)*'|"(?:[^"\\]|\\.)*"/g, m => {
+            stringTokens.push(m);
+            return `${stringTokens.length - 1}`;
+        });
+
+        let result = work
             .replace(/\b[A-Za-z_][A-Za-z0-9_]*#([A-Za-z_][A-Za-z0-9_]*)\b/g, '$1') // TypeName#EnumValue → EnumValue
             .replace(/\b16#([0-9A-Fa-f]+)/gi, '0x$1')  // IEC hex literal: 16#FF → 0xFF
             .replace(/:=/g, '__ASSIGN__')               // protect assignments before = → == pass
             .replace(/<>/g, '!=')                       // IEC not-equal → C not-equal
             .replace(/(?<![:=<>!])=(?!=)/g, '==')       // comparison = → == (not :=, <=, >=, !=, ==)
             .replace(/__ASSIGN__/g, '=')                // restore assignments
-            .replace(/\bAND\b/g, '&&')
-            .replace(/\bOR\b/g, '||')
-            .replace(/\bNOT\b/g, '!')
-            .replace(/\bMOD\b/g, '%')
-            .replace(/\bXOR\b/g, '^')
+            // Bitwise (IEC vendor extension) — must run BEFORE logical AND/OR/XOR/NOT
+            // so e.g. BAND doesn't get partially matched by the AND rule.
+            .replace(/\bBAND\b/gi, '&')
+            .replace(/\bBOR\b/gi, '|')
+            .replace(/\bBXOR\b/gi, '^^^')   // placeholder — XOR rewrite below collapses ^
+            .replace(/\bBNOT\b/gi, '~')
+            .replace(/\bAND\b/gi, '&&')
+            .replace(/\bOR\b/gi, '||')
+            .replace(/\bNOT\b/gi, '!')
+            .replace(/\bMOD\b/gi, '%')
+            .replace(/\bXOR\b/gi, '^')
+            .replace(/\^\^\^/g, '^')        // restore BXOR placeholder
             .replace(/\bTRUE\b/gi, 'true')
             .replace(/\bFALSE\b/gi, 'false');
+        // IEC time-duration literal → microsecond integer.
+        // Only the simple forms (T#5ms / TIME#1s / T#250us) are converted —
+        // compound forms (T#1h30m) fall through unchanged.
+        result = result.replace(/\b(?:T|TIME)#\d+(?:US|MS|S)\b/gi, m => String(mapIECtoTimeUs(m)));
         result = result.replace(/\bADR\s*\(\s*([^)]+?)\s*\)/gi, (_, inner) => `(&(${resolveVarsInExpr(inner.trim())}))`);
-        result = result.replace(/\bNULL\b/g, 'NULL');
+        result = result.replace(/\bNULL\b/gi, 'NULL');
         // IEC 61131-3 type-conversion functions → KRON_ library names
         // e.g. BYTE_TO_UINT(...) → KRON_BYTE_TO_UINT16(...)
         const IEC_TO_KRON_TYPE = {
@@ -2408,8 +2534,9 @@ const transpileSTLogics = (code, stdFunctions = {}, parentName = '', category = 
             USINT:'UINT8', UINT:'UINT16', UDINT:'UINT32', ULINT:'UINT32',
             REAL:'REAL', LREAL:'LREAL',
         };
-        result = result.replace(/\b([A-Z]+)_TO_([A-Z]+)(?=\s*\()/g, (match, src, dst) => {
-            const ks = IEC_TO_KRON_TYPE[src], kd = IEC_TO_KRON_TYPE[dst];
+        result = result.replace(/\b([A-Za-z]+)_TO_([A-Za-z]+)(?=\s*\()/g, (match, src, dst) => {
+            const ks = IEC_TO_KRON_TYPE[src.toUpperCase()];
+            const kd = IEC_TO_KRON_TYPE[dst.toUpperCase()];
             return (ks && kd) ? `KRON_${ks}_TO_${kd}` : match;
         });
         // IEC type cast functions: INT(x) → (int16_t)(x), DINT(x) → (int32_t)(x), etc.
@@ -2419,13 +2546,15 @@ const transpileSTLogics = (code, stdFunctions = {}, parentName = '', category = 
             USINT: 'uint8_t', UINT: 'uint16_t', UDINT: 'uint32_t', ULINT: 'uint64_t',
             REAL: 'float', LREAL: 'double',
         };
-        result = result.replace(/\b(BOOL|BYTE|WORD|DWORD|SINT|INT|DINT|LINT|USINT|UINT|UDINT|ULINT|REAL|LREAL)\s*\(/g,
+        result = result.replace(/\b(BOOL|BYTE|WORD|DWORD|SINT|INT|DINT|LINT|USINT|UINT|UDINT|ULINT|REAL|LREAL)\s*\(/gi,
             (match, typeName) => {
-                const ct = IEC_CAST_C[typeName];
+                const ct = IEC_CAST_C[typeName.toUpperCase()];
                 return ct ? `(${ct})(` : match;
             }
         );
-        return resolveVarsInExpr(result);
+        result = resolveVarsInExpr(result);
+        // Restore protected strings
+        return result.replace(/(\d+)/g, (_, i) => stringTokens[+i]);
     };
 
     lines.forEach(line => {
@@ -2618,6 +2747,120 @@ const transpileSTLogics = (code, stdFunctions = {}, parentName = '', category = 
             const retVal = trimmed.replace(/^RETURN\s*/i, '').replace(/;$/, '').trim();
             out += `${indent()}return${retVal ? ` ${transformExpr(retVal)}` : ''};\n`;
             return;
+        }
+
+        // ── FB instance call: instName(Pin1 := val1, Pin2 := val2, …) ─────
+        // Multi-line forms are pre-merged by the line-continuation loop above
+        // (lines ending with `,` or `(` get joined). We treat the statement as
+        // an FB call when the target is a known FB-typed variable; user
+        // functions and inline math FB types fall through to the generic path.
+        const fbCallMatch = trimmed.match(/^([A-Za-z_][A-Za-z0-9_]*)\s*\(([\s\S]*)\)\s*;?\s*$/);
+        if (fbCallMatch) {
+            const instName = fbCallMatch[1];
+            const argStr = fbCallMatch[2];
+            const fbType = varTypeMap[instName];
+            const isFB = fbType && (
+                stdFunctions[fbType] !== undefined ||
+                HAL_BLOCK_TYPES.has(fbType) ||
+                (fbType in FB_TRIGGER_PIN && !isInlineMathType(fbType))
+            );
+            // Accept named arg form (`:=`/`=>`) or empty arg list. Positional
+            // args (`inst(a, b)`) without `:=` for an FB instance also fall
+            // through here; we generate just the Call so the FB still ticks.
+            const looksLikeFBCall = isFB && (
+                /:=/.test(argStr) || /=>/.test(argStr) || !argStr.trim()
+            );
+            if (looksLikeFBCall) {
+                const cInst = varMap[instName];
+                // Top-level comma split — depth- and string-aware so nested
+                // calls/casts and string literals stay intact.
+                const args = [];
+                {
+                    let cur = '', d = 0, inStr = null;
+                    for (const ch of argStr) {
+                        if (inStr) {
+                            cur += ch;
+                            if (ch === inStr) inStr = null;
+                            continue;
+                        }
+                        if (ch === "'" || ch === '"') { inStr = ch; cur += ch; continue; }
+                        if (ch === '(') d++;
+                        else if (ch === ')' && d > 0) d--;
+                        if (ch === ',' && d === 0) {
+                            if (cur.trim()) args.push(cur.trim());
+                            cur = '';
+                        } else {
+                            cur += ch;
+                        }
+                    }
+                    if (cur.trim()) args.push(cur.trim());
+                }
+
+                const isMotion = MOTION_FB_AXIS_PARAM.has(fbType);
+                let axisExpr = null;
+                // Output captures (`OUT => varname`) are emitted AFTER the Call
+                // so the user reads post-call values.
+                const outputCaptures = [];
+
+                args.forEach(a => {
+                    // Try output-capture form first (`Pin => varname`); then
+                    // input form (`Pin := value`). Anything else is ignored.
+                    const outM = a.match(/^([A-Za-z_][A-Za-z0-9_]*)\s*=>\s*([\s\S]+)$/);
+                    if (outM) {
+                        const userPin = outM[1];
+                        const target  = outM[2].trim();
+                        const member  = cStructPin(fbType, canonicalPinName(fbType, userPin));
+                        const lhs     = transformExpr(target);
+                        outputCaptures.push(`${lhs} = ${cInst}.${member}`);
+                        return;
+                    }
+                    const m = a.match(/^([A-Za-z_][A-Za-z0-9_]*)\s*:=\s*([\s\S]+)$/);
+                    if (!m) return;
+                    const userPin  = m[1];
+                    const rawValue = m[2].trim();
+                    const pinName  = canonicalPinName(fbType, userPin);
+
+                    // Motion FB Axis pin: passed as 2nd Call arg, not a struct field
+                    if (isMotion && pinName === 'Axis') {
+                        axisExpr = IDENTIFIER_REF_REGEX.test(rawValue)
+                            ? `&(${resolveVarsInExpr(rawValue)})`
+                            : transformExpr(rawValue);
+                        return;
+                    }
+
+                    const inputType = FB_INPUT_TYPES[fbType]?.[pinName];
+                    let value;
+                    if (pinName === 'Port_ID') {
+                        const portNum = resolveHardwarePortSymbol(rawValue);
+                        value = portNum !== null ? portNum : transformExpr(rawValue);
+                    } else if (isPointerInputType(inputType)) {
+                        if (/^NULL$/i.test(rawValue)) value = 'NULL';
+                        else if (IDENTIFIER_REF_REGEX.test(rawValue)) value = `&(${resolveVarsInExpr(rawValue)})`;
+                        else value = transformExpr(rawValue);
+                    } else if (inputType === 'TIME') {
+                        const us = mapIECtoTimeUs(rawValue);
+                        value = (us !== null && us !== undefined) ? us.toString() : transformExpr(rawValue);
+                    } else {
+                        value = transformExpr(rawValue);
+                    }
+
+                    const member = cStructPin(fbType, pinName);
+                    out += `${indent()}${cInst}.${member} = ${value};\n`;
+                });
+
+                if (isMotion) {
+                    out += `${indent()}${fbType}_Call(&${cInst}, ${axisExpr || 'NULL'});\n`;
+                } else if (EC_FB_CFG_PARAM.has(fbType)) {
+                    out += `${indent()}${fbType}_Call(&${cInst}, &__ec_cfg);\n`;
+                } else if (stdFunctions[fbType]?.hasTime) {
+                    out += `${indent()}${fbType}_Call(&${cInst}, us_tick);\n`;
+                } else {
+                    out += `${indent()}${fbType}_Call(&${cInst});\n`;
+                }
+
+                outputCaptures.forEach(stmt => { out += `${indent()}${stmt};\n`; });
+                return;
+            }
         }
 
         // ── Regular statement (assignment, function call, etc.) ───────────
