@@ -1355,11 +1355,26 @@ fn do_update_server(app: &tauri::AppHandle) -> Result<(), String> {
     let go_ver = String::from_utf8_lossy(&go_check.stdout);
     let _ = app.emit("server-update-progress", format!("Found: {}", go_ver.trim()));
 
-    // Clone KronServer
+    // Wipe any previous clone before re-cloning. git clone refuses to write
+    // into a non-empty directory, so a stale temp_dir from a crashed earlier
+    // build would silently abort the clone with an unhelpful error if we
+    // didn't clear it first.
     let temp_dir = std::env::temp_dir().join("kroneditor_server_build");
-    let _ = fs::remove_dir_all(&temp_dir);
-    let _ = app.emit("server-update-progress", "Cloning KronServer repository...");
+    if temp_dir.exists() {
+        let _ = app.emit(
+            "server-update-progress",
+            format!("Removing previous clone at {}...", temp_dir.display()),
+        );
+        fs::remove_dir_all(&temp_dir).map_err(|e| {
+            format!(
+                "Failed to remove previous clone at {}: {}",
+                temp_dir.display(),
+                e
+            )
+        })?;
+    }
 
+    let _ = app.emit("server-update-progress", "Cloning KronServer repository...");
     let clone_out = Command::new("git")
         .args(["clone", "--depth=1", "--quiet", "https://github.com/Krontek/KronServer.git"])
         .arg(&temp_dir)

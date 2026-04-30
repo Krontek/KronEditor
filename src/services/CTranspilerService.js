@@ -407,7 +407,8 @@ export const transpileToC = (projectStructure, standardHeaders = [], boardId = n
     const IEC_TYPE_SIZES = {
         'BOOL': 1, 'SINT': 1, 'USINT': 1, 'BYTE': 1,
         'INT': 2, 'UINT': 2, 'WORD': 2,
-        'DINT': 4, 'UDINT': 4, 'TIME': 4, 'REAL': 4, 'DWORD': 4
+        'DINT': 4, 'UDINT': 4, 'TIME': 4, 'REAL': 4, 'DWORD': 4,
+        'LINT': 8, 'ULINT': 8, 'LREAL': 8, 'LWORD': 8
     };
 
     // Shared memory offset tracker — each scalar PLC variable gets a consecutive slot
@@ -885,11 +886,14 @@ ${boardDefines}${runtimePortHelpers}${customIncludes}${ecCfgEarly.motionIncludes
     // --- 6. BUILD SERVER VARIABLES ARRAY ---
     const IEC_TO_SERVER_TYPE = {
         'BOOL': 'bool',
-        'SINT': 'uint8', 'USINT': 'uint8', 'BYTE': 'uint8',
+        'SINT': 'int8',
+        'USINT': 'uint8', 'BYTE': 'uint8',
         'INT': 'int16',
         'UINT': 'uint16', 'WORD': 'uint16',
         'DINT': 'int32',
         'UDINT': 'uint32', 'DWORD': 'uint32',
+        'LINT': 'int64',
+        'ULINT': 'uint64', 'LWORD': 'uint64',
         'REAL': 'float32',
         'LREAL': 'float64',
         'TIME': 'uint32',
@@ -906,7 +910,7 @@ ${boardDefines}${runtimePortHelpers}${customIncludes}${ecCfgEarly.motionIncludes
             initial_value: info.defaultValue,
         }));
 
-    // --- 6. SHARED MEMORY SYNC (Linux only) ---
+    // --- 7. SHARED MEMORY SYNC (Linux only) ---
     variableTable.shmSize = shmOffset;
     if (shmEntries.length > 0) {
         source += `\n#if defined(__linux__)\n`;
@@ -939,7 +943,7 @@ ${boardDefines}${runtimePortHelpers}${customIncludes}${ecCfgEarly.motionIncludes
         source += `#endif /* __linux__ */\n\n`;
     }
 
-    // --- 6. DETERMINISTIC SCAN LOOP ---
+    // --- 8. DETERMINISTIC SCAN LOOP ---
     if (deviceArtifacts.sourceSupport) {
         source += deviceArtifacts.sourceSupport;
     }
@@ -1362,7 +1366,7 @@ extern KRON_Process_Image __gpi;
     // __gpi_snap is initialised to NULL; generateMainLoop sets it via
     // atomic_load_explicit at the top of every logic task's scan loop,
     // so it is always valid before any POU macro dereferences it.
-    const kronjPIDecl = hasAxes
+    const kronPIDecl = hasAxes
         ? `KRON_PROCESS_IMAGE  Kron_PI;\n` +
           `KRON_HAL_Driver    *Kron_HAL = NULL;\n` +
           `NC_AXIS             g_NC_Axes[${axisSlaves.length}];\n`
@@ -1384,7 +1388,7 @@ extern KRON_Process_Image __gpi;
 `KRON_Process_Image __gpi;\n` +
 `#endif\n` +
 `KRON_EC_Config __ec_cfg;\n` +
-kronjPIDecl +
+kronPIDecl +
 ncStubs;
 
     // motionIncludes: injected EARLY in plc.h (before global vars) so AXIS_REF type
@@ -1993,7 +1997,7 @@ const collectInputShadowVars = (rungs, progName) => {
         if (isBooleanLiteral(v)) return false;
         if (/^ADR\s*\(.+\)$/i.test(v)) return true;
         if (/^NULL$/i.test(v)) return true;
-        return v.length > 0 && /^[A-Za-z_][A-Za-z0-9_]*(\[[^\]]*\]|\.[A-Za-z_][A-Za-z0-9_]*)*$/.test(v);
+        return v.length > 0 && IDENTIFIER_REF_REGEX.test(v);
     };
     (rungs || []).forEach(rung => {
         (rung.blocks || []).forEach(b => {
@@ -2045,7 +2049,6 @@ const collectInputShadowVars = (rungs, progName) => {
 const collectUndeclaredPinVars = (rungs, progName, declaredVarNames, globalVarNames) => {
     const seen = new Set();
     const vars = [];
-    const idRegex = /^[A-Za-z_][A-Za-z0-9_]*(\[[^\]]*\]|\.[A-Za-z_][A-Za-z0-9_]*)*$/;
     const isLiteral = (s) =>
         /^-?[0-9]/.test(s) || /^(true|false)$/i.test(s) ||
         s.toUpperCase().startsWith('T#') || s.toUpperCase().startsWith('TIME#');
@@ -2061,7 +2064,7 @@ const collectUndeclaredPinVars = (rungs, progName, declaredVarNames, globalVarNa
                 const pinKey = type === 'Contact' ? 'var' : 'coil';
                 const raw = (vals[pinKey] || data.instanceName || '') + '';
                 const v = raw.replace(/[🌍🏠⊞⊡⊟]/g, '').trim();
-                if (v && idRegex.test(v) && !isLiteral(v)) {
+                if (v && IDENTIFIER_REF_REGEX.test(v) && !isLiteral(v)) {
                     const baseName = v.split(/[.[]/)[0];
                     if (!globalVarNames.includes(baseName) && !declaredVarNames.has(baseName) && !seen.has(baseName)) {
                         seen.add(baseName);
@@ -2074,7 +2077,7 @@ const collectUndeclaredPinVars = (rungs, progName, declaredVarNames, globalVarNa
             // All other blocks — scan every pin value
             Object.entries(vals).forEach(([pinName, rawVal]) => {
                 const v = rawVal ? (rawVal + '').replace(/[🌍🏠⊞⊡⊟]/g, '').trim() : '';
-                if (!v || !idRegex.test(v) || isLiteral(v)) return;
+                if (!v || !IDENTIFIER_REF_REGEX.test(v) || isLiteral(v)) return;
                 const baseName = v.split(/[.[]/)[0];
                 if (globalVarNames.includes(baseName) || declaredVarNames.has(baseName) || seen.has(baseName)) return;
                 seen.add(baseName);
@@ -2529,9 +2532,9 @@ const transpileSTLogics = (code, stdFunctions = {}, parentName = '', category = 
         // IEC 61131-3 type-conversion functions → KRON_ library names
         // e.g. BYTE_TO_UINT(...) → KRON_BYTE_TO_UINT16(...)
         const IEC_TO_KRON_TYPE = {
-            BOOL:'BOOL', BYTE:'BYTE', WORD:'WORD', DWORD:'DWORD',
-            SINT:'INT8', INT:'INT16', DINT:'INT32', LINT:'INT32',
-            USINT:'UINT8', UINT:'UINT16', UDINT:'UINT32', ULINT:'UINT32',
+            BOOL:'BOOL', BYTE:'BYTE', WORD:'WORD', DWORD:'DWORD', LWORD:'LWORD',
+            SINT:'INT8', INT:'INT16', DINT:'INT32', LINT:'INT64',
+            USINT:'UINT8', UINT:'UINT16', UDINT:'UINT32', ULINT:'UINT64',
             REAL:'REAL', LREAL:'LREAL',
         };
         result = result.replace(/\b([A-Za-z]+)_TO_([A-Za-z]+)(?=\s*\()/g, (match, src, dst) => {
@@ -2541,12 +2544,12 @@ const transpileSTLogics = (code, stdFunctions = {}, parentName = '', category = 
         });
         // IEC type cast functions: INT(x) → (int16_t)(x), DINT(x) → (int32_t)(x), etc.
         const IEC_CAST_C = {
-            BOOL: 'bool', BYTE: 'uint8_t', WORD: 'uint16_t', DWORD: 'uint32_t',
+            BOOL: 'bool', BYTE: 'uint8_t', WORD: 'uint16_t', DWORD: 'uint32_t', LWORD: 'uint64_t',
             SINT: 'int8_t', INT: 'int16_t', DINT: 'int32_t', LINT: 'int64_t',
             USINT: 'uint8_t', UINT: 'uint16_t', UDINT: 'uint32_t', ULINT: 'uint64_t',
             REAL: 'float', LREAL: 'double',
         };
-        result = result.replace(/\b(BOOL|BYTE|WORD|DWORD|SINT|INT|DINT|LINT|USINT|UINT|UDINT|ULINT|REAL|LREAL)\s*\(/gi,
+        result = result.replace(/\b(BOOL|BYTE|WORD|DWORD|LWORD|SINT|INT|DINT|LINT|USINT|UINT|UDINT|ULINT|REAL|LREAL)\s*\(/gi,
             (match, typeName) => {
                 const ct = IEC_CAST_C[typeName.toUpperCase()];
                 return ct ? `(${ct})(` : match;
@@ -2915,7 +2918,7 @@ const transpileLDLogics = (rungs, stdFunctions = {}, parentName = '', category =
         const adrMatch = s.match(/^ADR\s*\(\s*(.+?)\s*\)$/i);
         if (adrMatch) {
             const adrTarget = adrMatch[1].trim();
-            if (/^[A-Za-z_][A-Za-z0-9_]*(\[[^\]]*\]|\.[A-Za-z_][A-Za-z0-9_]*)*$/.test(adrTarget)) {
+            if (IDENTIFIER_REF_REGEX.test(adrTarget)) {
                 return `&(${resolveVar(adrTarget)})`;
             }
             return null;
@@ -2934,7 +2937,7 @@ const transpileLDLogics = (rungs, stdFunctions = {}, parentName = '', category =
         // Boolean literals
         if (isBooleanLiteral(s)) return normalizeBooleanLiteral(s);
         // Variable reference: simple, arr[idx], or struct.member
-        if (/^[A-Za-z_][A-Za-z0-9_]*(\[[^\]]*\]|\.[A-Za-z_][A-Za-z0-9_]*)*$/.test(s)) {
+        if (IDENTIFIER_REF_REGEX.test(s)) {
             return resolveVar(s);
         }
         return null; // unrecognised
@@ -3186,7 +3189,6 @@ const transpileLDLogics = (rungs, stdFunctions = {}, parentName = '', category =
                 });
 
                 const args = dataInputPins.map(pin => argValues[pin] || '0');
-                const validIdPattern = /^[A-Za-z_][A-Za-z0-9_]*(\[[^\]]*\]|\.[A-Za-z_][A-Za-z0-9_]*)*$/;
 
                 if (MATH_FB_BLOCKS.has(type)) {
                     // ── Math FB: local struct + _Call (kronmath.h) ──
@@ -3228,7 +3230,7 @@ const transpileLDLogics = (rungs, stdFunctions = {}, parentName = '', category =
                         out += `    float ${localRout} = 0.0f;\n`;
                         out += `    if (${bOut}) {\n`;
                         out += `        ${localRout} = ${realExpr};\n`;
-                        if (outVarCheck && validIdPattern.test(outVarCheck)) {
+                        if (outVarCheck && IDENTIFIER_REF_REGEX.test(outVarCheck)) {
                             out += `        ${resolveVar(outVarCheck)} = ${localRout};\n`;
                         }
                         out += `    }\n`;
@@ -3255,7 +3257,7 @@ const transpileLDLogics = (rungs, stdFunctions = {}, parentName = '', category =
                         }
                         out += `    ${callFn}(&${localVar});\n`;
 
-                        if (outVarCheck && validIdPattern.test(outVarCheck)) {
+                        if (outVarCheck && IDENTIFIER_REF_REGEX.test(outVarCheck)) {
                             out += `    ${resolveVar(outVarCheck)} = ${localVar}.OUT;\n`;
                         }
                         out += `    }\n`;
@@ -3264,7 +3266,7 @@ const transpileLDLogics = (rungs, stdFunctions = {}, parentName = '', category =
                     // ENO write-back (power-flow passthrough)
                     const enoRaw = data.values?.ENO;
                     const enoVar = enoRaw ? (enoRaw + '').replace(/[🌍🏠⊞⊡⊟]/g, '').trim() : '';
-                    if (enoVar && validIdPattern.test(enoVar)) {
+                    if (enoVar && IDENTIFIER_REF_REGEX.test(enoVar)) {
                         out += `    ${resolveVar(enoVar)} = ${bOut};\n`;
                     }
 
@@ -3298,7 +3300,7 @@ const transpileLDLogics = (rungs, stdFunctions = {}, parentName = '', category =
                         out += `    ${bOut} = ${inExpr};\n`;
                         const qRaw = data.values?.Q;
                         const qVar = qRaw ? (qRaw + '').replace(/[🌍🏠⊞⊡⊟]/g, '').trim() : '';
-                        if (qVar && validIdPattern.test(qVar)) {
+                        if (qVar && IDENTIFIER_REF_REGEX.test(qVar)) {
                             out += `    ${resolveVar(qVar)} = ${resultExpr};\n`;
                         }
                     } else {
@@ -3306,7 +3308,7 @@ const transpileLDLogics = (rungs, stdFunctions = {}, parentName = '', category =
                         // Assign OUT to target variable
                         const outRaw = data.values?.OUT;
                         const outVar = outRaw ? (outRaw + '').replace(/[🌍🏠⊞⊡⊟]/g, '').trim() : '';
-                        if (outVar && validIdPattern.test(outVar)) {
+                        if (outVar && IDENTIFIER_REF_REGEX.test(outVar)) {
                             out += `    if (${bOut}) { ${resolveVar(outVar)} = ${resultExpr}; }\n`;
                         }
                     }
@@ -3314,7 +3316,7 @@ const transpileLDLogics = (rungs, stdFunctions = {}, parentName = '', category =
                     // ENO write-back (if assigned to a variable)
                     const enoRaw = data.values?.ENO;
                     const enoVar = enoRaw ? (enoRaw + '').replace(/[🌍🏠⊞⊡⊟]/g, '').trim() : '';
-                    if (enoVar && validIdPattern.test(enoVar)) {
+                    if (enoVar && IDENTIFIER_REF_REGEX.test(enoVar)) {
                         out += `    ${resolveVar(enoVar)} = ${bOut};\n`;
                     }
                 }
@@ -3516,7 +3518,7 @@ const transpileLDLogics = (rungs, stdFunctions = {}, parentName = '', category =
                 outputPinNames.forEach(pinName => {
                     const rawVal = data.values?.[pinName];
                     const varStr = rawVal ? (rawVal + '').replace(/[🌍🏠⊞⊡⊟]/g, '').trim() : '';
-                    const isVarAssigned = varStr && /^[A-Za-z_][A-Za-z0-9_]*(\[[^\]]*\]|\.[A-Za-z_][A-Za-z0-9_]*)*$/.test(varStr);
+                    const isVarAssigned = varStr && IDENTIFIER_REF_REGEX.test(varStr);
                     if (isVarAssigned) {
                         out += `    ${resolveVar(varStr)} = ${callTarget}.${pinName};\n`;
                     }

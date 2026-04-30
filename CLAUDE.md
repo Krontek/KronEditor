@@ -165,6 +165,13 @@ All 3 `transpileToC` call sites in `App.jsx` pass `buses` and `busConfigs` as ar
 - Instance vars → `instance->` prefix
 - `varMap`: IEC variable name → C symbol; built automatically in `transpilePOUSource`
 
+### IEC Type Lookup Tables (must stay in sync)
+When adding a new IEC primitive type, update **all four** tables in `CTranspilerService.js`:
+- `IEC_TYPE_SIZES` — byte size; missing entry = no SHM slot, no force flag, var invisible to KronServer/REST API
+- `IEC_TO_SERVER_TYPE` — KronServer type name (`bool`, `int8/16/32/64`, `uint8/16/32/64`, `float32/64`); wrong signedness silently corrupts values displayed in HMI/REST
+- `IEC_TO_KRON_TYPE` (inside `transformExpr`) — KRON converter library suffix (e.g. `INT64`); truncated entry causes ST `X_TO_Y(...)` to silently lose precision
+- `IEC_CAST_C` (inside `transformExpr`) — C cast type for `INT(x)` style coercions; also update the regex listing the type names
+
 ### ST Transpilation — Operator Mappings
 | IEC ST | C |
 |--------|---|
@@ -192,6 +199,7 @@ All 3 `transpileToC` call sites in `App.jsx` pass `buses` and `busConfigs` as ar
 - Raw line split: `/\r?\n|\\n/` (handles both real and escaped newlines).
 - **Continuation merge**: lines ending with `AND`/`OR`/`NOT`/`XOR`, an arithmetic operator (`+ - * /`), a comparison operator (`< > <= >= <>` or bare `=`), `,`, or `(` are merged with the next line. `:=` is excluded so trailing assignments don't accidentally swallow the next statement.
 - **CASE label + body split**: a numeric label followed by an inline body on the same line (e.g. `1:  init_wait(IN := TRUE, PT := T#30ms);`) is automatically split into two lines so the body still passes through the full statement pipeline (FB-call detection, etc.). Without this split, named-arg FB calls inside CASE labels would be mangled into invalid C.
+- **String-literal placeholder uses ASCII control chars** (`\x01<idx>\x02`) inside `transformExpr`. They will not appear in any text editor view, but they exist in the JS source and must NOT be replaced with bare digits — bare-digit placeholders silently corrupt every numeric literal in the expression into `"undefined"` because the restore regex `\d+` cannot distinguish a placeholder from a real number.
 
 ### LD Transpilation — Data Structures
 ```js
@@ -459,8 +467,14 @@ Variables get an IEC address in the VariableManager "Address" column (e.g. `%MW0
 | GET | `/api/v1/variables` | Bearer token | All addressed variables |
 | GET | `/api/v1/variables/{name}` | Bearer token | Single addressed variable + address field |
 | POST | `/api/v1/variables/{name}` | Bearer token | Write value |
-| GET | `/api/v1/stream` | Bearer token | SSE stream (addressed only, 50ms) |
+| GET | `/api/v1/stream` | Bearer token | SSE stream (addressed only, cadence tunable, default 50ms) |
 | POST | `/api/v1/forces/clear` | Bearer token | Clear force flags |
+| GET | `/api/v1/runtime` | Bearer token | `{running, pid, auto_run, stream_interval_ms}` |
+| POST | `/api/v1/runtime/start` | Bearer token | Start PLC runtime (mirrors ConnectRPC `Start`) |
+| POST | `/api/v1/runtime/stop` | Bearer token | Stop PLC runtime (SIGTERM → 5s → SIGKILL) |
+| POST | `/api/v1/runtime/config` | Bearer token | Partial update of `auto_run` and/or `stream_interval_ms` |
+
+**Stream cadence scope**: only `/api/v1/stream` (addressed variables, external clients) is tunable. Editor streams (`/stream/vars` SSE and ConnectRPC `StreamVars`) are deliberately fixed at the `streamInterval` constant (50 ms) — the editor relies on this stability. The `stream_interval_ms` knob is clamped to **5–60000** and changes apply on the next tick to all in-flight `/api/v1/stream` clients (no reconnect needed).
 
 **Key files**:
 - Editor: `VariableManager.jsx` (`formatIECAddress`), `CTranspilerService.js` (propagation), `App.jsx` (password hash)
@@ -476,6 +490,6 @@ Variables get an IEC address in the VariableManager "Address" column (e.g. `%MW0
 
 **Editor on connect**: Every 10s status check parses `/status` JSON. If `running: true` and editor doesn't think it's running → attaches as if Start was pressed (creates PLCClient, starts stream, sets `isRunning=true`). If `running: false` and editor thinks it's running → detects crash, sets `isRunning=false`.
 
-**`/status` response** now includes `auto_run: bool`.
+**`/status` response** includes `auto_run: bool` and `stream_interval_ms: uint`.
 
-**`/deploy/config` endpoint**: `POST /deploy/config` — no auth required (same trust level as other deploy endpoints). Saves `runtime_config.json`.
+**`/deploy/config` endpoint**: `POST /deploy/config` — no auth required (same trust level as other deploy endpoints). Accepts a **partial** JSON body: omitted fields keep their current value, so the editor can push `{"auto_run": ...}` without clobbering an API-tuned `stream_interval_ms`. Saves `runtime_config.json`. Same partial-update payload is also accepted (with bearer auth) at `POST /api/v1/runtime/config`.

@@ -12,6 +12,12 @@ Onemotorcontrol.py — KronServer Motion Control GUI
 %MD3    REAL  — Velocity setpoint command (-20.000 .. 20.000)
 %MD4    REAL  — Velocity feedback
 
+Runtime row (uses /api/v1/runtime/*):
+  - START / STOP            launch or stop the PLC runtime on the agent
+  - RUNNING / STOPPED        live status indicator (polled every 1.5 s)
+  - AutoRun ON / OFF         toggle agent's autorun-at-boot flag
+  - Stream <ms> [Apply]      change the SSE / gRPC streaming cadence
+
 Usage: python3 Onemotorcontrol.py
 """
 
@@ -107,6 +113,26 @@ class KronClient:
     def write(self, name, value):
         self.post(f"/api/v1/variables/{name}", {"value": value})
 
+    # ── Runtime control ───────────────────────────────────────────────────────
+
+    def runtime_status(self):
+        """Return {'running', 'pid', 'auto_run', 'stream_interval_ms'}."""
+        return self.get("/api/v1/runtime")
+
+    def runtime_start(self):
+        return self.post("/api/v1/runtime/start")
+
+    def runtime_stop(self):
+        return self.post("/api/v1/runtime/stop")
+
+    def runtime_config(self, auto_run=None, stream_interval_ms=None):
+        body = {}
+        if auto_run is not None:
+            body["auto_run"] = bool(auto_run)
+        if stream_interval_ms is not None:
+            body["stream_interval_ms"] = int(stream_interval_ms)
+        return self.post("/api/v1/runtime/config", body)
+
     def stream_iter(self):
         url  = self.base_url + "/api/v1/stream"
         hdrs = {"Authorization": f"Bearer {self.token}"} if self.token else {}
@@ -144,6 +170,11 @@ class MotorControlApp(tk.Tk):
         self._power_on = False
         self._stop_on  = False
 
+        # Runtime state
+        self._runtime_running  = False
+        self._runtime_auto_run = False
+        self._runtime_poll_id  = None
+
         self._build_ui()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
@@ -151,6 +182,7 @@ class MotorControlApp(tk.Tk):
 
     def _build_ui(self):
         self._build_connection_bar()
+        self._build_runtime_bar()
         self._build_main_panel()
 
     def _build_connection_bar(self):
@@ -191,6 +223,63 @@ class MotorControlApp(tk.Tk):
         self.lbl_conn = tk.Label(conn, text="● Disconnected", bg=BG2,
                                  fg=RED, font=("Consolas", 10, "bold"))
         self.lbl_conn.pack(side=tk.LEFT)
+
+    def _build_runtime_bar(self):
+        bar = tk.Frame(self, bg=BG3, padx=10, pady=8)
+        bar.pack(fill=tk.X)
+
+        tk.Label(bar, text="Runtime:", bg=BG3, fg=TEXT,
+                 font=("Consolas", 10, "bold")).pack(side=tk.LEFT)
+
+        # START / STOP toggle button (controls the PLC process on the agent).
+        self.btn_runtime = tk.Button(bar, text="▶ START", width=10,
+                                     bg="#003a1a", fg=GREEN,
+                                     relief=tk.FLAT, font=("Consolas", 10, "bold"),
+                                     padx=8, pady=2, cursor="hand2",
+                                     state=tk.DISABLED,
+                                     command=self._toggle_runtime)
+        self.btn_runtime.pack(side=tk.LEFT, padx=(8, 8))
+
+        # Live status indicator (running ● green / stopped ● red).
+        self.lbl_runtime_state = tk.Label(bar, text="● STOPPED",
+                                          bg=BG3, fg=RED,
+                                          font=("Consolas", 10, "bold"))
+        self.lbl_runtime_state.pack(side=tk.LEFT)
+
+        self.lbl_runtime_pid = tk.Label(bar, text="", bg=BG3, fg=TEXT_DIM,
+                                        font=("Consolas", 9))
+        self.lbl_runtime_pid.pack(side=tk.LEFT, padx=(6, 12))
+
+        # AutoRun toggle (persisted in runtime_config.json on the agent).
+        tk.Label(bar, text="AutoRun:", bg=BG3, fg=TEXT,
+                 font=("Consolas", 10)).pack(side=tk.LEFT)
+        self.btn_autorun = tk.Button(bar, text="OFF", width=5,
+                                     bg="#3a0000", fg=RED,
+                                     relief=tk.FLAT, font=("Consolas", 10, "bold"),
+                                     padx=4, pady=2, cursor="hand2",
+                                     state=tk.DISABLED,
+                                     command=self._toggle_autorun)
+        self.btn_autorun.pack(side=tk.LEFT, padx=(4, 14))
+
+        # Stream interval (ms) — pushed via /api/v1/runtime/config and applied
+        # live to all SSE / gRPC streams without requiring reconnect.
+        tk.Label(bar, text="Stream:", bg=BG3, fg=TEXT,
+                 font=("Consolas", 10)).pack(side=tk.LEFT)
+        self.ent_interval = tk.Entry(bar, width=5, bg=BG2, fg=TEXT,
+                                     insertbackground=TEXT, relief=tk.FLAT,
+                                     font=("Consolas", 10),
+                                     highlightthickness=1, highlightbackground=BORDER,
+                                     justify=tk.RIGHT, state=tk.DISABLED)
+        self.ent_interval.pack(side=tk.LEFT, padx=(4, 2))
+        tk.Label(bar, text="ms", bg=BG3, fg=TEXT_DIM,
+                 font=("Consolas", 9)).pack(side=tk.LEFT)
+        self.btn_interval = tk.Button(bar, text="Apply", bg=ACCENT, fg="#fff",
+                                      relief=tk.FLAT, font=("Consolas", 9, "bold"),
+                                      padx=8, pady=2, cursor="hand2",
+                                      state=tk.DISABLED,
+                                      command=self._apply_interval)
+        self.btn_interval.pack(side=tk.LEFT, padx=(6, 0))
+        self.ent_interval.bind("<Return>", lambda _: self._apply_interval())
 
     def _build_main_panel(self):
         main = tk.Frame(self, bg=BG, padx=24, pady=20)
@@ -451,8 +540,10 @@ class MotorControlApp(tk.Tk):
         self.btn_conn.config(state=tk.NORMAL, text="Reconnect")
         self.lbl_conn.config(text="● Connected", fg=GREEN)
         for btn in (self.btn_power, self.btn_reset, self.btn_stop, self.btn_halt,
-                    self.btn_position_trigger, self.btn_velocity_trigger):
+                    self.btn_position_trigger, self.btn_velocity_trigger,
+                    self.btn_runtime, self.btn_autorun, self.btn_interval):
             btn.config(state=tk.NORMAL)
+        self.ent_interval.config(state=tk.NORMAL)
         # Sync toggle states from PLC
         try:
             self._set_power_ui(bool(self.client.read(self._names[POWER_ADDR.upper()])))
@@ -462,6 +553,10 @@ class MotorControlApp(tk.Tk):
             self._set_stop_ui(bool(self.client.read(self._names[STOP_ADDR.upper()])))
         except Exception:
             pass
+        # Pull initial runtime status (running, auto_run, stream_interval_ms)
+        # and start the periodic poller so the UI tracks the agent state.
+        threading.Thread(target=self._refresh_runtime_status, daemon=True).start()
+        self._start_runtime_polling()
         self._start_stream()
         self._log("Connected. Streaming live data.")
 
@@ -546,6 +641,121 @@ class MotorControlApp(tk.Tk):
             self.btn_velocity_trigger.config(text="▶  VELOCITY TRIGGER",
                                              bg="#1a2a3a", fg=TEXT_DIM)
 
+    # ── Runtime control ───────────────────────────────────────────────────────
+
+    def _toggle_runtime(self):
+        target_running = not self._runtime_running
+        # Disable the button while the request is in-flight to prevent the
+        # user from queueing a start-while-stopping race.
+        self.btn_runtime.config(state=tk.DISABLED)
+        threading.Thread(target=self._do_toggle_runtime,
+                         args=(target_running,), daemon=True).start()
+
+    def _do_toggle_runtime(self, target_running):
+        try:
+            if target_running:
+                self.client.runtime_start()
+            else:
+                self.client.runtime_stop()
+            self._refresh_runtime_status()
+        except Exception as e:
+            self.after(0, self._log, f"Runtime control error: {e}")
+        finally:
+            self.after(0, lambda: self.btn_runtime.config(state=tk.NORMAL))
+
+    def _toggle_autorun(self):
+        new_state = not self._runtime_auto_run
+        self.btn_autorun.config(state=tk.DISABLED)
+        threading.Thread(target=self._do_set_autorun,
+                         args=(new_state,), daemon=True).start()
+
+    def _do_set_autorun(self, new_state):
+        try:
+            cfg = self.client.runtime_config(auto_run=new_state)
+            self.after(0, self._set_autorun_ui, bool(cfg.get("auto_run", new_state)))
+        except Exception as e:
+            self.after(0, self._log, f"AutoRun error: {e}")
+        finally:
+            self.after(0, lambda: self.btn_autorun.config(state=tk.NORMAL))
+
+    def _apply_interval(self):
+        raw = self.ent_interval.get().strip()
+        try:
+            ms = int(raw)
+        except ValueError:
+            self._log("Stream interval must be an integer (ms)")
+            return
+        self.btn_interval.config(state=tk.DISABLED)
+        threading.Thread(target=self._do_set_interval,
+                         args=(ms,), daemon=True).start()
+
+    def _do_set_interval(self, ms):
+        try:
+            cfg = self.client.runtime_config(stream_interval_ms=ms)
+            applied = int(cfg.get("stream_interval_ms", ms))
+            self.after(0, self._set_interval_ui, applied)
+            if applied != ms:
+                self.after(0, self._log,
+                           f"Stream interval clamped to {applied} ms")
+        except Exception as e:
+            self.after(0, self._log, f"Stream interval error: {e}")
+        finally:
+            self.after(0, lambda: self.btn_interval.config(state=tk.NORMAL))
+
+    def _refresh_runtime_status(self):
+        """Pull latest runtime status from the agent. Safe to call from any thread."""
+        try:
+            st = self.client.runtime_status()
+        except Exception:
+            return
+        self.after(0, self._apply_runtime_status, st)
+
+    def _apply_runtime_status(self, st: dict):
+        running = bool(st.get("running"))
+        pid     = int(st.get("pid") or 0)
+        self._runtime_running = running
+        if running:
+            self.btn_runtime.config(text="■ STOP", bg="#4a1212", fg=RED)
+            self.lbl_runtime_state.config(text="● RUNNING", fg=GREEN)
+            self.lbl_runtime_pid.config(text=f"pid={pid}")
+        else:
+            self.btn_runtime.config(text="▶ START", bg="#003a1a", fg=GREEN)
+            self.lbl_runtime_state.config(text="● STOPPED", fg=RED)
+            self.lbl_runtime_pid.config(text="")
+
+        if "auto_run" in st:
+            self._set_autorun_ui(bool(st["auto_run"]))
+        if "stream_interval_ms" in st:
+            self._set_interval_ui(int(st["stream_interval_ms"]))
+
+    def _set_autorun_ui(self, on: bool):
+        self._runtime_auto_run = on
+        if on:
+            self.btn_autorun.config(text="ON",  bg="#003a00", fg=GREEN)
+        else:
+            self.btn_autorun.config(text="OFF", bg="#3a0000", fg=RED)
+
+    def _set_interval_ui(self, ms: int):
+        # Only overwrite the entry if the user is not actively editing it.
+        if self.focus_get() is not self.ent_interval:
+            self.ent_interval.config(state=tk.NORMAL)
+            self.ent_interval.delete(0, tk.END)
+            self.ent_interval.insert(0, str(ms))
+
+    def _start_runtime_polling(self):
+        if self._runtime_poll_id is not None:
+            return
+        self._runtime_poll_tick()
+
+    def _runtime_poll_tick(self):
+        threading.Thread(target=self._refresh_runtime_status, daemon=True).start()
+        self._runtime_poll_id = self.after(1500, self._runtime_poll_tick)
+
+    def _stop_runtime_polling(self):
+        if self._runtime_poll_id is not None:
+            self.after_cancel(self._runtime_poll_id)
+            self._runtime_poll_id = None
+
     # ── Sliders ───────────────────────────────────────────────────────────────
 
     def _on_position_slider(self, val):
@@ -611,6 +821,7 @@ class MotorControlApp(tk.Tk):
 
     def _on_close(self):
         self._streaming = False
+        self._stop_runtime_polling()
         self.destroy()
 
 
