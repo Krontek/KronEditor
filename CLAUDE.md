@@ -460,6 +460,8 @@ Variables get an IEC address in the VariableManager "Address" column (e.g. `%MW0
 
 **Initial values**: `WriteInitialValues()` is called before runtime Start. Writes `initial_value` from variable_table.json to SHM so variables start at their configured defaults on every restart.
 
+**Agent restart**: KronServer auto-rehydrates `{deploy-dir}/variable_table.json` on startup (`server.go` `loadStoredVariableTable`). Without this the API password (embedded in the file) would be empty after every reboot and `/api/v1/auth` would return 503 even though Build & Send had already deployed the file. The PLC runtime does NOT need to be running for the REST API to work — the agent and the runtime are independent processes; only `LoadVariableTable` matters for `APIEnabled()`.
+
 **REST API Endpoints** (`api.go`):
 | Method | Path | Auth | Description |
 |--------|------|------|-------------|

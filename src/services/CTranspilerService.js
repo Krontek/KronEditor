@@ -575,8 +575,7 @@ ${boardDefines}${runtimePortHelpers}${customIncludes}${ecCfgEarly.motionIncludes
         header += `// --- GLOBAL VARIABLES ---\n`;
         config.content.globalVars.forEach(v => {
             const isUserType = !!dataTypeDefs[v.type];
-            let initVal = (!isUserType && v.initialValue) ? ` = ${v.initialValue}` : '';
-            if (v.type === 'STRING' && v.initialValue) initVal = ` = "${v.initialValue}"`;
+            const initVal = isUserType ? '' : formatVarInitial(v.initialValue, v.type);
             header += `${mapType(v.type)} ${v.name}${initVal};\n`;
             const gInitVal = resolveInitialValue(v.initialValue, v.type);
             variableTable.globalVars[v.name] = { type: v.type, initialValue: gInitVal };
@@ -737,28 +736,7 @@ ${boardDefines}${runtimePortHelpers}${customIncludes}${ecCfgEarly.motionIncludes
                     // `state := 90` or `pca_dev_addr := 16#40`, which silently
                     // breaks state machines that rely on a non-zero start state.
                     const isUserType = !!dataTypeDefs[vType];
-                    let initStr = '';
-                    if (!isUserType && v.initialValue !== undefined && v.initialValue !== null && v.initialValue !== '') {
-                        if (vType === 'STRING') {
-                            initStr = ` = "${v.initialValue}"`;
-                        } else if (vType === 'BOOL') {
-                            const b = String(v.initialValue).trim().toLowerCase();
-                            initStr = ` = ${(b === 'true' || b === '1') ? 'true' : 'false'}`;
-                        } else {
-                            // Numeric — accept C decimal/hex (`64`, `0x40`) or IEC
-                            // typed-radix (`16#40`, `2#1010`) and translate the
-                            // latter to C syntax so the generated C compiles.
-                            const raw = String(v.initialValue).trim();
-                            const cVal = raw.replace(/\b(\d+)#([0-9A-Fa-f_]+)\b/g, (_, base, digits) => {
-                                const cleaned = digits.replace(/_/g, '');
-                                if (base === '16') return `0x${cleaned}`;
-                                if (base === '2')  return `0b${cleaned}`; // GCC extension
-                                if (base === '8')  return `0${cleaned}`;
-                                return parseInt(cleaned, parseInt(base, 10)).toString();
-                            });
-                            initStr = ` = ${cVal}`;
-                        }
-                    }
+                    const initStr = isUserType ? '' : formatVarInitial(v.initialValue, vType);
                     header += `${mapType(vType)} prog_${progName}_${vName}${initStr};\n`;
                 }
 
@@ -1001,6 +979,40 @@ const mapIECtoTimeUs = (iecTimeStr) => {
     if (str.endsWith('US')) return parseInt(str.replace('US', ''));
     if (str.endsWith('S')) return parseInt(str.replace('S', '')) * 1000000;
     return 10000; // Default 10000us (10ms)
+};
+
+// formatVarInitial — turn a Variable Manager `initialValue` field into a C
+// initialiser fragment (`= ...`). Without this normalisation the raw IEC
+// text would land in plc.h verbatim and break the build:
+//   BOOL  : `True` / `TRUE` / `1`     →  ` = true`        (C `bool`)
+//   TIME  : `T#300ms` / `TIME#1s`     →  ` = 300000`      (uint32 µs, matches transformExpr)
+//   INT…  : `16#40` / `2#1010`        →  ` = 0x40` / ` = 0b1010`
+//   STRING: `hello`                    →  ` = "hello"`
+// Empty/undefined returns '' so the caller can append nothing.
+const formatVarInitial = (raw, type) => {
+    if (raw === undefined || raw === null || raw === '') return '';
+    const T = String(type || '').toUpperCase();
+    if (T === 'STRING') return ` = "${raw}"`;
+    if (T === 'BOOL') {
+        const b = String(raw).trim().toLowerCase();
+        return ` = ${(b === 'true' || b === '1') ? 'true' : 'false'}`;
+    }
+    if (T === 'TIME') {
+        const s = String(raw).trim();
+        if (/^(?:T|TIME)#/i.test(s)) return ` = ${mapIECtoTimeUs(s)}`;
+        return ` = ${s}`;
+    }
+    // Numeric — accept C decimal/hex (`64`, `0x40`) or IEC typed-radix
+    // (`16#40`, `2#1010`) and translate the latter to C syntax.
+    const rawStr = String(raw).trim();
+    const cVal = rawStr.replace(/\b(\d+)#([0-9A-Fa-f_]+)\b/g, (_, base, digits) => {
+        const cleaned = digits.replace(/_/g, '');
+        if (base === '16') return `0x${cleaned}`;
+        if (base === '2')  return `0b${cleaned}`; // GCC extension
+        if (base === '8')  return `0${cleaned}`;
+        return parseInt(cleaned, parseInt(base, 10)).toString();
+    });
+    return ` = ${cVal}`;
 };
 
 const formatUsDisplay = (us) => {
