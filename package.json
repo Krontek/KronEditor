@@ -6,6 +6,8 @@
   "scripts": {
     "dev": "npx tauri dev",
     "web": "vite",
+    "web2": "VITE_PORT=1421 vite",
+    "dev2": "VITE_PORT=1421 npx tauri dev --config '{\"build\":{\"devUrl\":\"http://localhost:1421\",\"beforeDevCommand\":\"npm run web2\"}}'",
     "setup:llvm:linux": "python3 setup_toolchain.py --host linux",
     "setup:llvm:windows": "python3 setup_toolchain.py --host windows",
     "setup:llvm:macos": "python3 setup_toolchain.py --host macos",
@@ -21,6 +23,7 @@
   "dependencies": {
     "@monaco-editor/react": "^4.7.0",
     "@tauri-apps/api": "~2.2.0",
+    "@tauri-apps/plugin-clipboard-manager": "^2.3.2",
     "@tauri-apps/plugin-dialog": "^2.6.0",
     "@tauri-apps/plugin-fs": "^2.4.5",
     "i18next": "^25.8.0",

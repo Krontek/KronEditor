@@ -1870,23 +1870,45 @@ fn deploy_server_to_target_sync(
     std::io::Read::read_to_string(&mut channel, &mut out).ok();
     channel.wait_close().ok();
 
-    // Wait a moment for the agent to start
-    std::thread::sleep(std::time::Duration::from_secs(2));
-
-    let _ = app.emit("server-deploy-progress", "Verifying agent is running...");
-
-    // Verify
+    // Retry verification up to 5 times (ARM devices can take 10+ seconds to start)
     let check_addr = format!("{}:7070", host);
-    match check_server_status_sync(&check_addr) {
-        Ok(_) => {
-            let _ = app.emit("server-deploy-progress", "plc-agent deployed and running!");
-            Ok("Server deployed successfully".into())
+    let mut last_err = String::new();
+    let mut started = false;
+    for attempt in 1..=5u32 {
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        let _ = app.emit("server-deploy-progress",
+            format!("Verifying agent is running (attempt {}/5)...", attempt));
+        match check_server_status_sync(&check_addr) {
+            Ok(_) => { started = true; break; }
+            Err(e) => { last_err = e; }
         }
-        Err(e) => {
+    }
+
+    if started {
+        let _ = app.emit("server-deploy-progress", "plc-agent deployed and running!");
+        Ok("Server deployed successfully".into())
+    } else {
+        // SSH back to grab service/log diagnostics
+        let diag_cmd = format!(
+            "systemctl status plc-agent 2>&1 | head -30; echo '---'; journalctl -u plc-agent -n 20 2>&1; echo '---'; cat {}/plc-agent.log 2>&1 | tail -20",
+            remote_dir
+        );
+        let mut diag = String::new();
+        if let Ok(mut ch) = sess.channel_session() {
+            if ch.exec(&diag_cmd).is_ok() {
+                std::io::Read::read_to_string(&mut ch, &mut diag).ok();
+                ch.wait_close().ok();
+            }
+        }
+        let diag = diag.trim().to_string();
+        if !diag.is_empty() {
             let _ = app.emit("server-deploy-progress",
-                format!("WARNING: Agent may not have started: {}", e));
-            Err(format!("Server deployed but verification failed: {}", e))
+                format!("Agent did not start. Diagnostics:\n{}", diag));
+        } else {
+            let _ = app.emit("server-deploy-progress",
+                format!("WARNING: Agent may not have started: {}", last_err));
         }
+        Err(format!("Server deployed but agent did not respond after 10s: {}", last_err))
     }
 }
 
@@ -3727,6 +3749,7 @@ fn main() {
         })
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_clipboard_manager::init())
         .invoke_handler(tauri::generate_handler![
             simulate_st,
             write_plc_files,

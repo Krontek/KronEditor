@@ -386,6 +386,10 @@ const RungEditorNew = ({ variables, setVariables, rungs, setRungs, availableBloc
     if (readOnly) return;
     const clip = await readClipboard();
     if (!clip) return;
+    if (clip.kind === CLIP_KIND.POU) {
+        alert('Cannot paste here. The clipboard contains a data type or POU — paste it in the project sidebar.');
+        return;
+    }
 
     if (clip.kind === CLIP_KIND.RUNG) {
       // ── Rung paste ─────────────────────────────────────

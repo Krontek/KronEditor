@@ -297,7 +297,12 @@ const VariableManager = ({
   const pasteVariableAt = async (insertAfterIndex) => {
     if (disabled || isSimulationMode) return;
     const clip = await readClipboard();
-    if (!clip || clip.kind !== CLIP_KIND.VARIABLE || !onAdd) return;
+    if (!clip) return;
+    if (clip.kind === CLIP_KIND.POU) {
+        alert('Cannot paste here. The clipboard contains a data type or POU — paste it in the project sidebar.');
+        return;
+    }
+    if (clip.kind !== CLIP_KIND.VARIABLE || !onAdd) return;
     // Accept both array (multi) and legacy single-object payloads
     const list = Array.isArray(clip.payload) ? clip.payload : [clip.payload];
     if (list.length === 0) return;

@@ -238,13 +238,16 @@ const ProjectSidebar = ({
     const [ctxMenu, setCtxMenu] = useState(null); // { x, y, items }
     const closeCtx = useCallback(() => setCtxMenu(null), []);
 
-    const openCtx = (e, items) => {
+    const openCtx = async (e, itemsOrBuilder) => {
         e.preventDefault();
         e.stopPropagation();
-        // Refresh so the menu reflects what is actually on the clipboard
-        // right now, even if focus/visibility events were missed.
-        refreshClipboard();
-        setCtxMenu({ x: e.clientX, y: e.clientY, items });
+        if (typeof itemsOrBuilder === 'function') {
+            const clip = await refreshClipboard();
+            const clipCat = clip?.kind === CLIP_KIND.POU ? clip.meta?.category : null;
+            setCtxMenu({ x: e.clientX, y: e.clientY, items: itemsOrBuilder(clipCat) });
+        } else {
+            setCtxMenu({ x: e.clientX, y: e.clientY, items: itemsOrBuilder });
+        }
     };
 
     const globalVars = projectStructure.resources?.find(r => r.type === 'RESOURCE_EDITOR')?.content?.globalVars || [];
@@ -323,7 +326,7 @@ const ProjectSidebar = ({
     }, [isRunning, onDeleteItem, t]);
 
     /* ── Context menu builders ── */
-    const itemCtxItems = (category, item, insertIndex) => [
+    const itemCtxItems = (category, item, insertIndex, clipCat) => [
         {
             icon: '✎', label: t('common.rename'),
             disabled: isRunning,
@@ -334,7 +337,7 @@ const ProjectSidebar = ({
             disabled: isRunning,
             action: () => !isRunning && copyItem(category, item),
         },
-        ...(clipboardCategory === category ? [{
+        ...(clipCat === category ? [{
             icon: '📄', label: 'Paste',
             disabled: isRunning,
             action: () => handleSidebarPaste(category, insertIndex),
@@ -347,13 +350,13 @@ const ProjectSidebar = ({
         },
     ];
 
-    const categoryCtxItems = (category, items) => [
+    const categoryCtxItems = (category, items, clipCat) => [
         {
             icon: '+', label: t('actions.addNew'),
             disabled: isRunning,
             action: () => !isRunning && onAddItem(category, items.length),
         },
-        ...(clipboardCategory === category ? [{
+        ...(clipCat === category ? [{
             icon: '📄', label: 'Paste',
             disabled: isRunning,
             action: () => handleSidebarPaste(category, items.length),
@@ -384,7 +387,7 @@ const ProjectSidebar = ({
             label={title}
             isOpen={expanded[key]}
             onToggle={() => toggle(key)}
-            onContextMenu={(e) => openCtx(e, categoryCtxItems(key, items))}
+            onContextMenu={(e) => openCtx(e, (c) => categoryCtxItems(key, items, c))}
         >
             <div
                 onDragLeave={(e) => {
@@ -433,7 +436,7 @@ const ProjectSidebar = ({
                                     setDragItem(null); setDragEnabled(false); setDragOverIndex(null);
                                 }}
                                 onClick={() => onSelectItem(key, item.id)}
-                                onContextMenu={(e) => openCtx(e, itemCtxItems(key, item, index + 1))}
+                                onContextMenu={(e) => openCtx(e, (c) => itemCtxItems(key, item, index + 1, c))}
                                 style={{
                                     padding: '5px 8px 5px 42px',
                                     cursor: 'pointer',
