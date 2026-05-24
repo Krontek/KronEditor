@@ -96,7 +96,7 @@ src-tauri/
 
 public/libraries/           XML block library definitions loaded by LibraryService.js
 
-KronServer/ (/home/fehim/Documents/KronServer/)
+server/ (in-tree at <repo>/server/ — Go agent sources, cross-compiled to target binaries)
   main.go                   Entry point: CLI flags, logger, manager init, graceful shutdown
   server.go                 HTTP server: ConnectRPC routes, deploy endpoints, CORS, h2c
   service.go                PLCService RPC impl (Start/Stop/WriteVar/ClearAllForces/StreamVars)
@@ -377,7 +377,7 @@ All have `Axis` (AXIS_REF) as first input pin.
 
 ## KronServer — PLC Deployment & Debug Agent
 
-Source: `/home/fehim/Documents/KronServer/`
+Source: `<repo>/server/` (in-tree; cross-compiled by Settings → Build Server into `src-tauri/resources/<target>/server/` and shipped to the target hardware via SSH/SFTP deploy)
 
 ### Overview
 Go-based agent that deploys compiled PLC runtime binaries to target hardware, manages runtime lifecycle, and provides live variable streaming via shared memory IPC. Serves HMI web interface with role-based access control.

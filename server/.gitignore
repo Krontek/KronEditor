@@ -1,0 +1,19 @@
+# Build outputs
+dist/
+bin/
+
+# Go test artifacts
+*.test
+*.out
+coverage.out
+
+# Dependency vendoring
+vendor/
+
+# Workspace and local environment files
+.env
+.env.*
+
+# OS/editor noise
+.DS_Store
+Thumbs.db

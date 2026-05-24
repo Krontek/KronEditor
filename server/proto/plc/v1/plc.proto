@@ -1,0 +1,56 @@
+syntax = "proto3";
+
+package plc.v1;
+
+import "google/protobuf/struct.proto";
+
+option go_package = "plc-agent/gen/plc/v1;plcv1";
+
+// PLCService controls the PLC runtime and streams live variable data.
+service PLCService {
+  // Start launches the PLC runtime binary.
+  rpc Start(StartRequest) returns (StartResponse);
+
+  // Stop gracefully terminates the PLC runtime.
+  rpc Stop(StopRequest) returns (StopResponse);
+
+  // WriteVar force-writes a variable value into shared memory.
+  rpc WriteVar(WriteVarRequest) returns (WriteVarResponse);
+
+  // ClearAllForces removes all force flags so the PLC resumes normal sync.
+  rpc ClearAllForces(ClearAllForcesRequest) returns (ClearAllForcesResponse);
+
+  // StreamVars pushes all variable values every 50 ms (server streaming).
+  rpc StreamVars(StreamVarsRequest) returns (stream VarsUpdate);
+}
+
+message StartRequest {}
+
+message StartResponse {
+  int32 pid = 1;
+}
+
+message StopRequest {}
+
+message StopResponse {}
+
+message WriteVarRequest {
+  string name  = 1;
+  // value holds a bool, number, or string matching the variable's IEC type.
+  google.protobuf.Value value = 2;
+}
+
+message WriteVarResponse {}
+
+message ClearAllForcesRequest {}
+
+message ClearAllForcesResponse {}
+
+message StreamVarsRequest {}
+
+message VarsUpdate {
+  // variables maps IEC variable names to their current runtime values.
+  google.protobuf.Struct variables = 1;
+  // ts is the snapshot timestamp in Unix milliseconds.
+  int64 ts = 2;
+}

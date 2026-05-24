@@ -1,0 +1,12 @@
+{
+  "variables": [
+    { "name": "motor_speed_rpm",   "offset": 0,  "type": "float32", "size": 4 },
+    { "name": "pump_status",       "offset": 4,  "type": "bool",    "size": 1 },
+    { "name": "error_code",        "offset": 8,  "type": "int32",   "size": 4 },
+    { "name": "temperature_c",     "offset": 12, "type": "float64", "size": 8 },
+    { "name": "cycle_count",       "offset": 20, "type": "uint64",  "size": 8 },
+    { "name": "valve_position",    "offset": 28, "type": "uint8",   "size": 1 },
+    { "name": "pressure_bar",      "offset": 32, "type": "float32", "size": 4 },
+    { "name": "emergency_stop",    "offset": 36, "type": "bool",    "size": 1 }
+  ]
+}

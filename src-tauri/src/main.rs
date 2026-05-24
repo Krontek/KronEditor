@@ -1336,7 +1336,7 @@ fn update_libraries(app: tauri::AppHandle, repos: Vec<String>) -> Result<String,
 }
 
 // ---------------------------------------------------------------------------
-// update_server -- clone KronServer and cross-compile Go binaries
+// update_server -- cross-compile in-tree server/ Go sources for all targets
 // ---------------------------------------------------------------------------
 
 fn do_update_server(app: &tauri::AppHandle) -> Result<(), String> {
@@ -1344,6 +1344,14 @@ fn do_update_server(app: &tauri::AppHandle) -> Result<(), String> {
     if out_dirs.is_empty() { return Err("Cannot locate resources directory".into()); }
     let resources_root = out_dirs[0].clone();
 
+    // In-tree server source: <repo>/server/. Located via src-tauri's parent.
+    // Production (bundled) mode has no source — Build Server is a dev workflow.
+    let server_src = find_src_tauri_dir()
+        .and_then(|d| d.parent().map(|p| p.join("server")))
+        .ok_or_else(|| "Server source directory not found (Build Server requires dev mode with <repo>/server/)".to_string())?;
+    if !server_src.join("go.mod").exists() {
+        return Err(format!("Server source missing go.mod at {}", server_src.display()));
+    }
 
     // Check Go is available
     let _ = app.emit("server-update-progress", "Checking Go installation...");
@@ -1354,36 +1362,7 @@ fn do_update_server(app: &tauri::AppHandle) -> Result<(), String> {
     }
     let go_ver = String::from_utf8_lossy(&go_check.stdout);
     let _ = app.emit("server-update-progress", format!("Found: {}", go_ver.trim()));
-
-    // Wipe any previous clone before re-cloning. git clone refuses to write
-    // into a non-empty directory, so a stale temp_dir from a crashed earlier
-    // build would silently abort the clone with an unhelpful error if we
-    // didn't clear it first.
-    let temp_dir = std::env::temp_dir().join("kroneditor_server_build");
-    if temp_dir.exists() {
-        let _ = app.emit(
-            "server-update-progress",
-            format!("Removing previous clone at {}...", temp_dir.display()),
-        );
-        fs::remove_dir_all(&temp_dir).map_err(|e| {
-            format!(
-                "Failed to remove previous clone at {}: {}",
-                temp_dir.display(),
-                e
-            )
-        })?;
-    }
-
-    let _ = app.emit("server-update-progress", "Cloning KronServer repository...");
-    let clone_out = Command::new("git")
-        .args(["clone", "--depth=1", "--quiet", "https://github.com/Krontek/KronServer.git"])
-        .arg(&temp_dir)
-        .output()
-        .map_err(|e| format!("git not found: {}", e))?;
-    if !clone_out.status.success() {
-        return Err(format!("Clone failed: {}", String::from_utf8_lossy(&clone_out.stderr).trim()));
-    }
-    let _ = app.emit("server-update-progress", "Repository cloned.");
+    let _ = app.emit("server-update-progress", format!("Building from {}", server_src.display()));
 
     // Cross-compile for 3 targets
     let targets = [
@@ -1400,7 +1379,7 @@ fn do_update_server(app: &tauri::AppHandle) -> Result<(), String> {
         fs::create_dir_all(&server_dir).map_err(|e| e.to_string())?;
         let out_path = server_dir.join(out_name);
         let mut cmd = Command::new("go");
-        cmd.current_dir(&temp_dir)
+        cmd.current_dir(&server_src)
             .env("CGO_ENABLED", "0")
             .env("GOOS", goos)
             .env("GOARCH", goarch)
@@ -1423,9 +1402,6 @@ fn do_update_server(app: &tauri::AppHandle) -> Result<(), String> {
 
         let _ = app.emit("server-update-progress", format!("[{}/{}] {} built.", i + 1, targets.len(), out_name));
     }
-
-    // Cleanup
-    let _ = fs::remove_dir_all(&temp_dir);
 
     Ok(())
 }
@@ -1681,7 +1657,7 @@ fn deploy_to_server_sync(app: tauri::AppHandle, server_addr: String) -> Result<S
 fn check_server_status_sync(server_addr: &str) -> Result<String, String> {
     let url = format!("http://{}/status", server_addr);
     let resp = ureq::get(&url)
-        .timeout(std::time::Duration::from_secs(3))
+        .timeout(std::time::Duration::from_secs(5))
         .call()
         .map_err(|e| format!("Connection failed: {}", e))?;
     resp.into_string()
@@ -1698,6 +1674,125 @@ async fn check_server_status(server_addr: String) -> Result<String, String> {
 // ---------------------------------------------------------------------------
 // deploy_server_to_target -- SCP plc-agent binary to target + start via SSH
 // ---------------------------------------------------------------------------
+
+/// Target init system, used to choose how plc-agent is supervised.
+/// Detected once per deploy by probing the target via SSH.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TargetInitSystem {
+    /// systemctl present AND PID 1 is systemd (Raspberry Pi OS, Debian, Ubuntu).
+    Systemd,
+    /// Fallback supervision via `@reboot` crontab + shell loop.
+    /// Works on BusyBox, Alpine (OpenRC), Yocto, OpenWRT — anywhere cron exists.
+    CronReboot,
+}
+
+/// Run a single command over an SSH session, return its stdout.
+/// Lightweight wrapper for the deploy paths; channel errors propagate as Err.
+fn ssh_run(sess: &ssh2::Session, cmd: &str) -> Result<String, String> {
+    let mut channel = sess.channel_session()
+        .map_err(|e| format!("SSH channel error: {}", e))?;
+    channel.exec(cmd)
+        .map_err(|e| format!("SSH exec error: {}", e))?;
+    let mut out = String::new();
+    std::io::Read::read_to_string(&mut channel, &mut out).ok();
+    channel.wait_close().ok();
+    Ok(out)
+}
+
+/// Probe the target to decide between systemd and the universal cron fallback.
+/// Systemd requires both the binary AND being PID 1 (some images ship systemctl
+/// for compatibility but don't actually boot under systemd).
+fn detect_target_init_system(sess: &ssh2::Session) -> TargetInitSystem {
+    let probe = "if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then echo systemd; else echo cron; fi";
+    match ssh_run(sess, probe) {
+        Ok(out) if out.trim() == "systemd" => TargetInitSystem::Systemd,
+        _ => TargetInitSystem::CronReboot,
+    }
+}
+
+/// Install + enable the systemd unit. `Restart=always` keeps the agent up
+/// across crashes; the agent itself handles PLC runtime crash-restart.
+fn install_systemd_unit(
+    sess: &ssh2::Session,
+    sudo_prefix: &str,
+    remote_bin: &str,
+    remote_dir: &str,
+) -> Result<(), String> {
+    let unit_content = format!(
+        "[Unit]\nDescription=PLC Agent (KronServer)\nAfter=network.target\n\n[Service]\nExecStart={bin} -addr :7070 -deploy-dir {dir} -shm-name plc_runtime -shm-size 65536\nRestart=always\nRestartSec=3\nWorkingDirectory={dir}\nUser=root\n\n[Install]\nWantedBy=multi-user.target\n",
+        bin = remote_bin, dir = remote_dir
+    );
+    let install_cmd = format!(
+        "cat > /tmp/plc-agent.service << 'UNIT'\n{unit}UNIT\n{sudo}cp /tmp/plc-agent.service /etc/systemd/system/plc-agent.service && {sudo}systemctl daemon-reload && {sudo}systemctl enable plc-agent",
+        unit = unit_content, sudo = sudo_prefix
+    );
+    ssh_run(sess, &install_cmd).map(|_| ())
+}
+
+/// Start the systemd-managed agent. Returns Ok even if it was already running.
+fn start_systemd_unit(sess: &ssh2::Session, sudo_prefix: &str) -> Result<(), String> {
+    ssh_run(sess, &format!("{sudo}systemctl restart plc-agent", sudo = sudo_prefix)).map(|_| ())
+}
+
+/// Install a `@reboot` supervisor script for systems without systemd.
+/// The supervisor restarts the agent on crash (mirror of systemd's Restart=always)
+/// and is started immediately so the agent is live after a fresh deploy too,
+/// without waiting for a reboot.
+fn install_cron_supervisor(
+    sess: &ssh2::Session,
+    sudo_prefix: &str,
+    remote_bin: &str,
+    remote_dir: &str,
+) -> Result<(), String> {
+    let supervisor_path = format!("{}/plc-agent-supervisor.sh", remote_dir);
+    // POSIX-sh supervisor: launches the agent in background, waits, and
+    // restarts on exit. TERM/INT propagate to the agent so the user can
+    // cleanly stop the supervisor with `pkill -f plc-agent-supervisor`.
+    let supervisor_content = format!(
+        concat!(
+            "#!/bin/sh\n",
+            "# plc-agent supervisor — restarts the agent on crash.\n",
+            "# Installed by KronEditor when systemd is not available.\n",
+            "BIN={bin}\n",
+            "DIR={dir}\n",
+            "LOG=$DIR/plc-agent.log\n",
+            "trap 'kill -TERM \"$CHILD\" 2>/dev/null; exit 0' TERM INT\n",
+            "while true; do\n",
+            "  \"$BIN\" -addr :7070 -deploy-dir \"$DIR\" -shm-name plc_runtime -shm-size 65536 >> \"$LOG\" 2>&1 &\n",
+            "  CHILD=$!\n",
+            "  wait \"$CHILD\"\n",
+            "  sleep 2\n",
+            "done\n",
+        ),
+        bin = remote_bin, dir = remote_dir
+    );
+
+    // Write supervisor + chmod + replace its crontab entry atomically.
+    // The crontab pipeline strips any previous plc-agent-supervisor line so
+    // re-deploys don't pile up duplicate entries.
+    let cmd = format!(
+        "cat > {sup} << 'SUPERVISOR'\n{content}SUPERVISOR\n\
+         chmod +x {sup} && \
+         ( {sudo}crontab -l 2>/dev/null | grep -v plc-agent-supervisor ; echo '@reboot {sup} >/dev/null 2>&1' ) | {sudo}crontab -",
+        sup = supervisor_path, content = supervisor_content, sudo = sudo_prefix
+    );
+    ssh_run(sess, &cmd).map(|_| ())
+}
+
+/// Start (or restart) the supervisor in background. nohup detaches it from
+/// the SSH session so it survives our disconnect.
+fn start_cron_supervisor(
+    sess: &ssh2::Session,
+    sudo_prefix: &str,
+    remote_dir: &str,
+) -> Result<(), String> {
+    let supervisor_path = format!("{}/plc-agent-supervisor.sh", remote_dir);
+    let cmd = format!(
+        "{sudo}pkill -f plc-agent-supervisor 2>/dev/null; sleep 1; {sudo}nohup {sup} >/dev/null 2>&1 &",
+        sudo = sudo_prefix, sup = supervisor_path
+    );
+    ssh_run(sess, &cmd).map(|_| ())
+}
 
 #[tauri::command]
 async fn deploy_server_to_target(
@@ -1787,19 +1882,17 @@ fn deploy_server_to_target_sync(
         format!("echo '{}' | sudo -S ", password.replace('\'', "'\\''"))
     };
 
-    // Stop any running agent (systemd first, then fallback to pkill)
+    // Stop any running agent (covers both supervision modes — systemd unit
+    // and the cron @reboot supervisor — to support switching between them).
     let _ = app.emit("server-deploy-progress", "Stopping existing plc-agent...");
     let stop_cmd = format!(
-        "{0}systemctl stop plc-agent 2>/dev/null; pkill -f plc-agent 2>/dev/null; rm -f {1}; sleep 1; true",
-        sudo_prefix, remote_bin
+        "{sudo}systemctl stop plc-agent 2>/dev/null; \
+         {sudo}pkill -f plc-agent-supervisor 2>/dev/null; \
+         {sudo}pkill -f '{bin}' 2>/dev/null; \
+         rm -f {bin}; sleep 1; true",
+        sudo = sudo_prefix, bin = remote_bin
     );
-    let mut channel = sess.channel_session()
-        .map_err(|e| format!("SSH channel error: {}", e))?;
-    channel.exec(&stop_cmd)
-        .map_err(|e| format!("SSH exec error: {}", e))?;
-    let mut out = String::new();
-    std::io::Read::read_to_string(&mut channel, &mut out).ok();
-    channel.wait_close().ok();
+    let _ = ssh_run(&sess, &stop_cmd);
 
     let _ = app.emit("server-deploy-progress", "Uploading server binary via SFTP...");
 
@@ -1833,42 +1926,24 @@ fn deploy_server_to_target_sync(
         .map_err(|e| format!("SSH exec error: {}", e))?;
     channel.wait_close().ok();
 
-    let _ = app.emit("server-deploy-progress", "Installing systemd service...");
-
-    // Write systemd unit file and install it
-    let unit_content = format!(
-        "[Unit]\nDescription=PLC Agent (KronServer)\nAfter=network.target\n\n[Service]\nExecStart={} -addr :7070 -deploy-dir {} -shm-name plc_runtime -shm-size 65536\nRestart=always\nRestartSec=3\nWorkingDirectory={}\nUser=root\n\n[Install]\nWantedBy=multi-user.target\n",
-        remote_bin, remote_dir, remote_dir
-    );
-    let install_cmd = format!(
-        "cat > /tmp/plc-agent.service << 'UNIT'\n{unit}UNIT\n{sudo}cp /tmp/plc-agent.service /etc/systemd/system/plc-agent.service && {sudo}systemctl daemon-reload && {sudo}systemctl enable plc-agent",
-        unit = unit_content,
-        sudo = sudo_prefix
-    );
-    let mut channel = sess.channel_session()
-        .map_err(|e| format!("SSH channel error: {}", e))?;
-    channel.exec(&install_cmd)
-        .map_err(|e| format!("SSH exec error: {}", e))?;
-    let mut out = String::new();
-    std::io::Read::read_to_string(&mut channel, &mut out).ok();
-    channel.wait_close().ok();
-
-    let _ = app.emit("server-deploy-progress", "Starting plc-agent service...");
-
-    // Start the agent: try systemd first, fall back to direct nohup launch (for Yocto/no-systemd)
-    let start_cmd = format!(
-        "{sudo}systemctl start plc-agent 2>/dev/null || (pkill -f plc-agent 2>/dev/null; nohup {bin} -addr :7070 -deploy-dir {dir} -shm-name plc_runtime -shm-size 65536 > {dir}/plc-agent.log 2>&1 & sleep 1)",
-        sudo = sudo_prefix,
-        bin = remote_bin,
-        dir = remote_dir
-    );
-    let mut channel = sess.channel_session()
-        .map_err(|e| format!("SSH channel error: {}", e))?;
-    channel.exec(&start_cmd)
-        .map_err(|e| format!("SSH exec error: {}", e))?;
-    let mut out = String::new();
-    std::io::Read::read_to_string(&mut channel, &mut out).ok();
-    channel.wait_close().ok();
+    // Detect supervision mechanism and install accordingly. systemd is
+    // preferred when available; otherwise we fall back to a cron @reboot
+    // supervisor script that works on BusyBox / Alpine / Yocto / OpenWRT.
+    let init_system = detect_target_init_system(&sess);
+    match init_system {
+        TargetInitSystem::Systemd => {
+            let _ = app.emit("server-deploy-progress", "systemd detected — installing service unit...");
+            install_systemd_unit(&sess, &sudo_prefix, &remote_bin, &remote_dir)?;
+            let _ = app.emit("server-deploy-progress", "Starting plc-agent (systemd)...");
+            start_systemd_unit(&sess, &sudo_prefix)?;
+        }
+        TargetInitSystem::CronReboot => {
+            let _ = app.emit("server-deploy-progress", "systemd not found — installing cron @reboot supervisor...");
+            install_cron_supervisor(&sess, &sudo_prefix, &remote_bin, &remote_dir)?;
+            let _ = app.emit("server-deploy-progress", "Starting plc-agent supervisor...");
+            start_cron_supervisor(&sess, &sudo_prefix, &remote_dir)?;
+        }
+    }
 
     // Retry verification up to 5 times (ARM devices can take 10+ seconds to start)
     let check_addr = format!("{}:7070", host);
@@ -1885,21 +1960,31 @@ fn deploy_server_to_target_sync(
     }
 
     if started {
-        let _ = app.emit("server-deploy-progress", "plc-agent deployed and running!");
+        let mode = match init_system {
+            TargetInitSystem::Systemd => "systemd",
+            TargetInitSystem::CronReboot => "cron @reboot supervisor",
+        };
+        let _ = app.emit("server-deploy-progress",
+            format!("plc-agent deployed and running ({} supervision)!", mode));
         Ok("Server deployed successfully".into())
     } else {
-        // SSH back to grab service/log diagnostics
-        let diag_cmd = format!(
-            "systemctl status plc-agent 2>&1 | head -30; echo '---'; journalctl -u plc-agent -n 20 2>&1; echo '---'; cat {}/plc-agent.log 2>&1 | tail -20",
-            remote_dir
-        );
-        let mut diag = String::new();
-        if let Ok(mut ch) = sess.channel_session() {
-            if ch.exec(&diag_cmd).is_ok() {
-                std::io::Read::read_to_string(&mut ch, &mut diag).ok();
-                ch.wait_close().ok();
-            }
-        }
+        // Init-system-aware diagnostics: systemd path uses journalctl, the
+        // cron path only has the agent's own logfile + crontab to inspect.
+        let diag_cmd = match init_system {
+            TargetInitSystem::Systemd => format!(
+                "systemctl status plc-agent 2>&1 | head -30; echo '---'; \
+                 journalctl -u plc-agent -n 20 2>&1; echo '---'; \
+                 tail -20 {}/plc-agent.log 2>&1",
+                remote_dir
+            ),
+            TargetInitSystem::CronReboot => format!(
+                "ps -ef | grep -E 'plc-agent(-supervisor)?' | grep -v grep; echo '---'; \
+                 {sudo}crontab -l 2>&1 | grep plc-agent; echo '---'; \
+                 tail -40 {dir}/plc-agent.log 2>&1",
+                sudo = sudo_prefix, dir = remote_dir
+            ),
+        };
+        let diag = ssh_run(&sess, &diag_cmd).unwrap_or_default();
         let diag = diag.trim().to_string();
         if !diag.is_empty() {
             let _ = app.emit("server-deploy-progress",

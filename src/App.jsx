@@ -206,34 +206,45 @@ function App() {
   }, [editorSettings]);
 
   // --- PLC server connection check ---
+  // Read isRunning / isSimulationMode via refs so the polling effect doesn't
+  // tear down and rebuild every time they flip. The interval is created once
+  // per (plcAddress, connectionEnabled) change.
+  const isRunningRef = React.useRef(isRunning);
+  const isSimulationModeRef = React.useRef(isSimulationMode);
+  useEffect(() => { isRunningRef.current = isRunning; }, [isRunning]);
+  useEffect(() => { isSimulationModeRef.current = isSimulationMode; }, [isSimulationMode]);
+
   useEffect(() => {
     if (!plcAddress || !connectionEnabled) {
       setIsPlcConnected(false);
       return;
     }
+    // Hysteresis: require 2 consecutive failures before flipping to "Disconnected".
+    // Single-packet jitter / agent under load shouldn't blink the indicator.
+    let consecutiveFailures = 0;
+    const FAILURE_THRESHOLD = 2;
     const checkStatus = () => {
       invoke('check_server_status', { serverAddr: plcAddress })
         .then((jsonStr) => {
+          consecutiveFailures = 0;
           setIsPlcConnected(true);
           try {
             const status = JSON.parse(jsonStr);
             // If runtime is already running (e.g. AutoRun) and editor is not tracking it yet,
             // sync the running state so the editor shows it as running.
-            if (status.running && !isRunning && !isSimulationMode) {
-              // Ensure a PLCClient exists to stream data from the already-running runtime.
+            if (status.running && !isRunningRef.current && !isSimulationModeRef.current) {
               if (!plcClientRef.current) {
                 plcClientRef.current = new PLCClient(plcAddress);
               }
               setIsRunning(true);
               addLog('info', 'Runtime already running (AutoRun). Attaching stream...');
-              // Start variable stream to receive live data from already-running runtime.
               if (remoteVarKeysRef.current.length > 0 && !plcClientRef.current.isStreaming) {
                 stopStreamRef.current = plcClientRef.current.streamVars(
                   (vars) => { Object.assign(liveVarsRef.current, vars); liveVarsDirtyRef.current = true; },
                   (err) => addLog('error', `Stream error: ${err.message}`),
                 );
               }
-            } else if (!status.running && isRunning && !isSimulationMode) {
+            } else if (!status.running && isRunningRef.current && !isSimulationModeRef.current) {
               // Runtime stopped externally (e.g. crash) — reflect in editor.
               setIsRunning(false);
               if (stopStreamRef.current) { stopStreamRef.current(); stopStreamRef.current = null; }
@@ -242,16 +253,18 @@ function App() {
         })
         .catch(() => {
           // Don't mark disconnected while a stream is active (server is clearly alive)
-          if (!plcClientRef.current?.isStreaming) {
+          if (plcClientRef.current?.isStreaming) return;
+          consecutiveFailures += 1;
+          if (consecutiveFailures >= FAILURE_THRESHOLD) {
             setIsPlcConnected(false);
           }
         });
     };
     checkStatus();
-    const interval = setInterval(checkStatus, 10000);
+    const interval = setInterval(checkStatus, 3000);
     return () => clearInterval(interval);
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [plcAddress, connectionEnabled, isRunning, isSimulationMode]);
+  }, [plcAddress, connectionEnabled]);
 
   // --- isDirty: mark dirty only when LOGIC changes after deployment (not positions/layout) ---
   const computeLogicFingerprint = (s) => {
