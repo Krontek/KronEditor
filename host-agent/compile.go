@@ -299,9 +299,6 @@ func (s *Server) llvmCompileBaseArgs(target string) (string, []string, []string,
 	case "arm-linux-gnueabihf":
 		triple = "arm-linux-gnueabihf"
 		archFlags = []string{"-mcpu=cortex-a8", "-mfloat-abi=hard", "-mfpu=neon-vfpv4"}
-	case "arm-none-eabi":
-		triple = "arm-none-eabi"
-		archFlags = []string{"-ffreestanding", "-fno-builtin"}
 	default:
 		return "", nil, nil, fmt.Errorf("unsupported LLVM compile target: %s", target)
 	}
@@ -314,7 +311,7 @@ func (s *Server) llvmCompileBaseArgs(target string) (string, []string, []string,
 	if target != "x86_64-w64-mingw32" {
 		args = append(args, "-nostdinc")
 	}
-	if target == "arm-none-eabi" || target == "aarch64-linux-gnu" || target == "arm-linux-gnueabihf" {
+	if target == "aarch64-linux-gnu" || target == "arm-linux-gnueabihf" {
 		args = append(args, "--gcc-toolchain="+sysroot)
 	}
 	args = append(args, archFlags...)

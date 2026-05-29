@@ -71,12 +71,6 @@ func targetResourceKey(target string) (string, error) {
 		return "aarch64-linux-gnu", nil
 	case "arm/armv7":
 		return "arm-linux-gnueabihf", nil
-	case "arm/CortexM/M0":
-		return "arm-none-eabi-m0", nil
-	case "arm/CortexM/M4":
-		return "arm-none-eabi-m4", nil
-	case "arm/CortexM/M7":
-		return "arm-none-eabi-m7", nil
 	case "server/linux/amd64":
 		return "x86_64-linux-gnu", nil
 	case "server/linux/arm64":

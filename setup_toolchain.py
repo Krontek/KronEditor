@@ -26,13 +26,6 @@ LLVM_VERSION = "21.1.6"
 LLVM_RELEASE_TAG = f"llvmorg-{LLVM_VERSION}"
 LLVM_RELEASE_API = f"https://api.github.com/repos/llvm/llvm-project/releases/tags/{LLVM_RELEASE_TAG}"
 
-ARM_NONE_EABI_VERSION = "10.3-2021.07"
-ARM_NONE_EABI_ARCHIVE = f"gcc-arm-none-eabi-{ARM_NONE_EABI_VERSION}-x86_64-linux.tar.bz2"
-ARM_NONE_EABI_URL = (
-    f"https://developer.arm.com/-/media/Files/downloads/gnu-rm/{ARM_NONE_EABI_VERSION}/"
-    f"{ARM_NONE_EABI_ARCHIVE}"
-)
-
 ARM_LINUX_VERSION = "10.2-2020.11"
 ARM_LINUX_BASE = f"https://developer.arm.com/-/media/Files/downloads/gnu-a/{ARM_LINUX_VERSION}/binrel"
 ARM_AARCH64_ARCHIVE = f"gcc-arm-{ARM_LINUX_VERSION}-x86_64-aarch64-none-linux-gnu.tar.xz"
@@ -65,7 +58,6 @@ LLVM_BINARIES = [
 ]
 
 TARGETS = {
-    "arm-none-eabi": "Bare-metal ARM",
     "aarch64-linux-gnu": "Embedded Linux 64-bit",
     "arm-linux-gnueabihf": "Embedded Linux 32-bit",
     "x86_64-linux-gnu": "Industrial PC Linux",
@@ -350,38 +342,6 @@ def install_llvm(host_os: str, host_arch: str, root: Path, cache_dir: Path, forc
         if not builtin_headers.exists():
             raise SetupError("LLVM package does not contain lib/clang")
         copy_tree(builtin_headers, root / "lib" / "clang")
-
-
-def harvest_arm_none_eabi(root: Path, cache_dir: Path, force: bool, force_download: bool) -> None:
-    destination = root / "sysroots" / "arm-none-eabi"
-    if destination.exists() and not force:
-        log("arm-none-eabi already installed; skipping")
-        return
-
-    archive = download(ARM_NONE_EABI_URL, cache_dir / ARM_NONE_EABI_ARCHIVE, force_download)
-    with tempfile.TemporaryDirectory(prefix="kron-arm-none-eabi-") as tmp:
-        extract_root = Path(tmp)
-        extract_archive(archive, extract_root)
-        toolchains_root = find_dir(
-            extract_root,
-            lambda candidate, _dirs, _files: (candidate / "arm-none-eabi" / "include").exists(),
-        )
-
-        staging = extract_root / "_harvest"
-        reset_directory(staging)
-        copy_tree(toolchains_root / "arm-none-eabi", staging / "arm-none-eabi")
-
-        gcc_root = toolchains_root / "lib" / "gcc" / "arm-none-eabi"
-        if gcc_root.exists():
-            copy_tree(gcc_root, staging / "lib" / "gcc" / "arm-none-eabi")
-
-        clang_rt_root = toolchains_root / "lib" / "clang-runtimes" / "arm-none-eabi"
-        if clang_rt_root.exists():
-            copy_tree(clang_rt_root, staging / "clang-runtimes" / "arm-none-eabi")
-
-        remove_path(destination)
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        shutil.move(str(staging), str(destination))
 
 
 def harvest_linux_libc_sysroot(
@@ -709,46 +669,6 @@ def command_templates(llvm_version: str) -> dict:
                     "@common.link_flags",
                 ],
             },
-            "arm-none-eabi": {
-                "triple": "arm-none-eabi",
-                "sysroot": "toolchains/sysroots/arm-none-eabi",
-                "compile": [
-                    "toolchains/bin/clang",
-                    "--target=arm-none-eabi",
-                    "--sysroot=toolchains/sysroots/arm-none-eabi",
-                    "-resource-dir",
-                    f"toolchains/lib/clang/{llvm_version}",
-                    "-mcpu=cortex-m4",
-                    "-mthumb",
-                    "-ffreestanding",
-                    "-fno-exceptions",
-                    "-c",
-                    "${source}",
-                    "-o",
-                    "${object}",
-                    "@common.compile_flags",
-                ],
-                "link": [
-                    "toolchains/bin/clang",
-                    "--target=arm-none-eabi",
-                    "--sysroot=toolchains/sysroots/arm-none-eabi",
-                    "-resource-dir",
-                    f"toolchains/lib/clang/{llvm_version}",
-                    "-mcpu=cortex-m4",
-                    "-mthumb",
-                    "-nostartfiles",
-                    "-Wl,-T,${linker_script}",
-                    "${object}",
-                    "-Ltoolchains/sysroots/arm-none-eabi/arm-none-eabi/lib",
-                    "-Ltoolchains/sysroots/arm-none-eabi/lib/gcc/arm-none-eabi",
-                    "-lc",
-                    "-lm",
-                    "-lgcc",
-                    "-o",
-                    "${output}",
-                    "@common.link_flags",
-                ],
-            },
             "simulation_env": {
                 "triple": "${host_triple}",
                 "include_overlay": "toolchains/sysroots/simulation_env/include",
@@ -784,7 +704,6 @@ def write_manifest(root: Path, host_os: str, host_arch: str) -> None:
         },
         "llvm_version": LLVM_VERSION,
         "sources": {
-            "arm_none_eabi": ARM_NONE_EABI_URL,
             "aarch64_linux_gnu": ARM_AARCH64_URL,
             "arm_linux_gnueabihf": ARM_ARMHF_URL,
             "x86_64_linux_gnu": BOOTLIN_X86_64_URL,
@@ -831,7 +750,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--only",
         nargs="+",
-        help="Subset to install: llvm arm-none-eabi aarch64-linux-gnu arm-linux-gnueabihf x86_64-linux-gnu x86_64-w64-mingw32 simulation_env",
+        help="Subset to install: llvm aarch64-linux-gnu arm-linux-gnueabihf x86_64-linux-gnu x86_64-w64-mingw32 simulation_env",
     )
     parser.add_argument(
         "--skip-llvm",
@@ -918,8 +837,6 @@ def main() -> int:
         install_llvm(host_os, host_arch, root, cache_dir, args.force, args.force_download)
 
     if not args.skip_sysroots:
-        if "arm-none-eabi" in wanted:
-            harvest_arm_none_eabi(root, cache_dir, args.force, args.force_download)
         if "aarch64-linux-gnu" in wanted:
             harvest_linux_libc_sysroot(
                 root=root,

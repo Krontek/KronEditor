@@ -1,14 +1,14 @@
 {
   "name": "KronEditor",
   "private": true,
-  "version": "0.2.0",
+  "version": "1.0.0",
   "type": "module",
   "scripts": {
     "dev": "concurrently --kill-others --names \"vite,agent\" --prefix-colors \"cyan,magenta\" \"npm:dev:frontend\" \"npm:dev:host-agent\"",
     "dev:frontend": "vite",
     "dev:host-agent": "cd host-agent && go run .",
     "build:frontend": "vite build",
-    "build:host-agent": "cd host-agent && go build -o ../dist-binary/kron-host-agent .",
+    "build:host-agent": "cd host-agent && go build -ldflags \"-X main.appVersion=$npm_package_version\" -o ../dist-binary/kron-host-agent .",
     "build": "npm run build:frontend && npm run build:host-agent",
     "lint": "eslint . --ext ts,tsx --report-unused-disable-directives --max-warnings 0",
     "preview": "vite preview"

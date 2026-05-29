@@ -1,6 +1,7 @@
 import React from 'react';
 import { useTranslation } from 'react-i18next';
 import PlcIcon from '../assets/icons/plc-icon.png';
+import { APP_VERSION } from '../version';
 
 const LANGUAGES = [
   { code: 'en', label: 'English', flag: '🇬🇧' },
@@ -183,7 +184,7 @@ const StartScreen = ({ onNewProject, onOpenProject, theme, setTheme }) => {
           </h4>
           <div style={{ fontSize: '13px', color: '#aaa', lineHeight: 1.7 }}>
             <div style={{ fontWeight: 600, color: '#ddd', marginBottom: '4px', fontSize: '15px' }}>KronEditor</div>
-            <div style={{ color: '#666', marginBottom: '8px' }}>{t('settingsPage.version') || 'Version'} 2.1.0</div>
+            <div style={{ color: '#666', marginBottom: '8px' }}>{t('settingsPage.version') || 'Version'} {APP_VERSION}</div>
             <div style={{ color: '#888', fontSize: '12px' }}>
               {t('settingsPage.aboutDescription') || 'IEC 61131-3 compatible PLC programming environment for embedded hardware.'}
             </div>

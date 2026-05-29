@@ -19,11 +19,14 @@ OUT="$DIST/KronEditor-x86_64.AppImage"
 
 mkdir -p "$DIST"
 
-echo "==> 1/6 Building frontend"
+# Single source of truth for the version: package.json (injected into the Go binary).
+VERSION="$(node -p "require('$ROOT/package.json').version")"
+
+echo "==> 1/6 Building frontend (v$VERSION)"
 ( cd "$ROOT" && npm run build:frontend )
 
 echo "==> 2/6 Building host-agent (linux/amd64)"
-( cd "$ROOT/host-agent" && GOOS=linux GOARCH=amd64 go build -o "$DIST/kron-host-agent" . )
+( cd "$ROOT/host-agent" && GOOS=linux GOARCH=amd64 go build -ldflags "-X main.appVersion=$VERSION" -o "$DIST/kron-host-agent" . )
 
 echo "==> 3/6 Assembling AppDir"
 rm -rf "$APPDIR"

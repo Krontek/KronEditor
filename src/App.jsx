@@ -168,6 +168,13 @@ function App() {
   const [isDirty, setIsDirty] = useState(false);
   const isDirtyRef = React.useRef(false);
 
+  // Bumped when the AI agent commits changes to the currently-open POU, forcing
+  // EditorPane to remount so it re-reads the mutated content (it seeds its local
+  // state from initialContent only on mount).
+  const [agentReloadKey, setAgentReloadKey] = useState(0);
+  // Hot-swap (online change) session active — agent-approved edits go live.
+  const [isHotSwap, setIsHotSwap] = useState(false);
+
   // Save-confirm dialog state
   const [saveConfirmOpen, setSaveConfirmOpen] = useState(false);
   const saveConfirmResolveRef = React.useRef(null); // resolves with 'save' | 'discard' | 'cancel'
@@ -1757,6 +1764,91 @@ function App() {
     }));
   };
 
+  // The AI agent committed changes (it already called setProjectStructure with
+  // the new structure). If it touched the open POU, remount the editor so it
+  // reflects the new code/variables; always log it.
+  const handleAgentApplied = useCallback((pouNames) => {
+    const names = pouNames || [];
+    if (activeItem && names.some(n => (n || '').toLowerCase() === (activeItem.name || '').toLowerCase())) {
+      setAgentReloadKey(k => k + 1);
+    }
+    addLog('info', `AI agent applied changes: ${names.length ? names.join(', ') : 'project structure'}`);
+  }, [activeItem, addLog]);
+
+  // ── Hot-swap (online change) session ──────────────────────────────────────
+  // When a live session is running, an agent-approved code change is pushed to
+  // the running PLC without a restart (state preserved). Live values keep
+  // flowing on the existing simulation-output SSE (the host-agent's SHM poller).
+  const hotSwapActiveRef = React.useRef(false);
+
+  // "Go live": if connected to a remote PLC, deploy a hot-swap-capable runtime
+  // (loader-host + logic_0.so) to the field; otherwise start a LOCAL sim
+  // hot-swap session. Either way, agent-approved edits then apply online.
+  const startHotSwapSession = useCallback(async () => {
+    const standardHeaders = await host.getStandardHeaders().catch(() => []);
+    if (isPlcConnected && plcAddress) {
+      addLog('info', 'Deploying hot-swap runtime to target…');
+      const cCode = transpileToC(projectStructure, standardHeaders, selectedBoard, false, buses, busConfigs);
+      await host.hotswapTargetBuild({
+        header: cCode.header, source: cCode.source,
+        variableTable: JSON.stringify(cCode.variableTable, null, 2), hal: cCode.hal || '',
+        hostGlue: cCode.hostGlue || '', boardId: selectedBoard,
+      });
+      await host.deployToServer(plcAddress); // runtime.bin(host) + variable-table + logic_0.so
+      hotSwapActiveRef.current = false;       // field mode (not local sim)
+      setIsHotSwap(true);
+      addLog('success', 'Field hot-swap runtime deployed — online change enabled on the target.');
+    } else {
+      const cCode = transpileToC(projectStructure, standardHeaders, selectedBoard, true, buses, busConfigs);
+      await host.hotswapBuild({
+        header: cCode.header, source: cCode.source,
+        variableTable: JSON.stringify(cCode.variableTable, null, 2), hal: cCode.hal || '',
+        hostGlue: cCode.hostGlue || '',
+      });
+      await host.hotswapRun();
+      hotSwapActiveRef.current = true;
+      setIsHotSwap(true);
+      setIsSimulationMode(true);
+      setIsRunning(true);
+      addLog('success', 'Hot-swap session started (simulation) — online change enabled.');
+    }
+  }, [projectStructure, selectedBoard, buses, busConfigs, isPlcConnected, plcAddress, addLog]);
+
+  const stopHotSwapSession = useCallback(async () => {
+    if (hotSwapActiveRef.current) { try { await host.hotswapStop(); } catch { /* ignore */ } setIsRunning(false); }
+    hotSwapActiveRef.current = false;
+    setIsHotSwap(false);
+    addLog('info', 'Hot-swap session stopped.');
+  }, [addLog]);
+
+  // Agent approved a code change while a hot-swap session is active → push it as
+  // an online change (no restart, state preserved). Sim → local swap; field →
+  // recompile logic.so for the target, upload to KronServer, swap. A
+  // layout-changing edit can't be swapped (the runtime rolls back / errors —
+  // surface it; the user should redeploy). Field swaps confirm first (live HW).
+  const handleAgentHotSwap = useCallback(async (touchedPous) => {
+    const what = (touchedPous || []).join(', ') || 'logic';
+    const standardHeaders = await host.getStandardHeaders().catch(() => []);
+    try {
+      if (hotSwapActiveRef.current) {
+        const cCode = transpileToC(projectStructure, standardHeaders, selectedBoard, true, buses, busConfigs);
+        await host.hotswapSwap({ header: cCode.header, source: cCode.source });
+        addLog('success', `Online change applied (sim): ${what}`);
+      } else if (isHotSwap && isPlcConnected && plcAddress) {
+        if (!window.confirm(`Apply this change to the RUNNING PLC at ${plcAddress} now (online change)?\n\n${what}`)) {
+          addLog('info', 'Online change to target cancelled.');
+          return;
+        }
+        const cCode = transpileToC(projectStructure, standardHeaders, selectedBoard, false, buses, busConfigs);
+        await host.hotswapTargetLogic({ header: cCode.header, source: cCode.source, boardId: selectedBoard });
+        await host.hotswapDeploySwap(plcAddress);
+        addLog('success', `Online change applied to target: ${what}`);
+      }
+    } catch (e) {
+      addLog('error', `Hot-swap apply failed (a layout change needs a full redeploy): ${e.message || e}`);
+    }
+  }, [projectStructure, selectedBoard, buses, busConfigs, isHotSwap, isPlcConnected, plcAddress, addLog]);
+
   // --- Resize Effects ---
   useEffect(() => {
     let rafId = null;
@@ -2152,7 +2244,7 @@ function App() {
                         </div>
                       ) : (
                         <EditorPane
-                          key={activeItem.id}
+                          key={`${activeItem.id}_${agentReloadKey}`}
                           fileType={activeItem.type}
                           initialContent={activeItem.content}
                           onContentChange={handleContentChange}
@@ -2265,7 +2357,18 @@ function App() {
                   </div>
                   {rightTab === 'agent' && (
                     <div style={{ flex: 1, overflow: 'hidden' }}>
-                      <AiAgentPanel activeItem={activeItem} />
+                      <AiAgentPanel
+                        activeItem={activeItem}
+                        projectStructure={projectStructure}
+                        setProjectStructure={setProjectStructure}
+                        selectedBoard={selectedBoard}
+                        liveVariables={(isSimulationMode || isRunning) ? (liveVariables || {}) : null}
+                        onApplied={handleAgentApplied}
+                        onHotSwap={handleAgentHotSwap}
+                        hotSwapActive={isHotSwap}
+                        onStartHotSwap={startHotSwapSession}
+                        onStopHotSwap={stopHotSwapSession}
+                      />
                     </div>
                   )}
                 </div>
