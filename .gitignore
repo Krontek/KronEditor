@@ -40,3 +40,4 @@ packaging/dist/
 # Persistent windows-host LLVM (downloaded once by build-windows.sh)
 toolchains-win/
 toolchains/*
+experiments/*
