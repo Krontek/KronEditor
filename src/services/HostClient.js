@@ -221,6 +221,78 @@ export class HostClient {
   async ollamaPull(model, baseUrl) {
     return _post(this._p('/api/host/ollama-pull'), { model, baseUrl });
   }
+  /**
+   * Report where a model runs (CPU/GPU/split) and GPU VRAM usage. Pass
+   * `load:true` to preload the model first so its placement is observable.
+   * Returns `{ loaded, processor, gpuPercent, modelSize, modelVram,
+   * gpu?:{name, vramTotal, vramUsed} }`. `gpu` is omitted on non-NVIDIA hosts.
+   */
+  async ollamaRuntime(model, baseUrl, load = false) {
+    return _post(this._p('/api/host/ollama-runtime'), { model, baseUrl, load });
+  }
+  /** Evict a model from memory now (keep_alive:0) to free VRAM. */
+  async ollamaUnload(model, baseUrl) {
+    return _post(this._p('/api/host/ollama-unload'), { model, baseUrl });
+  }
+
+  /**
+   * One turn of a tool-calling chat, normalized across providers. The agent
+   * loop itself lives on the frontend; this just asks the configured provider
+   * for the assistant's next message.
+   *
+   * payload = { provider, model, apiKey, baseUrl, system, messages, tools,
+   *             maxTokens?, temperature? }
+   *   messages = [ { role:'user'|'assistant'|'tool', content,
+   *                  toolCalls?:[{id,name,arguments}], toolCallId?, name? } ]
+   *   tools    = [ { name, description, parameters(JSON Schema) } ]
+   * Returns the normalized assistant message:
+   *   { role:'assistant', content, toolCalls:[{id,name,arguments}] }
+   */
+  async aiChat(payload) {
+    const j = await _post(this._p('/api/host/ai/chat'), payload);
+    if (!j.ok) throw new Error(j.error || 'aiChat failed');
+    return j.message;
+  }
+
+  // ── Hot-swap (online change) — local simulation ─────────────────────────────
+  /**
+   * Build the hot-swappable runtime: writes plc.* + variables.json, compiles
+   * the loader-host (once) and logic_0.so. Payload = { header, source,
+   * variableTable, hal } (same shape as writePlcFiles).
+   */
+  async hotswapBuild({ header, source, variableTable, hal, hostGlue }) {
+    return _post(this._p('/api/host/hotswap/build'), { header, source, variableTable, hal, hostGlue });
+  }
+  /** Spawn the loader-host with logic_0.so; live variables stream on the usual
+   *  simulation-output SSE topic (read from the host-owned /dev/shm mirror). */
+  async hotswapRun() {
+    return _post(this._p('/api/host/hotswap/run'), {});
+  }
+  /**
+   * Apply an ONLINE change: compile a new logic_<n>.so from the new code and
+   * swap it into the running host at a scan boundary (state preserved; rolls
+   * back on a bad build). Payload = { header, source } — same PlcState layout.
+   */
+  async hotswapSwap({ header, source }) {
+    return _post(this._p('/api/host/hotswap/swap'), { header, source });
+  }
+  async hotswapStop() {
+    return _post(this._p('/api/host/hotswap/stop'), {});
+  }
+
+  // Field hot-swap (deployed KronServer target)
+  /** Cross-compile the loader-host (runtime.bin) + logic_0.so for the target board. */
+  async hotswapTargetBuild({ header, source, variableTable, hal, hostGlue, boardId }) {
+    return _post(this._p('/api/host/hotswap/target-build'), { header, source, variableTable, hal, hostGlue, boardId });
+  }
+  /** Recompile logic_<n>.so for the target (an online change). */
+  async hotswapTargetLogic({ header, source, boardId }) {
+    return _post(this._p('/api/host/hotswap/target-logic'), { header, source, boardId });
+  }
+  /** Push the latest logic.so to a deployed KronServer and trigger a live swap. */
+  async hotswapDeploySwap(serverAddr) {
+    return _post(this._p('/api/host/hotswap/deploy-swap'), { serverAddr });
+  }
 
   // ── EtherCAT ──────────────────────────────────────────────────────────────
   async buildSoem() {

@@ -1,9 +1,17 @@
 import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react'
+import { readFileSync } from 'node:fs'
+
+// Single source of truth for the app version: package.json. Injected at
+// build/serve time as the global __APP_VERSION__ (see src/version.js).
+const pkg = JSON.parse(readFileSync(new URL('./package.json', import.meta.url), 'utf-8'))
 
 // https://vitejs.dev/config/
 export default defineConfig({
   plugins: [react()],
+  define: {
+    __APP_VERSION__: JSON.stringify(pkg.version),
+  },
   // Tauri expects a fixed port, fail if that port is not available
   server: {
     port: parseInt(process.env.VITE_PORT ?? '') || 1420,

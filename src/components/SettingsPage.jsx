@@ -4,6 +4,7 @@ import { Editor } from '@monaco-editor/react';
 import { transpileToC } from '../services/CTranspilerService';
 import { HostClient, host } from '../services/HostClient';
 import { openFile } from '../services/browserFs';
+import { APP_VERSION } from '../version';
 
 const KRON_REPOS = [
     'KronStandard', 'KronControl', 'KronCompare', 'KronConverter',
@@ -885,7 +886,7 @@ const SettingsPage = ({ theme, setTheme, editorSettings, setEditorSettings, sele
                 return (
                     <div style={{ maxWidth: '600px', textAlign: 'center', padding: '40px 0' }}>
                         <h1>📦 PLC Editor</h1>
-                        <p style={{ color: '#aaa' }}>{t('settingsPage.version')} 2.1.0</p>
+                        <p style={{ color: '#aaa' }}>{t('settingsPage.version')} {APP_VERSION}</p>
                         <hr style={{ borderColor: '#333', margin: '20px 0' }} />
                         <p style={{ color: '#ccc' }}>
                             {t('settingsPage.aboutDescription')}

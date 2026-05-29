@@ -9,7 +9,15 @@
 ; opens http://localhost:7171 in a browser.
 
 #define AppName "KronEditor"
-#define AppVersion "0.2.0"
+; AppVersion is single-sourced from package.json: build-windows.sh generates
+; version.iss (a single `#define AppVersion "x.y.z"` line). Falls back to a dev
+; version if you run iscc without building first.
+#ifexist "version.iss"
+  #include "version.iss"
+#endif
+#ifndef AppVersion
+  #define AppVersion "0.0.0-dev"
+#endif
 #define AppExe "kron-host-agent.exe"
 
 [Setup]

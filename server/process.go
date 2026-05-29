@@ -54,11 +54,11 @@ type ProcessManager struct {
 	stderrFile *os.File
 
 	// AutoRun crash-restart state. All fields below are guarded by mu.
-	intentionalStop    bool          // set by Stop() so watchProcess won't auto-restart
-	autoRunGetter      func() bool   // queried after a crash to decide whether to respawn
-	restartTimer       *time.Timer   // pending auto-restart, nil if none scheduled
-	lastStartedAt      time.Time     // for backoff reset logic
-	consecutiveCrashes int           // current index into restartBackoffDelays
+	intentionalStop    bool        // set by Stop() so watchProcess won't auto-restart
+	autoRunGetter      func() bool // queried after a crash to decide whether to respawn
+	restartTimer       *time.Timer // pending auto-restart, nil if none scheduled
+	lastStartedAt      time.Time   // for backoff reset logic
+	consecutiveCrashes int         // current index into restartBackoffDelays
 }
 
 func NewProcessManager(deployDir string) *ProcessManager {
@@ -235,16 +235,29 @@ func (pm *ProcessManager) Start() error {
 		return fmt.Errorf("failed to create stderr log file: %w", err)
 	}
 
+	// Hot-swap (online change) mode: if a logic_0.so is present, runtime.bin is
+	// the loader-host and takes the logic .so as its argument. Otherwise it is a
+	// classic self-contained binary. Presence of logic_0.so is the switch.
+	logic0 := filepath.Join(pm.deployDir, "logic_0.so")
+	hotSwap := false
+	if _, err := os.Stat(logic0); err == nil {
+		hotSwap = true
+	}
+
 	// SOEM requires CAP_NET_RAW (raw socket access for EtherCAT).
 	// If this process is already root (uid=0), spawn directly.
 	// Otherwise wrap with "sudo -n" — requires a passwordless sudoers entry:
 	//   plc ALL=(root) NOPASSWD: /opt/plc/runtime.bin
 	var cmd *exec.Cmd
+	var binArgs []string
+	if hotSwap {
+		binArgs = []string{logic0}
+	}
 	if os.Getuid() == 0 {
-		cmd = exec.Command(binPath)
+		cmd = exec.Command(binPath, binArgs...)
 	} else {
 		slog.Warn("plc-agent not running as root; using sudo -n for runtime (ensure NOPASSWD sudoers entry)")
-		cmd = exec.Command("sudo", "-n", binPath)
+		cmd = exec.Command("sudo", append([]string{"-n", binPath}, binArgs...)...)
 	}
 	cmd.Dir = pm.deployDir
 	cmd.Stdout = stdoutF
@@ -275,6 +288,36 @@ func (pm *ProcessManager) Start() error {
 		"stdout_log", stdoutPath,
 		"stderr_log", stderrPath,
 	)
+	return nil
+}
+
+// SwapLogic pushes an ONLINE CHANGE to the running loader-host: it writes the
+// new logic .so path to deploy-dir/swap_request and sends SIGUSR1 so the host
+// swaps it at the next scan boundary, preserving PlcState (it rolls back a bad
+// .so itself). Only valid when the runtime was started in hot-swap mode.
+//
+// NOTE: when the agent runs the runtime via "sudo -n", the tracked process is
+// sudo, which does not forward SIGUSR1 — for field hot-swap the agent should
+// run as root (or be granted the runtime via setcap), so the signal reaches the
+// loader-host directly.
+func (pm *ProcessManager) SwapLogic(logicFile string) error {
+	pm.mu.Lock()
+	defer pm.mu.Unlock()
+	if !pm.isRunning() || pm.cmd == nil || pm.cmd.Process == nil {
+		return fmt.Errorf("runtime is not running")
+	}
+	abs := filepath.Join(pm.deployDir, logicFile)
+	if _, err := os.Stat(abs); err != nil {
+		return fmt.Errorf("logic not found: %s", abs)
+	}
+	reqPath := filepath.Join(pm.deployDir, "swap_request")
+	if err := os.WriteFile(reqPath, []byte(abs+"\n"), 0644); err != nil {
+		return fmt.Errorf("write swap_request: %w", err)
+	}
+	if err := pm.cmd.Process.Signal(syscall.SIGUSR1); err != nil {
+		return fmt.Errorf("signal SIGUSR1: %w", err)
+	}
+	slog.Info("Hot-swap signaled", "logic", logicFile)
 	return nil
 }
 

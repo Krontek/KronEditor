@@ -12,6 +12,12 @@ import (
 	"time"
 )
 
+// appVersion is the single-sourced app version. Real builds inject it from
+// package.json via -ldflags "-X main.appVersion=$npm_package_version" (see the
+// build:host-agent npm script and packaging/*.sh); "dev" is the `go run .`
+// fallback.
+var appVersion = "dev"
+
 var (
 	flagAddr           = flag.String("addr", ":7171", "Listen address")
 	flagResourcesRoot  = flag.String("resources-root", "", "Resources root (defaults to ./src-tauri/resources or ./resources)")
@@ -20,11 +26,12 @@ var (
 )
 
 type Server struct {
-	paths  *Paths
-	events *Events
-	sim    *SimState
-	hmi    *HmiState
-	ollama *OllamaState
+	paths   *Paths
+	events  *Events
+	sim     *SimState
+	hmi     *HmiState
+	ollama  *OllamaState
+	hotswap *HotSwapState
 }
 
 func main() {
@@ -36,11 +43,12 @@ func main() {
 	}
 
 	srvState := &Server{
-		paths:  paths,
-		events: NewEvents(),
-		sim:    NewSimState(),
-		hmi:    NewHmiState(),
-		ollama: NewOllamaState(),
+		paths:   paths,
+		events:  NewEvents(),
+		sim:     NewSimState(),
+		hmi:     NewHmiState(),
+		ollama:  NewOllamaState(),
+		hotswap: NewHotSwapState(),
 	}
 
 	mux := http.NewServeMux()
@@ -78,6 +86,20 @@ func main() {
 	mux.HandleFunc("/api/host/ollama-status", srvState.handleOllamaStatus)
 	mux.HandleFunc("/api/host/ollama-setup", srvState.handleOllamaSetup)
 	mux.HandleFunc("/api/host/ollama-pull", srvState.handleOllamaPull)
+	mux.HandleFunc("/api/host/ollama-runtime", srvState.handleOllamaRuntime)
+	mux.HandleFunc("/api/host/ollama-unload", srvState.handleOllamaUnload)
+
+	// AI Agent — provider-agnostic chat proxy with tool-calling
+	mux.HandleFunc("/api/host/ai/chat", srvState.handleAIChat)
+
+	// Hot-swap (online change) — local simulation
+	mux.HandleFunc("/api/host/hotswap/build", srvState.handleHotSwapBuild)
+	mux.HandleFunc("/api/host/hotswap/run", srvState.handleHotSwapRun)
+	mux.HandleFunc("/api/host/hotswap/swap", srvState.handleHotSwapSwap)
+	mux.HandleFunc("/api/host/hotswap/stop", srvState.handleHotSwapStop)
+	mux.HandleFunc("/api/host/hotswap/target-build", srvState.handleHotSwapTargetBuild)   // cross-compile host+logic.so for the field
+	mux.HandleFunc("/api/host/hotswap/target-logic", srvState.handleHotSwapTargetLogic)   // recompile logic.so for an online change
+	mux.HandleFunc("/api/host/hotswap/deploy-swap", srvState.handleHotSwapDeploySwap)     // push logic.so to KronServer + swap
 
 	// HMI
 	mux.HandleFunc("/api/host/start-hmi-server", srvState.handleStartHmiServer)
@@ -122,6 +144,7 @@ func main() {
 	srvState.sim.Stop()
 	srvState.hmi.Stop()
 	srvState.ollama.Stop()
+	srvState.hotswap.Stop()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	_ = srv.Shutdown(ctx)
@@ -131,7 +154,7 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok":             true,
 		"name":           "kron-host-agent",
-		"version":        "0.2.0",
+		"version":        appVersion,
 		"resourcesRoot":  s.paths.ResourcesRoot,
 		"toolchainsRoot": s.paths.ToolchainsRoot,
 		"appDataDir":     s.paths.AppDataDir,

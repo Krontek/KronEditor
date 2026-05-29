@@ -15,6 +15,7 @@ type writePLCFilesReq struct {
 	Source        string `json:"source"`
 	VariableTable string `json:"variableTable"`
 	HAL           string `json:"hal"`
+	HostGlue      string `json:"hostGlue"` // hot-swap: HAL trampolines compiled into the loader-host
 }
 
 func (s *Server) handleWritePLCFiles(w http.ResponseWriter, r *http.Request) {

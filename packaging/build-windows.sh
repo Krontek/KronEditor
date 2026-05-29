@@ -29,11 +29,14 @@ PAYLOAD="$DIST/KronEditor"
 
 mkdir -p "$PAYLOAD"
 
-echo "==> 1/4 Building frontend"
+# Single source of truth for the version: package.json (injected into the Go binary).
+VERSION="$(node -p "require('$ROOT/package.json').version")"
+
+echo "==> 1/4 Building frontend (v$VERSION)"
 ( cd "$ROOT" && npm run build:frontend )
 
 echo "==> 2/4 Building host-agent (windows/amd64)"
-( cd "$ROOT/host-agent" && GOOS=windows GOARCH=amd64 go build -o "$PAYLOAD/kron-host-agent.exe" . )
+( cd "$ROOT/host-agent" && GOOS=windows GOARCH=amd64 go build -ldflags "-X main.appVersion=$VERSION" -o "$PAYLOAD/kron-host-agent.exe" . )
 
 echo "==> 3/4 Resources"
 rm -rf "$PAYLOAD/resources"
@@ -62,6 +65,10 @@ cp -a --reflink=auto "$SRC_TC/sysroots"   "$PAYLOAD/toolchains/sysroots"  # shar
 cp -a "$SRC_TC"/*.json "$PAYLOAD/toolchains/" 2>/dev/null || true
 
 echo
+# Single-source the installer version too: emit the AppVersion define the .iss includes.
+printf '#define AppVersion "%s"\n' "$VERSION" > "$ROOT/packaging/windows/version.iss"
+echo "Wrote packaging/windows/version.iss (AppVersion $VERSION)"
+
 echo "Payload ready: $PAYLOAD"
 echo "Next (on Windows): iscc packaging\\windows\\kron-editor.iss   → installer"
 echo "Or zip the folder for a portable build. Run kron-host-agent.exe, then open http://localhost:7171"

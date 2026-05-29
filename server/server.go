@@ -36,9 +36,9 @@ import (
 
 	connect "connectrpc.com/connect"
 	"encoding/json"
-	plcv1connect "plc-agent/gen/plc/v1/plcv1connect"
 	"golang.org/x/net/http2"
 	"golang.org/x/net/http2/h2c"
+	plcv1connect "plc-agent/gen/plc/v1/plcv1connect"
 )
 
 const maxUploadSize = 128 << 20 // 128 MB
@@ -107,6 +107,8 @@ func NewServer(cfg Config, ipc *IPCManager, pm *ProcessManager, hmi *HMIManager)
 func (s *Server) registerRoutes() {
 	// Deploy / status (plain HTTP, unchanged).
 	s.mux.HandleFunc("/deploy/runtime", s.handleDeployRuntime)
+	s.mux.HandleFunc("/deploy/logic", s.handleDeployLogic) // hot-swap logic .so
+	s.mux.HandleFunc("/hotswap/swap", s.handleHotSwap)     // apply online change
 	s.mux.HandleFunc("/deploy/variable-table", s.handleDeployVariableTable)
 	s.mux.HandleFunc("/deploy/project-file", s.handleProjectFile)
 	s.mux.HandleFunc("/deploy/config", s.handleDeployConfig)
@@ -377,8 +379,8 @@ func (s *Server) handleDeployConfig(w http.ResponseWriter, r *http.Request) {
 //   - true  + runtime not running → start runtime immediately
 //   - true  + runtime running     → no-op (already serving)
 //   - false                       → cancel any pending auto-restart timer;
-//                                   a currently running runtime is left
-//                                   alone (user manually stops if desired)
+//     a currently running runtime is left
+//     alone (user manually stops if desired)
 func (s *Server) UpdateRuntimeConfig(u runtimeConfigUpdate) map[string]any {
 	s.rtMu.Lock()
 	if u.AutoRun != nil {
