@@ -24,8 +24,13 @@ const CreateItemModal = ({ isOpen, onClose, onConfirm, category, defaultName, is
                 category === 'functionBlocks' ? 'Create Function Block' :
                     'Create Function';
 
+    // IEC 61131-3 identifier: letter/underscore start, then letters/digits/_.
+    // No spaces or punctuation — required by the C transpiler.
+    const nameTrimmed = name.trim();
+    const nameValid = /^[A-Za-z_][A-Za-z0-9_]*$/.test(nameTrimmed);
+
     const handleConfirm = () => {
-        if (!name.trim()) return;
+        if (!nameTrimmed || !nameValid) return;
         const success = onConfirm(name, language, returnType);
         if (success === false) {
             setName(isEdit ? initialData?.name || '' : defaultName || '');
@@ -92,6 +97,11 @@ const CreateItemModal = ({ isOpen, onClose, onConfirm, category, defaultName, is
                             if (e.key === 'Escape') onClose();
                         }}
                     />
+                    {nameTrimmed && !nameValid && (
+                        <div style={{ marginTop: '6px', fontSize: '11px', color: '#e06c75' }}>
+                            Invalid name — use only letters, digits and underscore, no spaces, and don't start with a digit.
+                        </div>
+                    )}
                 </div>
 
                 {/* Return Type Selection (Only for Functions) */}
@@ -150,16 +160,16 @@ const CreateItemModal = ({ isOpen, onClose, onConfirm, category, defaultName, is
                     </button>
                     <button
                         onClick={handleConfirm}
-                        disabled={!name.trim()}
+                        disabled={!nameTrimmed || !nameValid}
                         style={{
                             padding: '8px 16px',
                             background: '#0d47a1',
                             border: 'none',
                             color: '#fff',
                             borderRadius: '4px',
-                            cursor: 'pointer',
+                            cursor: (!nameTrimmed || !nameValid) ? 'default' : 'pointer',
                             fontWeight: 'bold',
-                            opacity: !name.trim() ? 0.5 : 1
+                            opacity: (!nameTrimmed || !nameValid) ? 0.5 : 1
                         }}
                     >
                         {isEdit ? 'Save' : 'Create'}

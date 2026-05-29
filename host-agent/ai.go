@@ -422,16 +422,22 @@ func callOllama(ctx context.Context, req aiChatReq) (aiMessage, error) {
 		})
 	}
 
+	// Give the agent a context window large enough for the (compact) system
+	// prompt + tool schemas + a few turns, so Ollama doesn't truncate and drop
+	// the project map. 8192 is a good balance on a 6 GB GPU once weights are
+	// loaded (KV cache stays modest); Ollama clamps to the model's max.
+	options := map[string]any{"num_ctx": 8192}
+	if req.Temperature != nil {
+		options["temperature"] = *req.Temperature
+	}
 	payload := map[string]any{
 		"model":    req.Model,
 		"messages": msgs,
 		"stream":   false,
+		"options":  options,
 	}
 	if len(tools) > 0 {
 		payload["tools"] = tools
-	}
-	if req.Temperature != nil {
-		payload["options"] = map[string]any{"temperature": *req.Temperature}
 	}
 
 	var out struct {

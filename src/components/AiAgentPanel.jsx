@@ -181,35 +181,37 @@ function affectedPOUs(steps) {
   return [...names];
 }
 
-// System prompt: the agent's role + project conventions + a live overview so it
-// rarely needs to call get_project_overview just to orient itself.
+// System prompt: the agent's role + project conventions + a COMPACT project map
+// (POU names + globals only — small, so it fits a modest context window and the
+// model always sees every POU). Details come on demand via read_pou /
+// get_project_overview, not by embedding the full overview each turn.
 function buildSystemPrompt(projectStructure, board, activeItem) {
   const overview = buildProjectOverview(projectStructure, board);
   const active = activeItem ? `${activeItem.name} (${activeItem.type})` : 'none';
+  const pous = overview.pous.map((p) => `${p.name}[${p.language}${p.returnType ? ' ' + p.returnType : ''}]`).join(', ') || '(none)';
+  const globals = overview.globalVariables.map((g) => g.name).join(', ') || '(none)';
+  const dts = overview.dataTypes.map((d) => d.name).join(', ');
   return [
     'You are the embedded engineering agent for KronEditor, an IEC 61131-3 PLC editor.',
-    'You edit the project by calling tools. You can create/rename/delete POUs, rewrite Structured Text, and add/update/remove variables (local and global).',
+    'You edit the project by calling tools: create/rename/delete POUs, rewrite Structured Text, set ladder, and add/update/remove variables (local + global).',
     '',
     'Rules:',
-    '- The selected board is READ-ONLY context. Never attempt to change hardware.',
-    '- All generated code, names and comments must be in English (project rule).',
-    '- Structured Text must be valid IEC 61131-3. Operators: := assign, AND/OR/NOT are logical; use BAND/BOR/BXOR/BNOT for bitwise. Time literals like T#500ms. ABS()/SQRT() available.',
-    '- Before using a variable in ST, make sure it exists: add it with add_variable (local to the POU, or global) in the SAME response.',
-    '- Make the smallest change that satisfies the request. Prefer editing an existing POU over creating new ones unless asked.',
-    '- delete_pou and remove_variable are destructive — only use them when explicitly asked.',
-    '- When you call set_st_code you must provide the COMPLETE new body for that POU, not a fragment.',
-    '- For Ladder (LD) POUs use set_ladder (contacts + coils; for timers/counters/FBs in logic, use an ST POU instead). It also replaces the whole ladder, so include every rung.',
-    '- Every change is shown to the user as a diff they approve or reject. If a change is rejected, adapt — do not repeat it.',
-    '- CRITICAL: you make changes ONLY by emitting tool calls. NEVER write the code in prose and claim it is done. NEVER output text like "APPLIED:" or "I have set the code" — only the system applies and confirms changes. If the user asks you to write code into a POU, you MUST call set_st_code (or set_ladder); do not just describe it.',
-    '- For ST POUs, set_st_code takes ONLY the body statements (no PROGRAM/VAR/END_VAR/END_PROGRAM wrapper). Declare variables with add_variable, not in a VAR block.',
-    '- PLC logic runs ONCE per scan cycle (cyclically), NOT in a main loop. NEVER write unbounded loops like WHILE TRUE — that hangs the PLC. To do something over time (e.g. blink), use a timer (TON) and edge logic across scans, e.g. `pulse(IN := NOT pulse.Q, PT := T#1s); IF pulse.Q THEN out := NOT out; END_IF`.',
-    '- If the program is running, you can call read_live_variables to inspect actual runtime values and diagnose behaviour before proposing a fix. Approved code changes are pushed to the running PLC as an online change (hot-swap) when a live session is active.',
-    '- When the task is done, reply with a short plain-language summary of what you changed. Reply in the user\'s language.',
+    '- The selected board is READ-ONLY context. Never change hardware.',
+    '- All generated code, names and comments in English. Names must be IEC identifiers (letters/digits/underscore, no spaces, no leading digit).',
+    '- Structured Text must be valid IEC 61131-3: := assign; AND/OR/NOT logical; BAND/BOR/BXOR/BNOT bitwise; time literals like T#500ms.',
+    '- Before using a variable in ST, add it with add_variable (in the SAME response).',
+    '- Make the smallest change that satisfies the request; prefer editing an existing POU over creating new ones unless asked. delete_pou/remove_variable only when explicitly asked.',
+    '- set_st_code replaces the WHOLE body and takes ONLY body statements — NO PROGRAM/VAR/END_VAR/END_PROGRAM wrapper (variables go via add_variable). set_ladder (contacts+coils only) replaces all rungs.',
+    '- PLC logic runs ONCE per scan, cyclically — NEVER write unbounded loops (no WHILE TRUE; it hangs the PLC). For timing use a TON across scans, e.g. `pulse(IN := NOT pulse.Q, PT := T#1s); IF pulse.Q THEN out := NOT out; END_IF`.',
+    '- CRITICAL: you change the project ONLY by emitting tool calls. NEVER write code in prose and claim it is done; NEVER output "APPLIED:" or "I have set the code" — the SYSTEM applies + confirms. To write code into a POU you MUST call set_st_code/set_ladder.',
+    '- Every change is shown as a diff the user approves/rejects; if rejected, adapt. When done, reply with a short summary in the user\'s language.',
+    '- Use read_pou for a POU\'s code+variables, get_project_overview for full detail, read_live_variables (while running) to diagnose before a fix.',
     '',
-    `Currently open POU: ${active}.`,
-    'Project overview (JSON):',
-    JSON.stringify(overview),
-  ].join('\n');
+    `Board: ${board || 'none'}. Currently open POU: ${active}.`,
+    `POUs (${overview.pous.length}): ${pous}.`,
+    `Global variables: ${globals}.`,
+    dts ? `Data types: ${dts}.` : '',
+  ].filter(Boolean).join('\n');
 }
 
 export default function AiAgentPanel({

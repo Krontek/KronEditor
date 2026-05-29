@@ -23,11 +23,17 @@ const RESOURCE_TYPE = 'RESOURCE_EDITOR';
 
 // ── small immutable helpers ──────────────────────────────────────────────────
 
+// IEC 61131-3 identifier: starts with a letter or underscore, then letters /
+// digits / underscores. No spaces or punctuation. Used for POU + variable names.
+const IEC_NAME_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
+const isValidIecName = (n) => IEC_NAME_RE.test(String(n || '').trim());
+
 function findPOU(struct, name) {
-  const lname = String(name || '').toLowerCase();
+  // Trim + case-insensitive so whitespace/case differences never cause a miss.
+  const lname = String(name || '').trim().toLowerCase();
   for (const category of POU_CATEGORIES) {
     const list = struct[category] || [];
-    const idx = list.findIndex((p) => (p.name || '').toLowerCase() === lname);
+    const idx = list.findIndex((p) => (p.name || '').trim().toLowerCase() === lname);
     if (idx >= 0) return { category, index: idx, item: list[idx] };
   }
   return null;
@@ -283,6 +289,7 @@ export function applyToolCall(struct, name, args = {}) {
         const category = args.category;
         if (!POU_CATEGORIES.includes(category)) return { ok: false, error: `invalid category "${category}"` };
         if (!args.name || !args.name.trim()) return { ok: false, error: 'name is required' };
+        if (!isValidIecName(args.name)) return { ok: false, error: `invalid name "${args.name}" — POU names must be IEC identifiers (letters, digits, underscore; no spaces; can't start with a digit)` };
         if (findPOU(struct, args.name)) return { ok: false, error: `a POU named "${args.name}" already exists` };
         const language = args.language === 'LD' ? 'LD' : 'ST';
         const content = language === 'LD' ? { rungs: [], variables: [] } : { code: '', variables: [] };
@@ -306,6 +313,7 @@ export function applyToolCall(struct, name, args = {}) {
         const hit = findPOU(struct, args.name);
         if (!hit) return { ok: false, error: `POU "${args.name}" not found` };
         if (!args.newName || !args.newName.trim()) return { ok: false, error: 'newName is required' };
+        if (!isValidIecName(args.newName)) return { ok: false, error: `invalid name "${args.newName}" — must be an IEC identifier (no spaces; can't start with a digit)` };
         if (findPOU(struct, args.newName)) return { ok: false, error: `name "${args.newName}" is already taken` };
         const list = struct[hit.category].map((p, i) => (i === hit.index ? { ...p, name: args.newName.trim() } : p));
         let next = { ...struct, [hit.category]: list };
@@ -380,6 +388,7 @@ export function applyToolCall(struct, name, args = {}) {
       case 'add_variable': {
         const scope = args.scope === 'global' ? 'global' : 'local';
         if (!args.name || !args.name.trim()) return { ok: false, error: 'name is required' };
+        if (!isValidIecName(args.name)) return { ok: false, error: `invalid variable name "${args.name}" — must be an IEC identifier (no spaces; can't start with a digit)` };
         const v = makeVar(scope, { ...args, name: args.name.trim() });
         if (scope === 'global') {
           const globals = getGlobals(struct);
