@@ -1,11 +1,9 @@
 import { useState, useEffect, useRef } from 'react';
 import { useTranslation } from 'react-i18next';
-import { invoke } from '@tauri-apps/api/core';
-import { listen } from '@tauri-apps/api/event';
-import { open } from '@tauri-apps/plugin-dialog';
-import { readTextFile } from '@tauri-apps/plugin-fs';
 import { Editor } from '@monaco-editor/react';
 import { transpileToC } from '../services/CTranspilerService';
+import { HostClient, host } from '../services/HostClient';
+import { openFile } from '../services/browserFs';
 
 const KRON_REPOS = [
     'KronStandard', 'KronControl', 'KronCompare', 'KronConverter',
@@ -41,6 +39,35 @@ const SettingsPage = ({ theme, setTheme, editorSettings, setEditorSettings, sele
         return parts[1] || '7070';
     });
     const [connStatus, setConnStatus] = useState(null); // null | 'checking' | 'connected' | 'failed' | 'disconnected'
+
+    // ── Host-agent PoC (temporary — remove after migration) ──────────────────
+    const [hostBuildStatus, setHostBuildStatus] = useState(null); // null | 'running' | 'ok' | 'fail'
+    const [hostBuildLog, setHostBuildLog] = useState('');
+    const handleTestHostBuild = async () => {
+        setHostBuildStatus('running');
+        setHostBuildLog('');
+        try {
+            const client = new HostClient();
+            const health = await client.health();
+            const helloC = `#include <stdio.h>\nint main(void){ printf("hello from host-agent build\\n"); return 0; }\n`;
+            const result = await client.build({
+                sources: { 'hello.c': helloC },
+                output: 'hello',
+            });
+            const ok = result.ok === true;
+            setHostBuildStatus(ok ? 'ok' : 'fail');
+            setHostBuildLog(
+                `agent: ${JSON.stringify(health)}\n` +
+                `buildDir: ${result.buildDir || '(none)'}\n` +
+                `binary: ${result.binaryPath || '(none)'}\n` +
+                `error: ${result.error || '(none)'}\n` +
+                `--- compiler log ---\n${result.log || '(empty)'}`
+            );
+        } catch (err) {
+            setHostBuildStatus('fail');
+            setHostBuildLog(`error: ${err.message}`);
+        }
+    };
 
     // Sync connStatus with live connection state when entering the page
     useEffect(() => {
@@ -83,11 +110,30 @@ const SettingsPage = ({ theme, setTheme, editorSettings, setEditorSettings, sele
     useEffect(() => {
         return () => {
             if (unlistenRef.current) {
-                unlistenRef.current.progress?.();
-                unlistenRef.current.done?.();
+                unlistenRef.current();
             }
         };
     }, []);
+
+    // Helper: subscribe to host-agent SSE for build/update progress topics.
+    // Mirrors the pattern of the old Tauri `listen('topic', cb)` flow but
+    // multiplexes over the single /api/host/events stream.
+    const subscribeProgress = (topicProgress, topicDone, onDone) => {
+        const stop = host.streamEvents((msg) => {
+            if (!msg || !msg.topic) return;
+            if (msg.topic === topicProgress) {
+                setProgressLog(prev => prev + String(msg.data) + '\n');
+            } else if (msg.topic === topicDone) {
+                const { success, message } = msg.data || {};
+                setProgressLog(prev => prev + (success ? '✓ ' : '✗ ') + (message || '') + '\n');
+                setIsUpdating(false);
+                stop();
+                unlistenRef.current = null;
+                if (onDone) onDone();
+            }
+        });
+        unlistenRef.current = stop;
+    };
 
     useEffect(() => {
         if (logRef.current) {
@@ -98,11 +144,11 @@ const SettingsPage = ({ theme, setTheme, editorSettings, setEditorSettings, sele
     // ── Transpiler debug handlers ────────────────────────────────────────────
     const handleTranspile = async () => {
         try {
-            const standardHeaders = await invoke('get_standard_headers').catch(() => []);
+            const standardHeaders = await host.getStandardHeaders().catch(() => []);
             const result = transpileToC(projectStructure || {}, standardHeaders, selectedBoard, true, buses || [], busConfigs || {});
             setTranspilerOut({ header: result.header || '', source: result.source || '' });
         } catch (err) {
-            setTranspilerOut({ header: '// Error: ' + err, source: '' });
+            setTranspilerOut({ header: '// Error: ' + (err.message || err), source: '' });
         }
     };
 
@@ -110,12 +156,12 @@ const SettingsPage = ({ theme, setTheme, editorSettings, setEditorSettings, sele
         setIsBuildRunning(true);
         setBuildLog('Starting build → runtime2.bin...\n');
         try {
-            const standardHeaders = await invoke('get_standard_headers').catch(() => []);
+            const standardHeaders = await host.getStandardHeaders().catch(() => []);
             const result = transpileToC(projectStructure || {}, standardHeaders, selectedBoard, false, buses || [], busConfigs || {});
             setTranspilerOut({ header: result.header || '', source: result.source || '' });
             setBuildLog(prev => prev + 'Transpile OK. Cross-compiling...\n');
 
-            const outPath = await invoke('compile_for_target', {
+            const outPath = await host.compileForTarget({
                 header: result.header,
                 source: result.source,
                 variableTable: JSON.stringify(result.variableTable || {}, null, 2),
@@ -125,7 +171,7 @@ const SettingsPage = ({ theme, setTheme, editorSettings, setEditorSettings, sele
             });
             setBuildLog(prev => prev + `✓ Built: ${outPath}\n`);
         } catch (err) {
-            setBuildLog(prev => prev + '✗ ' + String(err) + '\n');
+            setBuildLog(prev => prev + '✗ ' + String(err.message || err) + '\n');
         } finally {
             setIsBuildRunning(false);
             if (buildLogRef.current) buildLogRef.current.scrollTop = buildLogRef.current.scrollHeight;
@@ -145,56 +191,22 @@ const SettingsPage = ({ theme, setTheme, editorSettings, setEditorSettings, sele
         setIsUpdating(true);
         setProgressLog('Starting library build for all targets...\n');
         setProgressLog(prev => prev + 'Targets: x86_64/linux (Clang), x86_64/win32 (Clang + llvm-mingw sysroot), arm/linux (aarch64/armv7 via Clang), arm/CortexM/M0, M4, M7 (Clang + arm-none-eabi sysroot)\n\n');
-
-        const unlistenProgress = await listen('library-update-progress', (event) => {
-            setProgressLog(prev => prev + event.payload + '\n');
-        });
-
-        const unlistenDone = await listen('library-update-done', (event) => {
-            const { success, message } = event.payload;
-            setProgressLog(prev => prev + (success ? '✓ ' : '✗ ') + message + '\n');
+        subscribeProgress('library-update-progress', 'library-update-done');
+        host.updateLibraries(selectedRepos).catch(err => {
+            setProgressLog(prev => prev + 'Error: ' + (err.message || err) + '\n');
             setIsUpdating(false);
-            unlistenProgress();
-            unlistenDone();
-            unlistenRef.current = null;
-        });
-
-        unlistenRef.current = { progress: unlistenProgress, done: unlistenDone };
-
-        invoke('update_libraries', { repos: selectedRepos }).catch(err => {
-            setProgressLog(prev => prev + 'Error: ' + err + '\n');
-            setIsUpdating(false);
-            unlistenProgress();
-            unlistenDone();
-            unlistenRef.current = null;
+            if (unlistenRef.current) { unlistenRef.current(); unlistenRef.current = null; }
         });
     };
 
     const handleBuildCanopen = async () => {
         setIsUpdating(true);
         setProgressLog('Starting CANopen build (cloning + compiling for all toolchains)...\n');
-
-        const unlistenProgress = await listen('library-update-progress', (event) => {
-            setProgressLog(prev => prev + event.payload + '\n');
-        });
-
-        const unlistenDone = await listen('library-update-done', (event) => {
-            const { success, message } = event.payload;
-            setProgressLog(prev => prev + (success ? '✓ ' : '✗ ') + message + '\n');
+        subscribeProgress('library-update-progress', 'library-update-done');
+        host.buildCanopen().catch(err => {
+            setProgressLog(prev => prev + 'Error: ' + (err.message || err) + '\n');
             setIsUpdating(false);
-            unlistenProgress();
-            unlistenDone();
-            unlistenRef.current = null;
-        });
-
-        unlistenRef.current = { progress: unlistenProgress, done: unlistenDone };
-
-        invoke('build_canopen').catch(err => {
-            setProgressLog(prev => prev + 'Error: ' + err + '\n');
-            setIsUpdating(false);
-            unlistenProgress();
-            unlistenDone();
-            unlistenRef.current = null;
+            if (unlistenRef.current) { unlistenRef.current(); unlistenRef.current = null; }
         });
     };
 
@@ -202,28 +214,11 @@ const SettingsPage = ({ theme, setTheme, editorSettings, setEditorSettings, sele
     const handleUpdateServer = async () => {
         setIsUpdating(true);
         setProgressLog('Starting KronServer build...\n');
-
-        const unlistenProgress = await listen('server-update-progress', (event) => {
-            setProgressLog(prev => prev + event.payload + '\n');
-        });
-
-        const unlistenDone = await listen('server-update-done', (event) => {
-            const { success, message } = event.payload;
-            setProgressLog(prev => prev + (success ? '✓ ' : '✗ ') + message + '\n');
+        subscribeProgress('server-update-progress', 'server-update-done');
+        host.updateServer().catch(err => {
+            setProgressLog(prev => prev + 'Error: ' + (err.message || err) + '\n');
             setIsUpdating(false);
-            unlistenProgress();
-            unlistenDone();
-            unlistenRef.current = null;
-        });
-
-        unlistenRef.current = { progress: unlistenProgress, done: unlistenDone };
-
-        invoke('update_server').catch(err => {
-            setProgressLog(prev => prev + 'Error: ' + err + '\n');
-            setIsUpdating(false);
-            unlistenProgress();
-            unlistenDone();
-            unlistenRef.current = null;
+            if (unlistenRef.current) { unlistenRef.current(); unlistenRef.current = null; }
         });
     };
 
@@ -232,7 +227,7 @@ const SettingsPage = ({ theme, setTheme, editorSettings, setEditorSettings, sele
         const addr = `${connIp}:${connPort}`;
         setConnStatus('checking');
         try {
-            await invoke('check_server_status', { serverAddr: addr });
+            await host.checkServerStatus(addr);
             setConnStatus('connected');
             localStorage.setItem('plcAddress', addr);
             if (setPlcAddress) setPlcAddress(addr);
@@ -262,12 +257,14 @@ const SettingsPage = ({ theme, setTheme, editorSettings, setEditorSettings, sele
         setIsDeploying(true);
         setProgressLog('');
 
-        const unlistenProgress = await listen('server-deploy-progress', (event) => {
-            setProgressLog(prev => prev + event.payload + '\n');
+        const stopProgress = host.streamEvents((msg) => {
+            if (msg?.topic === 'server-deploy-progress') {
+                setProgressLog(prev => prev + String(msg.data) + '\n');
+            }
         });
 
         try {
-            await invoke('deploy_server_to_target', {
+            await host.deployServerToTarget({
                 host: connIp,
                 port: parseInt(sshPort) || 22,
                 username: sshUser,
@@ -280,10 +277,10 @@ const SettingsPage = ({ theme, setTheme, editorSettings, setEditorSettings, sele
             localStorage.setItem('plcAddress', addr);
             if (setPlcAddress) setPlcAddress(addr);
         } catch (err) {
-            setProgressLog(prev => prev + '✗ Deploy failed: ' + err + '\n');
+            setProgressLog(prev => prev + '✗ Deploy failed: ' + (err.message || err) + '\n');
         } finally {
             setIsDeploying(false);
-            unlistenProgress();
+            stopProgress();
         }
     };
 
@@ -294,17 +291,12 @@ const SettingsPage = ({ theme, setTheme, editorSettings, setEditorSettings, sele
         setEsiLoadError(null);
         setEsiLoadLog('');
         try {
-            const selected = await open({
-                filters: [{ name: 'ESI XML', extensions: ['xml', 'XML'] }],
-                multiple: false,
-            });
-            if (!selected) return;
-            const content = await readTextFile(selected);
-            const filename = selected.split('/').pop().split('\\').pop();
-            await onLoadEsiFile?.(filename, content);
-            setEsiLoadLog(`Loaded: ${filename}`);
+            const picked = await openFile({ accept: '.xml,.XML' });
+            if (!picked) return;
+            await onLoadEsiFile?.(picked.name, picked.content);
+            setEsiLoadLog(`Loaded: ${picked.name}`);
         } catch (e) {
-            setEsiLoadError('Error: ' + e.message);
+            setEsiLoadError('Error: ' + (e.message || e));
         }
     };
 
@@ -330,36 +322,39 @@ const SettingsPage = ({ theme, setTheme, editorSettings, setEditorSettings, sele
                         <div style={{ marginBottom: '25px' }}>
                             <h3 style={{ borderBottom: '1px solid #444', paddingBottom: '10px', marginTop: 0 }}>{t('common.language')}</h3>
                             <div style={{ display: 'flex', gap: '10px' }}>
-                                <button
-                                    onClick={() => changeLanguage('en')}
-                                    style={{
-                                        flex: 1, padding: '10px',
-                                        backgroundColor: i18n.language === 'en' ? '#007acc' : '#2d2d2d',
-                                        color: '#fff', border: '1px solid #444', borderRadius: '4px', cursor: 'pointer'
-                                    }}
-                                >
-                                    🇬🇧 English
-                                </button>
-                                <button
-                                    onClick={() => changeLanguage('tr')}
-                                    style={{
-                                        flex: 1, padding: '10px',
-                                        backgroundColor: i18n.language === 'tr' ? '#007acc' : '#2d2d2d',
-                                        color: '#fff', border: '1px solid #444', borderRadius: '4px', cursor: 'pointer'
-                                    }}
-                                >
-                                    🇹🇷 Türkçe
-                                </button>
-                                <button
-                                    onClick={() => changeLanguage('ru')}
-                                    style={{
-                                        flex: 1, padding: '10px',
-                                        backgroundColor: i18n.language === 'ru' ? '#007acc' : '#2d2d2d',
-                                        color: '#fff', border: '1px solid #444', borderRadius: '4px', cursor: 'pointer'
-                                    }}
-                                >
-                                    🇷🇺 Русский
-                                </button>
+                                {[
+                                    { code: 'en', label: 'English' },
+                                    { code: 'tr', label: 'Türkçe' },
+                                    { code: 'ru', label: 'Русский' },
+                                ].map(({ code, label }) => {
+                                    const active = (i18n.resolvedLanguage || i18n.language || 'en') === code;
+                                    return (
+                                        <button
+                                            key={code}
+                                            onClick={() => changeLanguage(code)}
+                                            style={{
+                                                flex: 1, padding: '10px',
+                                                backgroundColor: active ? '#0e639c' : '#2d2d2d',
+                                                color: active ? '#fff' : '#ccc',
+                                                border: `1px solid ${active ? '#1177bb' : '#444'}`,
+                                                borderRadius: '4px',
+                                                cursor: 'pointer',
+                                                fontWeight: active ? 600 : 400,
+                                                transition: 'background 0.1s, border-color 0.1s',
+                                            }}
+                                        >
+                                            <span style={{
+                                                display: 'inline-block',
+                                                fontFamily: 'monospace',
+                                                fontSize: 11,
+                                                opacity: 0.7,
+                                                marginRight: 6,
+                                                letterSpacing: '0.05em',
+                                            }}>{code.toUpperCase()}</span>
+                                            {label}
+                                        </button>
+                                    );
+                                })}
                             </div>
                         </div>
 
@@ -532,6 +527,52 @@ const SettingsPage = ({ theme, setTheme, editorSettings, setEditorSettings, sele
                                 )}
                             </div>
                         </div>
+
+                        <div style={{ height: '1px', background: '#333', margin: '20px 0' }} />
+
+                        {/* Host-agent PoC — temporary test panel */}
+                        <h3 style={{ borderBottom: '1px solid #444', paddingBottom: '10px' }}>
+                            Host Agent (PoC)
+                        </h3>
+                        <p style={{ color: '#888', fontSize: '12px', marginBottom: '12px' }}>
+                            Calls local kron-host-agent on :7171 via Vite proxy. Will be removed after migration.
+                        </p>
+                        <div style={{ display: 'flex', gap: '10px', alignItems: 'center', marginBottom: '12px' }}>
+                            <button
+                                onClick={handleTestHostBuild}
+                                disabled={hostBuildStatus === 'running'}
+                                style={{
+                                    padding: '8px 18px',
+                                    backgroundColor: '#2d2d2d',
+                                    color: '#ccc',
+                                    border: '1px solid #444',
+                                    borderRadius: '4px',
+                                    cursor: hostBuildStatus === 'running' ? 'not-allowed' : 'pointer',
+                                    fontSize: '13px',
+                                }}
+                            >
+                                {hostBuildStatus === 'running' ? 'Building…' : 'Test Host Build'}
+                            </button>
+                            {hostBuildStatus === 'ok' && (
+                                <span style={{ color: '#4ec9b0', fontSize: '13px' }}>● Build OK</span>
+                            )}
+                            {hostBuildStatus === 'fail' && (
+                                <span style={{ color: '#f44747', fontSize: '13px' }}>● Build Failed</span>
+                            )}
+                        </div>
+                        {hostBuildLog && (
+                            <pre style={{
+                                background: '#1e1e1e',
+                                color: '#ccc',
+                                padding: '10px',
+                                borderRadius: '4px',
+                                fontSize: '11px',
+                                maxHeight: '200px',
+                                overflow: 'auto',
+                                whiteSpace: 'pre-wrap',
+                                border: '1px solid #333',
+                            }}>{hostBuildLog}</pre>
+                        )}
 
                         <div style={{ height: '1px', background: '#333', margin: '20px 0' }} />
 

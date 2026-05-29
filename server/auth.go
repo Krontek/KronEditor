@@ -243,7 +243,7 @@ func requireSession(us *UserStore, ss *SessionStore, next http.HandlerFunc) http
 			return
 		}
 		if _, ok := sessionFromRequest(r, ss); !ok {
-			http.Redirect(w, r, "/hmi/login", http.StatusSeeOther)
+			http.Redirect(w, r, hmiBase(r)+"/login", http.StatusSeeOther)
 			return
 		}
 		next(w, r)

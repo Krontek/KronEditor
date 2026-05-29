@@ -1,11 +1,33 @@
 {
     "sidebar": {
+        "global": "Global",
         "dataTypes": "Veri Tipleri",
         "functionBlocks": "Fonksiyon Blokları",
         "functions": "Fonksiyonlar",
         "programs": "Programlar",
-        "global": "Global",
+        "resources": "Kaynaklar",
         "configuration": "Yapılandırma"
+    },
+    "tables": {
+        "name": "İsim",
+        "type": "Tip",
+        "class": "Sınıf",
+        "location": "Konum",
+        "initialValue": "Başlangıç Değeri",
+        "description": "Açıklama",
+        "actions": "İşlem",
+        "program": "Program",
+        "task": "Görev",
+        "triggering": "Tetikleme",
+        "interval": "Aralık",
+        "priority": "Öncelik",
+        "structMembers": "Yapı Üyeleri",
+        "identifier": "Tanımlayıcı",
+        "valueOptional": "Değer (Opsiyonel)",
+        "min": "Min (Tamsayı)",
+        "max": "Maks (Tamsayı)",
+        "baseType": "Temel Tip",
+        "dimensions": "Boyutlar"
     },
     "saveConfirm": {
         "title": "Kaydedilmemiş Değişiklikler",
@@ -26,12 +48,12 @@
         "language": "Dil",
         "english": "İngilizce",
         "turkish": "Türkçe",
-        "russian": "Rusça",
         "name": "İsim",
         "type": "Tip",
         "action": "İşlem",
         "moveUp": "Yukarı Taşı",
         "moveDown": "Aşağı Taşı",
+        "rightClick": "Sağ tık",
         "pin": "Sabitle",
         "networkTitle": "Ağ Başlığı",
         "variableName": "Değişken Adı",
@@ -44,30 +66,7 @@
         "openProject": "Proje Aç",
         "close": "Kapat",
         "project": "Proje",
-        "plc": "PLC",
-        "rightClick": "Sağ tık"
-    },
-    "tables": {
-        "name": "İsim",
-        "type": "Tip",
-        "class": "Sınıf",
-        "location": "Konum",
-        "initialValue": "Başlangıç Değeri",
-        "description": "Açıklama",
-        "actions": "İşlem",
-        "program": "Program",
-        "rightClick": "Sau011f tu0131k",
-        "task": "Görev",
-        "triggering": "Tetikleme",
-        "interval": "Aralık",
-        "priority": "Öncelik",
-        "structMembers": "Yapı Üyeleri",
-        "identifier": "Tanımlayıcı",
-        "valueOptional": "Değer (İsteğe Bağlı)",
-        "min": "Min (Tamsayı)",
-        "max": "Max (Tamsayı)",
-        "baseType": "Temel Tip",
-        "dimensions": "Boyutlar"
+        "plc": "PLC"
     },
     "actions": {
         "add": "Ekle",
@@ -119,30 +118,18 @@
         "confirmCloseProject": "Mevcut projeyi kapatmak istediğinize emin misiniz? Kaydedilmemiş değişiklikler kaybolacak."
     },
     "resources": {
-        "globalVariables": "Global Değişkenler",
-        "taskConfiguration": "Görev Yapılandırması",
-        "programInstances": "Program Örnekleri",
-        "triggering": "Tetikleme",
-        "interval": "Aralık",
-        "priority": "Öncelik",
-        "program": "Program",
-        "task": "Görev",
-        "cyclic": "Döngüsel",
-        "interrupt": "Kesme"
+        "globalVariables": "Global Değişkenler"
     },
     "modals": {
         "create": "Yeni Oluştur",
         "createDataType": "Veri Tipi Oluştur",
         "enterName": "İsim Girin:",
-        "enterCycleTime": "Döngü Süresi Girin:",
+        "enterCycleTime": "Döngü Süresini Girin:",
         "returnType": "Dönüş Tipi:",
         "confirm": "Onayla",
         "contactSettings": "Kontak Ayarları",
         "coilSettings": "Bobin Ayarları",
-        "blockSettings": "Blok Ayarları",
-        "addMember": "Üye Ekle",
-        "addValue": "Değer Ekle",
-        "addDimension": "Boyut Ekle"
+        "blockSettings": "Blok Ayarları"
     },
     "errors": {
         "nameRequired": "İsim zorunludur",

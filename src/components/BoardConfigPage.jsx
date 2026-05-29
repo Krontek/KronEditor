@@ -547,7 +547,7 @@ const UsbPortsVisual = ({ board, interfaceConfig, onInterfaceConfigChange }) => 
                   onChange={(e) => updatePort(port.id, { baudRate: Number(e.target.value) })}
                   style={InputBaseStyle}
                 >
-                  {[9600, 19200, 38400, 57600, 115200, 230400, 460800, 921600].map(b => (
+                  {[9600, 19200, 38400, 57600, 115200, 230400, 460800, 921600, 1000000, 1500000, 2000000, 3000000].map(b => (
                     <option key={b} value={b}>{b}</option>
                   ))}
                 </select>
@@ -752,7 +752,7 @@ const ProtocolPortCard = ({ board, protocol, port, value, onChange }) => {
             <div>
               <FieldLabel>{t('board.baudRate')}</FieldLabel>
               <select value={value.baudRate ?? 115200} onChange={(e) => update({ baudRate: Number(e.target.value) })} style={InputBaseStyle}>
-                {[9600, 19200, 38400, 57600, 115200, 230400, 460800, 921600].map(baud => (
+                {[9600, 19200, 38400, 57600, 115200, 230400, 460800, 921600, 1000000, 1500000, 2000000, 3000000].map(baud => (
                   <option key={baud} value={baud}>{baud}</option>
                 ))}
               </select>

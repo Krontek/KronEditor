@@ -22,11 +22,14 @@ After every prompt, before ending your turn, briefly evaluate whether anything *
 
 ## Technology Stack
 
-- **Frontend**: React (Vite), ReactFlow (LD diagram), Monaco (ST editor)
-- **Backend**: Tauri v2 (Rust), IPC via `invoke` + Tauri events
-- **PLC languages**: IEC 61131-3 LD + ST → transpiled to C → compiled with GCC (`x86_64-linux-gnu`)
-- **Simulation**: compiled binary + shared memory, managed by Rust
-- **Deployment Server**: Go (KronServer) — ConnectRPC/gRPC agent for PLC runtime deployment, shared memory IPC, HMI serving
+- **Frontend**: React (Vite), ReactFlow (LD diagram), Monaco (ST editor) — runs in a browser tab
+- **Host agent**: Go (`host-agent/`) — single binary, listens on **`:7171`**, embeds the Vite build via `embed.FS`. Replaces what Tauri's Rust backend used to do (file I/O, GCC/clang invocation, simulation spawn, shared memory, HMI server, deploy to remote device).
+- **PLC languages**: IEC 61131-3 LD + ST → transpiled to C → compiled with bundled clang (LLVM toolchains under `toolchains/`)
+- **Simulation**: compiled binary spawned by the host agent; variables read/written via `/proc/<pid>/mem` (Linux); live updates streamed to the browser over SSE (`/api/host/plc-variables` and `/api/host/events`)
+- **Deployment Server**: Go (KronServer, `server/`) — ConnectRPC/gRPC agent that runs on the **target device** for PLC runtime deployment, shared memory IPC, HMI serving. The host agent talks to it over HTTP for `Build & Send`.
+
+### Tauri removed
+The old Tauri v2 desktop wrapper (`src-tauri/`) has been deleted in favour of the browser+host-agent setup. All 24 `invoke('cmd', args)` calls were ported to `host.<method>(args)` (see `src/services/HostClient.js`); event listeners were ported to SSE via `host.streamEvents()`; `@tauri-apps/plugin-fs`, `plugin-dialog`, `plugin-clipboard-manager`, and `getCurrentWindow()` were replaced by `src/services/browserFs.js` and `navigator.clipboard`. **Some commands are intentionally stubbed (501 Not Implemented)** in `host-agent/`: `deploy_server_to_target` (needs SSH/SCP), `update_libraries`, `update_server`, `build_soem`, `build_canopen`, `ec_request_state`. Re-implementing them is a follow-up — the editor's core compile/run/deploy path does not depend on them.
 
 ---
 
@@ -43,6 +46,38 @@ Files generated there:
 - `variables.json` — symbol table for SHM offsets, addressed vars, password hashes
 
 Use this directory when verifying transpiler output or diagnosing runtime behavior.
+
+---
+
+## Dev Workflow
+
+```
+# Terminal 1: Go host agent (serves API + embedded frontend on :7171)
+cd host-agent && go run .
+
+# Terminal 2: Vite dev server (hot-reload, proxies /api/host → :7171)
+npm run dev
+```
+
+Open `http://localhost:1420` (Vite) for active development; the host-agent's `http://localhost:7171` serves the built frontend (after `npm run build:frontend`) for production-mode browsing.
+
+Single-binary production build:
+```
+npm run build           # = build:frontend + build:host-agent
+./dist-binary/kron-host-agent
+```
+The resulting binary embeds the React app via `embed.FS` (see `host-agent/embed.go`) and looks for the `resources/` and `toolchains/` directories as siblings of the executable (or the working directory).
+
+### Distributables (`packaging/`)
+Two end-user bundles, each = host-agent binary + `resources/` + a **host-specific** `toolchains/`:
+- `packaging/build-appimage.sh` → `KronEditor-x86_64.AppImage` (linux toolchains; `AppRun` opens a terminal and runs the agent; both simulation and Build & Send work).
+- `packaging/build-windows.sh` → `dist/windows/KronEditor/` payload (cross-built `.exe` + **windows** toolchains), packaged by `packaging/windows/kron-editor.iss` (Inno Setup, run on Windows) into `KronEditor-Setup.exe`.
+
+Key facts a future change must respect:
+- **Toolchains are per-host, sysroots are shared.** `setup_toolchain.py --host {linux|windows} --root <dir>` downloads the matching LLVM (`clang` vs `clang.exe`); target sysroots are identical. So Windows `clang.exe` cross-compiles to the Linux PLC targets — **Build & Send works on Windows**.
+- **Local simulation is Linux-only and stays that way on Windows**: `runtime.go` reads `/proc/<pid>/mem` and runs a host-compiled binary. The host-agent *does* cross-compile for Windows (`GOOS=windows go build` succeeds — `/proc` paths are runtime strings, not build-time), so the editor + Build & Send ship fine; only RUN/simulate is disabled there.
+- `setup_toolchain.py` emits to the repo-root `toolchains/` by default (the dir the host-agent resolves); packaging passes `--root <payload>/toolchains` to write into the bundle instead. `toolchains/` is ~5 GB and is embedded whole (no on-demand download), so artifacts are multi-GB.
+- Startup UX is **terminal-only** (no auto-browser, no tray): the agent logs ports/URL to stdout; the user opens `http://localhost:7171`.
 
 ---
 
@@ -67,9 +102,11 @@ src/
   services/
     CTranspilerService.js   ST → C and LD → C transpiler (main compilation path)
     LibraryService.js       Loads XML block library from public/libraries/
-    PLCClient.js            Tauri IPC wrapper (invoke calls to Rust backend)
+    HostClient.js           HTTP client for the local host-agent (compile, run-sim, deploy, etc.)
+    browserFs.js            Browser replacements for plugin-fs / plugin-dialog (open/save/ask)
+    PLCClient.js            HTTP/SSE client for the **remote** KronServer on the target device
     HmiExportService.js     HMI export
-    EsiLibraryService.js    EtherCAT ESI file reader
+    EsiLibraryService.js    EtherCAT ESI file reader (uses host-agent filesystem endpoints)
   utils/
     boardDefinitions.js     All supported boards: specs, pinout, usbPorts[], interfaces[]
     boardLibraryBlocks.js   Channel-specific HAL blocks per board (UART0_Send, USB2_Receive, …)
@@ -81,18 +118,33 @@ src/
     plcStandards.js         IEC 61131-3 data type definitions
     iecSTLanguage.js        Monaco language definition for ST
 
-src-tauri/
-  src/
-    main.rs                 Tauri commands: compile, run simulation, file I/O, shared memory
-    lexer.rs / grammar.lalrpop / ast.rs   LALRPOP-based ST parser (for static analysis)
-  resources/x86_64-linux-gnu/
-    include/HAL/
-      kronhal.h             HAL struct definitions + dispatch functions (SECONDARY COPY — edit KrontekLibraries/KronHAL/ first)
-      kronhal_sim.h         Simulation stubs
-      kronhal_rpi.h         Raspberry Pi HAL
-      kronhal_jetson.h      NVIDIA Jetson HAL
-      kronhal_bb.h          BeagleBone HAL
-    lib/                    Prebuilt .a libraries (do not edit)
+host-agent/                 Local Go agent (replaces Tauri's Rust backend)
+  main.go                   HTTP server, flag parsing, lifecycle
+  paths.go                  Resolves resources/ + toolchains/ + app-data dir
+  files.go                  write_plc_files, get_standard_headers, generic FS ops
+  compile.go                compile_simulation, compile_for_target (bundled clang)
+  runtime.go                run/stop_simulation, write_variable, ELF symbol parsing, /proc/<pid>/mem
+  deploy.go                 check_server_status, deploy_to_server (HTTP to remote KronServer)
+  hmi.go                    HMI in-memory state (server stubbed pending full HTML port)
+  libraries.go              update_libraries / update_server (stubbed)
+  ethercat.go               build_soem / build_canopen / ec_request_state (stubbed)
+  events.go                 SSE broadcaster for build-command, library-update-progress, etc.
+  embed.go                  embed.FS for the Vite build → served at /
+  dist/                     Vite build output (Go embed source)
+
+resources/<triple>/         Krontek libraries (was src-tauri/resources/)
+  include/HAL/
+    kronhal.h               HAL struct definitions + dispatch functions (SECONDARY COPY — edit KrontekLibraries/KronHAL/ first)
+    kronhal_sim.h           Simulation stubs
+    kronhal_rpi.h           Raspberry Pi HAL
+    kronhal_jetson.h        NVIDIA Jetson HAL
+    kronhal_bb.h            BeagleBone HAL
+  lib/                      Prebuilt .a libraries (do not edit)
+
+toolchains/                 Bundled LLVM (clang, llvm-ar) + harvested sysroots
+  bin/clang, llvm-ar
+  lib/clang/<ver>/include/
+  sysroots/<triple>/        Per-target sysroot (x86_64-linux-gnu, aarch64-linux-gnu, …)
 
 public/libraries/           XML block library definitions loaded by LibraryService.js
 
@@ -128,14 +180,15 @@ KrontekLibraries/           SOURCE OF TRUTH for all .c/.h files
 ### Key States (App.jsx)
 - `isRunning` — simulation binary is running; all editors go readOnly
 - `isSimulationMode` — simulation mode is active
-- `liveVariables` — map of live variable values from Tauri `plc_variables` event (updated ~500ms)
+- `liveVariables` — map of live variable values pushed from the host-agent SSE stream (`simulation-output` topic on `/api/host/events`)
 
 ### Simulation Flow
 ```
 App.jsx: startSimulation()
-  → PLCClient.invoke('compile') → Rust: transpile + gcc → binary
-  → PLCClient.invoke('run_simulation') → Rust: spawn binary + shared memory
-  → Tauri event 'plc_variables' → liveVariables state → watch panel
+  → host.writePlcFiles({...})        POST /api/host/write-plc-files     (Go agent writes plc.c/h, variables.json)
+  → host.compileSimulation()         POST /api/host/compile-simulation  (Go agent invokes bundled clang → runtime.bin)
+  → host.runSimulation()             POST /api/host/run-simulation      (Go spawns binary, starts /proc/<pid>/mem poller)
+  → SSE `simulation-output` topic on /api/host/events → liveVariables state → watch panel
 isRunning=true → all editors go readOnly
 ```
 
@@ -226,6 +279,19 @@ rung.connections[i].targetPin // 'in' (Contact/Coil), 'in_0','in_1'... (FB)
 
 ---
 
+## AI Agent Panel (`src/components/AiAgentPanel.jsx`)
+
+Second tab of the right "Kütüphane" sidebar — a Copilot-style chat. **The chat model call (`sampleReply`/`send`) is still STUBBED** (canned replies); only model *config* and *local-model download* are real. Config persists in `localStorage["aiAgentConfig"]` = `{provider, model, apiKey, baseUrl}`.
+
+### Local model download & setup (Ollama) — REAL
+The "Download & Setup" tab in the config dropdown talks to a locally-running **Ollama daemon** (default `http://localhost:11434`, overridable via the host field which writes `draftCfg.baseUrl`). Backend in **`host-agent/ollama.go`**, no `ollama` CLI shell-out — it proxies the daemon's HTTP API:
+- `POST /api/host/ollama-status {baseUrl?}` → `{running, models:[{name,size}]}` (queries `GET {base}/api/tags`; unreachable daemon = `running:false`, not an error).
+- `POST /api/host/ollama-pull {model, baseUrl?}` → returns immediately `{started}`; runs `POST {base}/api/pull` (stream) in a **detached goroutine** (2 h ctx, survives the request) and rebroadcasts progress on the generic event bus under topic **`ollama-pull-progress`** = `{model, status, completed, total, percent, done, error}`. `inFlightPulls` map dedupes concurrent pulls of the same model.
+- Frontend consumes progress via the existing `host.streamEvents()` SSE (NOT a dedicated stream). On `done && !error` it auto-writes `aiAgentConfig` to that ollama model and "connects" it. `OLLAMA_CATALOG` is the curated model list; installed models not in it render under "Other installed".
+- HostClient methods: `ollamaStatus(baseUrl)`, `ollamaPull(model, baseUrl)`.
+
+---
+
 ## HAL Pattern
 
 Every hardware block: **struct + `_Call` function**
@@ -277,6 +343,18 @@ Every hardware block: **struct + `_Call` function**
   ```
 - **Wrap** `varsByType`/`dtMap`/`allRawVars` in `useMemo` (deps: `variables, globalVars, dataTypes`)
 - **Do not** add custom equality to `RungContainerWrapper` until all callbacks use `setRungs(prev => …)` form (stale closure risk)
+
+---
+
+## Clipboard / Copy-Paste (`src/utils/kronClipboard.js`)
+
+Cross-tab copy/paste rides the OS clipboard (`navigator.clipboard`) with an in-process fallback. Every payload is tagged with a `CLIP_KIND` (`POU`, `RUNG`, `BLOCK`, `VARIABLE`, `GLOBALS`). Keyboard handlers in ProjectSidebar / VariableManager / RungEditorNew are **scope-gated** via `editorScope.js` (`EDITOR_SCOPE.SIDEBAR|VARIABLES|LD`), set on the container's `onMouseDown`; a handler bails if the scope isn't its own, so the three Ctrl+C/V listeners don't race on the shared clipboard.
+
+**Paste-naming rules differ by kind — this is intentional:**
+- **POUs / data types** (`handlePasteItem`, App.jsx): keep the original name; on collision append `_copy1`, `_copy2`, … (strip any existing `_copy\d*` first). ProjectSidebar's paste passes the source name verbatim — it does **not** pre-suffix `_copy`.
+- **Local variables** (`uniqueVarName`, VariableManager): same `_copy{n}` scheme.
+- **Global-variable SET** (sidebar "Global Variables" node → `CLIP_KIND.GLOBALS` → `handlePasteGlobals`, App.jsx): **merge by name, NOT `_copy`**. Globals are shared definitions, so a same-named global is **skipped** (destination's copy kept) rather than duplicated as `Foo_copy1`. Addresses are dropped on paste (hardware-unique; matches the variable-table paste convention). Copy/paste the whole set via Ctrl+C/V or right-click on the node; merging into another project is the point.
+- **Referenced globals bundled with a POU**: copying a POU also bundles the globals it references (`bundleReferencedGlobals`) into `meta.globalsBundle`; `handlePasteItem` merges them by name (skip-if-present) — same philosophy as the GLOBALS kind.
 
 ---
 
@@ -401,8 +479,11 @@ Go-based agent that deploys compiled PLC runtime binaries to target hardware, ma
 ### HTTP Endpoints
 - `POST /deploy/runtime` — upload PLC runtime binary (128 MB max, atomic write)
 - `POST /deploy/variable-table` — upload `variable_table.json`
+- `POST /deploy/project-file` — upload the editor project source (`project.xml`); `GET` returns it back. Editor-only — the runtime never reads it. Stored at `{deploy-dir}/project.xml` (`handleProjectFile` in `server.go`). Powers "Pull from Target".
 - `GET /status` — JSON status report
 - `GET /stream/vars` — SSE variable stream
+
+**Project file round-trip**: `handleBuildAndSend` (App.jsx) POSTs the serialized project XML to `/deploy/project-file` right after the runtime/variable deploy — a failure here **fails the whole Build & Send** (strict). The Project dropdown's "Pull from Target" (`handlePullFromTarget`) GETs it back, loads it via `processFileContent(xml, label)` then clears `currentFilePath` so the next Save acts as Save As. Both calls are direct browser→KronServer fetches (like `/deploy/hmi-layout` and `/deploy/config`), NOT routed through the host agent. **Consequence: an already-deployed older KronServer without this endpoint will break Build & Send — rebuild + redeploy the server first.**
 
 ### Shared Memory IPC (`ipc.go`)
 - Variable table loaded from `variable_table.json` (name, offset, type, size, force_flag_offset)
@@ -415,6 +496,15 @@ Go-based agent that deploys compiled PLC runtime binaries to target hardware, ma
 - Session tokens: 64-byte random hex, 8h TTL
 - HMI layout: XML or JSON import, per-page read/write permissions
 - Persisted at `deploy-dir/hmi_layout.json`
+
+### HMI serving — two listeners, base-path aware
+The same HMI UI is reachable two ways:
+- **Agent port** (`:7070`) under **`/hmi/`** — always registered (`RegisterHMIRoutes`).
+- **Dedicated operator port** at the **root** (`http://ip:PORT/`) — registered by `RegisterHMIRoutesAtRoot` on a second `http.Server` that only carries HMI routes (no deploy/RPC surface). Managed by `Server.applyHMIPort(port)` in `server.go`: idempotent, tears down on 0, rebinds on change, bind failures are logged not fatal. The port is `RuntimeConfig.HMIPort` (persisted in `runtime_config.json`, pushed via `/deploy/config` `hmi_port`); started in `Start()` and on every config update.
+- Handlers/templates are **base-path aware** via `hmiBase(r)` (`"/hmi"` when the path starts with `/hmi`, else `""`). It drives the login/logout redirects, the session-cookie `Path` (`hmiCookiePath`), and the `BASE` const injected into `mainHMIHTML`/`loginHTML` (all fetch/form URLs are `BASE+'/api/...'`). Add base-awareness to any new HMI route or template path, or root serving breaks.
+- **`/hmi/api/variables` returns only ADDRESSED variables** (`ReadAddressedVariables`), matching the REST API and the editor restriction below.
+
+**Editor side**: the Visualization variable picker (`HmiProperties.jsx` `collectVars`) lists **only addressed variables** (global + local, with the address shown) — non-addressed vars have no value on the target's addressed feed, so binding them is pointless. The HMI port lives in **`hmiLayout.port`** (edited in the Visualization toolbar, default 8080, persisted in project XML since the whole `hmiLayout` is JSON-serialized). `handleBuildAndSend` pushes it as `/deploy/config` `hmi_port` (or `0` when there are no HMI pages → tears the listener down) and logs `http://<plc-host>:<port>/`.
 
 ### CLI Flags
 ```
@@ -494,4 +584,4 @@ Variables get an IEC address in the VariableManager "Address" column (e.g. `%MW0
 
 **`/status` response** includes `auto_run: bool` and `stream_interval_ms: uint`.
 
-**`/deploy/config` endpoint**: `POST /deploy/config` — no auth required (same trust level as other deploy endpoints). Accepts a **partial** JSON body: omitted fields keep their current value, so the editor can push `{"auto_run": ...}` without clobbering an API-tuned `stream_interval_ms`. Saves `runtime_config.json`. Same partial-update payload is also accepted (with bearer auth) at `POST /api/v1/runtime/config`.
+**`/deploy/config` endpoint**: `POST /deploy/config` — no auth required (same trust level as other deploy endpoints). Accepts a **partial** JSON body (`auto_run`, `stream_interval_ms`, `hmi_port`): omitted fields keep their current value, so the editor can push `{"auto_run": ...}` without clobbering an API-tuned `stream_interval_ms`. Saves `runtime_config.json`. A present `hmi_port` triggers `applyHMIPort` (rebind/teardown of the dedicated HMI listener). Same partial-update payload is also accepted (with bearer auth) at `POST /api/v1/runtime/config`.

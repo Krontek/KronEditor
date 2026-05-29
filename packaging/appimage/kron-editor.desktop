@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=KronEditor
+Comment=IEC 61131-3 PLC editor — runs a local service, open in your browser
+Exec=AppRun
+Icon=kron-editor
+Categories=Development;Engineering;
+Terminal=false

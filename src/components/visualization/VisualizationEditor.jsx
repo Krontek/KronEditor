@@ -273,6 +273,25 @@ const VisualizationEditor = ({
                     )}
                 </button>
 
+                {/* HMI broadcast port — the deployed HMI is served at
+                    http://<plc-ip>:<port>/ (pushed to the target on Build & Send) */}
+                <div style={{ width: 1, height: 22, background: '#2a2a2a', margin: '0 8px' }} />
+                <div style={{ display: 'flex', alignItems: 'center', gap: 5, fontSize: 11, color: '#555' }}
+                    title="HMI broadcast port — served at http://<plc-ip>:<port>/ after Build & Send">
+                    <span>🌐 Port</span>
+                    <input
+                        type="number"
+                        min={1024}
+                        max={65535}
+                        value={hmiLayout?.port ?? 8080}
+                        onChange={e => {
+                            const n = Math.max(0, Math.min(65535, Number(e.target.value) || 0));
+                            onLayoutChange({ ...hmiLayout, port: n });
+                        }}
+                        style={{ width: 60, background: '#1a1a1a', border: '1px solid #2a2a2a', color: '#7eb8f7', fontSize: 11, padding: '2px 4px', textAlign: 'right', fontFamily: 'monospace' }}
+                    />
+                </div>
+
                 {/* Duplicate */}
                 {selectedComp && !isPreview && activeView === 'editor' && (
                     <button onClick={handleDuplicate} title="Duplicate (Ctrl+D)"

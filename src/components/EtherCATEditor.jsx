@@ -6,8 +6,7 @@
 
 import { useState, useCallback, useEffect } from 'react';
 import EtherCATIconSrc from '../assets/icons/ethercat.png';
-import { invoke } from '@tauri-apps/api/core';
-import { listen } from '@tauri-apps/api/event';
+import { host } from '../services/HostClient';
 
 /* ── Styles ────────────────────────────────────────────────────────────────── */
 const S = {
@@ -70,26 +69,26 @@ export default function EtherCATEditor({ busConfig, onChange, isRunning = false 
   const [liveEcState, setLiveEcState] = useState(null);
 
   useEffect(() => {
-    invoke('list_network_interfaces').then(setNetIfaces).catch(() => {});
+    host.listNetworkInterfaces().then(setNetIfaces).catch(() => {});
   }, []);
 
   useEffect(() => {
     if (!isRunning) { setLiveEcState(null); return; }
-    let unlisten;
-    listen('ec-state-update', (event) => {
-      const code = event.payload?.state_code;
+    const stop = host.streamEvents((msg) => {
+      if (!msg || msg.topic !== 'ec-state-update') return;
+      const code = msg.data?.state_code;
       const st = EC_STATES.find(s => s.code === code);
       if (st) setLiveEcState(st.id);
-    }).then(u => { unlisten = u; });
-    return () => { unlisten?.(); };
+    });
+    return () => stop();
   }, [isRunning]);
 
   const handleRequestState = useCallback(async (stateId) => {
     try {
-      await invoke('ec_request_state', { state: stateId });
+      await host.ecRequestState(stateId);
       setLog(`State transition to ${stateId.toUpperCase()} requested`);
     } catch (e) {
-      setLog(`Error: ${e}`);
+      setLog(`Error: ${e.message || e}`);
     }
   }, []);
 

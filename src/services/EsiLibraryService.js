@@ -1,36 +1,39 @@
 /**
  * EsiLibraryService.js
- * Manages persistent ESI device library stored in the app's local data directory.
- * Dev mode:     ~/.local/share/com.plceditor.app/esi/
- * Installed:    same (AppLocalData resolves to the OS app-data folder)
+ * Manages persistent ESI device library stored in the host-agent's app data dir.
+ *
+ * The host-agent exposes its app-data dir via /api/host/build-dir (returns the
+ * parent dir under .appDataDir). ESI files live under <appDataDir>/esi/.
  */
 
-import { readDir, mkdir, writeTextFile, readTextFile, exists, BaseDirectory } from '@tauri-apps/plugin-fs';
+import { host } from './HostClient';
 import { parseEsiXml } from './EsiParser';
 
-const ESI_DIR = 'esi';
-const BASE    = BaseDirectory.AppLocalData;
-
-async function ensureEsiDir() {
-  const ok = await exists(ESI_DIR, { baseDir: BASE });
-  if (!ok) await mkdir(ESI_DIR, { baseDir: BASE, recursive: true });
+let _esiDirCache = null;
+async function esiDir() {
+  if (_esiDirCache) return _esiDirCache;
+  const info = await host.buildDir();
+  // buildDir is <appData>/build, so esi/ sits next to it
+  const appData = (info.buildDir || '').replace(/\/build\/?$/, '');
+  _esiDirCache = `${appData}/esi`;
+  return _esiDirCache;
 }
 
 /** Save an ESI XML file to the library directory. Returns the stored filename. */
 export async function saveEsiFile(filename, content) {
-  await ensureEsiDir();
+  const dir = await esiDir();
   const safe = filename.replace(/[^a-zA-Z0-9._-]/g, '_');
-  await writeTextFile(`${ESI_DIR}/${safe}`, content, { baseDir: BASE });
+  await host.writeFile(`${dir}/${safe}`, content);
   return safe;
 }
 
 /** Returns list of stored ESI filenames. */
 export async function listEsiFiles() {
   try {
-    await ensureEsiDir();
-    const entries = await readDir(ESI_DIR, { baseDir: BASE });
+    const dir = await esiDir();
+    const entries = await host.listDir(dir);
     return entries
-      .filter(e => !e.isDirectory && e.name?.toLowerCase().endsWith('.xml'))
+      .filter(e => !e.isDir && e.name?.toLowerCase().endsWith('.xml'))
       .map(e => e.name);
   } catch {
     return [];
@@ -40,14 +43,19 @@ export async function listEsiFiles() {
 /** Loads and parses all ESI files from the library. Returns flat device array. */
 export async function loadAllEsiDevices() {
   try {
-    await ensureEsiDir();
-    const entries = await readDir(ESI_DIR, { baseDir: BASE });
+    const dir = await esiDir();
+    let entries;
+    try {
+      entries = await host.listDir(dir);
+    } catch {
+      return [];
+    }
     const devices = [];
     for (const entry of entries) {
-      if (entry.isDirectory || !entry.name?.toLowerCase().endsWith('.xml')) continue;
+      if (entry.isDir || !entry.name?.toLowerCase().endsWith('.xml')) continue;
       try {
-        const content = await readTextFile(`${ESI_DIR}/${entry.name}`, { baseDir: BASE });
-        const parsed  = parseEsiXml(content);
+        const content = await host.readFile(`${dir}/${entry.name}`);
+        const parsed = parseEsiXml(content);
         devices.push(...parsed.map(d => ({ ...d, _esiFile: entry.name })));
       } catch (e) {
         console.warn(`[EsiLibrary] Skipped ${entry.name}:`, e.message);

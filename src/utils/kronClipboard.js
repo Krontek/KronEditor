@@ -1,9 +1,8 @@
 // Cross-instance clipboard for KronEditor.
 //
-// Uses @tauri-apps/plugin-clipboard-manager (native OS clipboard) when
-// available so that two separate KronEditor processes can exchange POUs,
-// rungs, blocks, and variables.  Falls back to navigator.clipboard, and
-// finally to an in-process cache so copy/paste still works even when
+// Uses navigator.clipboard (the browser's async clipboard API) so two
+// separate browser tabs can exchange POUs, rungs, blocks, and variables.
+// Falls back to an in-process cache so copy/paste still works even when
 // clipboard permissions are denied entirely.
 
 import { useEffect, useState } from 'react';
@@ -15,6 +14,7 @@ export const CLIP_KIND = {
     RUNG: 'RUNG',
     BLOCK: 'BLOCK',
     VARIABLE: 'VARIABLE',
+    GLOBALS: 'GLOBALS', // the whole global-variable set (sidebar "Global Variables" node)
 };
 
 let fallbackEntry = null;
@@ -34,29 +34,11 @@ const decode = (text) => {
     return null;
 };
 
-// Lazy-load Tauri clipboard plugin to avoid import errors in non-Tauri
-// (browser-only) builds.
-let tauriClip = null;
-async function getTauriClip() {
-    if (tauriClip) return tauriClip;
-    try {
-        tauriClip = await import('@tauri-apps/plugin-clipboard-manager');
-    } catch { tauriClip = null; }
-    return tauriClip;
-}
-
 async function osWrite(text) {
-    const t = await getTauriClip();
-    if (t) {
-        await t.writeText(text);
-        return;
-    }
     await navigator.clipboard?.writeText(text);
 }
 
 async function osRead() {
-    const t = await getTauriClip();
-    if (t) return t.readText();
     return navigator.clipboard?.readText();
 }
 

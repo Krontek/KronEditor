@@ -16,7 +16,11 @@ import zipfile
 from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-FIXED_TOOLCHAIN_ROOT = SCRIPT_DIR / "src-tauri" / "toolchains"
+# Default output root. The host-agent looks for `toolchains/` as a sibling of
+# the binary / working dir (host-agent/paths.go guessSiblingDir); src-tauri was
+# removed, so emit straight to the repo-root `toolchains/`. Override with --root
+# (packaging passes the AppImage/installer payload dir).
+FIXED_TOOLCHAIN_ROOT = SCRIPT_DIR / "toolchains"
 
 LLVM_VERSION = "21.1.6"
 LLVM_RELEASE_TAG = f"llvmorg-{LLVM_VERSION}"
@@ -819,6 +823,12 @@ def parse_args() -> argparse.Namespace:
         help="Override packaged host OS for LLVM binary selection",
     )
     parser.add_argument(
+        "--root",
+        help="Output toolchains root (default: <repo>/toolchains). "
+             "Used by packaging to emit host-specific toolchains straight into "
+             "an AppImage/installer payload, e.g. --root dist/payload/toolchains",
+    )
+    parser.add_argument(
         "--only",
         nargs="+",
         help="Subset to install: llvm arm-none-eabi aarch64-linux-gnu arm-linux-gnueabihf x86_64-linux-gnu x86_64-w64-mingw32 simulation_env",
@@ -896,7 +906,7 @@ def patch_lld_libxml2(root: Path) -> None:
 def main() -> int:
     args = parse_args()
     host_os, host_arch = detect_host(args.host)
-    root = FIXED_TOOLCHAIN_ROOT
+    root = Path(args.root).resolve() if args.root else FIXED_TOOLCHAIN_ROOT
     ensure_layout(root)
     cache_dir = root / ".cache"
     wanted = selected_targets(args)

@@ -12,10 +12,23 @@ This script is intentionally a complement to Onemotorcontrol.py:
   - lidarsampling.py demonstrates reads, the live SSE stream, and
     server-side cadence control.
 
-Project requirements (PLC variables marked addressed in KronEditor):
-  %MD20  REAL   — beam angle in degrees (0° = forward, clockwise)
-  %MD21  REAL   — beam distance in meters
-  %MB5   USINT  — quality / signal strength (0..255)
+Project requirements — declare these as GLOBAL variables in KronEditor
+with the addresses below (the ST driver `lidar.st` writes to them):
+
+  lidar_angle      REAL   %MD20   beam angle in degrees (0° = forward, CW)
+  lidar_distance   REAL   %MD21   beam distance in mm (raw RPLIDAR Q2 value)
+  lidar_quality    USINT  %MB5    signal strength (0..63 raw quality)
+
+Optional diagnostics (if present, the panel shows extra info):
+
+  lidar_pkt_count  UDINT  %MD22   per-sample counter — actual lidar Hz
+  lidar_state      USINT  %MB6    current driver state (0..9)
+
+The script binds *by address*, so the underlying variable name doesn't
+matter as long as the addresses point at the correct globals. Locals
+named `angle`, `distance` etc. in the parser POU will silently shadow
+the globals — keep them named `lidar_*` (or whatever you bind) to
+avoid the collision.
 
 Usage:  python3 lidarsampling.py
 """
@@ -44,18 +57,38 @@ TEXT_DIM = "#666666"
 TEXT_H   = "#9cdcfe"
 
 # ── Addresses ─────────────────────────────────────────────────────────────────
+# Required addresses — script will refuse to start if these are missing.
 ANGLE_ADDR    = "%MD20"
 DIST_ADDR     = "%MD21"
 QUALITY_ADDR  = "%MB5"
-ALL_ADDRESSES = (ANGLE_ADDR, DIST_ADDR, QUALITY_ADDR)
+REQ_ADDRESSES = (ANGLE_ADDR, DIST_ADDR, QUALITY_ADDR)
+
+# Optional diagnostic addresses — script displays them if present.
+PKT_COUNT_ADDR = "%MD22"
+STATE_ADDR     = "%MB6"
+OPT_ADDRESSES  = (PKT_COUNT_ADDR, STATE_ADDR)
+
+# Driver state labels (matches the CASE values in lidar.st)
+STATE_LABELS = {
+    0: "STOP",        1: "wait",       2: "PWM=0",     3: "wait",
+    4: "RESET",       5: "reboot",     6: "PWM=660",   7: "spinup",
+    8: "SCAN",        9: "streaming",
+}
+
+# ── Distance unit ─────────────────────────────────────────────────────────────
+# The RPLIDAR protocol (and the reference ST sample) emits distance in mm
+# (the Q2 fixed-point value divided by 4 yields mm). To plot in meters we
+# multiply by 0.001. If your PLC pre-converts to meters, set this to 1.0.
+DIST_SCALE_TO_M = 0.001
 
 # ── Display ───────────────────────────────────────────────────────────────────
 CANVAS_SIZE        = 540
 CANVAS_MARGIN      = 36
-MAX_BUFFER         = 720          # ~one full revolution at 0.5° resolution
+ANGLE_BUCKETS      = 720          # 0.5° resolution map (360° / 0.5)
 DEFAULT_RANGE_M    = 5.0
 REDRAW_INTERVAL_MS = 50           # canvas refresh — independent of stream rate
 RATE_WINDOW_S      = 1.0          # live Hz readout averaged over this window
+SAMPLE_TTL_S       = 4.0          # bucket fades out (then drops) after this long
 
 
 # ── API client ────────────────────────────────────────────────────────────────
@@ -146,13 +179,23 @@ class LidarApp(tk.Tk):
         # All sample state is guarded by a single lock — the SSE worker
         # thread mutates these while the Tk main thread reads them in
         # _redraw_canvas / _update_readout.
+        #
+        # `_buckets` holds the most recent (dist, quality, ts) per angle
+        # bucket — replacing entries instead of appending makes the canvas
+        # behave like a real 2D scan map: a fresh sweep refreshes each
+        # angle's reading, old buckets fade out over SAMPLE_TTL_S.
         self._lock          = threading.Lock()
-        self._samples       = collections.deque(maxlen=MAX_BUFFER)
+        self._buckets       = [None] * ANGLE_BUCKETS
         self._last_angle    = 0.0
         self._last_dist     = 0.0
         self._last_quality  = 0
         self._sample_times  = collections.deque()
         self._sample_count  = 0
+
+        # Optional diag — populated only when the optional addresses exist.
+        self._driver_state  = None
+        self._pkt_count     = None
+        self._pkt_count_t0  = None   # (count, ts) for actual lidar Hz estimate
 
         self._range_m         = DEFAULT_RANGE_M
         self._redraw_after_id = None
@@ -185,7 +228,7 @@ class LidarApp(tk.Tk):
                             highlightbackground=BORDER, **kw)
 
         lbl("Host:").pack(side=tk.LEFT)
-        self.ent_host = ent(15); self.ent_host.insert(0, "192.168.1.121")
+        self.ent_host = ent(15); self.ent_host.insert(0, "192.168.1.129")
         self.ent_host.pack(side=tk.LEFT, padx=(3, 10))
 
         lbl("Port:").pack(side=tk.LEFT)
@@ -290,8 +333,15 @@ class LidarApp(tk.Tk):
         pw   = self.ent_pass.get().strip()
         try:
             self.client.connect(host, port, pw)
-            for addr in ALL_ADDRESSES:
+            # Required — fail loudly if any is missing.
+            for addr in REQ_ADDRESSES:
                 self._names[addr.upper()] = self.client.resolve(addr)
+            # Optional — record None on miss; UI just hides those readouts.
+            for addr in OPT_ADDRESSES:
+                try:
+                    self._names[addr.upper()] = self.client.resolve(addr)
+                except KeyError:
+                    self._names[addr.upper()] = None
             try:
                 st = self.client.runtime_status()
                 ms = int(st.get("stream_interval_ms", 50))
@@ -359,9 +409,12 @@ class LidarApp(tk.Tk):
 
     def _clear_buffer(self):
         with self._lock:
-            self._samples.clear()
+            self._buckets = [None] * ANGLE_BUCKETS
             self._sample_times.clear()
             self._sample_count = 0
+            # Re-baseline the lidar Hz estimate so it doesn't include
+            # the time before the user cleared.
+            self._pkt_count_t0 = None
 
     # ── SSE stream ────────────────────────────────────────────────────────────
 
@@ -384,20 +437,46 @@ class LidarApp(tk.Tk):
         a_n = self._names.get(ANGLE_ADDR.upper())
         d_n = self._names.get(DIST_ADDR.upper())
         q_n = self._names.get(QUALITY_ADDR.upper())
+        s_n = self._names.get(STATE_ADDR.upper())
+        p_n = self._names.get(PKT_COUNT_ADDR.upper())
         now = time.monotonic()
         with self._lock:
+            # Optional diagnostics — pulled first so they're available
+            # to the readout even when angle/distance are still 0.
+            if s_n and s_n in flat:
+                try: self._driver_state = int(flat[s_n])
+                except (TypeError, ValueError): pass
+            if p_n and p_n in flat:
+                try:
+                    cur = int(flat[p_n])
+                    if self._pkt_count_t0 is None:
+                        self._pkt_count_t0 = (cur, now)
+                    self._pkt_count = cur
+                except (TypeError, ValueError): pass
             if a_n in flat:
                 try: self._last_angle = float(flat[a_n])
                 except (TypeError, ValueError): pass
             if d_n in flat:
-                try: self._last_dist = float(flat[d_n])
+                try:
+                    # Convert the PLC's distance to meters here so the rest
+                    # of the code (range checks, ring labels, drawing) works
+                    # in a single unit.
+                    self._last_dist = float(flat[d_n]) * DIST_SCALE_TO_M
                 except (TypeError, ValueError): pass
             if q_n in flat:
                 try: self._last_quality = int(flat[q_n])
                 except (TypeError, ValueError): pass
-            self._samples.append(
-                (self._last_angle, self._last_dist, self._last_quality)
-            )
+
+            # Store this reading in its angle bucket (replaces the previous
+            # measurement at that angle — the map updates in place as the
+            # lidar rotates instead of trailing as a circular buffer).
+            angle_norm = self._last_angle % 360.0
+            idx = int(angle_norm * ANGLE_BUCKETS / 360.0) % ANGLE_BUCKETS
+            self._buckets[idx] = (self._last_angle,
+                                  self._last_dist,
+                                  self._last_quality,
+                                  now)
+
             self._sample_times.append(now)
             cutoff = now - RATE_WINDOW_S
             while self._sample_times and self._sample_times[0] < cutoff:
@@ -445,12 +524,23 @@ class LidarApp(tk.Tk):
             c.create_text(lx, ly, text=label, fill=TEXT_DIM,
                           font=("Consolas", 8))
 
-        # Snapshot under the lock to avoid drawing a torn buffer.
+        # Snapshot under the lock to avoid drawing a torn buffer. Stale
+        # buckets (older than SAMPLE_TTL_S) are also dropped here so the
+        # map self-cleans when a beam stops returning data.
+        now = time.monotonic()
         with self._lock:
-            samples = list(self._samples)
+            buckets = list(self._buckets)
+            for idx, b in enumerate(buckets):
+                if b is not None and (now - b[3]) > SAMPLE_TTL_S:
+                    self._buckets[idx] = None
+                    buckets[idx] = None
+            last_a = self._last_angle
+            last_d = self._last_dist
 
-        n = len(samples)
-        for i, (a, d, q) in enumerate(samples):
+        for b in buckets:
+            if b is None:
+                continue
+            a, d, q, ts = b
             if d <= 0 or d > rng:
                 continue
             ar = math.radians(a)
@@ -458,28 +548,26 @@ class LidarApp(tk.Tk):
             x  = cx + math.sin(ar) * rr
             y  = cy - math.cos(ar) * rr
 
-            # Brightness fades from age (newest = bright); quality
+            # Brightness fades with bucket age (fresh = bright, fades to
+            # dim before being dropped at SAMPLE_TTL_S). Quality
             # contributes the remaining 65 % of the luminance budget.
-            age_frac = (n - 1 - i) / max(1, n - 1)   # 0 newest, 1 oldest
-            life     = 1.0 - age_frac
-            qf       = max(0, min(255, q)) / 255.0
-            green    = max(0, min(255,
-                              int(60 + 195 * life * (0.35 + 0.65 * qf))))
-            color    = f"#00{green:02x}33"
+            life  = max(0.0, 1.0 - (now - ts) / SAMPLE_TTL_S)
+            qf    = max(0, min(255, q)) / 255.0
+            green = max(0, min(255,
+                          int(60 + 195 * life * (0.35 + 0.65 * qf))))
+            color = f"#00{green:02x}33"
             c.create_oval(x - 1.5, y - 1.5, x + 1.5, y + 1.5,
                           fill=color, outline="")
 
-        # Highlight the most recent sample with a beam line + bright dot.
-        if samples:
-            a, d, q = samples[-1]
-            if 0 < d <= rng:
-                ar = math.radians(a)
-                rr = d * scale
-                x  = cx + math.sin(ar) * rr
-                y  = cy - math.cos(ar) * rr
-                c.create_line(cx, cy, x, y, fill="#1d4a1d", width=1)
-                c.create_oval(x - 3, y - 3, x + 3, y + 3,
-                              fill="#fffd55", outline=GREEN, width=1)
+        # Beam line + bright dot for the most recent reading.
+        if 0 < last_d <= rng:
+            ar = math.radians(last_a)
+            rr = last_d * scale
+            x  = cx + math.sin(ar) * rr
+            y  = cy - math.cos(ar) * rr
+            c.create_line(cx, cy, x, y, fill="#1d4a1d", width=1)
+            c.create_oval(x - 3, y - 3, x + 3, y + 3,
+                          fill="#fffd55", outline=GREEN, width=1)
 
     def _ring_step(self, rng):
         if rng <= 1.5:  return 0.25
@@ -489,14 +577,37 @@ class LidarApp(tk.Tk):
         return 5.0
 
     def _update_readout(self):
+        now = time.monotonic()
         with self._lock:
             a, d, q = self._last_angle, self._last_dist, self._last_quality
             rate    = len(self._sample_times) / RATE_WINDOW_S
             total   = self._sample_count
-        self.lbl_readout.config(
-            text=(f"angle={a:7.2f}°  dist={d:6.3f} m  quality={q:3d}  "
-                  f"rate={rate:5.1f} Hz  samples={total}")
-        )
+            ds      = self._driver_state
+            pc      = self._pkt_count
+            pc_t0   = self._pkt_count_t0
+
+        # Stream snapshots per second (what the SSE delivers). The actual
+        # lidar sample rate is much higher and only visible through
+        # pkt_count delta if the PLC exposes it.
+        text = (f"angle={a:7.2f}°  dist={d:6.3f} m  quality={q:3d}  "
+                f"snap={rate:5.1f} Hz  ")
+
+        if pc is not None and pc_t0 is not None:
+            pc0, t0 = pc_t0
+            dt = now - t0
+            if dt > 1.0:
+                lidar_hz = (pc - pc0) / dt
+                text += f"lidar={lidar_hz:6.0f} Hz  pkts={pc:>7d}  "
+            else:
+                text += f"pkts={pc:>7d}  "
+        else:
+            text += f"samples={total}  "
+
+        if ds is not None:
+            label = STATE_LABELS.get(ds, "?")
+            text += f"state={ds}({label})"
+
+        self.lbl_readout.config(text=text)
 
     # ── Helpers ───────────────────────────────────────────────────────────────
 

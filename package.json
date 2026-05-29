@@ -1,31 +1,20 @@
 {
   "name": "KronEditor",
   "private": true,
-  "version": "0.1.1",
+  "version": "0.2.0",
   "type": "module",
   "scripts": {
-    "dev": "npx tauri dev",
-    "web": "vite",
-    "web2": "VITE_PORT=1421 vite",
-    "dev2": "VITE_PORT=1421 npx tauri dev --config '{\"build\":{\"devUrl\":\"http://localhost:1421\",\"beforeDevCommand\":\"npm run web2\"}}'",
-    "setup:llvm:linux": "python3 setup_toolchain.py --host linux",
-    "setup:llvm:windows": "python3 setup_toolchain.py --host windows",
-    "setup:llvm:macos": "python3 setup_toolchain.py --host macos",
-    "build:linux": "npm run setup:llvm:linux && ARCH=x86_64 npx tauri build",
-    "build:windows": "npm run setup:llvm:windows && npx tauri build --target x86_64-pc-windows-gnu",
-    "build:macos": "npm run setup:llvm:macos && npx tauri build --target universal-apple-darwin",
-    "build": "npm run build:linux && npm run build:windows && npm run build:macos",
-    "build:web": "vite build",
-    "postbuild": "node scripts/move-releases.js",
+    "dev": "concurrently --kill-others --names \"vite,agent\" --prefix-colors \"cyan,magenta\" \"npm:dev:frontend\" \"npm:dev:host-agent\"",
+    "dev:frontend": "vite",
+    "dev:host-agent": "cd host-agent && go run .",
+    "build:frontend": "vite build",
+    "build:host-agent": "cd host-agent && go build -o ../dist-binary/kron-host-agent .",
+    "build": "npm run build:frontend && npm run build:host-agent",
     "lint": "eslint . --ext ts,tsx --report-unused-disable-directives --max-warnings 0",
     "preview": "vite preview"
   },
   "dependencies": {
     "@monaco-editor/react": "^4.7.0",
-    "@tauri-apps/api": "~2.2.0",
-    "@tauri-apps/plugin-clipboard-manager": "^2.3.2",
-    "@tauri-apps/plugin-dialog": "^2.6.0",
-    "@tauri-apps/plugin-fs": "^2.4.5",
     "i18next": "^25.8.0",
     "i18next-browser-languagedetector": "^8.2.0",
     "react": "^18.2.0",
@@ -34,17 +23,16 @@
     "reactflow": "^11.11.4"
   },
   "devDependencies": {
-    "@tauri-apps/cli": "~2.2.0",
     "@types/react": "^18.2.64",
     "@types/react-dom": "^18.2.21",
     "@typescript-eslint/eslint-plugin": "^7.1.1",
     "@typescript-eslint/parser": "^7.1.1",
     "@vitejs/plugin-react": "^4.2.1",
+    "concurrently": "^9.2.1",
     "eslint": "^8.57.0",
     "eslint-plugin-react-hooks": "^4.6.0",
     "eslint-plugin-react-refresh": "^0.4.5",
     "typescript": "^5.2.2",
     "vite": "^5.1.6"
-  },
-  "main": "dist-electron/main.js"
+  }
 }

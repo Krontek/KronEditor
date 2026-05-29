@@ -1,6 +1,6 @@
 import React, { useState, useRef, useCallback, useEffect } from 'react';
 import { useTranslation } from 'react-i18next';
-import { ask } from '@tauri-apps/plugin-dialog';
+import { ask } from '../services/browserFs';
 import { getBoardById } from '../utils/boardDefinitions';
 import EtherCATIconSrc from '../assets/icons/ethercat.png';
 import {
@@ -197,7 +197,7 @@ const BUS_META = {
 
 const ProjectSidebar = ({
     projectStructure, onSelectItem, activeId,
-    onAddItem, onDeleteItem, onEditItem, onReorderItem, onPasteItem,
+    onAddItem, onDeleteItem, onEditItem, onReorderItem, onPasteItem, onPasteGlobals,
     onBoardClick, selectedBoard, isRunning = false, liveVariables = null,
     buses = [], onAddBus, onDeleteBus, onSelectBus,
     busConfigs = {}, onAddSlave, onAddSlaveFromLibrary, onDeleteSlave, onSelectSlave,
@@ -233,6 +233,7 @@ const ProjectSidebar = ({
     const clipboardEntry = useKronClipboard();
     const clipboardCategory =
         clipboardEntry?.kind === CLIP_KIND.POU ? clipboardEntry.meta?.category : null;
+    const canPasteGlobals = clipboardEntry?.kind === CLIP_KIND.GLOBALS;
 
     /* Context menu */
     const [ctxMenu, setCtxMenu] = useState(null); // { x, y, items }
@@ -244,13 +245,14 @@ const ProjectSidebar = ({
         if (typeof itemsOrBuilder === 'function') {
             const clip = await refreshClipboard();
             const clipCat = clip?.kind === CLIP_KIND.POU ? clip.meta?.category : null;
-            setCtxMenu({ x: e.clientX, y: e.clientY, items: itemsOrBuilder(clipCat) });
+            setCtxMenu({ x: e.clientX, y: e.clientY, items: itemsOrBuilder(clipCat, clip) });
         } else {
             setCtxMenu({ x: e.clientX, y: e.clientY, items: itemsOrBuilder });
         }
     };
 
-    const globalVars = projectStructure.resources?.find(r => r.type === 'RESOURCE_EDITOR')?.content?.globalVars || [];
+    const globalResource = projectStructure.resources?.find(r => r.type === 'RESOURCE_EDITOR') || projectStructure.resources?.[0];
+    const globalVars = globalResource?.content?.globalVars || [];
 
     /* ── Clipboard helpers ── */
     const copyItem = useCallback((category, item) => {
@@ -259,13 +261,30 @@ const ProjectSidebar = ({
         writeClipboard(CLIP_KIND.POU, payload, { category, globalsBundle });
     }, [globalVars]);
 
+    // Copy the whole global-variable set as one clipboard entry, so it can be
+    // pasted into another project's Global Variables (merged by name there).
+    const copyGlobals = useCallback(() => {
+        if (isRunning || globalVars.length === 0) return;
+        writeClipboard(CLIP_KIND.GLOBALS, JSON.parse(JSON.stringify(globalVars)));
+    }, [isRunning, globalVars]);
+
+    const pasteGlobals = useCallback(async () => {
+        if (isRunning) return;
+        const clip = await readClipboard();
+        if (!clip || clip.kind !== CLIP_KIND.GLOBALS) return;
+        const list = Array.isArray(clip.payload) ? clip.payload : [];
+        if (list.length === 0) return;
+        onPasteGlobals?.(list);
+    }, [isRunning, onPasteGlobals]);
+
     const handleSidebarCopy = useCallback(() => {
         if (isRunning || !activeId) return;
+        if (globalResource && activeId === globalResource.id) { copyGlobals(); return; }
         for (const cat of ['dataTypes', 'functions', 'functionBlocks', 'programs']) {
             const item = projectStructure[cat]?.find(i => i.id === activeId);
             if (item) { copyItem(cat, item); return; }
         }
-    }, [isRunning, activeId, projectStructure, copyItem]);
+    }, [isRunning, activeId, projectStructure, copyItem, copyGlobals, globalResource]);
 
     const handleSidebarPaste = useCallback(async (targetCategory, insertIndex) => {
         if (isRunning) return;
@@ -276,7 +295,7 @@ const ProjectSidebar = ({
         const ts = Date.now();
         const newItem = {
             ...src, id: `${targetCategory}_${ts}`,
-            name: `${src.name}_copy`,
+            name: src.name,
             content: JSON.parse(JSON.stringify(src.content || {})),
             _globalsBundle: clip.meta?.globalsBundle || [],
         };
@@ -296,7 +315,9 @@ const ProjectSidebar = ({
             if (key === 'c') handleSidebarCopy();
             else if (key === 'v') {
                 const clip = await readClipboard();
-                if (!clip || clip.kind !== CLIP_KIND.POU) return;
+                if (!clip) return;
+                if (clip.kind === CLIP_KIND.GLOBALS) { pasteGlobals(); return; }
+                if (clip.kind !== CLIP_KIND.POU) return;
                 const cat = clip.meta?.category;
                 if (!cat) return;
                 handleSidebarPaste(cat, projectStructure[cat]?.length || 0);
@@ -304,7 +325,7 @@ const ProjectSidebar = ({
         };
         window.addEventListener('keydown', handler);
         return () => window.removeEventListener('keydown', handler);
-    }, [handleSidebarCopy, handleSidebarPaste, projectStructure]);
+    }, [handleSidebarCopy, handleSidebarPaste, pasteGlobals, projectStructure]);
 
     /* ── Delete with confirm ──
        Tauri's `ask` rejects silently when the dialog:allow-ask capability is
@@ -360,6 +381,21 @@ const ProjectSidebar = ({
             icon: '📄', label: 'Paste',
             disabled: isRunning,
             action: () => handleSidebarPaste(category, items.length),
+        }] : []),
+    ];
+
+    // Context menu for the "Global Variables" node. `clip` is the freshly-read
+    // clipboard entry passed by openCtx; Paste shows only when it holds globals.
+    const globalsCtxItems = (clip) => [
+        {
+            icon: '📋', label: 'Copy',
+            disabled: isRunning || globalVars.length === 0,
+            action: () => copyGlobals(),
+        },
+        ...(clip?.kind === CLIP_KIND.GLOBALS ? [{
+            icon: '📄', label: 'Paste',
+            disabled: isRunning,
+            action: () => pasteGlobals(),
         }] : []),
     ];
 
@@ -544,7 +580,6 @@ const ProjectSidebar = ({
     /* ─── Render ─────────────────────────────────────────────────────────────── */
 
     const boardName = selectedBoard ? (getBoardById(selectedBoard)?.name || selectedBoard) : 'PLC Project';
-    const globalItem = projectStructure.resources?.[0];
 
     return (
         <div
@@ -576,8 +611,9 @@ const ProjectSidebar = ({
                         level={2}
                         icon="🌐"
                         label={t('sidebar.global') || 'Global Variables'}
-                        active={activeId === globalItem?.id}
-                        onClick={() => globalItem && onSelectItem('resources', globalItem.id)}
+                        active={activeId === globalResource?.id}
+                        onClick={() => globalResource && onSelectItem('resources', globalResource.id)}
+                        onContextMenu={(e) => openCtx(e, (clipCat, clip) => globalsCtxItems(clip))}
                     />
 
                     {renderCategory(t('sidebar.dataTypes') || 'Data Types',      'dataTypes',      projectStructure.dataTypes)}

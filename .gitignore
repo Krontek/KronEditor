@@ -24,68 +24,19 @@ dist-ssr
 *.sw?
 
 
-src-tauri/*
-!src-tauri/src/
-!src-tauri/build.rs
-!src-tauri/Cargo.toml
-!src-tauri/tauri.conf.json
-!src-tauri/capabilities/
-!src-tauri/grammar.lalrpop
-!src-tauri/toolchains/
-src-tauri/toolchains/*
-!src-tauri/toolchains/README.md
-!src-tauri/toolchains/SIMULATION_RUNTIME.md
-!src-tauri/toolchains/clang-command-templates.json
-!src-tauri/toolchains/clang_invocation_builder.py
-!src-tauri/toolchains/BAREMETAL_INTEGRATION.md
-!src-tauri/toolchains/bin/
-src-tauri/toolchains/bin/*
-!src-tauri/toolchains/bin/.gitkeep
-!src-tauri/toolchains/sysroots/
-src-tauri/toolchains/sysroots/*
-!src-tauri/toolchains/sysroots/arm-none-eabi/
-!src-tauri/toolchains/sysroots/aarch64-linux-gnu/
-!src-tauri/toolchains/sysroots/arm-linux-gnueabihf/
-!src-tauri/toolchains/sysroots/x86_64-linux-gnu/
-!src-tauri/toolchains/sysroots/x86_64-w64-mingw32/
-!src-tauri/toolchains/sysroots/simulation_env/
-src-tauri/toolchains/sysroots/arm-none-eabi/*
-src-tauri/toolchains/sysroots/aarch64-linux-gnu/*
-src-tauri/toolchains/sysroots/arm-linux-gnueabihf/*
-src-tauri/toolchains/sysroots/x86_64-linux-gnu/*
-src-tauri/toolchains/sysroots/x86_64-w64-mingw32/*
-src-tauri/toolchains/sysroots/simulation_env/*
-!src-tauri/toolchains/sysroots/arm-none-eabi/.gitkeep
-!src-tauri/toolchains/sysroots/aarch64-linux-gnu/.gitkeep
-!src-tauri/toolchains/sysroots/arm-linux-gnueabihf/.gitkeep
-!src-tauri/toolchains/sysroots/x86_64-linux-gnu/.gitkeep
-!src-tauri/toolchains/sysroots/x86_64-w64-mingw32/.gitkeep
-!src-tauri/toolchains/sysroots/simulation_env/include/
-!src-tauri/toolchains/sysroots/simulation_env/lib/
-src-tauri/toolchains/sysroots/simulation_env/include/*
-src-tauri/toolchains/sysroots/simulation_env/lib/*
-!src-tauri/toolchains/sysroots/simulation_env/include/kronosim_hal.h
-!src-tauri/toolchains/sysroots/simulation_env/include/kronosim_runtime.h
-!src-tauri/toolchains/sysroots/simulation_env/include/kron_mock_io.h
-!src-tauri/toolchains/sysroots/simulation_env/lib/.gitkeep
 Releases/
 
-
-
-# TCC toolchain binaries (downloaded separately, not in repo)
-src-tauri/tcc/
-
-# MinGW toolchain (downloaded by scripts/download-mingw.js)
-src-tauri/mingw/
-
-# Library output directories (created automatically by build.rs and build commands)
-src-tauri/resources
 /resources
 
 # Backend Artifacts
 bin/
-!src-tauri/toolchains/bin/.gitkeep
 build/plc.h
 build/plc.c
 build/simulation
 .codex
+
+# Packaging build artifacts (multi-GB: binaries, toolchains, AppImage)
+packaging/dist/
+# Persistent windows-host LLVM (downloaded once by build-windows.sh)
+toolchains-win/
+toolchains/*

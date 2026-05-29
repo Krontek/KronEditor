@@ -1,15 +1,21 @@
 import { useMemo } from 'react';
 
-/* Collect all available variable expressions from project structure */
+/* Collect the variable expressions that may be bound to HMI widgets.
+ *
+ * Only ADDRESSED variables are eligible: a non-empty `address` (e.g. %MW0)
+ * means the variable is published over the REST API and the deployed HMI
+ * server's /api/variables feed. Binding a widget to a non-addressed variable
+ * would render no live value on the target, so they are excluded here. */
 const collectVars = (projectStructure) => {
     if (!projectStructure) return [];
     const vars = [];
+    const isAddressed = (v) => v && v.name && typeof v.address === 'string' && v.address.trim() !== '';
     const globalVars = projectStructure.resources?.find(r => r.type === 'RESOURCE_EDITOR')?.content?.globalVars || [];
-    globalVars.forEach(v => { if (v.name) vars.push({ expr: v.name, type: v.type || '' }); });
+    globalVars.forEach(v => { if (isAddressed(v)) vars.push({ expr: v.name, type: v.type || '', address: v.address }); });
     const allPOUs = [...(projectStructure.programs || []), ...(projectStructure.functionBlocks || [])];
     allPOUs.forEach(pou => {
         (pou.content?.variables || []).forEach(v => {
-            if (v.name) vars.push({ expr: `${pou.name}.${v.name}`, type: v.type || '' });
+            if (isAddressed(v)) vars.push({ expr: `${pou.name}.${v.name}`, type: v.type || '', address: v.address });
         });
     });
     return vars;
@@ -86,7 +92,7 @@ const VarField = ({ value, onChange, vars }) => (
             list="hmi-var-list"
             value={value || ''}
             onChange={e => onChange(e.target.value)}
-            placeholder="variable or Prog.var"
+            placeholder="addressed variable (e.g. %MW0)"
             style={{
                 width: '100%', background: '#0f1929', border: '1px solid #1e3a5c',
                 color: '#7eb8f7', fontSize: 11, padding: '2px 6px', outline: 'none',
@@ -96,7 +102,7 @@ const VarField = ({ value, onChange, vars }) => (
             onBlur={e => e.target.style.borderColor = '#1e3a5c'}
         />
         <datalist id="hmi-var-list">
-            {vars.map(v => <option key={v.expr} value={v.expr} label={v.type} />)}
+            {vars.map(v => <option key={v.expr} value={v.expr} label={v.address ? `${v.address} · ${v.type}` : v.type} />)}
         </datalist>
     </div>
 );

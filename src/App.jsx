@@ -4,6 +4,7 @@ const EtherCATEditor = lazy(() => import('./components/EtherCATEditor'));
 import SlaveConfigPage from './components/SlaveConfigPage';
 import EditorPane from './components/EditorPane';
 import Toolbox from './components/Toolbox';
+import AiAgentPanel from './components/AiAgentPanel';
 import ProjectSidebar from './components/ProjectSidebar';
 import CreateItemModal from './components/CreateItemModal';
 import DataTypeCreationModal from './components/DataTypeCreationModal';
@@ -16,6 +17,10 @@ import BoardConfigPage from './components/BoardConfigPage';
 import TaskManager from './components/TaskManager';
 import OutputPanel from './components/OutputPanel';
 import EditorTabs from './components/EditorTabs';
+import {
+  FolderIcon, ChevronDownIcon, InfoIcon, SettingsIcon, BuildIcon, UploadIcon,
+  FlaskIcon, PlayIcon, StopIcon, RepeatIcon, OpenIcon, SaveIcon, SaveAsIcon, CloseIcon,
+} from './components/ToolbarIcons';
 import SaveConfirmDialog from './components/SaveConfirmDialog';
 import VisualizationEditor from './components/visualization/VisualizationEditor';
 import { getBoardById } from './utils/boardDefinitions';
@@ -30,12 +35,10 @@ import { exportProjectToXml, importProjectFromXml } from './services/XmlService'
 import { libraryService } from './services/LibraryService'; // Import Service
 import { errorCodeService } from './services/ErrorCodeService';
 import { loadAllEsiDevices, saveEsiFile } from './services/EsiLibraryService';
-import { open, save, ask } from '@tauri-apps/plugin-dialog';
-import { readTextFile, writeTextFile } from '@tauri-apps/plugin-fs';
-import { getCurrentWindow } from '@tauri-apps/api/window';
-import { invoke } from '@tauri-apps/api/core';
+import { openFile, saveFile, ask, readTextFile, writeTextFile } from './services/browserFs';
 import { transpileToC, validateProjectST } from './services/CTranspilerService';
 import { PLCClient } from './services/PLCClient';
+import { host } from './services/HostClient';
 import PlcIcon from './assets/icons/plc-icon.png';
 import EtherCATIconSrc from './assets/icons/ethercat.png';
 const EtherCATTabIcon = <img src={EtherCATIconSrc} height="13" style={{ objectFit: 'contain', verticalAlign: 'middle' }} alt="EtherCAT" />;
@@ -224,7 +227,7 @@ function App() {
     let consecutiveFailures = 0;
     const FAILURE_THRESHOLD = 2;
     const checkStatus = () => {
-      invoke('check_server_status', { serverAddr: plcAddress })
+      host.checkServerStatus(plcAddress)
         .then((jsonStr) => {
           consecutiveFailures = 0;
           setIsPlcConnected(true);
@@ -312,32 +315,22 @@ function App() {
   const isProjectOpenRef = React.useRef(isProjectOpen);
   useEffect(() => { isProjectOpenRef.current = isProjectOpen; }, [isProjectOpen]);
 
-  // --- Window close: ask to save if project is open ---
-  // Registered ONCE so multiple isProjectOpen changes don't stack listeners.
+  // --- Window close: warn before unload if project has unsaved changes ---
+  // Browser security disallows blocking unload to show a custom dialog
+  // (the beforeunload event only supports the native browser prompt). The
+  // save-confirm modal used to live in the Tauri onCloseRequested hook; we
+  // surface it instead via a confirm prompt + native beforeunload guard.
   useEffect(() => {
-    const win = getCurrentWindow();
-    let isHandlingClose = false;
-    const unlistenPromise = win.onCloseRequested(async (event) => {
-      if (isHandlingClose) return;
+    const handler = (event) => {
       if (!isProjectOpenRef.current) return;
-      if (!hasUnsavedRef.current) return; // no changes since last save → close directly
+      if (!hasUnsavedRef.current) return;
       event.preventDefault();
-      isHandlingClose = true;
-      try {
-        const choice = await showSaveConfirm();
-        if (choice === 'cancel') { isHandlingClose = false; return; }
-        if (choice === 'save' && handleSaveRef.current) {
-          await handleSaveRef.current().catch(() => {});
-        }
-      } catch {
-        isHandlingClose = false;
-        return;
-      }
-      isHandlingClose = false;
-      await win.destroy().catch(() => win.close().catch(() => {}));
-    });
-    return () => { unlistenPromise.then(fn => fn()).catch(() => {}); };
-  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+      event.returnValue = '';
+      return '';
+    };
+    window.addEventListener('beforeunload', handler);
+    return () => window.removeEventListener('beforeunload', handler);
+  }, []);
 
   // --- Bus handlers ---
   const handleAddBus = useCallback((type) => {
@@ -596,6 +589,7 @@ function App() {
     consoleHeight: 150
   });
   const [isResizing, setIsResizing] = useState(null); // 'left', 'right', 'console'
+  const [rightTab, setRightTab] = useState('blocks'); // 'blocks' | 'agent' — right sidebar tabs
 
   // Console Scroll Ref
   const [logs, setLogs] = useState([
@@ -674,27 +668,20 @@ function App() {
     });
   }, []);
 
-  // --- Simulation Compile Log Listener (debug) ---
+  // --- Host-agent event stream (build-command, simulation-compile-log, …) ---
   useEffect(() => {
-    let unlisten = null;
-    import('@tauri-apps/api/event').then(({ listen }) => {
-      listen('simulation-compile-log', (event) => {
-        addLog('info', event.payload);
-      }).then(f => unlisten = f);
+    const stop = host.streamEvents((msg) => {
+      if (!msg || !msg.topic) return;
+      if (msg.topic === 'simulation-compile-log') {
+        addLog('info', typeof msg.data === 'string' ? msg.data : JSON.stringify(msg.data));
+      } else if (msg.topic === 'build-command') {
+        addLog('info', `Build command: ${typeof msg.data === 'string' ? msg.data : JSON.stringify(msg.data)}`);
+      } else if (msg.topic === 'library-update-progress' || msg.topic === 'server-update-progress') {
+        addLog('info', String(msg.data));
+      }
     });
-    return () => { if (unlisten) unlisten(); };
-  }, []);
-
-  // --- Build Command Listener (shows gcc command in log panel) ---
-  useEffect(() => {
-    let unlisten = null;
-    import('@tauri-apps/api/event').then(({ listen }) => {
-      listen('build-command', (event) => {
-        addLog('info', `Build command: ${event.payload}`);
-      }).then(f => unlisten = f);
-    });
-    return () => { if (unlisten) unlisten(); };
-  }, []);
+    return () => stop();
+  }, [addLog]);
 
   // --- Live Variable Listener ---
   const [liveVariables, setLiveVariables] = useState({});
@@ -714,68 +701,49 @@ function App() {
   }, [isRunning]);
 
   useEffect(() => {
-    let unlisten = null;
-    import('@tauri-apps/api/event').then(({ listen }) => {
-      listen('simulation-output', (event) => {
-        try {
-          const parsed = typeof event.payload === 'string' ? JSON.parse(event.payload) : event.payload;
-          if (parsed.vars) {
-            // Write to ref (no re-render); throttled sync will push to state
-            Object.assign(liveVarsRef.current, parsed.vars);
-            liveVarsDirtyRef.current = true;
-          } else if (parsed.status === 'exited' || parsed.status === 'crashed') {
-            setIsRunning(false);
-            addLog('warning', t('logs.simulationStatus', { status: parsed.status }) || `Simulation ${parsed.status}.`);
-          } else if (parsed.error) {
-            addLog('error', t('logs.simulationError', { error: parsed.error }) || `Simulation: ${parsed.error}`);
-          }
-        } catch (e) {
-          console.error("Failed to parse simulation output:", e, "Raw Payload:", event.payload);
+    const stop = host.streamEvents((msg) => {
+      if (!msg || msg.topic !== 'simulation-output') return;
+      try {
+        const parsed = typeof msg.data === 'string' ? JSON.parse(msg.data) : msg.data;
+        if (parsed.vars) {
+          Object.assign(liveVarsRef.current, parsed.vars);
+          liveVarsDirtyRef.current = true;
+        } else if (parsed.status === 'exited' || parsed.status === 'crashed') {
+          setIsRunning(false);
+          addLog('warning', t('logs.simulationStatus', { status: parsed.status }) || `Simulation ${parsed.status}.`);
+        } else if (parsed.error) {
+          addLog('error', t('logs.simulationError', { error: parsed.error }) || `Simulation: ${parsed.error}`);
         }
-      }).then(f => unlisten = f);
+      } catch (e) {
+        console.error('Failed to parse simulation output:', e, msg);
+      }
     });
-    return () => { if (unlisten) unlisten(); };
-  }, []);
+    return () => stop();
+  }, [addLog, t]);
 
   // --- File Operations ---
 
   const handleSaveAs = useCallback(async () => {
     try {
-      let filePath = await save({
-        filters: []
-      });
-      if (!filePath) return;
-
-      if (!filePath.toLowerCase().endsWith('.xml')) {
-        filePath += '.xml';
-      }
-
       const xmlContent = exportProjectToXml(projectStructure, selectedBoard, { plcAddress, sshUser, sshPort, apiPassword, autoRun }, buses, busConfigs, watchTable, hmiLayout);
-      await writeTextFile(filePath, xmlContent);
+      const suggestedName = (currentFilePath || 'project.xml').split('/').pop() || 'project.xml';
+      const savedName = await saveFile({ suggestedName, content: xmlContent });
+      if (!savedName) return;
 
       hasUnsavedRef.current = false;
-      setCurrentFilePath(filePath);
-      addLog('success', t('logs.projectSaved', { path: filePath }) || `Project saved to ${filePath} `);
+      setCurrentFilePath(savedName);
+      addLog('success', t('logs.projectSaved', { path: savedName }) || `Project saved to ${savedName} `);
     } catch (error) {
       addLog('error', t('logs.saveAsError', { error: error }) || `Save As Error: ${error} `);
     }
-  }, [projectStructure, selectedBoard, plcAddress, sshUser, sshPort, buses, busConfigs, hmiLayout, addLog]);
+  }, [projectStructure, selectedBoard, plcAddress, sshUser, sshPort, apiPassword, autoRun, buses, busConfigs, watchTable, hmiLayout, currentFilePath, addLog, t]);
 
   const handleSave = useCallback(async () => {
-    if (!currentFilePath) {
-      await handleSaveAs();
-      return;
-    }
-
-    try {
-      const xmlContent = exportProjectToXml(projectStructure, selectedBoard, { plcAddress, sshUser, sshPort, apiPassword, autoRun }, buses, busConfigs, watchTable, hmiLayout);
-      await writeTextFile(currentFilePath, xmlContent);
-      hasUnsavedRef.current = false;
-      addLog('success', t('logs.projectSaved', { path: currentFilePath }) || `Project saved to ${currentFilePath} `);
-    } catch (error) {
-      addLog('error', t('logs.saveError', { error: error }) || `Save Error: ${error} `);
-    }
-  }, [currentFilePath, handleSaveAs, projectStructure, selectedBoard, plcAddress, sshUser, sshPort, buses, busConfigs, hmiLayout, addLog]);
+    // In browser there is no in-place path write — every save goes through the
+    // file picker / download path. Forward to handleSaveAs for both first and
+    // subsequent saves.
+    await handleSaveAs();
+  }, [handleSaveAs]);
 
   // Keep ref up-to-date so onCloseRequested handler can call it without stale closure
   useEffect(() => { handleSaveRef.current = handleSave; }, [handleSave]);
@@ -844,41 +812,47 @@ function App() {
   }, [defaultProjectStructure]);
 
   const handleOpen = async () => {
-    // Determine if we are running in Tauri
-    const isTauri = window.__TAURI_INTERNALS__ !== undefined;
+    try {
+      const picked = await openFile({ accept: '.xml' });
+      if (!picked) return;
+      processFileContent(picked.content, picked.path);
+    } catch (error) {
+      console.error(error);
+      addLog('error', t('logs.openError', { error: error }) || `Open Error: ${error} `);
+    }
+  };
 
-    if (isTauri) {
-      try {
-        const selected = await open({
-          multiple: false
-        });
-
-        if (!selected) return;
-
-        const filePath = Array.isArray(selected) ? selected[0] : selected;
-        const content = await readTextFile(filePath);
-        processFileContent(content, filePath);
-      } catch (error) {
-        console.error(error);
-        addLog('error', t('logs.openError', { error: error }) || `Open Error: ${error} `);
+  // Pull the running project back from the connected target device. The pulled
+  // project replaces the current one in the editor and is loaded WITHOUT a file
+  // path, so the next Save acts as Save As (user must choose where to store it).
+  const handlePullFromTarget = async () => {
+    setIsProjectDropdownOpen(false);
+    if (!isPlcConnected || !plcAddress) {
+      addLog('error', t('logs.pullNotConnected') || 'Cannot pull: not connected to PLC server.');
+      return;
+    }
+    // eslint-disable-next-line no-alert
+    if (!window.confirm(t('actions.pullConfirm') || 'The current project will be closed and replaced by the one on the target. Continue?')) {
+      return;
+    }
+    try {
+      addLog('info', t('logs.pulling', { addr: plcAddress }) || `Pulling project from ${plcAddress}...`);
+      const resp = await fetch(`http://${plcAddress}/deploy/project-file`);
+      if (!resp.ok) {
+        if (resp.status === 404) {
+          addLog('error', t('logs.pullNotFound') || 'No project file found on target (deploy a project first).');
+        } else {
+          addLog('error', `Pull failed: ${resp.status} ${resp.statusText}`);
+        }
+        return;
       }
-    } else {
-      // Web Fallback: Use standard HTML file input
-      const input = document.createElement('input');
-      input.type = 'file';
-      input.accept = '.xml';
-      input.onchange = e => {
-        const file = e.target.files[0];
-        if (!file) return;
-
-        const reader = new FileReader();
-        reader.onload = async (event) => {
-          const content = event.target.result;
-          processFileContent(content, file.name);
-        };
-        reader.readAsText(file);
-      };
-      input.click();
+      const xml = await resp.text();
+      // Load with a display label, then clear the path so Save → Save As.
+      processFileContent(xml, `${plcAddress} (target)`);
+      setCurrentFilePath(null);
+      addLog('success', t('logs.pulled', { addr: plcAddress }) || `Project pulled from ${plcAddress}.`);
+    } catch (err) {
+      addLog('error', `Pull failed: ${err.message || err}`);
     }
   };
 
@@ -967,18 +941,19 @@ function App() {
     if (nextMode) {
       addLog('info', t('logs.compilingSimulationTranspile') || 'Compiling Project for Simulation (C Transpilation)...');
       try {
-        const standardHeaders = await invoke('get_standard_headers').catch(() => []);
+        const standardHeaders = await host.getStandardHeaders().catch(() => []);
         const cCode = transpileToC(projectStructure, standardHeaders, selectedBoard, true, buses, busConfigs);
-        const outPath = await invoke('write_plc_files', {
+        const writeRes = await host.writePlcFiles({
           header: cCode.header,
           source: cCode.source,
           variableTable: JSON.stringify(cCode.variableTable, null, 2),
           hal: cCode.hal || ''
         });
+        const outPath = writeRes.buildDir;
         addLog('success', t('logs.transpiledSaved', { path: outPath }) || `Transpiled C header and source successfully saved to ${outPath}`);
 
         addLog('info', t('logs.compilingSimulation') || 'Compiling simulation executable...');
-        const exePath = await invoke('compile_simulation');
+        const exePath = await host.compileSimulation();
         addLog('success', t('logs.simulationCompiled', { path: exePath }) || `Simulation executable compiled: ${exePath}`);
 
         setIsSimulationMode(true);
@@ -1015,9 +990,9 @@ function App() {
       setIsRunning(true);
       addLog('success', 'Running Simulation Execution...');
       try {
-        await invoke('run_simulation');
+        await host.runSimulation();
       } catch (err) {
-        addLog('error', `Failed to start simulation: ${err}`);
+        addLog('error', `Failed to start simulation: ${err.message || err}`);
         setIsRunning(false);
       }
     } else if (isDeployed && !isDirty && isPlcConnected) {
@@ -1074,9 +1049,9 @@ function App() {
 
       if (isSimulationMode) {
         try {
-          await invoke('stop_simulation');
+          await host.stopSimulation();
         } catch (err) {
-          addLog('error', `Failed to stop simulation: ${err}`);
+          addLog('error', `Failed to stop simulation: ${err.message || err}`);
         }
       } else if (plcClientRef.current) {
         // Stop the variable stream first.
@@ -1089,7 +1064,7 @@ function App() {
         plcClientRef.current.clearAllForces().catch(() => {});
         // Re-check server status immediately so connection indicator stays green.
         if (plcAddress && connectionEnabled) {
-          invoke('check_server_status', { serverAddr: plcAddress })
+          host.checkServerStatus(plcAddress)
             .then(() => setIsPlcConnected(true))
             .catch(() => setIsPlcConnected(false));
         }
@@ -1097,7 +1072,7 @@ function App() {
 
       addLog('info', 'Execution Stopped.');
       if (isSimulationMode) {
-        invoke('stop_hmi_server').catch(() => {});
+        host.stopHmiServer().catch(() => {});
       }
     }
   };
@@ -1121,9 +1096,9 @@ function App() {
       });
     } else {
       try {
-        await invoke('write_variable', { name: key, value: String(value) });
+        await host.writeVariable(key, value);
       } catch (err) {
-        addLog('error', `Force write failed for '${key}': ${err}`);
+        addLog('error', `Force write failed for '${key}': ${err.message || err}`);
       }
     }
   }, [isRunning, isSimulationMode, addLog]);
@@ -1132,16 +1107,16 @@ function App() {
   useEffect(() => {
     if (!isRunning || !isSimulationMode) return;
     const layoutJson = JSON.stringify(hmiLayout);
-    invoke('start_hmi_server', { port: hmiPort, layoutJson })
+    host.startHmiServer(hmiPort, layoutJson)
       .then(() => addLog('info', `HMI available at http://localhost:${hmiPort}/hmi/`))
-      .catch((e) => addLog('warning', `HMI server failed to start: ${e}`));
-    return () => { invoke('stop_hmi_server').catch(() => {}); };
+      .catch((e) => addLog('warning', `HMI server failed to start: ${e.message || e}`));
+    return () => { host.stopHmiServer().catch(() => {}); };
   }, [isRunning, isSimulationMode]); // eslint-disable-line
 
   // Push live variables to local HMI server during simulation
   useEffect(() => {
     if (!isRunning || !isSimulationMode || !liveVariables) return;
-    invoke('push_hmi_variables', { varsJson: JSON.stringify(liveVariables) }).catch(() => {});
+    host.pushHmiVariables(JSON.stringify(liveVariables)).catch(() => {});
   }, [isRunning, isSimulationMode, liveVariables]);
 
   // Poll HMI write requests from local server during simulation
@@ -1149,9 +1124,9 @@ function App() {
     if (!isRunning || !isSimulationMode) return;
     const interval = setInterval(async () => {
       try {
-        const writes = await invoke('poll_hmi_writes');
+        const writes = await host.pollHmiWrites();
         if (Array.isArray(writes)) {
-          writes.forEach(([key, val]) => handleForceWrite(key, val));
+          writes.forEach((w) => handleForceWrite(w.key, w.value));
         }
       } catch (_) {}
     }, 200);
@@ -1197,15 +1172,15 @@ function App() {
     checkBaremetalConcurrency();
     addLog('info', `Build started for board: ${boardInfo?.name || selectedBoard}...`);
     try {
-      const standardHeaders = await invoke('get_standard_headers').catch(() => []);
+      const standardHeaders = await host.getStandardHeaders().catch(() => []);
       const cCode = transpileToC(projectStructure, standardHeaders, selectedBoard, true, buses, busConfigs);
-      await invoke('write_plc_files', {
+      await host.writePlcFiles({
         header: cCode.header,
         source: cCode.source,
         variableTable: JSON.stringify(cCode.variableTable, null, 2),
         hal: cCode.hal || ''
       });
-      await invoke('compile_simulation');
+      await host.compileSimulation();
       addLog('success', 'Build successful.');
     } catch (err) {
       addLog('error', `Build failed: ${err.message || err}`);
@@ -1228,7 +1203,7 @@ function App() {
     checkBaremetalConcurrency();
     addLog('info', `Build & Send for ${boardInfo?.name || selectedBoard}...`);
     try {
-      const standardHeaders = await invoke('get_standard_headers').catch(() => []);
+      const standardHeaders = await host.getStandardHeaders().catch(() => []);
       const cCode = transpileToC(projectStructure, standardHeaders, selectedBoard, false, buses, busConfigs);
 
       // Inject API password hash into variable table
@@ -1243,24 +1218,40 @@ function App() {
       }
 
       addLog('info', 'Cross-compiling for target...');
-      await invoke('compile_for_target', {
+      await host.compileForTarget({
         header: cCode.header,
         source: cCode.source,
         variableTable: JSON.stringify(cCode.variableTable, null, 2),
         hal: cCode.hal || '',
         boardId: selectedBoard,
-        diCount: boardInfo?.pinout?.diCount ?? null,
-        doCount: boardInfo?.pinout?.doCount ?? null,
       });
       addLog('success', 'Cross-compilation successful.');
 
       addLog('info', `Deploying to ${plcAddress}...`);
-      await invoke('deploy_to_server', { serverAddr: plcAddress });
+      await host.deployToServer(plcAddress);
       addLog('success', `Deployed to ${plcAddress}.`);
+
+      // Send the project source file so it can be pulled back later
+      // ("Pull from Target"). A failure here fails the whole Build & Send.
+      addLog('info', 'Sending project file...');
+      const projectXml = exportProjectToXml(projectStructure, selectedBoard, { plcAddress, sshUser, sshPort, apiPassword, autoRun }, buses, busConfigs, watchTable, hmiLayout);
+      const projResp = await fetch(`http://${plcAddress}/deploy/project-file`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/xml' },
+        body: projectXml,
+      });
+      if (!projResp.ok) {
+        throw new Error(`project file deploy failed: ${projResp.status} ${projResp.statusText}`);
+      }
+      addLog('success', 'Project file sent.');
 
       // Deploy HMI layout (JSON). Empty pages → server clears HMI, serves nothing.
       const hasHmiPages = (hmiLayout?.pages?.length ?? 0) > 0;
       const hmiPayload = hasHmiPages ? JSON.stringify(hmiLayout) : '{}';
+      // HMI broadcast port (served at the root on a dedicated listener). When
+      // there are no HMI pages we push 0 to tear down any existing listener.
+      const hmiPort = hasHmiPages ? (Number(hmiLayout?.port) || 8080) : 0;
+      const plcHost = String(plcAddress).replace(/:\d+$/, '');
       try {
         const hmiResp = await fetch(`http://${plcAddress}/deploy/hmi-layout`, {
           method: 'POST',
@@ -1272,22 +1263,22 @@ function App() {
         } else {
           const result = await hmiResp.json();
           if (hasHmiPages) {
-            addLog('info', `HMI deployed: ${result.pages ?? '?'} page(s). Access at http://${plcAddress}/hmi/`);
+            addLog('info', `HMI deployed: ${result.pages ?? '?'} page(s). Access at http://${plcHost}:${hmiPort}/`);
           }
         }
       } catch (hmiErr) {
         addLog('warning', `HMI layout deploy skipped: ${hmiErr.message}`);
       }
 
-      // Deploy autorun config
+      // Deploy autorun + HMI port config
       try {
         await fetch(`http://${plcAddress}/deploy/config`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ auto_run: autoRun }),
+          body: JSON.stringify({ auto_run: autoRun, hmi_port: hmiPort }),
         });
       } catch (cfgErr) {
-        addLog('warning', `AutoRun config deploy skipped: ${cfgErr.message}`);
+        addLog('warning', `Runtime config deploy skipped: ${cfgErr.message}`);
       }
 
       setIsDeployed(true);
@@ -1593,6 +1584,44 @@ function App() {
     addLog('info', logMsg);
   };
 
+  // Paste a whole global-variable set (copied from the sidebar "Global
+  // Variables" node, possibly in another project). Merges by name: globals
+  // whose name already exists are skipped (destination copy is kept), the
+  // rest are added. Addresses are dropped — they are hardware-unique and the
+  // user re-assigns them, matching the variable-table paste convention.
+  const handlePasteGlobals = (list) => {
+    if (!Array.isArray(list) || list.length === 0) return;
+    const added = [];
+    const skipped = [];
+    setProjectStructure(prev => {
+      const resources = (prev.resources || []).map(r => {
+        if (r.type !== 'RESOURCE_EDITOR') return r;
+        const existing = r.content?.globalVars || [];
+        const existingNames = new Set(existing.map(v => v.name));
+        const toAdd = [];
+        list.forEach((g, i) => {
+          if (!g || !g.name) return;
+          if (existingNames.has(g.name)) { skipped.push(g.name); return; }
+          existingNames.add(g.name);
+          toAdd.push({ ...g, id: `var_${Date.now()}_${Math.random()}_${i}`, address: '' });
+          added.push(g.name);
+        });
+        if (!toAdd.length) return r;
+        return { ...r, content: { ...r.content, globalVars: [...existing, ...toAdd] } };
+      });
+      return { ...prev, resources };
+    });
+    if (added.length) {
+      addLog('info', `Pasted ${added.length} global variable(s): ${added.join(', ')}`);
+    }
+    if (skipped.length) {
+      addLog('warning', `Skipped ${skipped.length} global(s) already present: ${skipped.join(', ')}`);
+    }
+    if (!added.length && !skipped.length) {
+      addLog('warning', 'No global variables to paste.');
+    }
+  };
+
   const handleEditItemDetails = (category, id) => {
     const item = projectStructure[category].find(i => i.id === id);
     if (!item) return;
@@ -1820,135 +1849,143 @@ function App() {
         onCancel={handleSaveConfirmCancel}
       />
 
-      {/* CUSTOM TITLEBAR */}
-      <div data-tauri-drag-region className="custom-titlebar">
+      {/* Browser-only title bar — the custom titlebar (with min/max/close
+          buttons) was Tauri-specific. In browser mode the OS browser chrome
+          owns window controls, so we render a slim header strip with only the
+          app name. */}
+      <div className="custom-titlebar">
         <div className="titlebar-title">
           <img src={PlcIcon} alt="Logo" style={{ height: '18px', marginRight: '8px', pointerEvents: 'none' }} />
           <span>KronEditor</span>
         </div>
-        <div className="titlebar-controls">
-          <div className="titlebar-button" onClick={() => getCurrentWindow().minimize()}>_</div>
-          <div className="titlebar-button" onClick={() => getCurrentWindow().toggleMaximize()}>□</div>
-          <div className="titlebar-button titlebar-close" onClick={() => getCurrentWindow().close()}>✕</div>
-        </div>
       </div>
 
-      {/* 1. HEADER (Fixed) */}
-      <div className="header" style={{ height: '50px', flexShrink: 0, display: 'flex', alignItems: 'center', padding: '0 15px', background: '#2d2d2d', borderBottom: '1px solid #3e3e42' }}>
+      {/* 1. HEADER / TOOLBAR */}
+      <div className="header app-toolbar">
         {isProjectOpen && (
           <>
-            {/* Project Dropdown */}
-            <div className="dropdown" style={{ marginRight: '10px' }}>
+            {/* ── Group: File ──────────────────────────────────────────── */}
+            <div className="dropdown">
               <button
-                className="toolbar-btn"
+                className="tb-btn tb-text"
                 onClick={() => setIsProjectDropdownOpen(!isProjectDropdownOpen)}
                 onBlur={() => setTimeout(() => setIsProjectDropdownOpen(false), 200)}
+                title={t('common.project') || 'Project'}
               >
-                📁 {t('common.project') || 'Project'} ▼
+                <FolderIcon />
+                <span>{t('common.project') || 'Project'}</span>
+                <ChevronDownIcon width={12} height={12} />
               </button>
               {isProjectDropdownOpen && (
                 <div className="dropdown-content">
                   <div className="dropdown-item" onClick={handleOpen}>
-                    📂 {t('common.open') || 'Open'}
+                    <OpenIcon /> {t('common.open') || 'Open'}
                   </div>
                   <div className="dropdown-item" onClick={handleSave}>
-                    💾 {t('common.save')}
+                    <SaveIcon /> {t('common.save')}
                   </div>
                   <div className="dropdown-item" onClick={handleSaveAs}>
-                    💾 {t('common.saveAs') || 'Save As'}
+                    <SaveAsIcon /> {t('common.saveAs') || 'Save As'}
                   </div>
-                  <div style={{ height: '1px', background: '#3e3e42', margin: '4px 0' }}></div>
-                  <div className="dropdown-item" onClick={handleCloseProject} style={{ color: '#ff9800' }}>
-                    ✖ {t('actions.closeProject') || 'Close Project'}
+                  <div className="dropdown-sep" />
+                  <div
+                    className={`dropdown-item ${isPlcConnected ? '' : 'dropdown-item-disabled'}`}
+                    onClick={isPlcConnected ? handlePullFromTarget : undefined}
+                    title={isPlcConnected ? '' : 'Connect to a PLC server to pull its project'}
+                  >
+                    <OpenIcon /> {t('actions.pullFromTarget') || 'Pull from Target'}
+                  </div>
+                  <div className="dropdown-sep" />
+                  <div className="dropdown-item dropdown-item-warn" onClick={handleCloseProject}>
+                    <CloseIcon /> {t('actions.closeProject') || 'Close Project'}
                   </div>
                 </div>
               )}
             </div>
 
-            {/* Info & Settings buttons */}
+            <div className="tb-divider" />
+
+            {/* ── Group: App-level ────────────────────────────────────── */}
             <button
-              className="toolbar-btn"
+              className="tb-btn tb-icon"
               onClick={() => setShortcutsModalOpen(true)}
-              style={{ fontSize: '24px', lineHeight: 1, padding: '4px 6px', background: 'transparent', border: '1px solid transparent' }}
               title={t('common.shortcuts') || 'Shortcuts'}
             >
-              ℹ️
+              <InfoIcon />
             </button>
             <button
-              className="toolbar-btn"
+              className="tb-btn tb-icon"
               onClick={() => openSpecialTab('SETTINGS')}
-              style={{ fontSize: '24px', lineHeight: 1, padding: '4px 6px', background: 'transparent', border: '1px solid transparent', marginRight: '10px' }}
               title={t('common.settings')}
             >
-              ⚙️
+              <SettingsIcon />
             </button>
 
-            {/* Build OR Build & Send (single button, depends on PLC connection) */}
+            <div className="tb-divider" />
+
+            {/* ── Group: Build ─────────────────────────────────────────── */}
             <button
-              className="toolbar-btn"
+              className="tb-btn tb-text tb-primary"
               onClick={isPlcConnected ? handleBuildAndSend : handleBuild}
               disabled={isRunning}
-              style={{ opacity: isRunning ? 0.5 : 1 }}
+              title={isPlcConnected ? 'Build & Send to PLC' : (t('actions.build') || 'Build')}
             >
-              {isPlcConnected ? '📡 Build & Send' : `🔨 ${t('actions.build') || 'Build'}`}
+              {isPlcConnected ? <UploadIcon /> : <BuildIcon />}
+              <span>{isPlcConnected ? 'Build & Send' : (t('actions.build') || 'Build')}</span>
             </button>
 
-            <div style={{ width: 10 }}></div>
+            <div className="tb-divider" />
 
-            {/* Simulation Toggle */}
+            {/* ── Group: Run ───────────────────────────────────────────── */}
             <button
-              className={`toolbar-btn ${isSimulationMode ? 'simulation-active' : ''}`}
+              className={`tb-btn tb-text ${isSimulationMode ? 'tb-toggle-on' : 'tb-toggle-off'}`}
               onClick={handleToggleSimulation}
               disabled={isRunning}
-              style={{
-                background: isSimulationMode ? '#007acc' : 'transparent',
-                border: isSimulationMode ? '1px solid #0098ff' : '1px solid transparent',
-              }}
+              title="Toggle Simulation Mode"
             >
-              🚀 {isSimulationMode ? 'Simulation ON' : 'Simulation OFF'}
+              <FlaskIcon />
+              <span>Simulation</span>
+              <span className={`tb-pill ${isSimulationMode ? 'on' : ''}`}>
+                {isSimulationMode ? 'ON' : 'OFF'}
+              </span>
             </button>
-
-            {/* Execution Controls */}
             <button
-              className="toolbar-btn run"
+              className="tb-btn tb-icon tb-run"
               onClick={handleStartExecution}
               disabled={isRunning || (!isSimulationMode && !(isDeployed && !isDirty && isPlcConnected))}
-              style={{ opacity: (isRunning || (!isSimulationMode && !(isDeployed && !isDirty && isPlcConnected))) ? 0.5 : 1 }}
+              title={t('actions.start') || 'Start'}
             >
-              ▶ {t('actions.start')}
+              <PlayIcon />
             </button>
-
             <button
-              className="toolbar-btn stop"
+              className="tb-btn tb-icon tb-stop"
               onClick={handleStopExecution}
               disabled={!isRunning}
-              style={{ opacity: !isRunning ? 0.5 : 1 }}
+              title={t('actions.stop') || 'Stop'}
             >
-              ⏹ {t('actions.stop')}
+              <StopIcon />
             </button>
 
-            {/* AutoRun toggle */}
+            {/* ── Right-aligned group: status ──────────────────────────── */}
+            <div style={{ flex: 1 }} />
+
             <button
-              className="toolbar-btn"
+              className={`tb-btn tb-text ${autoRun ? 'tb-toggle-on' : 'tb-toggle-off'}`}
               onClick={() => setAutoRun(!autoRun)}
               title="AutoRun: automatically start runtime on PLC boot"
-              style={{
-                opacity: 1,
-                background: autoRun ? '#1b5e20' : 'transparent',
-                border: autoRun ? '1px solid #4caf50' : '1px solid #555',
-                color: autoRun ? '#81c784' : '#888',
-                fontSize: '11px',
-                padding: '3px 8px',
-              }}
             >
-              {autoRun ? 'AutoRun ON' : 'AutoRun OFF'}
+              <RepeatIcon />
+              <span>AutoRun</span>
+              <span className={`tb-pill ${autoRun ? 'on' : ''}`}>
+                {autoRun ? 'ON' : 'OFF'}
+              </span>
             </button>
 
-            {/* Connection indicator */}
             {plcAddress && (
               <button
+                className="tb-conn"
                 onClick={() => {
-                  if (isRunning) return; // Don't toggle connection while running
+                  if (isRunning) return;
                   if (isPlcConnected) {
                     setConnectionEnabled(false);
                     setIsPlcConnected(false);
@@ -1958,20 +1995,11 @@ function App() {
                 }}
                 disabled={isRunning}
                 title={isRunning ? 'Stop execution before disconnecting' : isPlcConnected ? 'Click to disconnect' : 'Click to connect'}
-                style={{
-                  marginLeft: '10px', display: 'flex', alignItems: 'center', gap: '6px',
-                  fontSize: '12px', color: '#888', background: 'none', border: '1px solid #3e3e42',
-                  borderRadius: '4px', padding: '2px 8px', cursor: 'pointer'
-                }}
               >
-                <span style={{
-                  width: 8, height: 8, borderRadius: '50%',
-                  background: isPlcConnected ? '#4ec9b0' : '#666',
-                  display: 'inline-block', flexShrink: 0
-                }} />
-                {isPlcConnected ? 'Connected' : 'Disconnected'}
-                {isDeployed && !isDirty && <span style={{ color: '#4ec9b0', marginLeft: 4 }}>Deployed</span>}
-                {isDeployed && isDirty && <span style={{ color: '#f44747', marginLeft: 4 }}>Modified</span>}
+                <span className={`tb-conn-dot ${isPlcConnected ? 'on' : ''}`} />
+                <span>{isPlcConnected ? 'Connected' : 'Disconnected'}</span>
+                {isDeployed && !isDirty && <span className="tb-tag tb-tag-ok">Deployed</span>}
+                {isDeployed && isDirty && <span className="tb-tag tb-tag-warn">Modified</span>}
               </button>
             )}
           </>
@@ -2000,6 +2028,7 @@ function App() {
                 onEditItem={handleEditItemDetails}
                 onReorderItem={handleReorderItem}
                 onPasteItem={handlePasteItem}
+                onPasteGlobals={handlePasteGlobals}
                 onBoardClick={() => openSpecialTab('BOARD_CONFIG')}
                 selectedBoard={selectedBoard}
                 isRunning={isRunning || isSimulationMode}
@@ -2198,8 +2227,29 @@ function App() {
                 />
 
                 <div style={{ width: layout.rightWidth, display: 'flex', flexDirection: 'column', background: '#252526', borderLeft: '1px solid #333' }}>
-                  <h4 style={{ padding: '10px 15px', margin: 0, background: '#2d2d2d', fontSize: '11px', textTransform: 'uppercase', color: '#ccc' }}>Kütüphane</h4>
-                  <div style={{ flex: 1, overflow: 'auto' }}>
+                  {/* Tab strip: Kütüphane (blocks) | AI Agent */}
+                  <div style={{ display: 'flex', background: '#2d2d2d', borderBottom: '1px solid #1e1e1e', flexShrink: 0, height: 32 }}>
+                    {[
+                      { id: 'blocks', label: 'Kütüphane', icon: '📦' },
+                      { id: 'agent', label: 'AI Agent', icon: '🤖' },
+                    ].map(tab => (
+                      <div
+                        key={tab.id}
+                        onClick={() => setRightTab(tab.id)}
+                        style={{
+                          flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 5,
+                          cursor: 'pointer', fontSize: 11, textTransform: 'uppercase', letterSpacing: '.04em',
+                          color: rightTab === tab.id ? '#fff' : '#999',
+                          background: rightTab === tab.id ? '#252526' : 'transparent',
+                          borderTop: rightTab === tab.id ? '2px solid #007acc' : '2px solid transparent',
+                          borderBottom: rightTab === tab.id ? '1px solid #252526' : '1px solid transparent',
+                        }}
+                      >
+                        <span>{tab.icon}</span>{tab.label}
+                      </div>
+                    ))}
+                  </div>
+                  <div style={{ flex: 1, overflow: 'auto', display: rightTab === 'blocks' ? 'block' : 'none' }}>
                     <Toolbox
                       libraryData={libraryData}
                       activeFileType={activeItem?.type}
@@ -2213,6 +2263,11 @@ function App() {
                       }
                     />
                   </div>
+                  {rightTab === 'agent' && (
+                    <div style={{ flex: 1, overflow: 'hidden' }}>
+                      <AiAgentPanel activeItem={activeItem} />
+                    </div>
+                  )}
                 </div>
               </>
             )}

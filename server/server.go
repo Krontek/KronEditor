@@ -52,6 +52,10 @@ const maxUploadSize = 128 << 20 // 128 MB
 type RuntimeConfig struct {
 	AutoRun          bool   `json:"auto_run"`
 	StreamIntervalMs uint32 `json:"stream_interval_ms,omitempty"`
+	// HMIPort is the TCP port for the dedicated, operator-facing HMI listener
+	// (served at the root: http://ip:HMIPort/). 0 = HMI not published on a
+	// dedicated port (it remains reachable on the agent port under /hmi/).
+	HMIPort uint16 `json:"hmi_port,omitempty"`
 }
 
 // runtimeConfigUpdate is the partial-update payload accepted by
@@ -60,6 +64,7 @@ type RuntimeConfig struct {
 type runtimeConfigUpdate struct {
 	AutoRun          *bool   `json:"auto_run,omitempty"`
 	StreamIntervalMs *uint32 `json:"stream_interval_ms,omitempty"`
+	HMIPort          *uint16 `json:"hmi_port,omitempty"`
 }
 
 // Server handles HTTP and ConnectRPC traffic.
@@ -72,6 +77,10 @@ type Server struct {
 	rtCfg   RuntimeConfig
 	mux     *http.ServeMux
 	httpSrv *http.Server
+
+	hmiMu   sync.Mutex   // guards the dedicated HMI listener
+	hmiSrv  *http.Server // dedicated operator-facing HMI server (nil if none)
+	hmiPort uint16       // port hmiSrv is currently bound to (0 if none)
 }
 
 func NewServer(cfg Config, ipc *IPCManager, pm *ProcessManager, hmi *HMIManager) *Server {
@@ -99,6 +108,7 @@ func (s *Server) registerRoutes() {
 	// Deploy / status (plain HTTP, unchanged).
 	s.mux.HandleFunc("/deploy/runtime", s.handleDeployRuntime)
 	s.mux.HandleFunc("/deploy/variable-table", s.handleDeployVariableTable)
+	s.mux.HandleFunc("/deploy/project-file", s.handleProjectFile)
 	s.mux.HandleFunc("/deploy/config", s.handleDeployConfig)
 	s.mux.HandleFunc("/status", s.handleStatus)
 
@@ -133,7 +143,59 @@ func (s *Server) Start() error {
 			slog.Error("HTTP server error", "err", err)
 		}
 	}()
+
+	// Bring up the dedicated HMI listener if one was configured (deployed).
+	s.applyHMIPort(s.rtCfg.HMIPort)
 	return nil
+}
+
+// applyHMIPort (re)binds the dedicated operator-facing HMI listener.
+//
+//   - port == current bound port → no-op
+//   - port == 0                  → tear down any existing listener
+//   - otherwise                  → stop the old listener (if any) and serve the
+//     HMI at the root on the new port
+//
+// Bind failures are logged, not fatal: the HMI stays reachable on the agent
+// port under /hmi/, and the agent keeps running.
+func (s *Server) applyHMIPort(port uint16) {
+	s.hmiMu.Lock()
+	defer s.hmiMu.Unlock()
+
+	if s.hmiSrv != nil && s.hmiPort == port {
+		return
+	}
+	if s.hmiSrv != nil {
+		old := s.hmiSrv
+		s.hmiSrv = nil
+		s.hmiPort = 0
+		go old.Close()
+		slog.Info("HMI listener stopped", "port", port)
+	}
+	if port == 0 {
+		return
+	}
+
+	mux := http.NewServeMux()
+	RegisterHMIRoutesAtRoot(mux, s.hmi)
+	srv := &http.Server{
+		Handler:     mux,
+		ReadTimeout: 60 * time.Second,
+		IdleTimeout: 120 * time.Second,
+	}
+	ln, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
+	if err != nil {
+		slog.Error("failed to start HMI listener", "port", port, "err", err)
+		return
+	}
+	s.hmiSrv = srv
+	s.hmiPort = port
+	go func() {
+		slog.Info("HMI listening", "addr", ln.Addr().String())
+		if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			slog.Error("HMI server error", "err", err)
+		}
+	}()
 }
 
 // corsMiddleware adds permissive CORS headers required by browser-based clients.
@@ -191,6 +253,34 @@ func (s *Server) handleDeployVariableTable(w http.ResponseWriter, r *http.Reques
 	count := s.ipc.VariableCount()
 	slog.Info("variable_table.json loaded", "dest", dest, "variables", count)
 	jsonOK(w, map[string]any{"status": "ok", "path": dest, "variable_count": count})
+}
+
+// handleProjectFile stores (POST) or returns (GET) the editor project source
+// file ({deploy-dir}/project.xml) alongside the deployed runtime. This lets a
+// project be pulled back into the editor from the target ("Pull from Target").
+// The project file is for the editor only — the runtime does not read it.
+func (s *Server) handleProjectFile(w http.ResponseWriter, r *http.Request) {
+	dest := filepath.Join(s.cfg.DeployDir, "project.xml")
+	switch r.Method {
+	case http.MethodPost:
+		if err := s.saveUpload(r, dest, false); err != nil {
+			slog.Error("failed to save project.xml", "err", err)
+			http.Error(w, "failed to save file: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+		slog.Info("project.xml uploaded successfully", "dest", dest)
+		jsonOK(w, map[string]string{"status": "ok", "path": dest})
+	case http.MethodGet:
+		data, err := os.ReadFile(dest)
+		if err != nil {
+			http.Error(w, "no project file deployed", http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "application/xml")
+		_, _ = w.Write(data)
+	default:
+		http.Error(w, "only GET and POST are supported", http.StatusMethodNotAllowed)
+	}
 }
 
 // runtimeConfigPath returns the path to the persisted runtime config file.
@@ -297,12 +387,22 @@ func (s *Server) UpdateRuntimeConfig(u runtimeConfigUpdate) map[string]any {
 	if u.StreamIntervalMs != nil {
 		s.rtCfg.StreamIntervalMs = SetAPIStreamIntervalMs(*u.StreamIntervalMs)
 	}
+	if u.HMIPort != nil {
+		s.rtCfg.HMIPort = *u.HMIPort
+	}
 	if err := s.saveRuntimeConfig(); err != nil {
 		slog.Warn("Failed to save runtime config", "err", err)
 	}
 	snap := s.runtimeConfigSnapshotLocked()
 	autoRun := s.rtCfg.AutoRun
+	hmiPort := s.rtCfg.HMIPort
 	s.rtMu.Unlock()
+
+	// Apply an HMI-port change outside the rtMu lock (it takes its own lock
+	// and starts a goroutine). Skip when the request didn't touch the port.
+	if u.HMIPort != nil {
+		s.applyHMIPort(hmiPort)
+	}
 
 	slog.Info("Runtime config updated",
 		"auto_run", autoRun,
@@ -343,6 +443,7 @@ func (s *Server) runtimeConfigSnapshotLocked() map[string]any {
 	return map[string]any{
 		"auto_run":           s.rtCfg.AutoRun,
 		"stream_interval_ms": uint32(GetAPIStreamInterval() / time.Millisecond),
+		"hmi_port":           s.rtCfg.HMIPort,
 	}
 }
 
@@ -371,6 +472,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	pid, running := s.pm.Status()
 	s.rtMu.Lock()
 	autoRun := s.rtCfg.AutoRun
+	hmiPort := s.rtCfg.HMIPort
 	s.rtMu.Unlock()
 	jsonOK(w, map[string]any{
 		"running":            running,
@@ -380,6 +482,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		"deploy_dir":         s.cfg.DeployDir,
 		"auto_run":           autoRun,
 		"stream_interval_ms": uint32(GetAPIStreamInterval() / time.Millisecond),
+		"hmi_port":           hmiPort,
 	})
 }
 

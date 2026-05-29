@@ -331,7 +331,28 @@ func parseRoleSet(s string) map[Role]bool {
 // HTTP handlers
 // ---------------------------------------------------------------------------
 
-// RegisterHMIRoutes registers all /hmi/* routes on the given mux.
+// hmiBase returns the path prefix the HMI is served under for this request.
+// The operator-facing listener serves at the root ("" → http://ip:port/);
+// the agent port serves the same UI under "/hmi". Handlers and templates use
+// this so links, fetch URLs, redirects and the session cookie path all match
+// whichever listener handled the request.
+func hmiBase(r *http.Request) string {
+	if strings.HasPrefix(r.URL.Path, "/hmi") {
+		return "/hmi"
+	}
+	return ""
+}
+
+// hmiCookiePath maps a base prefix to a session-cookie Path. At the root the
+// cookie must cover "/" so it is sent for "/", "/api/*" and "/login".
+func hmiCookiePath(base string) string {
+	if base == "" {
+		return "/"
+	}
+	return base
+}
+
+// RegisterHMIRoutes registers all /hmi/* routes on the given mux (agent port).
 func RegisterHMIRoutes(mux *http.ServeMux, hm *HMIManager) {
 	// Deploy endpoints (called from KronEditor)
 	mux.HandleFunc("POST /hmi/deploy", hm.handleDeploy)
@@ -354,6 +375,26 @@ func RegisterHMIRoutes(mux *http.ServeMux, hm *HMIManager) {
 
 	// User management (admin only)
 	mux.HandleFunc("GET /hmi/api/users", requireRole(hm.sessions, RoleAdmin, hm.handleAPIUsersGet))
+}
+
+// RegisterHMIRoutesAtRoot registers the operator-facing HMI at the root path
+// on a dedicated listener (http://ip:PORT/). Only the HMI UI + its API are
+// exposed here — deploy/RPC endpoints are intentionally absent so the public
+// panel URL is isolated from the agent's control surface. Handlers detect the
+// root base via hmiBase() (paths here never start with "/hmi").
+func RegisterHMIRoutesAtRoot(mux *http.ServeMux, hm *HMIManager) {
+	mux.HandleFunc("GET /login", hm.handleLoginPage)
+	mux.HandleFunc("POST /login", hm.handleLoginSubmit)
+	mux.HandleFunc("POST /logout", hm.handleLogout)
+
+	mux.HandleFunc("GET /api/session", hm.handleAPISession)
+	mux.HandleFunc("GET /api/layout", hm.handleAPILayout)
+	mux.HandleFunc("GET /api/variables", hm.handleAPIVariables)
+	mux.HandleFunc("POST /api/write", hm.handleAPIWrite)
+	mux.HandleFunc("GET /api/users", requireRole(hm.sessions, RoleAdmin, hm.handleAPIUsersGet))
+
+	// Catch-all → HMI page (most-specific routes above win in Go 1.22 mux).
+	mux.HandleFunc("GET /", requireSession(hm.users, hm.sessions, hm.handleHMIPage))
 }
 
 // handleDeployHMILayout receives the JSON HMI layout from KronEditor (sent during Build & Send).
@@ -431,24 +472,26 @@ func (hm *HMIManager) handleDeploy(w http.ResponseWriter, r *http.Request) {
 
 // handleLoginPage serves the login HTML.
 func (hm *HMIManager) handleLoginPage(w http.ResponseWriter, r *http.Request) {
+	base := hmiBase(r)
 	// If already logged in, redirect to HMI
 	if _, ok := sessionFromRequest(r, hm.sessions); ok {
-		http.Redirect(w, r, "/hmi/", http.StatusSeeOther)
+		http.Redirect(w, r, base+"/", http.StatusSeeOther)
 		return
 	}
 	errMsg := r.URL.Query().Get("error")
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	fmt.Fprint(w, loginHTML(errMsg))
+	fmt.Fprint(w, loginHTML(errMsg, base))
 }
 
 // handleLoginSubmit processes the login form.
 func (hm *HMIManager) handleLoginSubmit(w http.ResponseWriter, r *http.Request) {
+	base := hmiBase(r)
 	username := r.FormValue("username")
 	password := r.FormValue("password")
 
 	u, ok := hm.users.Authenticate(username, password)
 	if !ok {
-		http.Redirect(w, r, "/hmi/login?error=Invalid+credentials", http.StatusSeeOther)
+		http.Redirect(w, r, base+"/login?error=Invalid+credentials", http.StatusSeeOther)
 		return
 	}
 
@@ -456,26 +499,27 @@ func (hm *HMIManager) handleLoginSubmit(w http.ResponseWriter, r *http.Request) 
 	http.SetCookie(w, &http.Cookie{
 		Name:     sessionCookieName,
 		Value:    sess.Token,
-		Path:     "/hmi",
+		Path:     hmiCookiePath(base),
 		HttpOnly: true,
 		SameSite: http.SameSiteLaxMode,
 		MaxAge:   int(sessionTTL.Seconds()),
 	})
-	http.Redirect(w, r, "/hmi/", http.StatusSeeOther)
+	http.Redirect(w, r, base+"/", http.StatusSeeOther)
 }
 
 // handleLogout clears the session cookie.
 func (hm *HMIManager) handleLogout(w http.ResponseWriter, r *http.Request) {
+	base := hmiBase(r)
 	if c, err := r.Cookie(sessionCookieName); err == nil {
 		hm.sessions.Delete(c.Value)
 	}
 	http.SetCookie(w, &http.Cookie{
 		Name:   sessionCookieName,
 		Value:  "",
-		Path:   "/hmi",
+		Path:   hmiCookiePath(base),
 		MaxAge: -1,
 	})
-	http.Redirect(w, r, "/hmi/login", http.StatusSeeOther)
+	http.Redirect(w, r, base+"/login", http.StatusSeeOther)
 }
 
 // handleHMIPage serves the main HMI application page.
@@ -487,7 +531,7 @@ func (hm *HMIManager) handleHMIPage(w http.ResponseWriter, r *http.Request) {
 	}
 	sess, _ := sessionFromRequest(r, hm.sessions)
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	fmt.Fprint(w, mainHMIHTML(sess))
+	fmt.Fprint(w, mainHMIHTML(sess, hmiBase(r)))
 }
 
 // handleAPISession returns the current user's session info.
@@ -601,7 +645,10 @@ func (hm *HMIManager) handleAPIVariables(w http.ResponseWriter, r *http.Request)
 		jsonOK(w, map[string]any{})
 		return
 	}
-	vars, err := hm.ipc.ReadAllVariables()
+	// HMI widgets may only bind to addressed variables, so the feed is
+	// restricted to those — consistent with the REST API and avoiding
+	// publishing the full internal variable set to the panel.
+	vars, err := hm.ipc.ReadAddressedVariables()
 	if err != nil {
 		jsonError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -652,7 +699,7 @@ func (hm *HMIManager) handleAPIUsersGet(w http.ResponseWriter, r *http.Request) 
 // HTML templates
 // ---------------------------------------------------------------------------
 
-func loginHTML(errMsg string) string {
+func loginHTML(errMsg, base string) string {
 	errBlock := ""
 	if errMsg != "" {
 		errBlock = `<div class="err">` + errMsg + `</div>`
@@ -683,7 +730,7 @@ button:hover{background:#0090ee}
   <h1>KronHMI</h1>
   <p class="sub">Sign in to access the control panel</p>
   ` + errBlock + `
-  <form method="POST" action="/hmi/login">
+  <form method="POST" action="` + base + `/login">
     <label>Username</label>
     <input name="username" type="text" autocomplete="username" autofocus required>
     <label>Password</label>
@@ -710,7 +757,7 @@ func noConfigHTML() string {
 </html>`
 }
 
-func mainHMIHTML(sess *Session) string {
+func mainHMIHTML(sess *Session, base string) string {
 	username := ""
 	roleName := ""
 	if sess != nil {
@@ -763,7 +810,7 @@ body{background:#0d0d0d;color:#d4d4d4;font-family:Consolas,monospace;overflow:hi
   <div id="user-info">
     <span>` + username + `</span>
     <span class="role-badge">` + roleName + `</span>
-    <form method="POST" action="/hmi/logout" style="display:inline">
+    <form method="POST" action="` + base + `/logout" style="display:inline">
       <button id="logout-btn" type="submit">Sign out</button>
     </form>
   </div>
@@ -775,6 +822,7 @@ body{background:#0d0d0d;color:#d4d4d4;font-family:Consolas,monospace;overflow:hi
 const USER_ROLE_LEVEL = {viewer:1,operator:2,maintainer:3,admin:4};
 const MY_ROLE = '` + roleName + `';
 const MY_LEVEL = USER_ROLE_LEVEL[MY_ROLE] || 1;
+const BASE = '` + base + `';
 
 let pages = [];
 let currentPage = 0;
@@ -791,12 +839,12 @@ function fmtVal(v,dec){if(v===null||v===undefined)return'---';if(typeof v==='boo
 function isOn(v){return v===true||v===1||v==='TRUE'||v==='1';}
 
 async function sendWrite(key,value){
-  try{await fetch('/hmi/api/write',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({key,value})});}catch(e){}
+  try{await fetch(BASE+'/api/write',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({key,value})});}catch(e){}
 }
 
 async function loadLayout(){
   try{
-    const r=await fetch('/hmi/api/layout');
+    const r=await fetch(BASE+'/api/layout');
     const data=await r.json();
     pages=data.pages||[];
     buildPageTabs();
@@ -913,7 +961,7 @@ function updateLive(){
 }
 
 async function pollVars(){
-  try{const r=await fetch('/hmi/api/variables');variables=await r.json();updateLive();}catch(e){}
+  try{const r=await fetch(BASE+'/api/variables');variables=await r.json();updateLive();}catch(e){}
 }
 
 loadLayout();

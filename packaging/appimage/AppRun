@@ -1,0 +1,41 @@
+#!/bin/sh
+# AppRun — entry point for the KronEditor AppImage.
+#
+# Launches the embedded host-agent (serves the editor UI + API on :7171) with
+# resources/ and toolchains/ resolved INSIDE the mounted AppImage. Per the
+# chosen UX, it opens a terminal that prints the agent log + access URL; the
+# user opens the browser manually. If already attached to a TTY (run from a
+# shell) it runs in the foreground instead.
+
+HERE="$(dirname "$(readlink -f "$0")")"
+BIN="$HERE/usr/bin/kron-host-agent"
+RES="$HERE/usr/share/kron/resources"
+TC="$HERE/usr/share/kron/toolchains"
+ADDR="${KRON_ADDR:-:7171}"
+
+run_fg() {
+    exec "$BIN" --addr "$ADDR" --resources-root "$RES" --toolchains-root "$TC"
+}
+
+# Run directly when invoked from a terminal.
+[ -t 1 ] && run_fg
+
+# Otherwise spawn a terminal emulator (terminal-only UX). Keep the window open
+# after the agent exits so the user can read the final log lines.
+CMD="echo '=== KronEditor host-agent ==='; \
+echo 'Open http://localhost${ADDR} in your browser (e.g. http://localhost:7171).'; \
+echo; \
+'$BIN' --addr '$ADDR' --resources-root '$RES' --toolchains-root '$TC'; \
+echo; echo '[host-agent stopped] Press Enter to close...'; read _"
+
+for term in x-terminal-emulator gnome-terminal konsole xfce4-terminal xterm; do
+    if command -v "$term" >/dev/null 2>&1; then
+        case "$term" in
+            gnome-terminal) exec "$term" --title "KronEditor" -- sh -c "$CMD" ;;
+            *)              exec "$term" -e sh -c "$CMD" ;;
+        esac
+    fi
+done
+
+# No terminal emulator available: fall back to foreground.
+run_fg

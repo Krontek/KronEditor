@@ -24,6 +24,9 @@ const parseNumeric = (value, fallback = 0) => {
 const parseUartChannel = (port) =>
     parseNumeric(String(port?.id || '').match(/UART_(\d+)/)?.[1], 0);
 
+const parseUsbChannel = (port) =>
+    parseNumeric(String(port?.id || '').match(/USB_(\d+)/)?.[1], 0);
+
 const parseI2CBus = (port) =>
     parseNumeric(
         String(port?.path || '').match(/i2c-(\d+)/)?.[1]
@@ -139,6 +142,23 @@ const buildRuntimePortHelpers = (boardId, interfaceConfig = {}) => {
         })
         .sort((a, b) => a.channel - b.channel);
 
+    const usbPorts = getPortOptions(boardFamily, 'USB')
+        .map((port) => {
+            const config = {
+                enabled: false,
+                baudRate: 115200,
+                devicePath: '',
+                ...(interfaceConfig?.USB?.[port.id] || {}),
+            };
+            return {
+                channel: parseUsbChannel(port),
+                enabled: !!config.enabled,
+                baudRate: parseNumeric(config.baudRate, 115200),
+                devicePath: (config.devicePath || port.path || '').trim(),
+            };
+        })
+        .sort((a, b) => a.channel - b.channel);
+
     const renderSwitch = (cases, defaultValue, mapper) => {
         if (cases.length === 0) return `    (void)port;\n    return ${defaultValue};\n`;
         let code = '    switch (port) {\n';
@@ -226,6 +246,18 @@ const buildRuntimePortHelpers = (boardId, interfaceConfig = {}) => {
         uartPorts.map((entry) => ({ caseValue: entry.channel, stopBits: entry.stopBits })),
         '1',
         (entry) => `${entry.stopBits}`
+    );
+    helpers += `}\n\n`;
+
+    // USB baud-per-port dispatch — kronhal.h's USB_Send_Call / USB_Receive_Call
+    // call this so the kernel port is opened at the user-configured baud rate.
+    // Without this they were hardcoding 115200 and high-speed sensors
+    // (e.g. RPLIDAR S2 @ 1 Mbps) never got a clean byte stream.
+    helpers += `static inline int32_t KRON_USB_PortBaud(uint8_t port) {\n`;
+    helpers += renderSwitch(
+        usbPorts.map((entry) => ({ caseValue: entry.channel, baudRate: entry.baudRate })),
+        '115200',
+        (entry) => `${entry.baudRate}`
     );
     helpers += `}\n\n`;
 
