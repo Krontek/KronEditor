@@ -1,6 +1,7 @@
 package main
 
 import (
+	"debug/dwarf"
 	"debug/elf"
 	"encoding/binary"
 	"encoding/json"
@@ -344,7 +345,112 @@ func parseELFSymbols(path string) (map[string]uint64, error) {
 			out[sym.Name] = sym.Value
 		}
 	}
+	// PLC variables are now fields of `static PlcState __plc_state` (hot-swap
+	// refactor), reached via `S->field` — so the individual variable C symbols
+	// (prog_X_v, …) the variable table references are NOT standalone globals.
+	// Resolve each PlcState member's absolute address (base of __plc_state +
+	// member offset from DWARF) and register it under the member name, so
+	// buildVarSpecs() matches c_symbol/base_symbol exactly as before. Skipped
+	// silently for old-style binaries (no __plc_state) or builds without DWARF.
+	base, ok := out["__plc_state"]
+	if !ok {
+		// clang can suffix internal-linkage symbols (__plc_state.1); tolerate it.
+		for n, v := range out {
+			if strings.HasPrefix(n, "__plc_state.") {
+				base, ok = v, true
+				break
+			}
+		}
+	}
+	if ok {
+		if offs, err := plcStateMemberOffsets(f); err == nil {
+			for name, off := range offs {
+				if _, exists := out[name]; !exists {
+					out[name] = base + uint64(off)
+				}
+			}
+		}
+	}
 	return out, nil
+}
+
+// plcStateMemberOffsets reads the byte offset of each direct member of the
+// `PlcState` struct from the binary's DWARF debug info.
+func plcStateMemberOffsets(f *elf.File) (map[string]int64, error) {
+	d, err := f.DWARF()
+	if err != nil {
+		return nil, err
+	}
+	r := d.Reader()
+	for {
+		e, err := r.Next()
+		if err != nil {
+			return nil, err
+		}
+		if e == nil {
+			break
+		}
+		if e.Tag != dwarf.TagStructType {
+			continue
+		}
+		if name, _ := e.Val(dwarf.AttrName).(string); name != "PlcState" {
+			continue
+		}
+		offs := make(map[string]int64)
+		if !e.Children {
+			return offs, nil
+		}
+		for {
+			kid, err := r.Next()
+			if err != nil {
+				return nil, err
+			}
+			if kid == nil || kid.Tag == 0 { // null DIE closes the child list
+				break
+			}
+			if kid.Tag == dwarf.TagMember {
+				if mname, _ := kid.Val(dwarf.AttrName).(string); mname != "" {
+					offs[mname] = dwarfMemberOffset(kid)
+				}
+			} else if kid.Children {
+				r.SkipChildren()
+			}
+		}
+		return offs, nil
+	}
+	return nil, fmt.Errorf("PlcState struct not found in DWARF")
+}
+
+// dwarfMemberOffset extracts DW_AT_data_member_location, which clang emits as a
+// constant (DWARF ≥4) or, older, as a DW_OP_plus_uconst location expression.
+func dwarfMemberOffset(e *dwarf.Entry) int64 {
+	switch x := e.Val(dwarf.AttrDataMemberLoc).(type) {
+	case int64:
+		return x
+	case int:
+		return int64(x)
+	case uint64:
+		return int64(x)
+	case []byte:
+		if len(x) >= 2 && x[0] == 0x23 { // DW_OP_plus_uconst <uleb128>
+			off, _ := readULEB128(x[1:])
+			return int64(off)
+		}
+	}
+	return 0
+}
+
+func readULEB128(b []byte) (uint64, int) {
+	var result uint64
+	var shift uint
+	for i := 0; i < len(b); i++ {
+		result |= uint64(b[i]&0x7f) << shift
+		if b[i]&0x80 == 0 {
+			return result, i + 1
+		}
+		shift += 7
+	}
+	return result, len(b)
 }
 
 // ── variable table parsing ───────────────────────────────────────────────────

@@ -44,6 +44,23 @@ CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
 echo "      -> dist/plc-agent_linux_amd64"
 
 echo ""
+echo "=== Syncing binaries into resources/ (what 'Deploy Server to Target' ships) ==="
+# The host-agent's deploy_server_to_target reads the binary from
+# resources/<triple>/server/. Keep it in sync so a rebuild is actually deployed
+# (otherwise the editor would ship a stale server).
+REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+copy_to_resources() {
+    local src="$1" triple="$2"
+    local dst_dir="${REPO_ROOT}/resources/${triple}/server"
+    if [ -d "$dst_dir" ]; then
+        cp -f "$src" "$dst_dir/" && echo "      -> resources/${triple}/server/$(basename "$src")"
+    fi
+}
+copy_to_resources dist/plc-agent_linux_armv7 arm-linux-gnueabihf
+copy_to_resources dist/plc-agent_linux_arm64 aarch64-linux-gnu
+copy_to_resources dist/plc-agent_linux_amd64 x86_64-linux-gnu
+
+echo ""
 echo "=== Build completed ==="
 ls -lh dist/
 

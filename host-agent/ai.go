@@ -105,6 +105,11 @@ func (s *Server) handleAIChat(w http.ResponseWriter, r *http.Request) {
 		msg, err = callAnthropic(ctx, req)
 	case "openai":
 		msg, err = callOpenAI(ctx, req, "https://api.openai.com")
+	case "gemini", "google":
+		// Gemini exposes an OpenAI-compatible surface (Bearer auth, tool_calls).
+		// The base already contains "/v1beta", so callOpenAI appends only
+		// "/chat/completions" → .../v1beta/openai/chat/completions.
+		msg, err = callOpenAI(ctx, req, "https://generativelanguage.googleapis.com/v1beta/openai")
 	case "custom":
 		msg, err = callOpenAI(ctx, req, "") // baseUrl required; OpenAI-compatible
 	case "ollama", "":
@@ -491,6 +496,42 @@ func buildOpenAIMessages(req aiChatReq, argsAsString bool) []map[string]any {
 func callOllama(ctx context.Context, req aiChatReq) (aiMessage, error) {
 	base := normalizeOllamaBase(req.BaseURL)
 
+	msg, err := ollamaChatOnce(ctx, base, req)
+	// Some Ollama models (e.g. codellama) have no native tool API — passing
+	// `tools` makes the daemon answer HTTP 400 "<model> does not support tools".
+	// Fall back to PROMPT-BASED tool calling: drop the tools field, describe the
+	// tools in the system prompt and let the model emit tool calls as JSON text,
+	// which the frontend's extractInlineToolCalls()/repairJsonBrackets() recover.
+	if err != nil && len(req.Tools) > 0 && isUnsupportedToolsErr(err) {
+		req.System = strings.TrimRight(req.System, "\n") + "\n\n" + toolPrompt(req.Tools)
+		req.Tools = nil
+		return ollamaChatOnce(ctx, base, req)
+	}
+	return msg, err
+}
+
+// isUnsupportedToolsErr matches Ollama's "<model> does not support tools" 400.
+func isUnsupportedToolsErr(err error) bool {
+	return err != nil && strings.Contains(strings.ToLower(err.Error()), "does not support tools")
+}
+
+// toolPrompt renders the tool list into system-prompt text for models without a
+// native tool API. The shape it asks for ({"name","arguments"}) is exactly what
+// the frontend's extractInlineToolCalls() parses out of the assistant text.
+func toolPrompt(tools []aiTool) string {
+	var b strings.Builder
+	b.WriteString("TOOL CALLING — this model has no native tool API, so you call tools by writing JSON.\n")
+	b.WriteString("To call a tool, output ONLY a JSON object (no markdown fences, no prose) of the form:\n")
+	b.WriteString(`{"name": "<tool_name>", "arguments": { ...args... }}` + "\n")
+	b.WriteString("Emit one JSON object per tool call (you may emit several, each on its own line). After the tools run you get their results and may call more. When you are finished calling tools and only want to reply to the user, output plain text instead of JSON.\n\n")
+	b.WriteString("Available tools:\n")
+	for _, t := range tools {
+		fmt.Fprintf(&b, "- %s: %s\n  arguments JSON schema: %s\n", t.Name, t.Description, string(orEmptyObj(t.Parameters)))
+	}
+	return b.String()
+}
+
+func ollamaChatOnce(ctx context.Context, base string, req aiChatReq) (aiMessage, error) {
 	msgs := buildOpenAIMessages(req, false) // object-form arguments, no tool_call_id
 
 	tools := make([]map[string]any, 0, len(req.Tools))

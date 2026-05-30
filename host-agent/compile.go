@@ -62,6 +62,11 @@ func (s *Server) compileSimulation() (string, string, error) {
 		"-ffunction-sections",
 		"-fdata-sections",
 		"-O3",
+		// -g emits DWARF so the agent can resolve PlcState member offsets: all
+		// PLC variables are now fields of `static PlcState __plc_state` (hot-swap
+		// refactor), not standalone globals, so /proc/mem live-read needs the
+		// struct layout. Layout is ABI-fixed, unaffected by -O3.
+		"-g",
 		"-o", outFile,
 		plcC,
 	)

@@ -1,5 +1,5 @@
 /*
- * agentTools.js — the AI agent's action surface over the PLC project.
+ * agentTools.js — the PLC Agent's action surface over the PLC project.
  *
  * The agent loop (AiAgentPanel) sends TOOL_DEFS to the model. When the model
  * calls a tool, the panel runs it through applyToolCall(), which is a PURE
@@ -28,9 +28,10 @@ const RESOURCE_TYPE = 'RESOURCE_EDITOR';
 const IEC_NAME_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const isValidIecName = (n) => IEC_NAME_RE.test(String(n || '').trim());
 
-function findPOU(struct, name) {
+export function findPOU(struct, name) {
   // Trim + case-insensitive so whitespace/case differences never cause a miss.
   const lname = String(name || '').trim().toLowerCase();
+  if (!lname || lname === 'undefined' || lname === 'null') return null;
   for (const category of POU_CATEGORIES) {
     const list = struct[category] || [];
     const idx = list.findIndex((p) => (p.name || '').trim().toLowerCase() === lname);
@@ -125,6 +126,56 @@ export function buildProjectOverview(struct, board) {
   };
 }
 
+// Derive a user-defined POU's pins from its variable table: Input/InOut → inputs,
+// Output → outputs. Mirrors how the transpiler / RungContainer read FB pins.
+function pouPins(pou) {
+  const vars = pou.content?.variables || [];
+  const inputs = vars.filter((v) => v.class === 'Input' || v.class === 'InOut').map((v) => ({ name: v.name, type: v.type }));
+  const outputs = vars.filter((v) => v.class === 'Output').map((v) => ({ name: v.name, type: v.type }));
+  return { inputs, outputs };
+}
+
+// Build the catalog of usable blocks: standard library (from the loaded XML
+// libraryData) + the project's own function blocks/functions, each with pins.
+// `library` is App's `libraryData` = [{ id, title, blocks:[{blockType, class,
+// inputs, outputs, desc}] }]. Returns { standard:[…], project:[…] }.
+export function buildBlockCatalog(struct, library, filter) {
+  const f = (filter || '').trim().toLowerCase();
+  const matches = (type, category) => !f || (type || '').toLowerCase().includes(f) || (category || '').toLowerCase().includes(f);
+  const pinList = (arr) => (arr || []).map((p) => ({ name: p.name, type: p.type }));
+
+  const standard = [];
+  for (const cat of (Array.isArray(library) ? library : [])) {
+    for (const b of (cat.blocks || [])) {
+      if (!b.blockType || !matches(b.blockType, cat.title)) continue;
+      standard.push({
+        type: b.blockType,
+        kind: b.class || 'FunctionBlock',
+        category: cat.title,
+        description: b.desc || undefined,
+        inputs: pinList(b.inputs),
+        outputs: pinList(b.outputs),
+      });
+    }
+  }
+
+  const project = [];
+  for (const category of ['functionBlocks', 'functions']) {
+    for (const p of (struct[category] || [])) {
+      if (!matches(p.name, category)) continue;
+      const { inputs, outputs } = pouPins(p);
+      project.push({
+        type: p.name,
+        kind: category === 'functions' ? 'Function' : 'FunctionBlock',
+        language: p.type,
+        returnType: p.returnType || undefined,
+        inputs, outputs,
+      });
+    }
+  }
+  return { standard, project };
+}
+
 // ── tool definitions (sent to the model) ─────────────────────────────────────
 
 const S = (props, required = []) => ({ type: 'object', properties: props, required });
@@ -147,12 +198,17 @@ export const TOOL_DEFS = [
     parameters: S({}),
   },
   {
+    name: 'list_blocks',
+    description: 'List the building blocks you can use, EACH WITH ITS INPUT AND OUTPUT PINS: the standard library function blocks & functions (timers TON/TOF, counters CTU/CTD, math, comparison, motion MC_*, communication, conversion, HAL I/O blocks) AND the project\'s own function blocks/functions. ALWAYS call this before using any function block or function in ST so you reference the correct pin names and types. Optionally filter by a name/category substring.',
+    parameters: S({ filter: str('Optional case-insensitive substring to match block type or category (optional)') }),
+  },
+  {
     name: 'create_pou',
-    description: 'Create a new, empty POU. Use language "ST" for Structured Text or "LD" for Ladder.',
+    description: 'Create a new, empty POU. Language "ST" = Structured Text (set its body with set_st_code), "LD" = Ladder (set its rungs with set_ladder), "SCL" = mixed (rungs that are each ladder or ST — author with set_ladder and/or set_st_code).',
     parameters: S({
       category: { type: 'string', enum: ['programs', 'functionBlocks', 'functions'] },
       name: str('Unique POU name'),
-      language: { type: 'string', enum: ['ST', 'LD'] },
+      language: { type: 'string', enum: ['ST', 'LD', 'SCL'] },
       returnType: str('Return type — only for functions (e.g. BOOL, INT, REAL)'),
     }, ['category', 'name', 'language']),
   },
@@ -168,13 +224,13 @@ export const TOOL_DEFS = [
   },
   {
     name: 'set_st_code',
-    description: 'Replace the entire Structured Text body of an ST POU. Provide complete, valid IEC 61131-3 ST. The variables it uses must already exist (add them with add_variable) or be global.',
-    parameters: S({ pou: str('Target ST POU name'), code: str('The full new ST source') }, ['pou', 'code']),
+    description: 'Replace the entire Structured Text body of an ST (or SCL) POU. Provide complete, valid IEC 61131-3 ST. The variables it uses must already exist (add them with add_variable) or be global.',
+    parameters: S({ pou: str('Target ST/SCL POU name'), code: str('The full new ST source') }, ['pou', 'code']),
   },
   {
     name: 'set_ladder',
     description:
-      'Replace the ENTIRE ladder (all rungs) of an LD POU. Express each rung as a boolean network of CONTACTS driving one or more output COILS. ' +
+      'Replace the ENTIRE ladder (all rungs) of an LD or SCL POU. Express each rung as a boolean network of CONTACTS driving one or more output COILS. ' +
       'A rung = OR of `branches` (each branch is an AND-series of contacts), optionally followed by `seriesAfter` contacts (in series after the OR-merge — e.g. a normally-closed Stop for a seal-in), then `outputs` coils. ' +
       'Contact subType: "NO" (normally open) or "NC" (normally closed). Coil subType: "Normal", "Set", "Reset" or "Negated". ' +
       'Every contact/coil variable must be a BOOL that already exists (add it with add_variable first). ' +
@@ -210,10 +266,10 @@ export const TOOL_DEFS = [
   },
   {
     name: 'add_variable',
-    description: 'Add a variable. scope "local" needs a pou; scope "global" adds a project global. Optionally give an IEC address (e.g. %MW0) to expose it via the REST/HMI API.',
+    description: 'Add a variable. DEFAULT scope is "local" (a variable inside one POU) — pass scope "local" with the pou. Use scope "global" ONLY when the user explicitly asks for a global/shared variable, or when a variable must be shared across multiple POUs. Optionally give an IEC address (e.g. %MW0) to expose it via the REST/HMI API.',
     parameters: S({
-      scope: { type: 'string', enum: ['local', 'global'] },
-      pou: str('POU name (required when scope is local)'),
+      scope: { type: 'string', enum: ['local', 'global'], description: 'Default "local". Use "global" only when explicitly requested or genuinely shared across POUs.' },
+      pou: str('POU name — REQUIRED when scope is "local". Pass the exact name of the POU the variable belongs to (e.g. the one you just created with create_pou).'),
       name: str('Variable name'),
       type: str('IEC type, e.g. BOOL, INT, DINT, REAL, TIME, or a UDT/FB type'),
       initialValue: str('Initial value (optional)'),
@@ -269,6 +325,14 @@ export function applyToolCall(struct, name, args = {}) {
         return { mutation: false, ok: true, result: { running: true, values: live } };
       }
 
+      case 'list_blocks': {
+        const cat = buildBlockCatalog(struct, args.__library, args.filter);
+        if (cat.standard.length === 0 && cat.project.length === 0) {
+          return { mutation: false, ok: true, result: { note: args.filter ? `No blocks match "${args.filter}".` : 'No block library loaded.', standard: [], project: [] } };
+        }
+        return { mutation: false, ok: true, result: cat };
+      }
+
       case 'read_pou': {
         const hit = findPOU(struct, args.name);
         if (!hit) return { ok: false, error: `POU "${args.name}" not found` };
@@ -296,8 +360,9 @@ export function applyToolCall(struct, name, args = {}) {
         if (!args.name || !args.name.trim()) return { ok: false, error: 'name is required' };
         if (!isValidIecName(args.name)) return { ok: false, error: `invalid name "${args.name}" — POU names must be IEC identifiers (letters, digits, underscore; no spaces; can't start with a digit)` };
         if (findPOU(struct, args.name)) return { ok: false, error: `a POU named "${args.name}" already exists` };
-        const language = args.language === 'LD' ? 'LD' : 'ST';
-        const content = language === 'LD' ? { rungs: [], variables: [] } : { code: '', variables: [] };
+        const language = (args.language === 'LD' || args.language === 'SCL') ? args.language : 'ST';
+        // LD + SCL store logic as rungs; ST stores a single code body.
+        const content = (language === 'LD' || language === 'SCL') ? { rungs: [], variables: [] } : { code: '', variables: [] };
         const item = {
           id: `${category}_${Date.now()}`,
           name: args.name.trim(),
@@ -420,12 +485,16 @@ export function applyToolCall(struct, name, args = {}) {
       case 'set_ladder': {
         const hit = findPOU(struct, args.pou);
         if (!hit) return { ok: false, error: `POU "${args.pou}" not found` };
-        if (hit.item.type !== 'LD') return { ok: false, error: `"${args.pou}" is not a Ladder POU — use set_st_code for ST` };
+        // LD POUs are pure ladder; SCL POUs are mixed and accept ladder rungs too
+        // (each tagged lang:'LD'). ST POUs cannot hold ladder.
+        if (hit.item.type !== 'LD' && hit.item.type !== 'SCL') return { ok: false, error: `"${args.pou}" is not a Ladder/SCL POU — use set_st_code for ST` };
         const dsl = Array.isArray(args.rungs) ? args.rungs : [];
         if (dsl.length === 0) return { ok: false, error: 'rungs must be a non-empty array' };
         let compiled;
         try { compiled = dsl.map((r, i) => compileLadderRung(r, i)); }
         catch (e) { return { ok: false, error: `ladder: ${e.message}` }; }
+        // SCL rungs carry a per-rung language tag; ladder rungs are 'LD'.
+        if (hit.item.type === 'SCL') compiled = compiled.map((r) => ({ ...r, lang: 'LD' }));
         const oldRungs = hit.item.content?.rungs || [];
         const next = withPOUContent(struct, hit.category, hit.index, { ...hit.item.content, rungs: compiled });
         const lines = [

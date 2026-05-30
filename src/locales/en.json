@@ -66,8 +66,7 @@
         "openProject": "Open Project",
         "close": "Close",
         "project": "Project",
-        "plc": "PLC",
-        "rightClick": "Right-click"
+        "plc": "PLC"
     },
     "actions": {
         "add": "Add",
@@ -86,7 +85,9 @@
         "closeProject": "Close Project",
         "editCycleTime": "Edit Cycle Time",
         "selectTarget": "Select Target",
-        "build": "Build"
+        "build": "Build",
+        "loadFromTarget": "Load from Target",
+        "pullConfirm": "The current project will be closed and replaced by the one on the target. Continue?"
     },
     "options": {
         "cyclic": "Cyclic",
@@ -303,5 +304,12 @@
         "signalPin": "{{signal}} Pin",
         "resizeHorizontal": "Resize left and right panels",
         "resizeVertical": "Resize upper and lower panels"
+    },
+    "shortcuts": {
+        "saveProject": "Save Project",
+        "compileProject": "Compile Project",
+        "startSimulation": "Start Simulation",
+        "undo": "Undo",
+        "redo": "Redo"
     }
 }

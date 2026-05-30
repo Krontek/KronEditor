@@ -7,11 +7,11 @@ const ShortcutsModal = ({ isOpen, onClose }) => {
     if (!isOpen) return null;
 
     const shortcuts = [
-        { key: 'Ctrl + S', desc: t('actions.save') || 'Save Project' },
-        { key: 'Ctrl + B', desc: t('actions.compile') || 'Compile Project' },
-        { key: 'Ctrl + X', desc: t('actions.start') || 'Start Simulation' },
-        { key: 'Ctrl + Z', desc: t('actions.undo') || 'Undo' },
-        { key: 'Ctrl + Shift + Z', desc: t('actions.redo') || 'Redo' },
+        { key: 'Ctrl + S', desc: t('shortcuts.saveProject', 'Save Project') },
+        { key: 'Ctrl + B', desc: t('shortcuts.compileProject', 'Compile Project') },
+        { key: 'Ctrl + X', desc: t('shortcuts.startSimulation', 'Start Simulation') },
+        { key: 'Ctrl + Z', desc: t('shortcuts.undo', 'Undo') },
+        { key: 'Ctrl + Shift + Z', desc: t('shortcuts.redo', 'Redo') },
     ];
 
     return (

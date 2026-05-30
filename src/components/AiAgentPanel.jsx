@@ -1,9 +1,9 @@
 import { useState, useRef, useEffect, useCallback } from 'react';
 import { host } from '../services/HostClient';
-import { TOOL_DEFS, applyToolCall, buildProjectOverview } from '../services/agentTools';
+import { TOOL_DEFS, applyToolCall, buildProjectOverview, findPOU } from '../services/agentTools';
 
 /*
- * AiAgentPanel — project-editing AI agent.
+ * AiAgentPanel — the PLC Agent: a project-editing tool-calling agent.
  * ------------------------------------------------------------------
  * Lives as the second tab of the right "Kütüphane" sidebar. It is a real
  * tool-calling agent, not a chat stub: it can create/rename/delete POUs,
@@ -36,6 +36,7 @@ const C = {
 const PROVIDERS = [
   { id: 'anthropic', label: 'Anthropic', models: ['claude-opus-4-8', 'claude-sonnet-4-6', 'claude-haiku-4-5'] },
   { id: 'openai', label: 'OpenAI', models: ['gpt-4.1', 'gpt-4o', 'o4-mini'] },
+  { id: 'gemini', label: 'Google (Gemini)', models: ['gemini-2.5-pro', 'gemini-2.5-flash', 'gemini-2.5-flash-lite', 'gemini-2.0-flash', 'gemini-2.0-flash-lite'] },
   { id: 'ollama', label: 'Local (Ollama)', models: ['llama3.1', 'qwen2.5-coder', 'deepseek-coder'] },
   { id: 'custom', label: 'Custom endpoint', models: [] },
 ];
@@ -47,7 +48,7 @@ const OLLAMA_CATALOG = [
   { id: 'qwen2.5-coder:7b', label: 'Qwen2.5 Coder 7B', size: '~4.7 GB', desc: 'Strong, balanced coding model', recommended: true },
   { id: 'qwen2.5-coder:14b', label: 'Qwen2.5 Coder 14B', size: '~9.0 GB', desc: 'Higher quality, needs more RAM' },
   { id: 'deepseek-coder-v2:16b', label: 'DeepSeek Coder V2 16B', size: '~8.9 GB', desc: 'Strong code generation' },
-  { id: 'codellama:7b', label: 'Code Llama 7B', size: '~3.8 GB', desc: "Meta's code model" },
+  { id: 'codellama:7b', label: 'Code Llama 7B', size: '~3.8 GB', desc: "Meta's code model — no native tool API (uses a prompt fallback; less reliable for the agent)" },
   { id: 'llama3.1:8b', label: 'Llama 3.1 8B', size: '~4.7 GB', desc: 'General-purpose reasoning' },
 ];
 
@@ -199,6 +200,14 @@ function extractInlineToolCalls(content) {
   return calls.length ? calls : null;
 }
 
+// Tools that act on a single LOCAL POU and therefore need a valid `pou` arg.
+// (Variable tools only need it for local scope; set_st_code/set_ladder always.)
+function needsLocalPou(name, args) {
+  if (name === 'set_st_code' || name === 'set_ladder') return true;
+  if (name === 'add_variable' || name === 'update_variable' || name === 'remove_variable') return args.scope !== 'global';
+  return false;
+}
+
 // Parse a tool call's arguments (string or object) defensively.
 function parseArgs(raw) {
   if (raw == null) return {};
@@ -234,16 +243,42 @@ function affectedPOUs(steps) {
   return [...names];
 }
 
+// Which POU to bring to the screen after a proposal is applied — so the user
+// SEES what the agent wrote. Prefer the POU whose code/ladder was set (that's
+// the visible result), then a newly created one, then any touched POU.
+function focusTarget(steps) {
+  let codeWrite = null, created = null, any = null;
+  for (const s of steps) {
+    if (!(s.res?.mutation && s.res.ok)) continue;
+    const a = s.args || {};
+    if (s.tc.name === 'set_st_code' || s.tc.name === 'set_ladder') codeWrite = a.pou || codeWrite;
+    else if (s.tc.name === 'create_pou') created = a.name || created;
+    if (a.pou) any = a.pou;
+    else if (a.newName) any = a.newName;
+    else if (a.name && s.tc.name.endsWith('_pou')) any = a.name;
+  }
+  return codeWrite || created || any || null;
+}
+
 // System prompt: the agent's role + project conventions + a COMPACT project map
 // (POU names + globals only — small, so it fits a modest context window and the
 // model always sees every POU). Details come on demand via read_pou /
 // get_project_overview, not by embedding the full overview each turn.
-function buildSystemPrompt(projectStructure, board, activeItem) {
+function buildSystemPrompt(projectStructure, board, activeItem, libraryData = []) {
   const overview = buildProjectOverview(projectStructure, board);
   const active = activeItem ? `${activeItem.name} (${activeItem.type})` : 'none';
   const pous = overview.pous.map((p) => `${p.name}[${p.language}${p.returnType ? ' ' + p.returnType : ''}]`).join(', ') || '(none)';
   const globals = overview.globalVariables.map((g) => g.name).join(', ') || '(none)';
   const dts = overview.dataTypes.map((d) => d.name).join(', ');
+  // Compact catalog: standard block type names grouped by category + project FB/
+  // function names. NAMES only (scales as the XML grows); pins come from list_blocks.
+  const libLine = (Array.isArray(libraryData) ? libraryData : [])
+    .map((c) => { const names = (c.blocks || []).map((b) => b.blockType).filter(Boolean); return names.length ? `${c.title}: ${names.join(', ')}` : ''; })
+    .filter(Boolean).join(' | ');
+  const projBlocks = [
+    ...(projectStructure?.functionBlocks || []).map((p) => p.name),
+    ...(projectStructure?.functions || []).map((p) => p.name),
+  ].join(', ');
   return [
     'You are the embedded engineering agent for KronEditor, an IEC 61131-3 PLC editor.',
     'You edit the project by calling tools: create/rename/delete POUs, rewrite Structured Text, set ladder, and add/update/remove variables (local + global).',
@@ -251,13 +286,36 @@ function buildSystemPrompt(projectStructure, board, activeItem) {
     'Rules:',
     '- The selected board is READ-ONLY context. Never change hardware.',
     '- All generated code, names and comments in English. Names must be IEC identifiers (letters/digits/underscore, no spaces, no leading digit).',
+    '',
+    'CLARIFY FIRST when the request is ambiguous:',
+    '- If a MATERIAL detail is missing or ambiguous, ask 1–3 short, specific questions and STOP for that turn: emit NO tool calls, just write the question(s) in the user\'s language. Continue once they answer.',
+    '- Ask when, for example: a named "block" could be a FUNCTION BLOCK or a plain variable (e.g. "mc_power" → the MC_Power motion FB, or a BOOL?); the language (ST / LD / SCL) is unspecified for non-trivial logic; a variable\'s type / range / IEC address, or an FB\'s axis / pin wiring, is needed but unknown; which I/O channel (UART/USB/GPIO…) to use is unclear; or any choice would otherwise be a GUESS that changes the result.',
+    '- Prefer ONE round of questions covering everything you need, then build. Do NOT interrogate over trivia you can reasonably default, and NEVER ask the user to write the code/ladder for you — you author it; you only clarify REQUIREMENTS.',
+    '',
+    'LANGUAGE CHOICE (LD vs ST vs SCL) — STRICT:',
+    '- If the user mentions "ladder", "LD", "merdiven", "ladder diagram", "ladder dilinde", "rung", "kontak/coil" → create_pou with language "LD" AND use set_ladder. NEVER ST.',
+    '- If the user mentions "ST", "structured text", "yapısal metin", "kod", or asks for logic that needs timers/counters/FBs/math/loops → create_pou with language "ST" AND use set_st_code.',
+    '- If the user mentions "SCL" (mixed ladder+ST per rung) → create_pou with language "SCL"; author ladder rungs with set_ladder and/or an ST body with set_st_code.',
+    '- If the user does not specify, default to ST for anything beyond pure boolean contact/coil logic.',
+    '- ST POUs CANNOT contain ladder and vice versa. Never call set_st_code on an LD POU or set_ladder on an ST POU. (SCL accepts both.)',
+    '- A minimal LD rung exists — even a single coil with no contacts is valid: `rungs: [{ "outputs": [{"coil": "mc_power"}] }]`. Do NOT fall back to ST just because the requested logic is trivial.',
+    '- Ladder contacts and coils each reference a BOOL variable that MUST exist. Add every such BOOL with add_variable (scope "local", pou = the LD POU) BEFORE or together with set_ladder.',
+    '',
+    'GENERAL:',
+    '- Do NOT invent variables the user did not ask for. Only add the variables the user explicitly named, plus FB instances genuinely required by ST you write (e.g. a TON for a timer). NEVER add helper variables like `motor_enabled`, `temp`, `flag` unless the user asked for them or the ST you write actually references them.',
+    '- "BLOCK"/"blok"/"FB" terminology: when the user calls something a "block" (e.g. "mc_power blogu", "a TON block") and its name matches a standard/library block IGNORING case and underscores (mc_power→MC_Power, ton→TON, ctu→CTU), it is a FUNCTION BLOCK INSTANCE of THAT type — NOT a plain variable. You MUST: call list_blocks for its real pins, then add_variable with type = the FB type name (e.g. type "MC_Power"), then CALL it in ST. NEVER create a BOOL merely named after a known block (a `mc_power : BOOL` coil is WRONG when the user asked for the MC_Power block). Any separate "power"/"enable"/"güç" bool the user mentions is a DISTINCT BOOL variable that feeds the FB\'s Enable input — add it too.',
+    '- FBs CANNOT live in a ladder rung (set_ladder is contacts+coils only). So if the user wants a function block (MC_Power, TON, …) AND ladder, either write the FB call in ST, or use an SCL POU (create_pou language "SCL") and put the boolean contacts/coils in a ladder rung via set_ladder while calling the FB in an ST body via set_st_code. Do NOT silently downgrade the FB to a BOOL to fit ladder.',
     '- Structured Text must be valid IEC 61131-3: := assign; AND/OR/NOT logical; BAND/BOR/BXOR/BNOT bitwise; time literals like T#500ms.',
-    '- Before using a variable in ST, add it with add_variable (in the SAME response).',
+    '- Before using a variable in ST, add it with add_variable (in the SAME response). Conversely: every variable you add_variable for MUST be referenced in the body you write — no dead vars.',
+    '- Variables default to LOCAL scope. For a LOCAL variable you MUST pass BOTH scope "local" AND pou = the exact POU name it belongs to (usually the POU you just created in this same response). Never omit `pou` for a local variable. Use scope "global" ONLY when the user explicitly says global/shared, or the variable must be used by more than one POU.',
+    '- ORDER within one response: create_pou FIRST, then add_variable (with that pou) for every variable, then set_ladder / set_st_code last. Use the SAME POU name string everywhere.',
     '- Make the smallest change that satisfies the request; prefer editing an existing POU over creating new ones unless asked. delete_pou/remove_variable only when explicitly asked.',
-    '- Finish the WHOLE request in your tool calls before replying — if asked to create a POU AND write its code, emit create_pou THEN set_st_code/set_ladder AND the add_variable calls. NEVER stop to ask the user to "provide the code" or hand it back; you write it.',
+    '- Once requirements are clear (after any CLARIFY questions are answered), finish the WHOLE request in your tool calls before replying — if asked to create a POU AND write its code, emit create_pou THEN set_st_code/set_ladder AND the add_variable calls. NEVER ask the user to "provide the code" or hand the coding back to them; you write it. (Asking to clarify REQUIREMENTS is fine; asking them to do the coding is not.)',
     '- set_st_code replaces the WHOLE body and takes ONLY body statements — NO PROGRAM/VAR/END_VAR/END_PROGRAM wrapper (variables go via add_variable). set_ladder (contacts+coils only) replaces all rungs.',
     '- PLC logic runs ONCE per scan, cyclically — NEVER write unbounded loops (no WHILE TRUE; it hangs the PLC). For timing use a TON across scans, e.g. `pulse(IN := NOT pulse.Q, PT := T#1s); IF pulse.Q THEN out := NOT out; END_IF`.',
-    '- Function blocks (TON, TOF, TP, CTU, CTD, R_TRIG, user FBs) are INSTANCES, not functions. For each you must: (1) add_variable with type = the FB name itself (e.g. type "TON" — NOT "TIME"/"BOOL"); (2) CALL it as `name(IN := …, PT := …);`; (3) read its outputs as `name.Q`, `name.ET`. NEVER write `name := TON(…)` — assigning an FB call is invalid IEC and will not compile.',
+    '- Function blocks (TON, TOF, TP, CTU, CTD, R_TRIG, motion MC_*, communication, user FBs) are INSTANCES, not functions. For each you must: (1) add_variable with type = the FB name itself (e.g. type "TON" — NOT "TIME"/"BOOL"); (2) CALL it as `name(IN := …, PT := …);`; (3) read its outputs as `name.Q`, `name.ET`. NEVER write `name := TON(…)` — assigning an FB call is invalid IEC and will not compile.',
+    '- The blocks below are only NAMES — you do NOT know their exact pins from memory. BEFORE using any function block or function (standard or project-defined) in ST, call list_blocks (optionally filtered, e.g. {"filter":"MC_"}) to get its real input/output pin names and types, then use those exact pin names.',
+    '- set_ladder builds CONTACTS and COILS only — it CANNOT place a function block (TON, MC_Power, etc.) into a rung. If the user wants a timer/counter/motion/communication block in LADDER, tell them ladder cannot host FBs and ask whether to use ST instead. Do NOT silently switch the POU to ST.',
     '- A correct TON blink is EXACTLY: declare `blink : TON;` (add_variable type TON) and `led : BOOL`, then body `blink(IN := NOT blink.Q, PT := T#500ms); IF blink.Q THEN led := NOT led; END_IF;`. Do not also toggle led outside the IF.',
     '- CRITICAL: you change the project ONLY by emitting tool calls. NEVER write code in prose and claim it is done; NEVER output "APPLIED:" or "I have set the code" — the SYSTEM applies + confirms. To write code into a POU you MUST call set_st_code/set_ladder.',
     '- Every change is shown as a diff the user approves/rejects; if rejected, adapt. When done, reply with a short summary in the user\'s language.',
@@ -267,6 +325,8 @@ function buildSystemPrompt(projectStructure, board, activeItem) {
     `POUs (${overview.pous.length}): ${pous}.`,
     `Global variables: ${globals}.`,
     dts ? `Data types: ${dts}.` : '',
+    libLine ? `Standard library blocks (names only — call list_blocks for pins): ${libLine}` : '',
+    projBlocks ? `Project-defined blocks (call list_blocks for their pins): ${projBlocks}` : '',
   ].filter(Boolean).join('\n');
 }
 
@@ -275,6 +335,7 @@ export default function AiAgentPanel({
   projectStructure = null,
   setProjectStructure = null,
   selectedBoard = null,
+  libraryData = [],            // standard block library (XML) — block types + I/O pins, for list_blocks
   liveVariables = null,        // live values from the running sim/PLC (for read_live_variables)
   onApplied = null,            // (pouNames[]) → reload the open editor after a commit
   onHotSwap = null,            // (pouNames[]) → push an online change while running
@@ -457,7 +518,7 @@ export default function AiAgentPanel({
     try {
       assistant = await host.aiChat({
         provider: config.provider, model: config.model, apiKey: config.apiKey, baseUrl: config.baseUrl,
-        system: buildSystemPrompt(psRef.current, selectedBoard, activeItem),
+        system: buildSystemPrompt(psRef.current, selectedBoard, activeItem, libraryData),
         messages: apiMessages,
         tools: TOOL_DEFS,
       });
@@ -495,13 +556,42 @@ export default function AiAgentPanel({
     // composed diffs (e.g. add_variable then set_st_code) are computed correctly.
     let working = workingRef.current;
     const steps = [];
+    // Weak models routinely omit (or garble) the `pou` field on a local-scope
+    // variable/code call even right after create_pou — so the var never lands
+    // and the rung/body references an undefined name. Infer the intended target
+    // from turn context: the POU touched last → the single POU created this turn
+    // → the open POU. We only override when the model's `pou` doesn't resolve.
+    const createdThisTurn = calls
+      .filter((c) => c.name === 'create_pou')
+      .map((c) => parseArgs(c.arguments)?.name).filter(Boolean);
+    const singleCreated = createdThisTurn.length === 1 ? createdThisTurn[0] : null;
+    let lastPou = null;
+    const inferPou = () => {
+      for (const cand of [lastPou, singleCreated, activeItem?.name]) {
+        if (cand && findPOU(working, cand)) return cand;
+      }
+      return null;
+    };
     for (const tc of calls) {
       const args = parseArgs(tc.arguments);
       if (args.__parseError) { steps.push({ tc, args: {}, res: { ok: false, error: 'arguments were not valid JSON' } }); continue; }
       if (tc.name === 'get_project_overview') args.__board = selectedBoard;
       if (tc.name === 'read_live_variables') args.__live = liveVariables;
+      if (tc.name === 'list_blocks') args.__library = libraryData;
+      // Repair a missing/unresolvable local-scope POU target from context.
+      if (needsLocalPou(tc.name, args) && !findPOU(working, args.pou)) {
+        const inferred = inferPou();
+        if (inferred) args.pou = inferred;
+      }
       const res = applyToolCall(working, tc.name, args);
-      if (res.mutation && res.ok) working = res.next;
+      if (res.mutation && res.ok) {
+        working = res.next;
+        // Track the most recently touched POU so later calls in this turn that
+        // omit `pou` resolve to it (e.g. create_pou → add_variable → set_ladder).
+        if (tc.name === 'create_pou') lastPou = args.name;
+        else if (tc.name === 'rename_pou' && args.newName) lastPou = args.newName;
+        else if (args.pou) lastPou = args.pou;
+      }
       steps.push({ tc, args, res });
     }
 
@@ -542,7 +632,9 @@ export default function AiAgentPanel({
       setProjectStructure && setProjectStructure(dryStruct);
       workingRef.current = dryStruct;
       const touched = affectedPOUs(steps);
-      onApplied && onApplied(touched);
+      // Pass the committed structure + the POU to focus so App can open it on
+      // screen (race-free: don't rely on App's not-yet-updated state).
+      onApplied && onApplied(touched, { structure: dryStruct, focus: focusTarget(steps) });
       // If a hot-swap session is live, push the change online (App decides
       // whether a swap is possible or a cold restart is needed).
       onHotSwap && onHotSwap(touched);
@@ -581,7 +673,7 @@ export default function AiAgentPanel({
       {/* ── header: title + model pill + gear ─────────────────────────── */}
       <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '6px 10px', background: C.panel, borderBottom: `1px solid ${C.border}`, flexShrink: 0 }}>
         <span style={{ fontSize: 13 }}>🤖</span>
-        <span style={{ fontWeight: 600, marginRight: 'auto' }}>AI Agent</span>
+        <span style={{ fontWeight: 600, marginRight: 'auto' }}>PLC Agent</span>
         {(onStartHotSwap || onStopHotSwap) && (
           <button
             onClick={() => { if (hotSwapActive) { onStopHotSwap && onStopHotSwap(); } else { onStartHotSwap && onStartHotSwap(); } }}
@@ -630,15 +722,10 @@ export default function AiAgentPanel({
             {PROVIDERS.map(p => <option key={p.id} value={p.id}>{p.label}</option>)}
           </select>
           <label style={{ fontSize: 11, color: C.sub }}>Model</label>
-          {providerDef.models.length ? (
-            <select value={draftCfg.model} onChange={e => setDraftCfg(d => ({ ...d, model: e.target.value }))}
-              style={{ background: C.panel, border: `1px solid ${C.border2}`, color: C.text, fontSize: 12, padding: '4px 6px' }}>
-              {providerDef.models.map(m => <option key={m} value={m}>{m}</option>)}
-            </select>
-          ) : (
-            <input value={draftCfg.model} onChange={e => setDraftCfg(d => ({ ...d, model: e.target.value }))} placeholder="model name"
-              style={{ background: C.panel, border: `1px solid ${C.border2}`, color: C.text, fontSize: 12, padding: '4px 6px' }} />
-          )}
+          {/* Editable combo: known models are SUGGESTIONS but any name is typeable
+              (Gemini ships far more models than we can hardcode). */}
+          <ModelCombo value={draftCfg.model} suggestions={providerDef.models}
+            onChange={(m) => setDraftCfg(d => ({ ...d, model: m }))} />
           {draftCfg.provider !== 'ollama' && (
             <>
               <label style={{ fontSize: 11, color: C.sub }}>API key</label>
@@ -731,6 +818,57 @@ export default function AiAgentPanel({
           </div>
         </div>
       </div>
+    </div>
+  );
+}
+
+// ── editable model combobox (dark-theme; type any model, pick a suggestion) ──
+function ModelCombo({ value, suggestions = [], onChange }) {
+  const [open, setOpen] = useState(false);
+  const ref = useRef(null);
+  useEffect(() => {
+    if (!open) return;
+    const onDoc = (e) => { if (ref.current && !ref.current.contains(e.target)) setOpen(false); };
+    document.addEventListener('mousedown', onDoc);
+    return () => document.removeEventListener('mousedown', onDoc);
+  }, [open]);
+
+  const q = (value || '').trim().toLowerCase();
+  const filtered = suggestions.filter((m) => m.toLowerCase().includes(q));
+  const list = filtered.length ? filtered : suggestions;
+
+  return (
+    <div ref={ref} style={{ position: 'relative' }}>
+      <div style={{ display: 'flex', alignItems: 'center', background: C.panel, border: `1px solid ${open ? C.accent : C.border2}`, borderRadius: 4 }}>
+        <input
+          value={value || ''}
+          onChange={(e) => { onChange(e.target.value); if (!open) setOpen(true); }}
+          onFocus={() => setOpen(true)}
+          onKeyDown={(e) => { if (e.key === 'Escape') setOpen(false); }}
+          placeholder={suggestions[0] || 'model name'}
+          style={{ flex: 1, minWidth: 0, background: 'transparent', border: 'none', outline: 'none', color: C.text, fontSize: 12, padding: '5px 8px' }}
+        />
+        <button type="button" onClick={() => setOpen((o) => !o)} title="Suggestions"
+          style={{ background: 'transparent', border: 'none', color: C.muted, cursor: 'pointer', fontSize: 11, padding: '0 8px', alignSelf: 'stretch' }}>
+          {open ? '▴' : '▾'}
+        </button>
+      </div>
+      {open && list.length > 0 && (
+        <div style={{ position: 'absolute', top: '100%', left: 0, right: 0, zIndex: 50, marginTop: 3, background: C.panel, border: `1px solid ${C.border2}`, borderRadius: 4, maxHeight: 220, overflowY: 'auto', boxShadow: '0 8px 22px rgba(0,0,0,0.45)' }}>
+          {list.map((m) => {
+            const active = m === value;
+            return (
+              <div key={m}
+                onMouseDown={(e) => { e.preventDefault(); onChange(m); setOpen(false); }}
+                style={{ padding: '6px 9px', fontSize: 12, color: active ? C.green : C.text, background: active ? C.hover : 'transparent', cursor: 'pointer', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}
+                onMouseEnter={(e) => { e.currentTarget.style.background = C.hover; }}
+                onMouseLeave={(e) => { e.currentTarget.style.background = active ? C.hover : 'transparent'; }}>
+                {m}
+              </div>
+            );
+          })}
+        </div>
+      )}
     </div>
   );
 }

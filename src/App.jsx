@@ -168,7 +168,7 @@ function App() {
   const [isDirty, setIsDirty] = useState(false);
   const isDirtyRef = React.useRef(false);
 
-  // Bumped when the AI agent commits changes to the currently-open POU, forcing
+  // Bumped when the PLC Agent commits changes to the currently-open POU, forcing
   // EditorPane to remount so it re-reads the mutated content (it seeds its local
   // state from initialContent only on mount).
   const [agentReloadKey, setAgentReloadKey] = useState(0);
@@ -1771,16 +1771,32 @@ function App() {
     }));
   };
 
-  // The AI agent committed changes (it already called setProjectStructure with
+  // The PLC Agent committed changes (it already called setProjectStructure with
   // the new structure). If it touched the open POU, remount the editor so it
   // reflects the new code/variables; always log it.
-  const handleAgentApplied = useCallback((pouNames) => {
+  const handleAgentApplied = useCallback((pouNames, opts = {}) => {
     const names = pouNames || [];
     const norm = (n) => (n || '').trim().toLowerCase();   // tolerate stray spaces in names
-    if (activeItem && names.some(n => norm(n) === norm(activeItem.name))) {
-      setAgentReloadKey(k => k + 1);
+    // Bring what the agent just wrote to the screen so the result is visible.
+    // opts.structure is the freshly-committed projectStructure (passed by the
+    // panel) — using it avoids racing App's not-yet-updated state.
+    const struct = opts.structure;
+    const focusName = opts.focus || names[0];
+    if (struct && focusName) {
+      for (const key of Object.keys(struct)) {
+        if (!Array.isArray(struct[key])) continue;
+        const item = struct[key].find(i => norm(i.name) === norm(focusName));
+        if (item) {
+          openTab(item.id, item.name, getItemIcon(key, item.type));
+          setActiveId(item.id);            // focus its editor tab
+          break;
+        }
+      }
     }
-    addLog('info', `AI agent applied changes: ${names.length ? names.join(', ') : 'project structure'}`);
+    if (activeItem && names.some(n => norm(n) === norm(activeItem.name))) {
+      setAgentReloadKey(k => k + 1);       // already-open POU: force a content reload
+    }
+    addLog('info', `PLC Agent applied changes: ${names.length ? names.join(', ') : 'project structure'}`);
   }, [activeItem, addLog]);
 
   // ── Hot-swap (online change) session ──────────────────────────────────────
@@ -1993,7 +2009,7 @@ function App() {
                     onClick={isPlcConnected ? handlePullFromTarget : undefined}
                     title={isPlcConnected ? '' : 'Connect to a PLC server to pull its project'}
                   >
-                    <OpenIcon /> {t('actions.pullFromTarget') || 'Pull from Target'}
+                    <OpenIcon /> {t('actions.loadFromTarget', 'Load from Target')}
                   </div>
                   <div className="dropdown-sep" />
                   <div className="dropdown-item dropdown-item-warn" onClick={handleCloseProject}>
@@ -2317,7 +2333,7 @@ function App() {
 
             </div>
 
-            {/* RIGHT SIDEBAR — always present (Kütüphane + AI Agent are always available) */}
+            {/* RIGHT SIDEBAR — always present (Kütüphane + PLC Agent are always available) */}
             <>
                 {/* RESIZER (RIGHT) */}
                 <div
@@ -2326,11 +2342,11 @@ function App() {
                 />
 
                 <div style={{ width: layout.rightWidth, display: 'flex', flexDirection: 'column', background: '#252526', borderLeft: '1px solid #333' }}>
-                  {/* Tab strip: Kütüphane (blocks) | AI Agent */}
+                  {/* Tab strip: Kütüphane (blocks) | PLC Agent */}
                   <div style={{ display: 'flex', background: '#2d2d2d', borderBottom: '1px solid #1e1e1e', flexShrink: 0, height: 32 }}>
                     {[
                       { id: 'blocks', label: 'Kütüphane', icon: '📦' },
-                      { id: 'agent', label: 'AI Agent', icon: '🤖' },
+                      { id: 'agent', label: 'PLC Agent', icon: '🤖' },
                     ].map(tab => (
                       <div
                         key={tab.id}
@@ -2369,6 +2385,7 @@ function App() {
                         projectStructure={projectStructure}
                         setProjectStructure={setProjectStructure}
                         selectedBoard={selectedBoard}
+                        libraryData={libraryData}
                         liveVariables={(isSimulationMode || isRunning) ? (liveVariables || {}) : null}
                         onApplied={handleAgentApplied}
                         onHotSwap={handleAgentHotSwap}

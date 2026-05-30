@@ -104,13 +104,4 @@ func (s *Server) handleDeployToServer(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "message": "Deployed successfully"})
 }
 
-// ── deploy_server_to_target (SSH/SCP — deferred) ─────────────────────────────
-//
-// The Tauri implementation uses the ssh2 crate to SCP plc-agent to the target
-// board and install a systemd/cron supervisor. Porting requires
-// `golang.org/x/crypto/ssh` and `pkg/sftp` — adding those deps is a follow-up
-// stage. For now this endpoint reports the feature is not yet ported.
-
-func (s *Server) handleDeployServerToTarget(w http.ResponseWriter, r *http.Request) {
-	writeError(w, http.StatusNotImplemented, "deploy_server_to_target not yet ported to host-agent (needs SSH/SCP deps)")
-}
+// deploy_server_to_target is implemented in deploy_ssh.go (SSH/SFTP).

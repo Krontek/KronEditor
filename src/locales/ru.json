@@ -85,7 +85,9 @@
         "closeProject": "Закрыть проект",
         "editCycleTime": "Изменить время цикла",
         "selectTarget": "Выбрать цель",
-        "build": "Сборка"
+        "build": "Сборка",
+        "loadFromTarget": "Загрузить с цели",
+        "pullConfirm": "Текущий проект будет закрыт и заменён проектом с цели. Продолжить?"
     },
     "options": {
         "cyclic": "Циклический",
@@ -302,5 +304,12 @@
         "signalPin": "Вывод {{signal}}",
         "resizeHorizontal": "Изменить размер левой и правой панелей",
         "resizeVertical": "Изменить размер верхней и нижней панелей"
+    },
+    "shortcuts": {
+        "saveProject": "Сохранить проект",
+        "compileProject": "Скомпилировать проект",
+        "startSimulation": "Запустить симуляцию",
+        "undo": "Отменить",
+        "redo": "Повторить"
     }
 }

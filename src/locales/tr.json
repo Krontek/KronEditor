@@ -85,7 +85,9 @@
         "closeProject": "Projeyi Kapat",
         "editCycleTime": "Döngü Süresini Düzenle",
         "selectTarget": "Hedef Seç",
-        "build": "Derle"
+        "build": "Derle",
+        "loadFromTarget": "Hedeften Yükle",
+        "pullConfirm": "Mevcut proje kapatılıp hedeften gelen proje yüklenecek. Devam edilsin mi?"
     },
     "options": {
         "cyclic": "Döngüsel",
@@ -302,5 +304,12 @@
         "signalPin": "{{signal}} pini",
         "resizeHorizontal": "Sol ve sağ panelleri yeniden boyutlandır",
         "resizeVertical": "Üst ve alt panelleri yeniden boyutlandır"
+    },
+    "shortcuts": {
+        "saveProject": "Projeyi Kaydet",
+        "compileProject": "Projeyi Derle",
+        "startSimulation": "Simülasyonu Başlat",
+        "undo": "Geri Al",
+        "redo": "İleri Al"
     }
 }
