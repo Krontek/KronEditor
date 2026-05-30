@@ -460,46 +460,60 @@ export default function AiAgentPanel({
   const [config, setConfig] = useState(loadConfig);
   const [configOpen, setConfigOpen] = useState(false);
   const [draftCfg, setDraftCfg] = useState(() => config || { provider: 'anthropic', model: 'claude-opus-4-8', apiKey: '', baseUrl: '' });
-  // Claude-account OAuth: connection status + the pending "paste your code" flow.
+  // Claude-account OAuth: connection status + the "waiting in browser" flow.
   const [oauth, setOauth] = useState({ connected: false, checked: false, busy: false, error: '' });
-  const [oauthCode, setOauthCode] = useState('');     // the code#state the user pastes
-  const [oauthPending, setOauthPending] = useState(false); // authorize URL opened, awaiting code
+  const [oauthPending, setOauthPending] = useState(false); // authorize URL opened, polling for completion
+  const oauthPollRef = useRef(null);
 
   const refreshOauth = useCallback(async () => {
     try { const r = await host.anthropicOAuthStatus(); setOauth((o) => ({ ...o, connected: !!r.connected, checked: true })); }
     catch { setOauth((o) => ({ ...o, checked: true })); }
   }, []);
   useEffect(() => { refreshOauth(); }, [refreshOauth]);
+  useEffect(() => () => { if (oauthPollRef.current) clearInterval(oauthPollRef.current); }, []);
 
+  // Loopback flow (matches VSCode): open the authorize URL, then poll status —
+  // the host-agent catches the browser redirect at :7171/callback and stores
+  // the tokens, so there is NO code to paste.
   const startClaudeSignIn = async () => {
     setOauth((o) => ({ ...o, busy: true, error: '' }));
     try {
       const r = await host.anthropicOAuthStart();
       window.open(r.authorizeUrl, '_blank', 'noopener');
       setOauthPending(true);
-    } catch (e) {
-      setOauth((o) => ({ ...o, error: e.message || 'sign-in failed' }));
-    } finally {
       setOauth((o) => ({ ...o, busy: false }));
+      if (oauthPollRef.current) clearInterval(oauthPollRef.current);
+      const t0 = Date.now();
+      oauthPollRef.current = setInterval(async () => {
+        try {
+          const s = await host.anthropicOAuthStatus();
+          if (s.connected) {
+            clearInterval(oauthPollRef.current); oauthPollRef.current = null;
+            setOauth({ connected: true, checked: true, busy: false, error: '' });
+            setOauthPending(false);
+            const next = { provider: 'anthropic-oauth', model: draftCfg.model || 'claude-opus-4-8', apiKey: '', baseUrl: '' };
+            setDraftCfg(next); saveConfig(next); setConfig(next);
+          } else if (Date.now() - t0 > 180000) {
+            clearInterval(oauthPollRef.current); oauthPollRef.current = null;
+            setOauthPending(false);
+            setOauth((o) => ({ ...o, error: 'Timed out waiting for authorization.' }));
+          }
+        } catch { /* keep polling */ }
+      }, 1500);
+    } catch (e) {
+      setOauth((o) => ({ ...o, busy: false, error: e.message || 'sign-in failed' }));
     }
   };
-  const finishClaudeSignIn = async () => {
-    if (!oauthCode.trim()) return;
-    setOauth((o) => ({ ...o, busy: true, error: '' }));
-    try {
-      await host.anthropicOAuthExchange(oauthCode.trim());
-      setOauth({ connected: true, checked: true, busy: false, error: '' });
-      setOauthPending(false); setOauthCode('');
-      // Connect the agent to the Claude account (no API key needed).
-      const next = { provider: 'anthropic-oauth', model: draftCfg.model || 'claude-opus-4-8', apiKey: '', baseUrl: '' };
-      setDraftCfg(next); saveConfig(next); setConfig(next);
-    } catch (e) {
-      setOauth((o) => ({ ...o, busy: false, error: e.message || 'connect failed' }));
-    }
+  const cancelClaudeSignIn = () => {
+    if (oauthPollRef.current) { clearInterval(oauthPollRef.current); oauthPollRef.current = null; }
+    setOauthPending(false);
+    setOauth((o) => ({ ...o, busy: false }));
   };
   const claudeSignOut = async () => {
+    if (oauthPollRef.current) { clearInterval(oauthPollRef.current); oauthPollRef.current = null; }
     try { await host.anthropicOAuthLogout(); } catch { /* ignore */ }
     setOauth({ connected: false, checked: true, busy: false, error: '' });
+    setOauthPending(false);
   };
   // Restore the persisted conversation. A proposal left mid-approval is marked
   // not-applied on restore (it was never committed). _mid is advanced past the
@@ -922,7 +936,7 @@ export default function AiAgentPanel({
               ) : !oauthPending ? (
                 <>
                   <div style={{ fontSize: 10, color: C.muted, lineHeight: 1.5 }}>
-                    Sign in with your Claude Pro/Max subscription — no API key. Opens claude.ai; after you authorize, copy the code it shows and paste it below.
+                    Sign in with your Claude Pro/Max subscription — no API key. Opens claude.ai in your browser; once you authorize, it connects automatically (no code to paste).
                   </div>
                   <button onClick={startClaudeSignIn} disabled={oauth.busy}
                     style={{ alignSelf: 'flex-start', background: C.accentBtn, border: 'none', color: '#fff', fontSize: 11, padding: '5px 12px', borderRadius: 3, cursor: 'pointer' }}>
@@ -930,19 +944,11 @@ export default function AiAgentPanel({
                   </button>
                 </>
               ) : (
-                <>
-                  <div style={{ fontSize: 10, color: C.muted }}>Paste the authorization code from the claude.ai page:</div>
-                  <input value={oauthCode} onChange={e => setOauthCode(e.target.value)} placeholder="code#state"
-                    style={{ background: C.panel, border: `1px solid ${C.border2}`, color: C.text, fontSize: 12, padding: '4px 6px', fontFamily: 'monospace' }} />
-                  <div style={{ display: 'flex', gap: 6 }}>
-                    <button onClick={finishClaudeSignIn} disabled={oauth.busy || !oauthCode.trim()}
-                      style={{ background: C.accentBtn, border: 'none', color: '#fff', fontSize: 11, padding: '4px 12px', borderRadius: 3, cursor: 'pointer' }}>
-                      {oauth.busy ? 'Connecting…' : 'Connect'}
-                    </button>
-                    <button onClick={() => { setOauthPending(false); setOauthCode(''); }}
-                      style={{ background: 'transparent', border: `1px solid ${C.border2}`, color: C.sub, fontSize: 11, padding: '4px 12px', borderRadius: 3, cursor: 'pointer' }}>Cancel</button>
-                  </div>
-                </>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                  <span style={{ fontSize: 11, color: C.sub }}>⏳ Waiting for you to authorize in the browser… (connects automatically)</span>
+                  <button onClick={cancelClaudeSignIn}
+                    style={{ marginLeft: 'auto', background: 'transparent', border: `1px solid ${C.border2}`, color: C.sub, fontSize: 10, padding: '2px 8px', borderRadius: 3, cursor: 'pointer' }}>Cancel</button>
+                </div>
               )}
               {oauth.error && <span style={{ fontSize: 9, color: '#e06c75' }}>{oauth.error}</span>}
               <span style={{ fontSize: 9, color: '#777' }}>Uses Claude Code's OAuth; gray-area for 3rd-party use — your call.</span>

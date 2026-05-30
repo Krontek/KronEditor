@@ -99,6 +99,7 @@ func main() {
 
 	mux.HandleFunc("/api/host/anthropic-oauth/start", srvState.handleAnthropicOAuthStart)
 	mux.HandleFunc("/api/host/anthropic-oauth/exchange", srvState.handleAnthropicOAuthExchange)
+	mux.HandleFunc("/callback", srvState.handleAnthropicOAuthCallback) // OAuth loopback redirect target
 	mux.HandleFunc("/api/host/anthropic-oauth/status", srvState.handleAnthropicOAuthStatus)
 	mux.HandleFunc("/api/host/anthropic-oauth/logout", srvState.handleAnthropicOAuthLogout)
 

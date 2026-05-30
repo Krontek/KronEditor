@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
@@ -32,9 +31,18 @@ const (
 	anthropicOAuthClientID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e" // Claude Code's public client
 	anthropicAuthorizeURL  = "https://claude.ai/oauth/authorize"
 	anthropicTokenURL      = "https://console.anthropic.com/v1/oauth/token"
-	anthropicRedirectURI   = "https://console.anthropic.com/oauth/code/callback"
-	anthropicOAuthScopes   = "org:create_api_key user:profile user:inference"
-	anthropicOAuthBeta     = "oauth-2025-04-20"
+	// LOOPBACK redirect — verified from VSCode's working request. The Claude Code
+	// client requires an `http://localhost:<port>/callback` loopback URI (RFC 8252);
+	// the hosted `platform.claude.com/...callback` is REJECTED ("Invalid request
+	// format"). The host-agent (already on :7171) serves /callback itself, so the
+	// browser redirect lands back here and we exchange the code automatically
+	// (no manual paste). Must byte-match in both the authorize URL and the token
+	// exchange.
+	anthropicRedirectURI = "http://localhost:7171/callback"
+	// EXACT scope set from VSCode's working URL — six scopes; missing ANY of them
+	// (esp. user:file_upload, which earlier attempts lacked) → "Invalid request format".
+	anthropicOAuthScopes = "org:create_api_key user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload"
+	anthropicOAuthBeta   = "oauth-2025-04-20"
 )
 
 type anthropicTokens struct {
@@ -88,7 +96,7 @@ func pkcePair() (verifier, challenge string) {
 func (s *Server) handleAnthropicOAuthStart(w http.ResponseWriter, r *http.Request) {
 	st := s.anthropicOAuth
 	verifier, challenge := pkcePair()
-	state := randB64(16)
+	state := randB64(32) // 32 bytes (43 base64url chars) — match VSCode's state length
 	st.mu.Lock()
 	if len(st.verifiers) > 8 { // drop stale pending logins
 		st.verifiers = map[string]string{}
@@ -96,16 +104,21 @@ func (s *Server) handleAnthropicOAuthStart(w http.ResponseWriter, r *http.Reques
 	st.verifiers[state] = verifier
 	st.mu.Unlock()
 
-	q := url.Values{}
-	q.Set("code", "true")
-	q.Set("client_id", anthropicOAuthClientID)
-	q.Set("response_type", "code")
-	q.Set("redirect_uri", anthropicRedirectURI)
-	q.Set("scope", anthropicOAuthScopes)
-	q.Set("code_challenge", challenge)
-	q.Set("code_challenge_method", "S256")
-	q.Set("state", state)
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "authorizeUrl": anthropicAuthorizeURL + "?" + q.Encode(), "state": state})
+	// Build the query in VSCode/Claude Code's EXACT parameter ORDER (q.Encode()
+	// sorts alphabetically, which claude.ai's authorize appears to reject as
+	// "Invalid request format"). url.QueryEscape matches their encoding: %3A
+	// colons, `+` spaces in scope; %2F/%3A in redirect_uri.
+	params := []string{
+		"code=true",
+		"client_id=" + anthropicOAuthClientID,
+		"response_type=code",
+		"redirect_uri=" + url.QueryEscape(anthropicRedirectURI),
+		"scope=" + url.QueryEscape(anthropicOAuthScopes),
+		"code_challenge=" + challenge,
+		"code_challenge_method=S256",
+		"state=" + state,
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "authorizeUrl": anthropicAuthorizeURL + "?" + strings.Join(params, "&"), "state": state})
 }
 
 // POST /api/host/anthropic-oauth/exchange { code } — `code` is the "code#state"
@@ -136,13 +149,13 @@ func (s *Server) handleAnthropicOAuthExchange(w http.ResponseWriter, r *http.Req
 		writeError(w, http.StatusBadRequest, "no pending login — start sign-in again")
 		return
 	}
-	tok, err := st.tokenRequest(map[string]any{
-		"grant_type":    "authorization_code",
-		"code":          code,
-		"state":         state,
-		"client_id":     anthropicOAuthClientID,
-		"redirect_uri":  anthropicRedirectURI,
-		"code_verifier": verifier,
+	tok, err := st.tokenRequest(url.Values{
+		"grant_type":    {"authorization_code"},
+		"code":          {code},
+		"state":         {state},
+		"client_id":     {anthropicOAuthClientID},
+		"redirect_uri":  {anthropicRedirectURI},
+		"code_verifier": {verifier},
 	})
 	if err != nil {
 		writeError(w, http.StatusBadGateway, err.Error())
@@ -154,6 +167,58 @@ func (s *Server) handleAnthropicOAuthExchange(w http.ResponseWriter, r *http.Req
 	st.save()
 	st.mu.Unlock()
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "connected": true})
+}
+
+// GET /callback — the loopback redirect target. claude.ai sends the browser
+// here with ?code=…&state=… after the user authorizes. We exchange the code for
+// tokens server-side and show a "you can close this tab" page; the panel detects
+// the connection via its status poll. No manual code paste.
+func (s *Server) handleAnthropicOAuthCallback(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	code, state := q.Get("code"), q.Get("state")
+	page := func(title, msg string) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		fmt.Fprintf(w, `<!doctype html><meta charset=utf-8><title>%s</title><body style="font-family:system-ui;background:#1e1e1e;color:#ddd;display:flex;align-items:center;justify-content:center;height:100vh;margin:0"><div style="text-align:center"><h2 style="color:#4ec9b0">%s</h2><p>%s</p></div>`, title, title, msg)
+	}
+	if errMsg := q.Get("error"); errMsg != "" {
+		page("Authorization failed", "Claude returned: "+errMsg+". You can close this tab.")
+		return
+	}
+	if code == "" {
+		page("Authorization failed", "No code returned. You can close this tab and try again.")
+		return
+	}
+	st := s.anthropicOAuth
+	st.mu.Lock()
+	verifier := st.verifiers[state]
+	if verifier == "" && len(st.verifiers) == 1 {
+		for _, v := range st.verifiers {
+			verifier = v
+		}
+	}
+	st.mu.Unlock()
+	if verifier == "" {
+		page("Authorization failed", "No pending sign-in. Start again from KronEditor.")
+		return
+	}
+	tok, err := st.tokenRequest(url.Values{
+		"grant_type":    {"authorization_code"},
+		"code":          {code},
+		"state":         {state},
+		"client_id":     {anthropicOAuthClientID},
+		"redirect_uri":  {anthropicRedirectURI},
+		"code_verifier": {verifier},
+	})
+	if err != nil {
+		page("Authorization failed", "Token exchange error: "+err.Error())
+		return
+	}
+	st.mu.Lock()
+	st.tok = tok
+	delete(st.verifiers, state)
+	st.save()
+	st.mu.Unlock()
+	page("Signed in to Claude ✓", "You can close this tab and return to KronEditor.")
 }
 
 func (s *Server) handleAnthropicOAuthStatus(w http.ResponseWriter, r *http.Request) {
@@ -177,13 +242,13 @@ func (s *Server) handleAnthropicOAuthLogout(w http.ResponseWriter, r *http.Reque
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
-func (st *AnthropicOAuthState) tokenRequest(body map[string]any) (*anthropicTokens, error) {
-	buf, _ := json.Marshal(body)
-	req, err := http.NewRequest(http.MethodPost, anthropicTokenURL, bytes.NewReader(buf))
+func (st *AnthropicOAuthState) tokenRequest(form url.Values) (*anthropicTokens, error) {
+	// Anthropic's token endpoint wants form-urlencoded, NOT JSON.
+	req, err := http.NewRequest(http.MethodPost, anthropicTokenURL, strings.NewReader(form.Encode()))
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	resp, err := (&http.Client{Timeout: 30 * time.Second}).Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("oauth connect: %w", err)
@@ -220,10 +285,10 @@ func (st *AnthropicOAuthState) accessToken(force bool) (string, error) {
 		return "", fmt.Errorf("not signed in to a Claude account")
 	}
 	if force || st.tok.ExpiresAt-time.Now().Unix() < 60 {
-		tok, err := st.tokenRequest(map[string]any{
-			"grant_type":    "refresh_token",
-			"refresh_token": st.tok.RefreshToken,
-			"client_id":     anthropicOAuthClientID,
+		tok, err := st.tokenRequest(url.Values{
+			"grant_type":    {"refresh_token"},
+			"refresh_token": {st.tok.RefreshToken},
+			"client_id":     {anthropicOAuthClientID},
 		})
 		if err != nil {
 			return "", fmt.Errorf("token refresh failed (sign in again): %w", err)
