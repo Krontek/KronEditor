@@ -79,7 +79,10 @@ const CreateItemModal = ({ isOpen, onClose, onConfirm, category, defaultName, is
                     <input
                         type="text"
                         value={name}
-                        onChange={(e) => setName(e.target.value)}
+                        // Reject invalid IEC-identifier characters as you type: drop
+                        // spaces and punctuation; only [A-Za-z0-9_] are kept. A
+                        // leading digit is flagged below (not silently dropped).
+                        onChange={(e) => setName(e.target.value.replace(/[^A-Za-z0-9_]/g, ''))}
                         autoFocus
                         style={{
                             width: '100%',

@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 )
@@ -47,11 +49,11 @@ type aiToolCall struct {
 }
 
 type aiMessage struct {
-	Role       string          `json:"role"`                 // user | assistant | tool
-	Content    string          `json:"content"`              // text (may be empty on tool-only turns)
-	ToolCalls  []aiToolCall    `json:"toolCalls,omitempty"`  // assistant turns
-	ToolCallID string          `json:"toolCallId,omitempty"` // tool-result turns (OpenAI correlation)
-	Name       string          `json:"name,omitempty"`       // tool name on tool-result turns
+	Role       string       `json:"role"`                 // user | assistant | tool
+	Content    string       `json:"content"`              // text (may be empty on tool-only turns)
+	ToolCalls  []aiToolCall `json:"toolCalls,omitempty"`  // assistant turns
+	ToolCallID string       `json:"toolCallId,omitempty"` // tool-result turns (OpenAI correlation)
+	Name       string       `json:"name,omitempty"`       // tool name on tool-result turns
 }
 
 type aiTool struct {
@@ -111,12 +113,93 @@ func (s *Server) handleAIChat(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "unknown provider: "+req.Provider)
 		return
 	}
+	// Log the exchange (request + raw model output) so failures/odd outputs can
+	// be inspected later — see {AppDataDir}/ai-agent.log.
+	s.logAIChat(req, msg, err)
 	if err != nil {
 		writeError(w, http.StatusBadGateway, err.Error())
 		return
 	}
 	msg.Role = "assistant"
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "message": msg})
+}
+
+func truncForLog(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + fmt.Sprintf("… (%d more chars)", len(s)-n)
+}
+
+// logAIChat appends one agent exchange — the request we sent (system prompt,
+// messages, tool names) and the model's raw output (text + tool calls, or the
+// error) — to {AppDataDir}/ai-agent.log. Best-effort; never fails the request.
+func (s *Server) logAIChat(req aiChatReq, msg aiMessage, callErr error) {
+	path := filepath.Join(s.paths.AppDataDir, "ai-agent.log")
+	f, e := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+	if e != nil {
+		return
+	}
+	defer f.Close()
+
+	var b strings.Builder
+	fmt.Fprintf(&b, "\n===== %s  %s / %s =====\n", time.Now().Format("2006-01-02 15:04:05"), req.Provider, req.Model)
+	fmt.Fprintf(&b, "--- request: system ---\n%s\n", truncForLog(req.System, 4000))
+	fmt.Fprintf(&b, "--- request: messages (%d) ---\n", len(req.Messages))
+	for _, m := range req.Messages {
+		fmt.Fprintf(&b, "[%s] %s\n", m.Role, truncForLog(m.Content, 1500))
+		for _, tc := range m.ToolCalls {
+			fmt.Fprintf(&b, "   ↳ tool_call %s(%s)\n", tc.Name, truncForLog(string(tc.Arguments), 800))
+		}
+	}
+	toolNames := make([]string, 0, len(req.Tools))
+	for _, t := range req.Tools {
+		toolNames = append(toolNames, t.Name)
+	}
+	fmt.Fprintf(&b, "--- request: tools ---\n%s\n", strings.Join(toolNames, ", "))
+	if callErr != nil {
+		fmt.Fprintf(&b, "--- MODEL ERROR ---\n%v\n", callErr)
+	} else {
+		fmt.Fprintf(&b, "--- model output: content ---\n%s\n", msg.Content)
+		for _, tc := range msg.ToolCalls {
+			fmt.Fprintf(&b, "--- model output: tool_call ---\n%s(%s)\n", tc.Name, string(tc.Arguments))
+		}
+		if len(msg.ToolCalls) == 0 {
+			fmt.Fprintf(&b, "(no structured tool_calls — frontend will try to parse tool calls from the content above)\n")
+		}
+	}
+	_, _ = f.WriteString(b.String())
+}
+
+func (s *Server) aiLogPath() string { return filepath.Join(s.paths.AppDataDir, "ai-agent.log") }
+
+// handleAILogClear truncates the agent log (called on "New chat").
+func (s *Server) handleAILogClear(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "POST required")
+		return
+	}
+	_ = os.WriteFile(s.aiLogPath(), []byte{}, 0o644) // best-effort; recreated on next request
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+// handleAILogSave snapshots the current agent log to a timestamped file.
+func (s *Server) handleAILogSave(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "POST required")
+		return
+	}
+	data, err := os.ReadFile(s.aiLogPath())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "no log to save: "+err.Error())
+		return
+	}
+	dst := filepath.Join(s.paths.AppDataDir, "ai-agent-"+time.Now().Format("20060102-150405")+".log")
+	if err := os.WriteFile(dst, data, 0o644); err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "path": dst})
 }
 
 // httpJSON does a POST with a JSON body and returns the decoded response body,

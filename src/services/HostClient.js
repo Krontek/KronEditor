@@ -253,6 +253,14 @@ export class HostClient {
     if (!j.ok) throw new Error(j.error || 'aiChat failed');
     return j.message;
   }
+  /** Clear the agent exchange log (called on New chat). */
+  async aiLogClear() {
+    return _post(this._p('/api/host/ai/log-clear'), {});
+  }
+  /** Snapshot the agent log to a timestamped file; returns { ok, path }. */
+  async aiLogSave() {
+    return _post(this._p('/api/host/ai/log-save'), {});
+  }
 
   // ── Hot-swap (online change) — local simulation ─────────────────────────────
   /**

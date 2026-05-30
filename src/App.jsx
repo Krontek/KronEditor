@@ -1354,10 +1354,13 @@ function App() {
 
     const existingNames = projectStructure[category].map(item => item.name);
     let counter = 0;
-    while (existingNames.includes(`${prefix}${counter} `)) {
+    // NOTE: no trailing space — POU names must be valid IEC identifiers. A space
+    // here used to leak into names like "Program0 ", breaking the C symbol
+    // mapping and POU lookups (agent + editor reload).
+    while (existingNames.includes(`${prefix}${counter}`)) {
       counter++;
     }
-    const defaultName = `${prefix}${counter} `;
+    const defaultName = `${prefix}${counter}`;
 
     if (category === 'dataTypes') {
       setDataTypeModal({ isOpen: true, existingNames, insertIndex });
@@ -1409,8 +1412,12 @@ function App() {
     setDataTypeModal({ isOpen: false, existingNames: [] });
   };
 
-  const handleCreateConfirm = (name, type, returnType) => {
+  const handleCreateConfirm = (rawName, type, returnType) => {
     const category = createModal.category;
+    // POU/data-type names must be valid IEC identifiers — trim and collapse any
+    // stray whitespace so names like "Program0 " never reach the project (they
+    // break the C symbol mapping and POU lookups).
+    const name = String(rawName || '').trim().replace(/\s+/g, '_');
 
     // Check if name already exists in this category
     const isDuplicate = projectStructure[category].some(item =>
@@ -1769,7 +1776,8 @@ function App() {
   // reflects the new code/variables; always log it.
   const handleAgentApplied = useCallback((pouNames) => {
     const names = pouNames || [];
-    if (activeItem && names.some(n => (n || '').toLowerCase() === (activeItem.name || '').toLowerCase())) {
+    const norm = (n) => (n || '').trim().toLowerCase();   // tolerate stray spaces in names
+    if (activeItem && names.some(n => norm(n) === norm(activeItem.name))) {
       setAgentReloadKey(k => k + 1);
     }
     addLog('info', `AI agent applied changes: ${names.length ? names.join(', ') : 'project structure'}`);
@@ -2309,9 +2317,8 @@ function App() {
 
             </div>
 
-            {/* RIGHT SIDEBAR (Only if LD) */}
-            {(activeItem?.type === 'LD' || activeItem?.type === 'ST' || activeItem?.type === 'SCL') && (
-              <>
+            {/* RIGHT SIDEBAR — always present (Kütüphane + AI Agent are always available) */}
+            <>
                 {/* RESIZER (RIGHT) */}
                 <div
                   onMouseDown={() => startResizing('right')}
@@ -2349,7 +2356,7 @@ function App() {
                       buses={buses}
                       interfaceConfig={deviceInterfaceConfig}
                       userDefinedBlocks={
-                        activeItem.category === 'programs'
+                        activeItem?.category === 'programs'
                           ? [...projectStructure.functionBlocks, ...projectStructure.functions]
                           : []
                       }
@@ -2373,7 +2380,6 @@ function App() {
                   )}
                 </div>
               </>
-            )}
           </>
         )}
       </div>

@@ -47,6 +47,10 @@ const DataTypeCreationModal = ({ isOpen, onClose, onSave, existingNames }) => {
             setError(t('errors.nameRequired') || "Name is required");
             return;
         }
+        if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(trimmed)) {
+            setError("Invalid name — use only letters, digits and underscore, no spaces, and don't start with a digit.");
+            return;
+        }
         if (existingNames.includes(trimmed)) {
             setError(t('errors.nameExists') || "Name already exists");
             return;
@@ -74,7 +78,8 @@ const DataTypeCreationModal = ({ isOpen, onClose, onSave, existingNames }) => {
                     <input
                         type="text"
                         value={name}
-                        onChange={(e) => setName(e.target.value)}
+                        // IEC identifier only — strip spaces/punctuation as typed.
+                        onChange={(e) => setName(e.target.value.replace(/[^A-Za-z0-9_]/g, ''))}
                         style={{
                             width: '100%', padding: '8px', background: '#333',
                             border: '1px solid #555', color: 'white', borderRadius: '4px',

@@ -178,6 +178,9 @@ export const TOOL_DEFS = [
       'A rung = OR of `branches` (each branch is an AND-series of contacts), optionally followed by `seriesAfter` contacts (in series after the OR-merge — e.g. a normally-closed Stop for a seal-in), then `outputs` coils. ' +
       'Contact subType: "NO" (normally open) or "NC" (normally closed). Coil subType: "Normal", "Set", "Reset" or "Negated". ' +
       'Every contact/coil variable must be a BOOL that already exists (add it with add_variable first). ' +
+      'Each rung is an OBJECT (use {…}, never [...]). Example — Start/Stop seal-in driving Motor: ' +
+      'rungs: [{ "branches": [[{"contact":"Start"}], [{"contact":"Motor"}]], "seriesAfter": [{"contact":"Stop","subType":"NC"}], "outputs": [{"coil":"Motor"}] }]. ' +
+      'Simplest rung — coil driven directly from power (no contacts): rungs: [{ "outputs": [{"coil":"mc_power"}] }]. ' +
       'Note: this tool supports contacts and coils only — for timers, counters or other function blocks in ladder, use ST instead.',
     parameters: S({
       pou: str('Target LD POU name'),
@@ -270,14 +273,16 @@ export function applyToolCall(struct, name, args = {}) {
         const hit = findPOU(struct, args.name);
         if (!hit) return { ok: false, error: `POU "${args.name}" not found` };
         const c = hit.item.content || {};
+        // SCL keeps ST in per-rung code; surface it as `code` so the model sees it.
+        const sclStCode = (c.rungs || []).filter((r) => r.lang === 'ST').map((r) => r.code || '').filter(Boolean).join('\n');
         return {
           mutation: false, ok: true,
           result: {
             name: hit.item.name, category: hit.category, language: hit.item.type,
             returnType: hit.item.returnType || undefined,
-            code: typeof c.code === 'string' ? c.code : undefined,
+            code: (typeof c.code === 'string' && c.code) ? c.code : (sclStCode || undefined),
             rungCount: c.rungs ? c.rungs.length : undefined,
-            ladder: c.rungs ? summarizeRungs(c.rungs) : undefined,
+            ladder: (c.rungs && hit.item.type !== 'SCL') ? summarizeRungs(c.rungs) : undefined,
             variables: (c.variables || []).map((v) => ({
               name: v.name, type: v.type, class: v.class, initialValue: v.initialValue, address: v.address, description: v.description,
             })),
@@ -348,18 +353,66 @@ export function applyToolCall(struct, name, args = {}) {
       case 'set_st_code': {
         const hit = findPOU(struct, args.pou);
         if (!hit) return { ok: false, error: `POU "${args.pou}" not found` };
-        if (hit.item.type === 'LD') return { ok: false, error: `"${args.pou}" is a Ladder POU — edit it with ladder tools, not set_st_code` };
+        if (hit.item.type === 'LD') return { ok: false, error: `"${args.pou}" is a Ladder POU — edit it with set_ladder, not set_st_code` };
         if (typeof args.code !== 'string') return { ok: false, error: 'code must be a string' };
-        const oldCode = hit.item.content?.code || '';
         // The editor's ST box is BODY-ONLY (variables live in the table). Models
         // often wrap the code in PROGRAM/VAR…END_VAR — strip those so they don't
         // land in the body (where the transpiler would choke on them).
         const code = stripStWrappers(args.code);
-        const next = withPOUContent(struct, hit.category, hit.index, { ...hit.item.content, code });
+        // Safety net: if the model inlined declarations (VAR…END_VAR or bare
+        // `name : TYPE;` lines) instead of calling add_variable, recover them so
+        // the ST doesn't reference undefined names. Parse from the RAW code
+        // (stripStWrappers has since removed the blocks).
+        const recovered = extractStDeclarations(args.code);
+        const content = hit.item.content || {};
+        let oldCode, next;
+        if (hit.item.type === 'SCL') {
+          // SCL stores logic per-rung (each rung has lang ST|LD + code). The ST
+          // body goes into a single ST rung — content.code is NOT read for SCL.
+          const old = (content.rungs || []).filter((r) => r.lang === 'ST').map((r) => r.code || '').join('\n');
+          oldCode = old;
+          const rung = { id: `rung_${Date.now()}_0`, label: '000', lang: 'ST', blocks: [], connections: [], code };
+          next = withPOUContent(struct, hit.category, hit.index, { ...content, rungs: [rung] });
+        } else {
+          oldCode = content.code || '';
+          next = withPOUContent(struct, hit.category, hit.index, { ...content, code });
+        }
+        // Apply recovered declarations onto `next`, skipping names that already
+        // exist (locally or globally). Collect diff lines for the preview.
+        const addedVarLines = [];
+        if (recovered.length) {
+          const localVars = next[hit.category][hit.index].content?.variables || [];
+          const localNames = new Set(localVars.map((v) => (v.name || '').toLowerCase()));
+          const globalNames = new Set(getGlobals(next).map((v) => (v.name || '').toLowerCase()));
+          let nextLocals = localVars;
+          for (const d of recovered) {
+            const lname = d.name.toLowerCase();
+            if (d.scope === 'global') {
+              if (globalNames.has(lname)) continue;
+              const v = makeVar('global', d);
+              next = withGlobals(next, [...getGlobals(next), v]);
+              globalNames.add(lname);
+              addedVarLines.push({ type: 'add', text: `global  ${varLine(v)}` });
+            } else {
+              if (localNames.has(lname) || globalNames.has(lname)) continue;
+              const v = makeVar('local', d);
+              nextLocals = [...nextLocals, v];
+              localNames.add(lname);
+              addedVarLines.push({ type: 'add', text: `${hit.item.name}.${v.name} : ${v.type}` });
+            }
+          }
+          if (nextLocals !== localVars) {
+            // re-locate the POU in `next` (globals edits don't move it, but be safe)
+            const reHit = findPOU(next, hit.item.name);
+            next = withPOUContent(next, reHit.category, reHit.index, { ...next[reHit.category][reHit.index].content, variables: nextLocals });
+          }
+        }
         return {
           mutation: true, ok: true,
-          summary: `Rewrite ST in "${hit.item.name}"`,
-          diff: { kind: 'st-edit', target: hit.item.name, lines: diffLines(oldCode, code) },
+          summary: addedVarLines.length
+            ? `Rewrite ST in "${hit.item.name}" (+${addedVarLines.length} var${addedVarLines.length === 1 ? '' : 's'})`
+            : `Rewrite ST in "${hit.item.name}"`,
+          diff: { kind: 'st-edit', target: hit.item.name, lines: [...diffLines(oldCode, code), ...addedVarLines] },
           next,
         };
       }
@@ -497,14 +550,81 @@ function singular(category) {
 }
 
 // The ST editor box holds only the POU BODY — variables live in the variable
-// table. Strip any PROGRAM/FUNCTION[_BLOCK] wrapper and VAR…END_VAR blocks a
-// model may include, leaving just the executable statements.
+// table. Models often wrap the code in declarations/headers a body must not
+// contain; strip them deterministically, leaving just the executable statements.
 function stripStWrappers(code) {
   let c = String(code || '');
-  c = c.replace(/^\s*(PROGRAM|FUNCTION_BLOCK|FUNCTION)\b[^\n]*\r?\n/i, '');           // header line
+  c = c.replace(/^\s*(PROGRAM|FUNCTION_BLOCK|FUNCTION)\b[^\n]*\r?\n/i, '');           // PROGRAM/FUNCTION header
+  // pseudo-program wrapper  name()\nBEGIN  (only when name() is followed by BEGIN,
+  // so legit no-arg FB calls like `pulse();` are never touched).
+  c = c.replace(/^[ \t]*[A-Za-z_]\w*[ \t]*\([ \t]*\)[ \t]*\r?\n[ \t]*BEGIN\b[^\n]*\r?\n/gim, '');
   c = c.replace(/\r?\n\s*END_(PROGRAM|FUNCTION_BLOCK|FUNCTION)\s*;?\s*$/i, '\n');     // footer
-  c = c.replace(/\bVAR(_INPUT|_OUTPUT|_IN_OUT|_GLOBAL|_TEMP|_EXTERNAL|_CONSTANT)?\b[\s\S]*?\bEND_VAR\b\s*;?/gi, ''); // VAR blocks
+  c = c.replace(/\bVAR(_INPUT|_OUTPUT|_IN_OUT|_GLOBAL|_TEMP|_EXTERNAL|_CONSTANT)?\b[\s\S]*?\bEND_VAR\b\s*;?/gi, ''); // VAR…END_VAR
+  c = c.replace(/^\s*BEGIN\s*$/gim, '');                                             // stray Pascal-ish BEGIN
+  c = c.replace(/^\s*END\s*;?\s*$/gim, '');                                          // bare END (not END_IF/END_WHILE/…)
+  // Bare declaration lines `name : TYPE [:= value];` (statements use :=, never `: type`).
+  c = c.replace(/^\s*[A-Za-z_]\w*\s*:\s*[A-Za-z_]\w*(\s*\[[^\]]*\])?(\s*:=\s*[^;\n]+)?\s*;?\s*$/gim, '');
   return c.replace(/^\s*\n+/, '').replace(/\s+$/, '') + '\n';
+}
+
+// Map a VAR-block keyword to the editor's variable `class`. Anything we don't
+// recognise (plain VAR, VAR_CONSTANT) becomes a Local.
+const VAR_CLASS_MAP = {
+  VAR_GLOBAL: 'Global', VAR_INPUT: 'Input', VAR_OUTPUT: 'Output',
+  VAR_IN_OUT: 'InOut', VAR_EXTERNAL: 'External', VAR_TEMP: 'Temp',
+};
+
+// Weak models routinely inline declarations into set_st_code's body as
+// VAR…END_VAR blocks (and bare `name : TYPE;` lines) instead of calling
+// add_variable. stripStWrappers throws those away, so the variables would
+// silently never reach the table — leaving the ST referencing undefined names.
+// This recovers them: parse the declarations the body shouldn't contain and
+// hand them back so set_st_code can add them as a safety net.
+//
+// Returns [{ scope:'local'|'global', name, type, initialValue, class }].
+function extractStDeclarations(code) {
+  const src = String(code || '');
+  const decls = [];
+  const seen = new Set();
+  const pushDecl = (cls, names, type, init) => {
+    const scope = cls === 'Global' ? 'global' : 'local';
+    for (const raw of names.split(',')) {
+      const name = raw.trim();
+      if (!isValidIecName(name)) continue;
+      const key = name.toLowerCase();
+      if (seen.has(key)) continue;
+      seen.add(key);
+      decls.push({ scope, name, type: type.trim(), initialValue: (init || '').trim(), class: cls });
+    }
+  };
+  // 1) Declarations inside VAR…END_VAR blocks (class taken from the keyword).
+  const blockRe = /\bVAR(_INPUT|_OUTPUT|_IN_OUT|_GLOBAL|_TEMP|_EXTERNAL|_CONSTANT)?\b([\s\S]*?)\bEND_VAR\b/gi;
+  let m;
+  while ((m = blockRe.exec(src)) !== null) {
+    const kw = ('VAR' + (m[1] || '')).toUpperCase();
+    const cls = VAR_CLASS_MAP[kw] || 'Local';
+    parseDeclLines(m[2], cls, pushDecl);
+  }
+  // 2) Bare top-level declaration lines outside any VAR block (also stripped by
+    // stripStWrappers). Only count lines that look like a declaration, not a `:=`
+    // assignment statement.
+  const withoutBlocks = src.replace(blockRe, '');
+  parseDeclLines(withoutBlocks, 'Local', pushDecl, /* bareOnly */ true);
+  return decls;
+}
+
+// Parse `a, b : TYPE := init;` style lines from a chunk of text.
+function parseDeclLines(chunk, cls, push, bareOnly = false) {
+  for (let line of String(chunk || '').split(/\r?\n/)) {
+    line = line.replace(/\/\/.*$/, '').trim();           // drop line comment
+    if (!line) continue;
+    line = line.replace(/;+\s*$/, '');                   // drop trailing semicolons
+    // name[, name…] [AT %addr] : TYPE [:= init]   — `:=` before the `:` means it's a statement.
+    const dm = line.match(/^([A-Za-z_]\w*(?:\s*,\s*[A-Za-z_]\w*)*)\s*(?:AT\s+\S+\s*)?:\s*([A-Za-z_]\w*(?:\s*\[[^\]]*\])?)\s*(?::=\s*(.+))?$/i);
+    if (!dm) continue;
+    if (/:=/.test(dm[1])) continue;                      // left side had `:=` → assignment, skip
+    push(cls, dm[1], dm[2], dm[3]);
+  }
 }
 
 function summarizeRungs(rungs) {

@@ -91,6 +91,8 @@ func main() {
 
 	// AI Agent — provider-agnostic chat proxy with tool-calling
 	mux.HandleFunc("/api/host/ai/chat", srvState.handleAIChat)
+	mux.HandleFunc("/api/host/ai/log-clear", srvState.handleAILogClear)
+	mux.HandleFunc("/api/host/ai/log-save", srvState.handleAILogSave)
 
 	// Hot-swap (online change) — local simulation
 	mux.HandleFunc("/api/host/hotswap/build", srvState.handleHotSwapBuild)

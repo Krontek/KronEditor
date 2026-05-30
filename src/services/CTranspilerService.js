@@ -2457,6 +2457,27 @@ const FB_C_PIN_NAME = {
     'CTU':  { 'R': 'RESET' },
     'CTUD': { 'R': 'RESET' },
 };
+
+// Public: the set of valid named-argument (pin) names for a standard FB/function
+// type — inputs ∪ outputs ∪ EN/ENO — used by the ST editor to validate named
+// arguments like `TON(IN := …, PT := …)`. Returns a lowercased Set, or null if
+// the type is not a known standard block (the caller must then NOT flag, since
+// it can't know the pin list — e.g. user-defined function blocks).
+export const getStandardFBPins = (type) => {
+    if (!type) return null;
+    const t = String(type).trim();
+    if (!t) return null;
+    // X_TO_Y conversion functions: EN/ENO + IN/OUT (not enumerated in FB_INPUTS).
+    if (/^[A-Za-z]+_TO_[A-Za-z]+$/i.test(t)) return new Set(['en', 'eno', 'in', 'out']);
+    const tl = t.toLowerCase();
+    const keyIn = Object.keys(FB_INPUTS).find((k) => k.toLowerCase() === tl);
+    const keyOut = Object.keys(FB_OUTPUTS).find((k) => k.toLowerCase() === tl);
+    if (!keyIn && !keyOut) return null;
+    const pins = new Set(['en', 'eno']);
+    (FB_INPUTS[keyIn] || []).forEach((p) => pins.add(p.toLowerCase()));
+    (FB_OUTPUTS[keyOut] || []).forEach((p) => pins.add(p.toLowerCase()));
+    return pins;
+};
 // Returns the C struct member name for a given editor pin name and block type.
 // Lookup is case-insensitive; the original-case canonical pin from FB_C_PIN_NAME
 // (or the user's spelling, when unknown) is returned.

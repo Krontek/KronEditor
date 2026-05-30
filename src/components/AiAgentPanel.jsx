@@ -84,8 +84,56 @@ const saveConvo = (messages, convo) => {
 };
 
 // Strip model chat-template / special tokens that some local models leak into
-// their output (e.g. <|im_start|>, <|im_end|>, <|endoftext|>).
-const stripSpecialTokens = (s) => (s || '').replace(/<\|[a-z_]+\|>/gi, '').trim();
+// their output (e.g. <|im_start|>, <|im_end|>, <|endoftext|>) plus the
+// <tool_call>/<tool_response> wrapper tags some models emit (the inner JSON, if
+// any, is kept so it can still be parsed into a tool call).
+const stripSpecialTokens = (s) => (s || '')
+  .replace(/<\|[a-z_]+\|>/gi, '')
+  .replace(/<\/?tool_(?:call|response|result|use)>/gi, '')
+  .trim();
+
+// Repair the single most common LLM JSON malformation: an object written with
+// square brackets. Models sometimes emit `[ "key": val ]` (array syntax) where
+// they meant `{ "key": val }` (object) — e.g. set_ladder's `rungs: [["outputs":…]]`.
+// Walk the string (ignoring brackets inside strings); a `[` whose first non-space
+// content is a `"…":` key is rewritten to `{` and its matching `]` to `}`.
+function repairJsonBrackets(s) {
+  let out = '';
+  let inStr = false, esc = false;
+  const stack = []; // { converted } per open bracket
+  for (let i = 0; i < s.length; i++) {
+    const ch = s[i];
+    if (inStr) {
+      out += ch;
+      if (esc) esc = false;
+      else if (ch === '\\') esc = true;
+      else if (ch === '"') inStr = false;
+      continue;
+    }
+    if (ch === '"') { inStr = true; out += ch; continue; }
+    if (ch === '[') {
+      // Look ahead: skip whitespace; is the next token a "string" followed by ':'?
+      let j = i + 1;
+      while (j < s.length && /\s/.test(s[j])) j++;
+      let looksLikeObject = false;
+      if (s[j] === '"') {
+        let k = j + 1, e2 = false;
+        for (; k < s.length; k++) { const c = s[k]; if (e2) { e2 = false; } else if (c === '\\') { e2 = true; } else if (c === '"') break; }
+        let m = k + 1;
+        while (m < s.length && /\s/.test(s[m])) m++;
+        if (s[m] === ':') looksLikeObject = true;
+      }
+      stack.push({ converted: looksLikeObject });
+      out += looksLikeObject ? '{' : '[';
+      continue;
+    }
+    if (ch === '{') { stack.push({ converted: false, brace: true }); out += '{'; continue; }
+    if (ch === ']') { const f = stack.pop(); out += (f && f.converted) ? '}' : ']'; continue; }
+    if (ch === '}') { stack.pop(); out += '}'; continue; }
+    out += ch;
+  }
+  return out;
+}
 
 let _mid = 1;
 const nextId = () => _mid++;
@@ -133,7 +181,12 @@ function extractInlineToolCalls(content) {
   } catch { /* not a clean array/object — scan for embedded objects */ }
   if (candidates.length === 0) {
     for (const raw of findJsonObjects(text)) {
-      try { candidates.push(JSON.parse(raw)); } catch { /* skip non-JSON */ }
+      try { candidates.push(JSON.parse(raw)); }
+      catch {
+        // Fallback: repair the array-vs-object bracket malformation and retry
+        // (e.g. set_ladder's `rungs: [["outputs":…]]` → `[{"outputs":…}]`).
+        try { candidates.push(JSON.parse(repairJsonBrackets(raw))); } catch { /* skip non-JSON */ }
+      }
     }
   }
   const calls = [];
@@ -201,8 +254,11 @@ function buildSystemPrompt(projectStructure, board, activeItem) {
     '- Structured Text must be valid IEC 61131-3: := assign; AND/OR/NOT logical; BAND/BOR/BXOR/BNOT bitwise; time literals like T#500ms.',
     '- Before using a variable in ST, add it with add_variable (in the SAME response).',
     '- Make the smallest change that satisfies the request; prefer editing an existing POU over creating new ones unless asked. delete_pou/remove_variable only when explicitly asked.',
+    '- Finish the WHOLE request in your tool calls before replying — if asked to create a POU AND write its code, emit create_pou THEN set_st_code/set_ladder AND the add_variable calls. NEVER stop to ask the user to "provide the code" or hand it back; you write it.',
     '- set_st_code replaces the WHOLE body and takes ONLY body statements — NO PROGRAM/VAR/END_VAR/END_PROGRAM wrapper (variables go via add_variable). set_ladder (contacts+coils only) replaces all rungs.',
     '- PLC logic runs ONCE per scan, cyclically — NEVER write unbounded loops (no WHILE TRUE; it hangs the PLC). For timing use a TON across scans, e.g. `pulse(IN := NOT pulse.Q, PT := T#1s); IF pulse.Q THEN out := NOT out; END_IF`.',
+    '- Function blocks (TON, TOF, TP, CTU, CTD, R_TRIG, user FBs) are INSTANCES, not functions. For each you must: (1) add_variable with type = the FB name itself (e.g. type "TON" — NOT "TIME"/"BOOL"); (2) CALL it as `name(IN := …, PT := …);`; (3) read its outputs as `name.Q`, `name.ET`. NEVER write `name := TON(…)` — assigning an FB call is invalid IEC and will not compile.',
+    '- A correct TON blink is EXACTLY: declare `blink : TON;` (add_variable type TON) and `led : BOOL`, then body `blink(IN := NOT blink.Q, PT := T#500ms); IF blink.Q THEN led := NOT led; END_IF;`. Do not also toggle led outside the IF.',
     '- CRITICAL: you change the project ONLY by emitting tool calls. NEVER write code in prose and claim it is done; NEVER output "APPLIED:" or "I have set the code" — the SYSTEM applies + confirms. To write code into a POU you MUST call set_st_code/set_ladder.',
     '- Every change is shown as a diff the user approves/rejects; if rejected, adapt. When done, reply with a short summary in the user\'s language.',
     '- Use read_pou for a POU\'s code+variables, get_project_overview for full detail, read_live_variables (while running) to diagnose before a fix.',
@@ -503,6 +559,17 @@ export default function AiAgentPanel({
     setPending(null);
     setMessages([]);
     try { localStorage.removeItem(CONVO_KEY); } catch { /* ignore */ }
+    host.aiLogClear().catch(() => {}); // start a fresh agent log too
+  };
+
+  // Snapshot the host-agent's exchange log to a timestamped file.
+  const saveLog = async () => {
+    try {
+      const r = await host.aiLogSave();
+      pushView({ role: 'note', text: `Log saved: ${r.path}` });
+    } catch (e) {
+      pushView({ role: 'note', text: `Log save failed: ${e.message || e}` });
+    }
   };
 
   const applyConfig = () => { saveConfig(draftCfg); setConfig(draftCfg); setConfigOpen(false); };
@@ -634,9 +701,13 @@ export default function AiAgentPanel({
               📎 {activeItem.name || activeItem.type} <span style={{ color: '#666' }}>· context</span>
             </span>
           )}
+          <button onClick={saveLog} title="Save the model-exchange log to a timestamped file"
+            style={{ marginLeft: 'auto', background: 'transparent', border: `1px solid ${C.border2}`, color: C.sub, fontSize: 10, padding: '1px 8px', borderRadius: 10, cursor: 'pointer' }}>
+            ⤓ Save log
+          </button>
           {messages.length > 0 && (
-            <button onClick={resetChat} disabled={busy} title="New chat"
-              style={{ marginLeft: 'auto', background: 'transparent', border: `1px solid ${C.border2}`, color: C.sub, fontSize: 10, padding: '1px 8px', borderRadius: 10, cursor: busy ? 'default' : 'pointer' }}>
+            <button onClick={resetChat} disabled={busy} title="New chat (also clears the agent log)"
+              style={{ background: 'transparent', border: `1px solid ${C.border2}`, color: C.sub, fontSize: 10, padding: '1px 8px', borderRadius: 10, cursor: busy ? 'default' : 'pointer' }}>
               ＋ New chat
             </button>
           )}

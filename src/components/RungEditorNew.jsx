@@ -6,6 +6,7 @@ import BlockSettingsModal from './BlockSettingsModal';
 import ForceWriteModal from './common/ForceWriteModal';
 import DragDropManager from '../utils/DragDropManager';
 import { registerIECSTLanguage } from '../utils/iecSTLanguage';
+import { findStMarkers } from '../utils/stValidation';
 import { writeClipboard, readClipboard, useKronClipboard, CLIP_KIND } from '../utils/kronClipboard';
 import { setEditorScope, getEditorScope, EDITOR_SCOPE } from '../utils/editorScope';
 
@@ -35,40 +36,15 @@ const ST_ALWAYS_ALLOWED = new Set([
 const ST_CONVERSION_REGEX = /^(?:BOOL|BYTE|WORD|DWORD|LWORD|SINT|USINT|INT|UINT|DINT|UDINT|LINT|ULINT|REAL|LREAL)_TO_(?:BOOL|BYTE|WORD|DWORD|LWORD|SINT|USINT|INT|UINT|DINT|UDINT|LINT|ULINT|REAL|LREAL)$/i;
 
 function validateSCLCode(code, variables, globalVars, monaco, model) {
-  const allowed = new Set(ST_ALWAYS_ALLOWED);
-  variables.forEach(v => { if (v.name) allowed.add(v.name.toLowerCase()); });
-  globalVars.forEach(v => { if (v.name) allowed.add(v.name.toLowerCase()); });
-
-  const markers = [];
-  // Strip multi-line (* block comments *) from the whole code before line-by-line scan
-  const strippedCode = (code || '').replace(/\(\*[\s\S]*?\*\)/g, match => '\n'.repeat((match.match(/\n/g) || []).length));
-  const lines = strippedCode.split('\n');
-  lines.forEach((rawLine, i) => {
-    // Strip single-line comments and IEC typed-radix integer literals
-    // (16#FE, 2#1010, 8#777). Replace literals with same-length spaces so
-    // marker columns stay accurate.
-    const line = rawLine
-      .replace(/\/\/.*$/, '')
-      .replace(/\(\*.*?\*\)/g, '')
-      .replace(/\b\d+#[0-9A-Fa-f_]+\b/g, m => ' '.repeat(m.length));
-    const regex = /\b[a-zA-Z_][a-zA-Z0-9_]*\b/g;
-    let match;
-    while ((match = regex.exec(line)) !== null) {
-      if (match.index > 0 && line[match.index - 1] === '.') continue;
-      const word = match[0];
-      if (allowed.has(word.toLowerCase())) continue;
-      if (ST_CONVERSION_REGEX.test(word)) continue;
-      if (!isNaN(word)) continue;
-      markers.push({
-        severity: monaco.MarkerSeverity.Error,
-        message: `Undefined identifier: '${word}'`,
-        startLineNumber: i + 1,
-        startColumn: match.index + 1,
-        endLineNumber: i + 1,
-        endColumn: match.index + 1 + word.length,
-      });
-    }
+  const allowedLower = new Set(ST_ALWAYS_ALLOWED);
+  const varTypes = new Map();
+  [...variables, ...globalVars].forEach(v => {
+    if (v.name) { allowedLower.add(v.name.toLowerCase()); varTypes.set(v.name.toLowerCase(), String(v.type || '').trim()); }
   });
+  // Shared scan: undefined identifiers + named-argument (pin) validation, so
+  // valid FB pins (IN, PT, …) are never flagged and only unknown ones are.
+  const markers = findStMarkers(code, { allowedLower, conversionPattern: ST_CONVERSION_REGEX, varTypes })
+    .map(mk => ({ ...mk, severity: monaco.MarkerSeverity.Error }));
   monaco.editor.setModelMarkers(model, 'scl-owner', markers);
 }
 

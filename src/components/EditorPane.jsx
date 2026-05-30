@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef } from 'react';
 import { Editor } from '@monaco-editor/react';
 import { registerIECSTLanguage } from '../utils/iecSTLanguage';
+import { findStMarkers } from '../utils/stValidation';
 import VariableManager from './VariableManager';
 import RungEditorNew from './RungEditorNew';
 import ResourceEditor from './ResourceEditor';
@@ -213,32 +214,15 @@ const EditorPane = ({
       const TYPE_NAMES = '(?:BOOL|BYTE|WORD|DWORD|LWORD|SINT|USINT|INT|UINT|DINT|UDINT|LINT|ULINT|REAL|LREAL)';
       const conversionPattern = new RegExp(`^${TYPE_NAMES}_TO_${TYPE_NAMES}$`, 'i');
 
-      lines.forEach((rawLine, i) => {
-        // Strip single-line comments and IEC typed-radix integer literals
-        // (16#FE, 2#1010, 8#777) before scanning. Replace with same-length
-        // spaces so column numbers in markers remain accurate.
-        const line = rawLine
-          .replace(/\/\/.*$/, '')
-          .replace(/\(\*.*?\*\)/g, '')
-          .replace(/\b\d+#[0-9A-Fa-f_]+\b/g, m => ' '.repeat(m.length));
-        const regex = /\b[a-zA-Z_][a-zA-Z0-9_]*\b/g;
-        let match;
-        while ((match = regex.exec(line)) !== null) {
-          if (match.index > 0 && line[match.index - 1] === '.') continue;
-          const word = match[0];
-          if (allowedLower.has(word.toLowerCase())) continue;
-          if (conversionPattern.test(word)) continue;
-          if (!isNaN(word)) continue;
-          markers.push({
-            severity: monacoInstance.MarkerSeverity.Error,
-            message: `Undefined identifier: '${word}'`,
-            startLineNumber: i + 1,
-            startColumn: match.index + 1,
-            endLineNumber: i + 1,
-            endColumn: match.index + 1 + word.length
-          });
-        }
+      const varTypes = new Map();
+      [...variables, ...globalVars].forEach(v => {
+        if (v?.name) varTypes.set(v.name.toLowerCase(), String(v.type || '').trim());
       });
+      // Shared scan: undefined identifiers + named-argument (pin) validation.
+      // (text already had block comments blanked above; the helper re-strips
+      // per-line comments/literals harmlessly.)
+      findStMarkers(text, { allowedLower, conversionPattern, varTypes }).forEach(mk =>
+        markers.push({ ...mk, severity: monacoInstance.MarkerSeverity.Error }));
       monacoInstance.editor.setModelMarkers(model, 'owner', markers);
 
       // ONLINE MODE DECORATIONS (CoDeSys-style inline values)
