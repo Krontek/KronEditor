@@ -8,6 +8,31 @@ import ResourceEditor from './ResourceEditor';
 import DragDropManager from '../utils/DragDropManager';
 import ForceWriteModal from './common/ForceWriteModal';
 
+// IEC scalar (elementary) types — anything else (FB instances like TON/CTU,
+// UDTs, ARRAY[...]) is a COMPOSITE whose live value is a struct/array, shown in
+// the debug overlay as an icon + hover instead of a raw inline value.
+const SCALAR_IEC_TYPES = new Set([
+  'BOOL', 'BYTE', 'WORD', 'DWORD', 'LWORD',
+  'SINT', 'USINT', 'INT', 'UINT', 'DINT', 'UDINT', 'LINT', 'ULINT',
+  'REAL', 'LREAL',
+  'TIME', 'LTIME', 'DATE', 'LDATE', 'TOD', 'LTOD', 'DT', 'LDT',
+  'STRING', 'WSTRING', 'CHAR', 'WCHAR',
+]);
+
+// Render a live FB/struct/array value as Markdown for the Monaco hover tooltip.
+function formatLiveHoverMd(name, val) {
+  const fmt = (v) => (typeof v === 'boolean' ? (v ? 'TRUE' : 'FALSE') : String(v));
+  if (Array.isArray(val)) {
+    const rows = val.slice(0, 64).map((v, i) => `| ${i} | ${typeof v === 'object' ? JSON.stringify(v) : fmt(v)} |`).join('\n');
+    return `**${name}**  (array, ${val.length})\n\n| # | value |\n|---|---|\n${rows}${val.length > 64 ? '\n| … | … |' : ''}`;
+  }
+  if (val && typeof val === 'object') {
+    const rows = Object.entries(val).map(([k, v]) => `| ${k} | ${typeof v === 'object' ? JSON.stringify(v) : fmt(v)} |`).join('\n');
+    return `**${name}**  (struct)\n\n| member | value |\n|---|---|\n${rows}`;
+  }
+  return `**${name}** = ${fmt(val)}`;
+}
+
 const EditorPane = ({
   fileType,
   initialContent,
@@ -229,12 +254,40 @@ const EditorPane = ({
       if (liveVariables && window.stEditor) {
         const decs = [];
         const safeProgName = (parentName || "").trim().replace(/\s+/g, '_');
+        // Context for the live-value hover provider (registered once below).
+        window.stLiveCtx = { live: liveVariables, prog: safeProgName };
 
         // Only look up actual user-defined variables, not keywords
         const userVarNames = new Set([
           ...variables.map(v => v.name),
           ...globalVars.map(v => v.name)
         ]);
+        // name → declared type, to classify scalar vs composite (FB/struct/array).
+        const varTypeMap = {};
+        [...variables, ...globalVars].forEach(v => { if (v && v.name) varTypeMap[v.name] = v.type; });
+        const isArrayType = (t) => /\barray\b|\[/i.test(String(t || ''));
+        const isCompositeType = (t) => {
+          const u = String(t || '').toUpperCase().trim();
+          if (!u) return false;
+          return isArrayType(t) || !SCALAR_IEC_TYPES.has(u); // FB instances, UDTs, arrays
+        };
+
+        // Style for a PRIMITIVE live value (bool/number/string).
+        const primStyle = (v) => {
+          const isBool = typeof v === 'boolean';
+          return {
+            text: isBool ? (v ? 'TRUE' : 'FALSE') : String(v),
+            hl: isBool ? (v ? 'live-var-hl-true' : 'live-var-hl-false') : 'live-var-hl-num',
+            txt: isBool ? (v ? 'live-var-text-true' : 'live-var-text-false') : 'live-var-text-num',
+          };
+        };
+        // Push an inline badge after the [startCol, endCol) range on a 1-based line.
+        const pushDec = (lineNo, startCol, endCol, style) => {
+          decs.push({
+            range: new monacoInstance.Range(lineNo, startCol, lineNo, endCol),
+            options: { className: style.hl, after: { content: ` ${style.text}`, inlineClassName: style.txt } },
+          });
+        };
 
         lines.forEach((line, i) => {
           const regex = /\b[a-zA-Z_][a-zA-Z0-9_]*\b/g;
@@ -242,6 +295,43 @@ const EditorPane = ({
           while ((match = regex.exec(line)) !== null) {
             const word = match[0];
             if (!userVarNames.has(word)) continue;
+
+            // Look at the next significant char after the identifier.
+            const afterIdx = match.index + word.length;
+            let j = afterIdx;
+            while (j < line.length && line[j] === ' ') j++;
+            const nextCh = line[j];
+
+            // Function/FB CALL site (e.g. blink(...)) — it has no value of its
+            // own, so render nothing.
+            if (nextCh === '(') continue;
+
+            const composite = isCompositeType(varTypeMap[word]);
+
+            // MEMBER access (e.g. blink.Q) — show the MEMBER's value, never the
+            // base. Always `continue` so the base FB/struct is not rendered as a
+            // bogus scalar (this is what caused `blink 0 .Q`).
+            if (nextCh === '.') {
+              const progKeyM = `prog_${safeProgName}_${word}`;
+              const valM = liveVariables[progKeyM] !== undefined ? liveVariables[progKeyM] : liveVariables[`prog__${word}`];
+              const mm = line.slice(j + 1).match(/^[a-zA-Z_][a-zA-Z0-9_]*/);
+              const member = mm && mm[0];
+              let mv;
+              if (valM && typeof valM === 'object') {
+                // Local sim: FB decoded to an object {Q, ET, …}.
+                mv = member ? valM[member] : undefined;
+              } else if (member) {
+                // Target (KronServer/SHM): FB outputs streamed as FLAT keys
+                // `prog_X_<var>.<pin>` (or global `prog__<var>.<pin>`).
+                const fk = `prog_${safeProgName}_${word}.${member}`;
+                mv = liveVariables[fk] !== undefined ? liveVariables[fk] : liveVariables[`prog__${word}.${member}`];
+              }
+              if (member && mv !== undefined && typeof mv !== 'object') {
+                const memStartCol = j + 2;                // 1-based col of member's first char
+                pushDec(i + 1, memStartCol, memStartCol + member.length, primStyle(mv));
+              }
+              continue;
+            }
 
             // Try program-scoped key first, then global key
             const progKey = `prog_${safeProgName}_${word}`;
@@ -251,28 +341,20 @@ const EditorPane = ({
               val = liveVariables[progKey];
             } else if (liveVariables[globalKey] !== undefined) {
               val = liveVariables[globalKey];
-            } else {
+            } else if (!composite) {
               continue;
             }
 
-            const isBool = typeof val === 'boolean';
-            const displayStr = isBool ? (val ? 'TRUE' : 'FALSE') : String(val);
-            const hlClass = isBool ? (val ? 'live-var-hl-true' : 'live-var-hl-false') : 'live-var-hl-num';
-            const textClass = isBool ? (val ? 'live-var-text-true' : 'live-var-text-false') : 'live-var-text-num';
+            // A composite (FB / struct / array) referenced as a whole — show an
+            // icon (NOT a scalar value), with full contents on hover.
+            if (composite || (val && typeof val === 'object')) {
+              const icon = isArrayType(varTypeMap[word]) ? '▦ array' : '{ } struct';
+              pushDec(i + 1, match.index + 1, afterIdx + 1, { text: icon, hl: 'live-var-hl-num', txt: 'live-var-text-struct' });
+              continue;
+            }
 
-            decs.push({
-              range: new monacoInstance.Range(
-                i + 1, match.index + 1,
-                i + 1, match.index + 1 + word.length
-              ),
-              options: {
-                className: hlClass,
-                after: {
-                  content: ` ${displayStr}`,
-                  inlineClassName: textClass,
-                }
-              }
-            });
+            // Primitive scalar — badge right after the identifier.
+            pushDec(i + 1, match.index + 1, afterIdx + 1, primStyle(val));
           }
         });
 
@@ -280,6 +362,7 @@ const EditorPane = ({
       } else if (window.stEditor && window.stEditor._liveDecs) {
         // Clear decorations when not in simulation
         window.stEditor._liveDecs = window.stEditor.deltaDecorations(window.stEditor._liveDecs, []);
+        window.stLiveCtx = null;
       }
     };
 
@@ -411,6 +494,54 @@ const EditorPane = ({
     };
   }, [monacoInstance]); // Only re-register if monaco instance changes (rarely)
 
+  // --- LIVE-VALUE HOVER (FB / struct / array contents) ---
+  // Hovering an FB instance, UDT or array variable while running shows its full
+  // live contents (members / elements) as a table. Reads window.stLiveCtx
+  // (refreshed by the decoration effect) so it always sees the latest values.
+  useEffect(() => {
+    if (!monacoInstance) return;
+    const disposable = monacoInstance.languages.registerHoverProvider('iec-st', {
+      provideHover: (model, position) => {
+        const ctx = window.stLiveCtx;
+        if (!ctx || !ctx.live) return null;
+        const wi = model.getWordAtPosition(position);
+        if (!wi) return null;
+        const word = wi.word;
+        const live = ctx.live;
+        const pk = `prog_${ctx.prog}_${word}`, gk = `prog__${word}`;
+        let val = live[pk] !== undefined ? live[pk] : live[gk];
+        // Array spread across indexed keys (prog_X_arr[0], …) → gather into one array.
+        if (val === undefined || typeof val !== 'object') {
+          const p1 = `prog_${ctx.prog}_${word}[`, p2 = `prog__${word}[`;
+          const elems = [];
+          for (const k of Object.keys(live)) {
+            const rest = k.startsWith(p1) ? k.slice(p1.length) : (k.startsWith(p2) ? k.slice(p2.length) : null);
+            if (rest === null) continue;
+            const idx = parseInt(rest, 10);
+            if (!Number.isNaN(idx)) elems[idx] = live[k];
+          }
+          if (elems.length) val = elems;
+        }
+        // FB/struct members spread across flat keys (prog_X_blink.Q, …, target SHM).
+        if (val === undefined || typeof val !== 'object') {
+          const d1 = `prog_${ctx.prog}_${word}.`, d2 = `prog__${word}.`;
+          const obj = {};
+          for (const k of Object.keys(live)) {
+            const rest = k.startsWith(d1) ? k.slice(d1.length) : (k.startsWith(d2) ? k.slice(d2.length) : null);
+            if (rest) obj[rest] = live[k];
+          }
+          if (Object.keys(obj).length) val = obj;
+        }
+        if (val === undefined || val === null || typeof val !== 'object') return null;
+        return {
+          range: new monacoInstance.Range(position.lineNumber, wi.startColumn, position.lineNumber, wi.endColumn),
+          contents: [{ value: formatLiveHoverMd(word, val) }],
+        };
+      },
+    });
+    return () => disposable.dispose();
+  }, [monacoInstance]);
+
   // --- ST EDITOR CONFIGURATION & DRAG-DROP ---
   const handleEditorDidMount = (editor, monaco) => {
     editorRef.current = editor;
@@ -456,6 +587,16 @@ const EditorPane = ({
           padding: 1px 5px !important;
           border-radius: 3px !important;
           margin-left: 4px !important;
+        }
+        .live-var-text-struct {
+          background-color: #5a3a7a !important;
+          color: #fff !important;
+          font-size: 10px !important;
+          font-style: normal !important;
+          padding: 1px 5px !important;
+          border-radius: 3px !important;
+          margin-left: 4px !important;
+          cursor: help !important;
         }
       `;
       document.head.appendChild(style);

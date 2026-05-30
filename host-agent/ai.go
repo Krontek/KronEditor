@@ -102,7 +102,19 @@ func (s *Server) handleAIChat(w http.ResponseWriter, r *http.Request) {
 	)
 	switch strings.ToLower(strings.TrimSpace(req.Provider)) {
 	case "anthropic":
-		msg, err = callAnthropic(ctx, req)
+		msg, err = callAnthropic(ctx, req, "")
+	case "anthropic-oauth", "claude-account":
+		// Subscription sign-in: use the stored Bearer token; on a 401 (expired
+		// mid-flight) force-refresh once and retry.
+		var tok string
+		if tok, err = s.anthropicOAuth.accessToken(false); err == nil {
+			msg, err = callAnthropic(ctx, req, tok)
+			if err != nil && strings.Contains(err.Error(), "HTTP 401") {
+				if tok, err = s.anthropicOAuth.accessToken(true); err == nil {
+					msg, err = callAnthropic(ctx, req, tok)
+				}
+			}
+		}
 	case "openai":
 		msg, err = callOpenAI(ctx, req, "https://api.openai.com")
 	case "gemini", "google":
@@ -244,7 +256,11 @@ func joinURL(base, suffix string) string {
 
 // ── Anthropic (/v1/messages) ─────────────────────────────────────────────────
 
-func callAnthropic(ctx context.Context, req aiChatReq) (aiMessage, error) {
+// oauthToken != "" switches to subscription OAuth mode: Bearer auth + the
+// oauth beta header, and the system prompt is sent as content blocks with a
+// Claude-Code identity FIRST (the subscription credential is only authorized for
+// Claude Code, so the request must identify as it).
+func callAnthropic(ctx context.Context, req aiChatReq, oauthToken string) (aiMessage, error) {
 	base := req.BaseURL
 	if strings.TrimSpace(base) == "" {
 		base = "https://api.anthropic.com"
@@ -309,7 +325,15 @@ func callAnthropic(ctx context.Context, req aiChatReq) (aiMessage, error) {
 		"max_tokens": req.MaxTokens,
 		"messages":   msgs,
 	}
-	if strings.TrimSpace(req.System) != "" {
+	if oauthToken != "" {
+		// Subscription OAuth: system MUST be content blocks led by the Claude
+		// Code identity, else the credential is rejected.
+		sys := []block{{"type": "text", "text": "You are Claude Code, Anthropic's official CLI for Claude."}}
+		if strings.TrimSpace(req.System) != "" {
+			sys = append(sys, block{"type": "text", "text": req.System})
+		}
+		payload["system"] = sys
+	} else if strings.TrimSpace(req.System) != "" {
 		payload["system"] = req.System
 	}
 	if len(tools) > 0 {
@@ -331,9 +355,12 @@ func callAnthropic(ctx context.Context, req aiChatReq) (aiMessage, error) {
 			Message string `json:"message"`
 		} `json:"error"`
 	}
-	headers := map[string]string{
-		"x-api-key":         req.APIKey,
-		"anthropic-version": "2023-06-01",
+	headers := map[string]string{"anthropic-version": "2023-06-01"}
+	if oauthToken != "" {
+		headers["Authorization"] = "Bearer " + oauthToken
+		headers["anthropic-beta"] = anthropicOAuthBeta
+	} else {
+		headers["x-api-key"] = req.APIKey
 	}
 	if err := httpJSON(ctx, joinURL(base, "/v1/messages"), headers, payload, &out); err != nil {
 		return aiMessage{}, err

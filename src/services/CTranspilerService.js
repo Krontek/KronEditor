@@ -801,6 +801,23 @@ ${boardDefines}${runtimePortHelpers}${customIncludes}${ecCfgEarly.motionIncludes
                 variableTable.debugDefaults[`prog_${progName}_${vName}`] = {
                     type: vType, c_symbol: cSym, defaultValue: initVal, address: v.address || '', ...vShmSlot
                 };
+                // FB instance OUTPUT pins (Q, ET, CV, …): expose each scalar pin
+                // as its own SHM-slotted variable so the TARGET (KronServer reads
+                // /dev/shm by offset) can stream them for debug. The FB struct
+                // itself has no SHM slot, but its scalar outputs do. Live key
+                // `prog_X_<var>.<pin>` (what the ST debug overlay resolves for
+                // member access); c_symbol points into the FB struct field.
+                if (isFB) {
+                    (FB_OUTPUTS[vType] || []).forEach(pin => {
+                        const pinType = getOutputPinType(vType, pin);
+                        if (!IEC_TYPE_SIZES[pinType?.toUpperCase()]) return; // scalar pins only
+                        const pinCSym = `${cSym}.${pin}`;
+                        const pinSlot = tryAssignShm(pinType, pinCSym);
+                        variableTable.debugDefaults[`prog_${progName}_${vName}.${pin}`] = {
+                            type: pinType, c_symbol: pinCSym, defaultValue: 0, ...pinSlot
+                        };
+                    });
+                }
                 // Debug: expand array elements and struct members
                 if (!isFB) {
                     const dtDef = dataTypeDefs[vType];
@@ -1063,7 +1080,21 @@ ${boardDefines}${runtimePortHelpers}${customIncludes}${ecCfgEarly.motionIncludes
     const plcStateBlock =
         `typedef struct PlcState PlcState;\n` +
         `struct PlcState {\n${stateFields.map(f => '    ' + f).join('\n')}\n};\n` +
+        // The single PlcState instance. In a hot-swap build the host owns state
+        // (binds S via plc_bind), so this local copy is just the initial and
+        // stays `static`. In the normal single-binary build it MUST have
+        // EXTERNAL linkage: otherwise -O3 + the SHM pull→use→sync pattern makes
+        // every field a pure pass-through (redundant with __plc_shm) and clang
+        // dissolves the whole struct via SROA — leaving no `__plc_state` symbol,
+        // so the local-sim live-read (DWARF member offsets off &__plc_state)
+        // finds nothing → "No variables matched in symbol table". An
+        // external-linkage global is observable (no LTO) so it can't be removed
+        // or scalarized; its ABI layout matches the DWARF the agent reads.
+        `#ifdef PLC_HOTSWAP\n` +
         `static PlcState __plc_state;\n` +
+        `#else\n` +
+        `PlcState __plc_state;\n` +
+        `#endif\n` +
         `static PlcState *S = &__plc_state;\n` +
         `void plc_bind(PlcState *s);\n` +
         `static void plc_state_init(void);\n` +
@@ -1654,13 +1685,16 @@ const generateMainLoop = (projectStructure, config, boardId = null, shmEnabled =
                     programTasks.push({ name: pName, intervalUs });
             });
         });
-        // Unassigned programs → default task with 10ms
+        // STRICT (IEC 61131-3): a program runs ONLY if it is explicitly assigned
+        // to a task. Programs not in any task are NOT executed (no default task).
+        // Their POU code is still generated but never called by a task thread, so
+        // their variables stay at their initial values. Warn so an "I made a
+        // program but it doesn't run / no live data" situation is diagnosable.
         const unassigned = (projectStructure.programs || [])
             .map(p => (p.name || '').trim().replace(/\s+/g, '_'))
             .filter(pName => !programTasks.find(pt => pt.name === pName));
         if (unassigned.length > 0) {
-            taskGroups.push({ taskName: '__unassigned', intervalUs: 10000, programs: unassigned });
-            unassigned.forEach(pName => programTasks.push({ name: pName, intervalUs: 10000 }));
+            console.warn(`[transpiler] Programs not assigned to any task (will NOT run): ${unassigned.join(', ')}. Assign them in Task Manager.`);
         }
     } else if (config?.content?.instances?.length > 0) {
         // Legacy res_config tasks/instances — one flat group per task
@@ -2559,6 +2593,19 @@ const transpileSTLogics = (code, stdFunctions = {}, parentName = '', category = 
     //   VAR … END_VAR (inline variable declarations — already declared in variable table)
     const stripped = code
         .replace(/\(\*[\s\S]*?\*\)/g, '')
+        // Strip // line comments HERE, before the keyword-normalization below.
+        // Otherwise an ST keyword that happens to appear inside a comment (e.g.
+        // the word "of" in "period of 1 second") matches \bOF\b and gets a
+        // newline injected, splitting the comment so its tail ("1 second")
+        // survives the later per-line // strip and leaks into the C output.
+        .replace(/\/\/[^\n]*/g, '')
+        // Drop a leading `global.` / `GVL.` namespace prefix that some models
+        // (CODESYS habit) put on variable refs — `global.blink(IN := …)` →
+        // `blink(IN := …)`. Without this the FB-call detector misses the call
+        // and emits invalid C `S->…blink(IN = …, PT = …)`. The lookbehind keeps
+        // genuine member access (`x.global.y`) untouched; there is no global
+        // namespace object in this dialect — variables are referenced bare.
+        .replace(/(?<![\w.])(?:global|gvl)\s*\.\s*/gi, '')
         .replace(/\bVAR\b[\s\S]*?\bEND_VAR\b\s*;?/gi, '');
 
     // Expand inline control-flow: insert newlines so that keywords that the

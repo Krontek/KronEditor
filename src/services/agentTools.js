@@ -194,7 +194,7 @@ export const TOOL_DEFS = [
   },
   {
     name: 'read_live_variables',
-    description: 'Read the CURRENT live values of variables from the running simulation/PLC. Use this to analyze actual runtime behaviour (e.g. a value stuck, oscillating, or out of range) before proposing a code fix. Only returns data while the program is running.',
+    description: 'Read live values from the running simulation/PLC: both the CURRENT snapshot AND a buffered time-series `history` per variable (last/first/min/max, how many times it changed, flags like "constant"/"oscillating", and a recent down-sampled series). Use the history to diagnose actual runtime behaviour — a value stuck, oscillating, drifting, or out of range — before proposing a code fix. Only returns data while the program is running.',
     parameters: S({}),
   },
   {
@@ -318,11 +318,16 @@ export function applyToolCall(struct, name, args = {}) {
         return { mutation: false, ok: true, result: buildProjectOverview(struct, args.__board) };
 
       case 'read_live_variables': {
-        const live = args.__live;
-        if (!live || Object.keys(live).length === 0) {
+        // The panel injects { current: {name:val}, history: summarizeLiveSamples(...) }.
+        const live = args.__live || {};
+        const current = live.current || null;
+        if (!current || Object.keys(current).length === 0) {
           return { mutation: false, ok: true, result: { running: false, note: 'No live data — the program is not running.' } };
         }
-        return { mutation: false, ok: true, result: { running: true, values: live } };
+        return {
+          mutation: false, ok: true,
+          result: { running: true, values: current, history: live.history || null },
+        };
       }
 
       case 'list_blocks': {
@@ -346,7 +351,9 @@ export function applyToolCall(struct, name, args = {}) {
             returnType: hit.item.returnType || undefined,
             code: (typeof c.code === 'string' && c.code) ? c.code : (sclStCode || undefined),
             rungCount: c.rungs ? c.rungs.length : undefined,
-            ladder: (c.rungs && hit.item.type !== 'SCL') ? summarizeRungs(c.rungs) : undefined,
+            // Faithful boolean-logic rendering of the rungs (LD + SCL) so the
+            // model can actually read the existing program, not just block names.
+            ladder: (c.rungs && (hit.item.type === 'LD' || hit.item.type === 'SCL')) ? renderRungs(c.rungs) : undefined,
             variables: (c.variables || []).map((v) => ({
               name: v.name, type: v.type, class: v.class, initialValue: v.initialValue, address: v.address, description: v.description,
             })),
@@ -355,8 +362,13 @@ export function applyToolCall(struct, name, args = {}) {
       }
 
       case 'create_pou': {
-        const category = args.category;
-        if (!POU_CATEGORIES.includes(category)) return { ok: false, error: `invalid category "${category}"` };
+        // Default/normalize the category — weak models often omit it or write a
+        // singular/variant ("program", "fb"). Programs are the common case.
+        const catRaw = String(args.category || '').toLowerCase();
+        const category = POU_CATEGORIES.includes(args.category) ? args.category
+          : (catRaw.startsWith('functionb') || catRaw === 'fb') ? 'functionBlocks'
+          : (catRaw === 'function' || catRaw === 'functions') ? 'functions'
+          : 'programs';
         if (!args.name || !args.name.trim()) return { ok: false, error: 'name is required' };
         if (!isValidIecName(args.name)) return { ok: false, error: `invalid name "${args.name}" — POU names must be IEC identifiers (letters, digits, underscore; no spaces; can't start with a digit)` };
         if (findPOU(struct, args.name)) return { ok: false, error: `a POU named "${args.name}" already exists` };
@@ -624,6 +636,14 @@ function singular(category) {
 function stripStWrappers(code) {
   let c = String(code || '');
   c = c.replace(/^\s*(PROGRAM|FUNCTION_BLOCK|FUNCTION)\b[^\n]*\r?\n/i, '');           // PROGRAM/FUNCTION header
+  // CODESYS-style OOP that this editor doesn't model — weak models emit it.
+  // METHOD <name> : <type> … END_METHOD: drop the header + END_METHOD so the
+  // inner statements survive as the program body (the METHOD-local VARs are
+  // recovered by extractStDeclarations; a method-style `RETURN <value>;` is
+  // meaningless in a program body so it's dropped — a bare `RETURN;` is kept).
+  c = c.replace(/^[ \t]*(METHOD|PROPERTY|ACTION)\b[^\n]*\r?\n/gim, '');               // METHOD/PROPERTY/ACTION header
+  c = c.replace(/\r?\n?[ \t]*END_(METHOD|PROPERTY|ACTION)\b\s*;?/gi, '\n');           // their footers
+  c = c.replace(/^[ \t]*RETURN[ \t]+[^;\n]+;?[ \t]*$/gim, '');                        // RETURN <value>; (method-style)
   // pseudo-program wrapper  name()\nBEGIN  (only when name() is followed by BEGIN,
   // so legit no-arg FB calls like `pulse();` are never touched).
   c = c.replace(/^[ \t]*[A-Za-z_]\w*[ \t]*\([ \t]*\)[ \t]*\r?\n[ \t]*BEGIN\b[^\n]*\r?\n/gim, '');
@@ -696,12 +716,145 @@ function parseDeclLines(chunk, cls, push, bareOnly = false) {
   }
 }
 
-function summarizeRungs(rungs) {
-  return rungs.map((r, i) => ({
-    index: i,
-    comment: r.comment || '',
-    blocks: (r.blocks || []).map((b) => b.type),
-  }));
+// ── program "tokenizer": faithful, model-readable rendering of a ladder ───────
+//
+// summarizeRungs only lists block TYPES — the model can't reason about the
+// logic. renderRungs traces each rung's power-flow graph (left rail → contacts/
+// FBs → coils) and renders it as boolean logic the model can actually read and
+// reason about (and that mirrors set_ladder's DSL): a contact is `var` (NO) or
+// `NOT var` (NC); series = AND, parallel/converging edges = OR; a coil becomes
+// `coil := <expr>` (with SET/RESET/NOT tags). Rungs containing function blocks
+// are still listed structurally (FBs are opaque to pure boolean rendering).
+
+const LEFT_RAIL_ID = 'terminal_left_middle';
+
+function andJoin(terms) {
+  const t = terms.filter((x) => x && x !== 'TRUE');
+  if (t.length === 0) return 'TRUE';
+  if (t.length === 1) return t[0];
+  return t.map((x) => (/[ ]OR[ ]| AND /.test(x) ? `(${x})` : x)).join(' AND ');
+}
+function orJoin(terms) {
+  const seen = new Set();
+  const t = [];
+  for (const x of terms) { if (x && !seen.has(x)) { seen.add(x); t.push(x); } }
+  if (t.some((x) => x === 'TRUE')) return 'TRUE';
+  if (t.length === 0) return 'TRUE';
+  if (t.length === 1) return t[0];
+  return t.map((x) => (/ AND /.test(x) ? `(${x})` : x)).join(' OR ');
+}
+
+function renderRungs(rungs) {
+  return (rungs || []).map((r, i) => {
+    // SCL rungs may be ST — surface the code verbatim.
+    if (r.lang === 'ST') return { index: i, comment: r.comment || '', lang: 'ST', code: r.code || '' };
+
+    const blocks = r.blocks || [];
+    const conns = r.connections || [];
+    const byId = {};
+    blocks.forEach((b) => { byId[b.id] = b; });
+    const incoming = {};
+    conns.forEach((c) => { (incoming[c.target] || (incoming[c.target] = [])).push(c.source); });
+
+    const contactLit = (b) => {
+      const v = b.data?.values?.var || b.data?.instanceName || '?';
+      const nc = (b.data?.subType || b.data?.customData?.subType) === 'NC';
+      return nc ? `NOT ${v}` : v;
+    };
+
+    const memo = {};
+    const exprOf = (id, seen) => {
+      if (id === LEFT_RAIL_ID) return 'TRUE';
+      if (memo[id] !== undefined) return memo[id];
+      if (seen.has(id)) return '/*loop*/';
+      const s2 = new Set(seen); s2.add(id);
+      const srcs = incoming[id] || [];
+      const power = srcs.length ? orJoin(srcs.map((s) => exprOf(s, s2))) : 'TRUE';
+      const b = byId[id];
+      let res = power;
+      if (b && b.type === 'Contact') res = andJoin([power, contactLit(b)]);
+      else if (b && b.type !== 'Coil') res = `${b.data?.instanceName || b.type}.<out>`; // FB output — opaque
+      memo[id] = res;
+      return res;
+    };
+
+    const coils = blocks.filter((b) => b.type === 'Coil');
+    const logic = coils.map((c) => {
+      const v = c.data?.values?.coil || c.data?.instanceName || '?';
+      const sub = c.data?.subType || c.data?.customData?.subType || 'Normal';
+      const drive = exprOf(c.id, new Set());
+      const tag = { Set: 'SET when ', Reset: 'RESET when ', Negated: 'NOT (' }[sub] || '';
+      const close = sub === 'Negated' ? ')' : '';
+      return `${v} := ${tag}${drive}${close}`;
+    });
+
+    const out = { index: i, comment: r.comment || '', logic };
+    const fbs = blocks.filter((b) => b.type !== 'Contact' && b.type !== 'Coil' && !String(b.id).startsWith('terminal'));
+    if (fbs.length) {
+      out.functionBlocks = fbs.map((b) => ({ type: b.type, instance: b.data?.instanceName || null }));
+      out.note = 'This rung contains function block(s); the boolean logic above omits FB internals.';
+    }
+    if (logic.length === 0 && fbs.length === 0) out.note = '(empty rung)';
+    return out;
+  });
+}
+
+// ── live-data buffer summarizer (diagnosis aid) ───────────────────────────────
+//
+// The panel keeps a rolling ring buffer of timestamped live-variable snapshots
+// while the program runs. This condenses it into a compact per-variable
+// time-series the model can reason about: last/first/min/max, how many times it
+// changed, a flag (constant / oscillating), and a short recent (down-sampled)
+// series — enough to see a value stuck, oscillating, drifting, or out of range
+// WITHOUT shipping hundreds of raw samples. `samples` = [{ t:ms, v:{name:val} }].
+export function summarizeLiveSamples(samples, opts = {}) {
+  const buf = Array.isArray(samples) ? samples : [];
+  if (buf.length === 0) return null;
+  const maxRecent = opts.maxRecent || 16;
+  const t0 = buf[0].t, t1 = buf[buf.length - 1].t;
+  const names = new Set();
+  buf.forEach((s) => Object.keys(s.v || {}).forEach((n) => names.add(n)));
+
+  const num = (x) => (typeof x === 'boolean' ? (x ? 1 : 0) : (typeof x === 'number' ? x : Number(x)));
+  const variables = {};
+  for (const name of names) {
+    const series = buf.map((s) => s.v?.[name]).filter((x) => x !== undefined && x !== null);
+    if (series.length === 0) continue;
+    let min = Infinity, max = -Infinity, changes = 0, prev, prevN;
+    let nonDecr = true, nonIncr = true;
+    const distinct = new Set();
+    for (const raw of series) {
+      const n = num(raw);
+      if (Number.isFinite(n)) {
+        if (n < min) min = n; if (n > max) max = n;
+        if (prevN !== undefined) { if (n < prevN) nonDecr = false; if (n > prevN) nonIncr = false; }
+        prevN = n;
+      }
+      if (prev !== undefined && raw !== prev) changes++;
+      distinct.add(raw);
+      prev = raw;
+    }
+    // Down-sample the recent tail to at most maxRecent points.
+    const step = Math.max(1, Math.ceil(series.length / maxRecent));
+    const recent = series.filter((_, k) => k % step === 0).slice(-maxRecent);
+    // Classify the trace so the model gets a hint without parsing the series:
+    // constant (never changed), oscillating (few distinct values, many flips),
+    // or a monotonic rising/falling ramp.
+    const flags = [];
+    if (changes === 0) flags.push('constant');
+    else if (distinct.size <= 3 && changes >= 4) flags.push('oscillating');
+    else if (nonDecr) flags.push('rising');
+    else if (nonIncr) flags.push('falling');
+    variables[name] = {
+      last: series[series.length - 1],
+      first: series[0],
+      ...(Number.isFinite(min) ? { min, max } : {}),
+      changes,
+      ...(flags.length ? { flags } : {}),
+      recent,
+    };
+  }
+  return { windowSeconds: Math.round((t1 - t0) / 100) / 10, samples: buf.length, variables };
 }
 
 // ── ladder compiler ──────────────────────────────────────────────────────────

@@ -1,6 +1,6 @@
 import { useState, useRef, useEffect, useCallback } from 'react';
 import { host } from '../services/HostClient';
-import { TOOL_DEFS, applyToolCall, buildProjectOverview, findPOU } from '../services/agentTools';
+import { TOOL_DEFS, applyToolCall, buildProjectOverview, findPOU, summarizeLiveSamples } from '../services/agentTools';
 
 /*
  * AiAgentPanel — the PLC Agent: a project-editing tool-calling agent.
@@ -34,7 +34,8 @@ const C = {
 };
 
 const PROVIDERS = [
-  { id: 'anthropic', label: 'Anthropic', models: ['claude-opus-4-8', 'claude-sonnet-4-6', 'claude-haiku-4-5'] },
+  { id: 'anthropic', label: 'Anthropic (API key)', models: ['claude-opus-4-8', 'claude-sonnet-4-6', 'claude-haiku-4-5'] },
+  { id: 'anthropic-oauth', label: 'Claude account (sign in)', models: ['claude-opus-4-8', 'claude-sonnet-4-6', 'claude-haiku-4-5'] },
   { id: 'openai', label: 'OpenAI', models: ['gpt-4.1', 'gpt-4o', 'o4-mini'] },
   { id: 'gemini', label: 'Google (Gemini)', models: ['gemini-2.5-pro', 'gemini-2.5-flash', 'gemini-2.5-flash-lite', 'gemini-2.0-flash', 'gemini-2.0-flash-lite'] },
   { id: 'ollama', label: 'Local (Ollama)', models: ['llama3.1', 'qwen2.5-coder', 'deepseek-coder'] },
@@ -160,43 +161,154 @@ function findJsonObjects(text) {
     }
     if (ch === '"') inStr = true;
     else if (ch === '{') { if (depth === 0) start = i; depth++; }
-    else if (ch === '}') { if (depth > 0) { depth--; if (depth === 0 && start >= 0) { out.push(text.slice(start, i + 1)); start = -1; } } }
+    else if (ch === '}') { if (depth > 0) { depth--; if (depth === 0 && start >= 0) { out.push({ raw: text.slice(start, i + 1), start }); start = -1; } } }
   }
   return out;
 }
 
-// Some models (especially local ones) emit tool calls as plain TEXT — one or
-// MORE JSON objects like { "name": "...", "arguments": {...} } — instead of the
-// provider's structured tool_calls field. Recover all of them so local models
-// stay usable. Returns a normalized toolCalls array, or null if none found.
+// The last KNOWN tool name mentioned in `text` (and where). Used to pair a bare
+// args object with the tool whose name the model wrote in surrounding prose
+// (e.g. a markdown heading "**create_pou**" right before the JSON args).
+function lastToolMention(text) {
+  let best = null, bestIdx = -1;
+  for (const name of KNOWN_TOOLS) {
+    const idx = text.lastIndexOf(name);
+    if (idx > bestIdx) { bestIdx = idx; best = name; }
+  }
+  return best;
+}
+
+// The explicit arguments object inside a tool-call wrapper, or null if the
+// object has no wrapper key (i.e. it IS the flat args).
+function explicitArgs(o) {
+  if (o.arguments !== undefined) return o.arguments;
+  if (o.parameters !== undefined) return o.parameters;
+  if (o.args !== undefined) return o.args;
+  return null;
+}
+
+// Some models (especially local ones) emit tool calls as plain TEXT instead of
+// the provider's structured tool_calls field — and weaker ones split them into
+// MARKDOWN where the tool NAME is a heading and only the ARGUMENTS are JSON:
+//   1. **create_pou**
+//      { "name": "Blinker", "language": "ST" }
+// Recover BOTH shapes: a proper { name, arguments } object, OR a bare args
+// object paired with the nearest preceding tool-name mention. Returns a
+// normalized toolCalls array, or null if none found.
 function extractInlineToolCalls(content) {
   if (!content) return null;
   // Strip code-fence markers (keep their contents) so fenced blocks are scanned.
   const text = content.replace(/```(?:json)?/gi, '').replace(/```/g, '');
-  const candidates = [];
-  // A whole-array form first: [ {…}, {…} ].
+  const calls = [];
+  const pushCall = (name, args) => {
+    if (!KNOWN_TOOLS.has(name)) return;
+    calls.push({ id: `inline_${calls.length}`, name, arguments: typeof args === 'string' ? args : JSON.stringify(args ?? {}) });
+  };
+  // Turn one parsed object into a call: prefer its own tool name + explicit args;
+  // else treat it as flat args for `fallbackName` (the surrounding-text tool name).
+  const consume = (o, fallbackName) => {
+    if (!o || typeof o !== 'object') return;
+    if (typeof o.name === 'string' && KNOWN_TOOLS.has(o.name)) {
+      const a = explicitArgs(o);
+      if (a !== null) { pushCall(o.name, a); return; }
+      const flat = { ...o }; delete flat.name;   // flat args that included the tool name
+      pushCall(o.name, flat);
+      return;
+    }
+    if (fallbackName) pushCall(fallbackName, o);  // bare args; name came from prose
+  };
+
+  // A whole-array / single-object form first: [ {…}, {…} ] or { name, arguments }.
   try {
     const arr = JSON.parse(text.trim());
-    if (Array.isArray(arr)) candidates.push(...arr);
-    else if (arr && typeof arr === 'object') candidates.push(arr);
-  } catch { /* not a clean array/object — scan for embedded objects */ }
-  if (candidates.length === 0) {
-    for (const raw of findJsonObjects(text)) {
-      try { candidates.push(JSON.parse(raw)); }
-      catch {
-        // Fallback: repair the array-vs-object bracket malformation and retry
-        // (e.g. set_ladder's `rungs: [["outputs":…]]` → `[{"outputs":…}]`).
-        try { candidates.push(JSON.parse(repairJsonBrackets(raw))); } catch { /* skip non-JSON */ }
-      }
+    const items = Array.isArray(arr) ? arr : [arr];
+    items.forEach((o) => consume(o, null));
+    if (calls.length) return calls;
+  } catch { /* not clean JSON — scan embedded objects */ }
+
+  for (const { raw, start } of findJsonObjects(text)) {
+    let o;
+    try { o = JSON.parse(raw); }
+    catch {
+      // Repair the array-vs-object bracket malformation and retry
+      // (e.g. set_ladder's `rungs: [["outputs":…]]` → `[{"outputs":…}]`).
+      try { o = JSON.parse(repairJsonBrackets(raw)); } catch { continue; }
+    }
+    consume(o, lastToolMention(text.slice(0, start)));
+  }
+  return calls.length ? calls : null;
+}
+
+// Weak models, after several turns, sometimes stop calling tools entirely and
+// just PRINT the POU body inside a ```st / ```iec-st / ``` code block (treating
+// the chat as a code-display, not an action). Recover the first such block as a
+// set_st_code call (no `pou` — the dry-run POU inference targets the open POU).
+// Skips JSON blocks (handled by extractInlineToolCalls) and only accepts content
+// that actually looks like ST, so a prose block isn't mistaken for code.
+function recoverStCodeBlock(text) {
+  if (!text) return null;
+  const fence = /```([a-zA-Z0-9_-]*)[ \t]*\r?\n([\s\S]*?)```/g;
+  let m;
+  while ((m = fence.exec(text)) !== null) {
+    const tag = (m[1] || '').toLowerCase();
+    const body = m[2];
+    const t = (body || '').trim();
+    if (!t || t.startsWith('{') || t.startsWith('[')) continue;       // JSON → handled elsewhere
+    const tagged = /^(st|scl|iec|iec-?st|iecst|pascal|structured-?text)$/i.test(tag);
+    const looksST = /:=|\bIF\b|\bEND_IF\b|\bVAR\b|\bFOR\b|\bWHILE\b|\bCASE\b|\bEND_/i.test(body);
+    if (tagged || looksST) {
+      return [{ id: 'inline_code', name: 'set_st_code', arguments: JSON.stringify({ code: body.replace(/\s+$/, '') }) }];
     }
   }
-  const calls = [];
-  candidates.forEach((o, i) => {
-    if (o && typeof o === 'object' && typeof o.name === 'string' && KNOWN_TOOLS.has(o.name)) {
-      const args = o.arguments ?? o.parameters ?? o.args ?? {};
-      calls.push({ id: `inline_${i}`, name: o.name, arguments: typeof args === 'string' ? args : JSON.stringify(args) });
+  return null;
+}
+
+// Some models emit tool calls in a NON-JSON `tool_name key="value" key=value`
+// form (one call per block; quoted values may span newlines — e.g. set_st_code's
+// `code="…multi-line…"`). Parse those: locate each known tool name at a call
+// position (line start, optional bullet/**), then read its key/value args up to
+// the next tool name. Returns a normalized toolCalls array, or null.
+function parseKeyValArgs(s) {
+  const args = {};
+  let i = 0;
+  while (i < s.length) {
+    while (i < s.length && /\s/.test(s[i])) i++;
+    const km = /^([A-Za-z_]\w*)[ \t]*=/.exec(s.slice(i));
+    if (!km) break;
+    const key = km[1];
+    i += km[0].length;
+    while (i < s.length && (s[i] === ' ' || s[i] === '\t')) i++;
+    let val = '';
+    if (s[i] === '"' || s[i] === "'") {
+      const q = s[i]; i++;
+      while (i < s.length && s[i] !== q) {
+        if (s[i] === '\\' && i + 1 < s.length) { val += s[i + 1]; i += 2; }
+        else { val += s[i]; i++; }
+      }
+      i++; // closing quote
+    } else {
+      while (i < s.length && !/\s/.test(s[i])) { val += s[i]; i++; }
     }
-  });
+    args[key] = val;
+  }
+  return args;
+}
+
+function extractKeyValToolCalls(content) {
+  if (!content) return null;
+  const text = content.replace(/```(?:json|st|iec-?st|pascal)?/gi, '').replace(/```/g, '');
+  const names = [...KNOWN_TOOLS].join('|');
+  // tool name at a line start (optional "1. " / "- " / "**"), followed by ` key=`.
+  const re = new RegExp(`(?:^|\\n)[ \\t]*(?:[-*]\\s*|\\d+[.)]\\s*)?(?:\\*\\*)?(${names})(?:\\*\\*)?[ \\t]+(?=[A-Za-z_]\\w*[ \\t]*=)`, 'g');
+  const hits = [];
+  let m;
+  while ((m = re.exec(text)) !== null) hits.push({ name: m[1], start: m.index + m[0].length });
+  const calls = [];
+  for (let k = 0; k < hits.length; k++) {
+    const end = k + 1 < hits.length ? hits[k + 1].start : text.length;
+    const args = parseKeyValArgs(text.slice(hits[k].start, end));
+    if (Object.keys(args).length) calls.push({ id: `kv_${k}`, name: hits[k].name, arguments: JSON.stringify(args) });
+  }
   return calls.length ? calls : null;
 }
 
@@ -306,12 +418,13 @@ function buildSystemPrompt(projectStructure, board, activeItem, libraryData = []
     '- "BLOCK"/"blok"/"FB" terminology: when the user calls something a "block" (e.g. "mc_power blogu", "a TON block") and its name matches a standard/library block IGNORING case and underscores (mc_power→MC_Power, ton→TON, ctu→CTU), it is a FUNCTION BLOCK INSTANCE of THAT type — NOT a plain variable. You MUST: call list_blocks for its real pins, then add_variable with type = the FB type name (e.g. type "MC_Power"), then CALL it in ST. NEVER create a BOOL merely named after a known block (a `mc_power : BOOL` coil is WRONG when the user asked for the MC_Power block). Any separate "power"/"enable"/"güç" bool the user mentions is a DISTINCT BOOL variable that feeds the FB\'s Enable input — add it too.',
     '- FBs CANNOT live in a ladder rung (set_ladder is contacts+coils only). So if the user wants a function block (MC_Power, TON, …) AND ladder, either write the FB call in ST, or use an SCL POU (create_pou language "SCL") and put the boolean contacts/coils in a ladder rung via set_ladder while calling the FB in an ST body via set_st_code. Do NOT silently downgrade the FB to a BOOL to fit ladder.',
     '- Structured Text must be valid IEC 61131-3: := assign; AND/OR/NOT logical; BAND/BOR/BXOR/BNOT bitwise; time literals like T#500ms.',
+    '- Reference every variable by its BARE name — NEVER prefix it with `global.`, `GVL.`, a program name, or any namespace. Write `led := NOT led;` and `blink(IN := NOT blink.Q, PT := T#1s);` — NOT `global.led` or `global.blink.Q`. (This is not CODESYS; there is no global namespace object.) Member access (`blink.Q`, `blink.ET`) is only for reading an FB instance\'s output pins.',
     '- Before using a variable in ST, add it with add_variable (in the SAME response). Conversely: every variable you add_variable for MUST be referenced in the body you write — no dead vars.',
     '- Variables default to LOCAL scope. For a LOCAL variable you MUST pass BOTH scope "local" AND pou = the exact POU name it belongs to (usually the POU you just created in this same response). Never omit `pou` for a local variable. Use scope "global" ONLY when the user explicitly says global/shared, or the variable must be used by more than one POU.',
     '- ORDER within one response: create_pou FIRST, then add_variable (with that pou) for every variable, then set_ladder / set_st_code last. Use the SAME POU name string everywhere.',
     '- Make the smallest change that satisfies the request; prefer editing an existing POU over creating new ones unless asked. delete_pou/remove_variable only when explicitly asked.',
     '- Once requirements are clear (after any CLARIFY questions are answered), finish the WHOLE request in your tool calls before replying — if asked to create a POU AND write its code, emit create_pou THEN set_st_code/set_ladder AND the add_variable calls. NEVER ask the user to "provide the code" or hand the coding back to them; you write it. (Asking to clarify REQUIREMENTS is fine; asking them to do the coding is not.)',
-    '- set_st_code replaces the WHOLE body and takes ONLY body statements — NO PROGRAM/VAR/END_VAR/END_PROGRAM wrapper (variables go via add_variable). set_ladder (contacts+coils only) replaces all rungs.',
+    '- set_st_code replaces the WHOLE body and takes ONLY plain executable statements — NO wrappers and NO OOP. Do NOT emit PROGRAM/END_PROGRAM, FUNCTION/FUNCTION_BLOCK, VAR/END_VAR, and especially NOT `METHOD … END_METHOD` / PROPERTY / ACTION (this is not CODESYS — there are no methods). NO `RETURN <value>;` (a program returns nothing). Just write the statements that run each scan; variables go via add_variable. set_ladder (contacts+coils only) replaces all rungs.',
     '- PLC logic runs ONCE per scan, cyclically — NEVER write unbounded loops (no WHILE TRUE; it hangs the PLC). For timing use a TON across scans, e.g. `pulse(IN := NOT pulse.Q, PT := T#1s); IF pulse.Q THEN out := NOT out; END_IF`.',
     '- Function blocks (TON, TOF, TP, CTU, CTD, R_TRIG, motion MC_*, communication, user FBs) are INSTANCES, not functions. For each you must: (1) add_variable with type = the FB name itself (e.g. type "TON" — NOT "TIME"/"BOOL"); (2) CALL it as `name(IN := …, PT := …);`; (3) read its outputs as `name.Q`, `name.ET`. NEVER write `name := TON(…)` — assigning an FB call is invalid IEC and will not compile.',
     '- The blocks below are only NAMES — you do NOT know their exact pins from memory. BEFORE using any function block or function (standard or project-defined) in ST, call list_blocks (optionally filtered, e.g. {"filter":"MC_"}) to get its real input/output pin names and types, then use those exact pin names.',
@@ -319,7 +432,8 @@ function buildSystemPrompt(projectStructure, board, activeItem, libraryData = []
     '- A correct TON blink is EXACTLY: declare `blink : TON;` (add_variable type TON) and `led : BOOL`, then body `blink(IN := NOT blink.Q, PT := T#500ms); IF blink.Q THEN led := NOT led; END_IF;`. Do not also toggle led outside the IF.',
     '- CRITICAL: you change the project ONLY by emitting tool calls. NEVER write code in prose and claim it is done; NEVER output "APPLIED:" or "I have set the code" — the SYSTEM applies + confirms. To write code into a POU you MUST call set_st_code/set_ladder.',
     '- Every change is shown as a diff the user approves/rejects; if rejected, adapt. When done, reply with a short summary in the user\'s language.',
-    '- Use read_pou for a POU\'s code+variables, get_project_overview for full detail, read_live_variables (while running) to diagnose before a fix.',
+    '- To SEE the existing program before editing it, call read_pou: it returns the full ST code AND, for LD/SCL, each rung rendered as boolean logic (e.g. `Motor := (Start OR Motor) AND NOT Stop`) plus the variable table. Use get_project_overview for the project-wide picture.',
+    '- While the program is RUNNING, read_live_variables returns the current values AND a buffered time-series `history` per variable (min/max/last, change count, flags like constant/oscillating/rising/falling, a recent sample series). Read it to diagnose real behaviour (a value stuck, oscillating, drifting, out of range) BEFORE proposing a fix, and refer to the concrete numbers when you explain the problem.',
     '',
     `Board: ${board || 'none'}. Currently open POU: ${active}.`,
     `POUs (${overview.pous.length}): ${pous}.`,
@@ -346,6 +460,47 @@ export default function AiAgentPanel({
   const [config, setConfig] = useState(loadConfig);
   const [configOpen, setConfigOpen] = useState(false);
   const [draftCfg, setDraftCfg] = useState(() => config || { provider: 'anthropic', model: 'claude-opus-4-8', apiKey: '', baseUrl: '' });
+  // Claude-account OAuth: connection status + the pending "paste your code" flow.
+  const [oauth, setOauth] = useState({ connected: false, checked: false, busy: false, error: '' });
+  const [oauthCode, setOauthCode] = useState('');     // the code#state the user pastes
+  const [oauthPending, setOauthPending] = useState(false); // authorize URL opened, awaiting code
+
+  const refreshOauth = useCallback(async () => {
+    try { const r = await host.anthropicOAuthStatus(); setOauth((o) => ({ ...o, connected: !!r.connected, checked: true })); }
+    catch { setOauth((o) => ({ ...o, checked: true })); }
+  }, []);
+  useEffect(() => { refreshOauth(); }, [refreshOauth]);
+
+  const startClaudeSignIn = async () => {
+    setOauth((o) => ({ ...o, busy: true, error: '' }));
+    try {
+      const r = await host.anthropicOAuthStart();
+      window.open(r.authorizeUrl, '_blank', 'noopener');
+      setOauthPending(true);
+    } catch (e) {
+      setOauth((o) => ({ ...o, error: e.message || 'sign-in failed' }));
+    } finally {
+      setOauth((o) => ({ ...o, busy: false }));
+    }
+  };
+  const finishClaudeSignIn = async () => {
+    if (!oauthCode.trim()) return;
+    setOauth((o) => ({ ...o, busy: true, error: '' }));
+    try {
+      await host.anthropicOAuthExchange(oauthCode.trim());
+      setOauth({ connected: true, checked: true, busy: false, error: '' });
+      setOauthPending(false); setOauthCode('');
+      // Connect the agent to the Claude account (no API key needed).
+      const next = { provider: 'anthropic-oauth', model: draftCfg.model || 'claude-opus-4-8', apiKey: '', baseUrl: '' };
+      setDraftCfg(next); saveConfig(next); setConfig(next);
+    } catch (e) {
+      setOauth((o) => ({ ...o, busy: false, error: e.message || 'connect failed' }));
+    }
+  };
+  const claudeSignOut = async () => {
+    try { await host.anthropicOAuthLogout(); } catch { /* ignore */ }
+    setOauth({ connected: false, checked: true, busy: false, error: '' });
+  };
   // Restore the persisted conversation. A proposal left mid-approval is marked
   // not-applied on restore (it was never committed). _mid is advanced past the
   // restored ids so new view items don't collide.
@@ -370,6 +525,20 @@ export default function AiAgentPanel({
   const workingRef = useRef(projectStructure);
   const psRef = useRef(projectStructure);
   useEffect(() => { psRef.current = projectStructure; }, [projectStructure]);
+
+  // Rolling ring buffer of timestamped live-variable snapshots while the program
+  // runs, so read_live_variables can hand the model a time-series (not just the
+  // instantaneous snapshot) to diagnose stuck/oscillating/out-of-range values.
+  // Kept in a ref + a lightweight effect so it never triggers heavy re-renders
+  // (live values tick every few hundred ms).
+  const liveBufRef = useRef([]);
+  const LIVE_BUF_MAX = 600; // cap (~minutes at the SSE cadence); auto-trimmed
+  useEffect(() => {
+    if (!liveVariables || Object.keys(liveVariables).length === 0) return;
+    const buf = liveBufRef.current;
+    buf.push({ t: Date.now(), v: liveVariables });
+    if (buf.length > LIVE_BUF_MAX) buf.splice(0, buf.length - LIVE_BUF_MAX);
+  }, [liveVariables]);
 
   // ── local-model (Ollama) download & setup ────────────────────────────────
   const [cfgTab, setCfgTab] = useState('connect');         // 'connect' | 'download'
@@ -500,7 +669,11 @@ export default function AiAgentPanel({
     saveConvo(messages, convoRef.current);
   }, [messages]);
 
-  const configured = !!(config && config.model && (config.provider === 'ollama' || config.apiKey || config.baseUrl));
+  const configured = !!(config && config.model && (
+    config.provider === 'ollama' ||
+    (config.provider === 'anthropic-oauth' && oauth.connected) ||
+    config.apiKey || config.baseUrl
+  ));
 
   const pushView = (item) => setMessages((m) => [...m, { id: nextId(), ...item }]);
   const setViewStatus = (viewId, status) =>
@@ -536,6 +709,18 @@ export default function AiAgentPanel({
     if (calls.length === 0) {
       const inline = extractInlineToolCalls(assistantText);
       if (inline) { calls = inline; assistantText = ''; }
+    }
+    // Some models emit calls as `tool_name key="value"` plain text (no JSON).
+    if (calls.length === 0) {
+      const kv = extractKeyValToolCalls(assistantText);
+      if (kv) { calls = kv; assistantText = ''; }
+    }
+    // Last-ditch fallback: a weak model that, after several turns, stops calling
+    // tools and just PRINTS the POU body in a ```st code block. Recover it as a
+    // set_st_code on the active POU (the POU-target inference fills the target).
+    if (calls.length === 0) {
+      const codeCall = recoverStCodeBlock(assistantText);
+      if (codeCall) { calls = codeCall; assistantText = ''; }
     }
     // Normalize every tool call's arguments to a valid OBJECT before it enters
     // the conversation. Otherwise a string/truncated-JSON argument (common from
@@ -576,7 +761,7 @@ export default function AiAgentPanel({
       const args = parseArgs(tc.arguments);
       if (args.__parseError) { steps.push({ tc, args: {}, res: { ok: false, error: 'arguments were not valid JSON' } }); continue; }
       if (tc.name === 'get_project_overview') args.__board = selectedBoard;
-      if (tc.name === 'read_live_variables') args.__live = liveVariables;
+      if (tc.name === 'read_live_variables') args.__live = { current: liveVariables, history: summarizeLiveSamples(liveBufRef.current) };
       if (tc.name === 'list_blocks') args.__library = libraryData;
       // Repair a missing/unresolvable local-scope POU target from context.
       if (needsLocalPou(tc.name, args) && !findPOU(working, args.pou)) {
@@ -648,6 +833,7 @@ export default function AiAgentPanel({
   const resetChat = () => {
     if (busy) return;
     convoRef.current = [];
+    liveBufRef.current = [];           // drop buffered live samples for the fresh chat
     setPending(null);
     setMessages([]);
     try { localStorage.removeItem(CONVO_KEY); } catch { /* ignore */ }
@@ -669,7 +855,7 @@ export default function AiAgentPanel({
   const providerDef = PROVIDERS.find(p => p.id === draftCfg.provider) || PROVIDERS[0];
 
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', height: '100%', background: C.bg, color: C.text, fontSize: 12 }}>
+    <div style={{ display: 'flex', flexDirection: 'column', flex: 1, minHeight: 0, height: '100%', background: C.bg, color: C.text, fontSize: 12 }}>
       {/* ── header: title + model pill + gear ─────────────────────────── */}
       <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '6px 10px', background: C.panel, borderBottom: `1px solid ${C.border}`, flexShrink: 0 }}>
         <span style={{ fontSize: 13 }}>🤖</span>
@@ -726,7 +912,42 @@ export default function AiAgentPanel({
               (Gemini ships far more models than we can hardcode). */}
           <ModelCombo value={draftCfg.model} suggestions={providerDef.models}
             onChange={(m) => setDraftCfg(d => ({ ...d, model: m }))} />
-          {draftCfg.provider !== 'ollama' && (
+          {draftCfg.provider === 'anthropic-oauth' ? (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 6, background: C.code, border: `1px solid ${C.border2}`, borderRadius: 4, padding: 8 }}>
+              {oauth.connected ? (
+                <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                  <span style={{ fontSize: 11, color: C.green }}>✓ Signed in to your Claude account</span>
+                  <button onClick={claudeSignOut} style={{ marginLeft: 'auto', background: 'transparent', border: `1px solid ${C.border2}`, color: C.sub, fontSize: 10, padding: '2px 8px', borderRadius: 3, cursor: 'pointer' }}>Sign out</button>
+                </div>
+              ) : !oauthPending ? (
+                <>
+                  <div style={{ fontSize: 10, color: C.muted, lineHeight: 1.5 }}>
+                    Sign in with your Claude Pro/Max subscription — no API key. Opens claude.ai; after you authorize, copy the code it shows and paste it below.
+                  </div>
+                  <button onClick={startClaudeSignIn} disabled={oauth.busy}
+                    style={{ alignSelf: 'flex-start', background: C.accentBtn, border: 'none', color: '#fff', fontSize: 11, padding: '5px 12px', borderRadius: 3, cursor: 'pointer' }}>
+                    {oauth.busy ? 'Opening…' : '🔐 Sign in with Claude'}
+                  </button>
+                </>
+              ) : (
+                <>
+                  <div style={{ fontSize: 10, color: C.muted }}>Paste the authorization code from the claude.ai page:</div>
+                  <input value={oauthCode} onChange={e => setOauthCode(e.target.value)} placeholder="code#state"
+                    style={{ background: C.panel, border: `1px solid ${C.border2}`, color: C.text, fontSize: 12, padding: '4px 6px', fontFamily: 'monospace' }} />
+                  <div style={{ display: 'flex', gap: 6 }}>
+                    <button onClick={finishClaudeSignIn} disabled={oauth.busy || !oauthCode.trim()}
+                      style={{ background: C.accentBtn, border: 'none', color: '#fff', fontSize: 11, padding: '4px 12px', borderRadius: 3, cursor: 'pointer' }}>
+                      {oauth.busy ? 'Connecting…' : 'Connect'}
+                    </button>
+                    <button onClick={() => { setOauthPending(false); setOauthCode(''); }}
+                      style={{ background: 'transparent', border: `1px solid ${C.border2}`, color: C.sub, fontSize: 11, padding: '4px 12px', borderRadius: 3, cursor: 'pointer' }}>Cancel</button>
+                  </div>
+                </>
+              )}
+              {oauth.error && <span style={{ fontSize: 9, color: '#e06c75' }}>{oauth.error}</span>}
+              <span style={{ fontSize: 9, color: '#777' }}>Uses Claude Code's OAuth; gray-area for 3rd-party use — your call.</span>
+            </div>
+          ) : draftCfg.provider !== 'ollama' && (
             <>
               <label style={{ fontSize: 11, color: C.sub }}>API key</label>
               <input type="password" value={draftCfg.apiKey} onChange={e => setDraftCfg(d => ({ ...d, apiKey: e.target.value }))} placeholder="sk-..."
@@ -751,7 +972,12 @@ export default function AiAgentPanel({
       )}
 
       {/* ── conversation / empty state ────────────────────────────────── */}
-      <div ref={scrollRef} style={{ flex: 1, overflowY: 'auto', padding: 10, display: 'flex', flexDirection: 'column', gap: 12 }}>
+      <div ref={scrollRef} style={{ flex: 1, minHeight: 0, overflowY: 'auto', padding: 10 }}>
+        {/* Inner content column: the OUTER div is a plain block that scrolls; if
+            the outer were a flex column, its children (bubbles, the tall proposal
+            card) would flex-shrink to fit and clip instead of overflowing — so
+            you couldn't scroll to the Approve/Reject buttons. */}
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 12, minHeight: '100%' }}>
         {messages.length === 0 ? (
           <div style={{ margin: 'auto 0', display: 'flex', flexDirection: 'column', gap: 12, alignItems: 'center', textAlign: 'center', color: C.sub }}>
             <div style={{ fontSize: 32 }}>🤖</div>
@@ -777,6 +1003,7 @@ export default function AiAgentPanel({
           ))
         )}
         {busy && <div style={{ color: C.muted, fontSize: 11, fontStyle: 'italic' }}>● ● ●  thinking…</div>}
+        </div>
       </div>
 
       {/* ── input bar ─────────────────────────────────────────────────── */}

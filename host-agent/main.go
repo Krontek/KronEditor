@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 )
@@ -26,12 +27,13 @@ var (
 )
 
 type Server struct {
-	paths   *Paths
-	events  *Events
-	sim     *SimState
-	hmi     *HmiState
-	ollama  *OllamaState
-	hotswap *HotSwapState
+	paths          *Paths
+	events         *Events
+	sim            *SimState
+	hmi            *HmiState
+	ollama         *OllamaState
+	hotswap        *HotSwapState
+	anthropicOAuth *AnthropicOAuthState
 }
 
 func main() {
@@ -43,12 +45,13 @@ func main() {
 	}
 
 	srvState := &Server{
-		paths:   paths,
-		events:  NewEvents(),
-		sim:     NewSimState(),
-		hmi:     NewHmiState(),
-		ollama:  NewOllamaState(),
-		hotswap: NewHotSwapState(),
+		paths:          paths,
+		events:         NewEvents(),
+		sim:            NewSimState(),
+		hmi:            NewHmiState(),
+		ollama:         NewOllamaState(),
+		hotswap:        NewHotSwapState(),
+		anthropicOAuth: NewAnthropicOAuthState(paths.AppDataDir),
 	}
 
 	mux := http.NewServeMux()
@@ -94,6 +97,11 @@ func main() {
 	mux.HandleFunc("/api/host/ai/log-clear", srvState.handleAILogClear)
 	mux.HandleFunc("/api/host/ai/log-save", srvState.handleAILogSave)
 
+	mux.HandleFunc("/api/host/anthropic-oauth/start", srvState.handleAnthropicOAuthStart)
+	mux.HandleFunc("/api/host/anthropic-oauth/exchange", srvState.handleAnthropicOAuthExchange)
+	mux.HandleFunc("/api/host/anthropic-oauth/status", srvState.handleAnthropicOAuthStatus)
+	mux.HandleFunc("/api/host/anthropic-oauth/logout", srvState.handleAnthropicOAuthLogout)
+
 	// Hot-swap (online change) — local simulation
 	mux.HandleFunc("/api/host/hotswap/build", srvState.handleHotSwapBuild)
 	mux.HandleFunc("/api/host/hotswap/run", srvState.handleHotSwapRun)
@@ -137,19 +145,41 @@ func main() {
 		log.Printf("  toolchains: %s", paths.ToolchainsRoot)
 		log.Printf("  app-data:   %s", paths.AppDataDir)
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			if strings.Contains(err.Error(), "address already in use") {
+				port := strings.TrimPrefix(*flagAddr, ":")
+				log.Fatalf("port %s is already in use — a previous kron-host-agent is probably still running "+
+					"(e.g. left STOPPED by a Ctrl+Z, which keeps holding the port).\n"+
+					"  Free it:  lsof -ti:%s | xargs -r kill -9\n"+
+					"  then start again.", *flagAddr, port)
+			}
 			log.Fatalf("listen: %v", err)
 		}
 	}()
 
 	<-stop
 	log.Println("shutting down...")
+	// Hard-exit backstop: if any cleanup step wedges — graceful Shutdown waiting
+	// on a long-lived SSE connection (the frontend's event stream never closes on
+	// its own), or a child-process Wait() blocking — force-exit so `go run` /
+	// `concurrently --kill-others` don't hang the dev session. A second ^C also
+	// force-exits immediately.
+	go func() {
+		select {
+		case <-time.After(3 * time.Second):
+			log.Println("forced exit (graceful shutdown timed out)")
+		case <-stop: // second signal
+			log.Println("forced exit (second interrupt)")
+		}
+		os.Exit(0)
+	}()
 	srvState.sim.Stop()
 	srvState.hmi.Stop()
 	srvState.ollama.Stop()
 	srvState.hotswap.Stop()
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
 	defer cancel()
-	_ = srv.Shutdown(ctx)
+	_ = srv.Shutdown(ctx) // brief graceful drain…
+	_ = srv.Close()       // …then force-close any lingering (SSE) connections
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {

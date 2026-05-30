@@ -93,7 +93,12 @@ export class HostClient {
   }
   async compileSimulation() {
     const j = await _post(this._p('/api/host/compile-simulation'), {});
-    if (!j.ok) throw new Error(j.error || 'compileSimulation failed');
+    if (!j.ok) {
+      // Attach the compiler output (clang stderr) so the UI can show WHY it failed.
+      const e = new Error(j.error || 'compileSimulation failed');
+      e.log = j.log || '';
+      throw e;
+    }
     return j.binaryPath;
   }
   async compileForTarget({ header, source, variableTable, hal, boardId, outputName }) {
@@ -260,6 +265,28 @@ export class HostClient {
   /** Snapshot the agent log to a timestamped file; returns { ok, path }. */
   async aiLogSave() {
     return _post(this._p('/api/host/ai/log-save'), {});
+  }
+
+  // ── Anthropic account OAuth (Claude Pro/Max sign-in instead of an API key) ──
+  /** Begin sign-in: returns { authorizeUrl } to open in a browser. */
+  async anthropicOAuthStart() {
+    const j = await _post(this._p('/api/host/anthropic-oauth/start'), {});
+    if (!j.ok) throw new Error(j.error || 'oauth start failed');
+    return j;
+  }
+  /** Exchange the pasted "code#state" for tokens. Returns { connected }. */
+  async anthropicOAuthExchange(code) {
+    const j = await _post(this._p('/api/host/anthropic-oauth/exchange'), { code });
+    if (!j.ok) throw new Error(j.error || 'oauth exchange failed');
+    return j;
+  }
+  /** Whether a Claude account is currently connected: { connected, expiresAt }. */
+  async anthropicOAuthStatus() {
+    return _post(this._p('/api/host/anthropic-oauth/status'), {});
+  }
+  /** Sign out / forget the stored tokens. */
+  async anthropicOAuthLogout() {
+    return _post(this._p('/api/host/anthropic-oauth/logout'), {});
   }
 
   // ── Hot-swap (online change) — local simulation ─────────────────────────────

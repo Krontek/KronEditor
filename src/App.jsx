@@ -23,6 +23,7 @@ import {
 } from './components/ToolbarIcons';
 import SaveConfirmDialog from './components/SaveConfirmDialog';
 import VisualizationEditor from './components/visualization/VisualizationEditor';
+import { getEditorScope, EDITOR_SCOPE } from './utils/editorScope';
 import { getBoardById } from './utils/boardDefinitions';
 import { getBoardFamilyDefine } from './utils/devicePortMapping';
 import { buildHardwarePortVars } from './utils/hwPortVars';
@@ -112,6 +113,22 @@ function App() {
   const [projectStructure, setProjectStructure] = useState(defaultProjectStructure);
   const [buses, setBuses] = useState([]);
   const [busConfigs, setBusConfigs] = useState({}); // busId → config object
+
+  // ── Project-tree undo/redo ────────────────────────────────────────────────
+  // Covers the sidebar structural ops (add/delete/rename/reorder/paste of
+  // programs, function blocks, functions, data types). Each such mutation calls
+  // pushUndoSnapshot(prev) INSIDE its setProjectStructure updater, so history
+  // records only real changes. Ctrl+Z / Ctrl+Shift+Z (or Ctrl+Y) restore.
+  const projectStructureRef = React.useRef(projectStructure);
+  useEffect(() => { projectStructureRef.current = projectStructure; }, [projectStructure]);
+  const undoHistoryRef = React.useRef({ past: [], future: [] });
+  const UNDO_LIMIT = 50;
+  const pushUndoSnapshot = (prev) => {
+    const h = undoHistoryRef.current;
+    h.past.push(prev);
+    if (h.past.length > UNDO_LIMIT) h.past.shift();
+    h.future = [];
+  };
 
   const [activeId, setActiveId] = useState(null);
   const [createModal, setCreateModal] = useState({
@@ -675,6 +692,48 @@ function App() {
     });
   }, []);
 
+  // Undo/redo for the project tree. undo: pop past → current goes to future →
+  // restore. redo: the inverse. Refs are updated synchronously so a rapid
+  // Ctrl+Z/Ctrl+Y sequence chains correctly without waiting for a re-render.
+  const undoProject = useCallback(() => {
+    const h = undoHistoryRef.current;
+    if (h.past.length === 0) { addLog('info', 'Nothing to undo'); return; }
+    const prev = h.past.pop();
+    h.future.push(projectStructureRef.current);
+    projectStructureRef.current = prev;
+    setProjectStructure(prev);
+    addLog('info', 'Undo (project tree)');
+  }, [addLog]);
+
+  const redoProject = useCallback(() => {
+    const h = undoHistoryRef.current;
+    if (h.future.length === 0) { addLog('info', 'Nothing to redo'); return; }
+    const next = h.future.pop();
+    h.past.push(projectStructureRef.current);
+    projectStructureRef.current = next;
+    setProjectStructure(next);
+    addLog('info', 'Redo (project tree)');
+  }, [addLog]);
+
+  // Ctrl+Z / Ctrl+Shift+Z (or Ctrl+Y) for the project tree. Gated like the
+  // sidebar copy/paste handler: bail in text inputs (Monaco/textarea handle
+  // their own undo) and when another editor scope (LD / variables) owns focus.
+  useEffect(() => {
+    const onKey = (e) => {
+      if (!(e.ctrlKey || e.metaKey)) return;
+      const k = e.key.toLowerCase();
+      if (k !== 'z' && k !== 'y') return;
+      const el = document.activeElement;
+      if (el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.isContentEditable)) return;
+      const scope = getEditorScope();
+      if (scope && scope !== EDITOR_SCOPE.SIDEBAR) return; // LD/variables own their undo
+      if (k === 'y' || (k === 'z' && e.shiftKey)) { e.preventDefault(); redoProject(); }
+      else if (k === 'z') { e.preventDefault(); undoProject(); }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [undoProject, redoProject]);
+
   // --- Host-agent event stream (build-command, simulation-compile-log, …) ---
   useEffect(() => {
     const stop = host.streamEvents((msg) => {
@@ -932,12 +991,22 @@ function App() {
     }
   };
 
-  const handleToggleSimulation = async () => {
-    if (isPlcConnected) {
-      addLog('error', t('logs.cannotSimulateConnected') || 'Cannot enable Simulation Mode while PLC is connected.');
-      return;
+  // Start the local simulation runtime. Shared by the Run button and by the
+  // auto-run when Simulation Mode is enabled (toggling sim ON = run).
+  const runSimulationNow = async () => {
+    setIsRunning(true);
+    addLog('success', 'Running Simulation Execution...');
+    try {
+      await host.runSimulation();
+    } catch (err) {
+      addLog('error', `Failed to start simulation: ${err.message || err}`);
+      setIsRunning(false);
     }
+  };
 
+  const handleToggleSimulation = async () => {
+    // Simulation Mode is allowed even while a PLC is connected — Build & Send is
+    // disabled for the duration instead (re-enabled when Simulation goes OFF).
     if (isRunning) {
       addLog('warning', t('logs.stopExecutionFirst') || 'Please stop execution before toggling simulation mode.');
       return;
@@ -950,6 +1019,17 @@ function App() {
       try {
         const standardHeaders = await host.getStandardHeaders().catch(() => []);
         const cCode = transpileToC(projectStructure, standardHeaders, selectedBoard, true, buses, busConfigs);
+
+        // Strict task semantics: only task-assigned programs run. Warn about any
+        // program that won't execute (so "I made it but no data" is diagnosable).
+        const runningProgs = new Set((cCode.variableTable?.tasks || []).map(tk => tk.program));
+        const notRunning = (projectStructure.programs || [])
+          .map(p => p.name)
+          .filter(n => n && !runningProgs.has(n.trim().replace(/\s+/g, '_')));
+        if (notRunning.length > 0) {
+          addLog('warning', `Not assigned to any task — will NOT run: ${notRunning.join(', ')}. Assign them in Task Manager.`);
+        }
+
         const writeRes = await host.writePlcFiles({
           header: cCode.header,
           source: cCode.source,
@@ -976,8 +1056,15 @@ function App() {
         liveVarsRef.current = initialLiveVars;
         setLiveVariables(initialLiveVars);
         addLog('info', t('logs.simulationEnabled') || 'Simulation Mode Enabled. Variables populated with default values.');
+
+        // Toggling Simulation ON auto-starts the run (no separate Run click).
+        await runSimulationNow();
       } catch (error) {
         addLog('error', t('logs.simulationCompileFailed', { error: error }) || `Simulation Compilation Failed: ${error}`);
+        // Surface the actual compiler output (clang errors) so the failure has a reason.
+        if (error && error.log && String(error.log).trim()) {
+          String(error.log).trim().split('\n').forEach(line => addLog('error', line));
+        }
       }
     } else {
       setIsSimulationMode(false);
@@ -994,14 +1081,7 @@ function App() {
     }
 
     if (isSimulationMode) {
-      setIsRunning(true);
-      addLog('success', 'Running Simulation Execution...');
-      try {
-        await host.runSimulation();
-      } catch (err) {
-        addLog('error', `Failed to start simulation: ${err.message || err}`);
-        setIsRunning(false);
-      }
+      await runSimulationNow();
     } else if (isDeployed && !isDirty && isPlcConnected) {
       // Remote execution via ConnectRPC (server streaming — no polling)
       try {
@@ -1432,6 +1512,7 @@ function App() {
 
     if (createModal.isEdit) {
       setProjectStructure(prev => {
+        pushUndoSnapshot(prev);
         const nextStruct = { ...prev };
         let oldProgramName = null;
 
@@ -1478,6 +1559,7 @@ function App() {
     };
 
     setProjectStructure(prev => {
+      pushUndoSnapshot(prev);
       const catItems = [...prev[category]];
       const insertAt = createModal.insertIndex;
       if (insertAt !== null && insertAt !== undefined && insertAt >= 0 && insertAt <= catItems.length) {
@@ -1498,6 +1580,7 @@ function App() {
 
   const handleDeleteItem = (category, id) => {
     setProjectStructure(prev => {
+      pushUndoSnapshot(prev);
       const removed = prev[category]?.find(item => item.id === id);
       const next = { ...prev, [category]: prev[category].filter(item => item.id !== id) };
       if (category === 'programs' && removed) {
@@ -1529,7 +1612,7 @@ function App() {
   const handleReorderItem = (category, sourceIndex, destinationIndex) => {
     setProjectStructure(prev => {
       if (!prev[category]) return prev;
-
+      pushUndoSnapshot(prev);
       const newItems = Array.from(prev[category]);
       const [movedItem] = newItems.splice(sourceIndex, 1);
       newItems.splice(destinationIndex, 0, movedItem);
@@ -1558,6 +1641,7 @@ function App() {
     const item = { ...rest, name };
     const mergedGlobalNames = [];
     setProjectStructure(prev => {
+      pushUndoSnapshot(prev);
       const items = [...prev[category]];
       if (insertIndex !== null && insertIndex !== undefined && insertIndex >= 0 && insertIndex <= items.length) {
         items.splice(insertIndex, 0, item);
@@ -1608,6 +1692,7 @@ function App() {
     const added = [];
     const skipped = [];
     setProjectStructure(prev => {
+      pushUndoSnapshot(prev);
       const resources = (prev.resources || []).map(r => {
         if (r.type !== 'RESOURCE_EDITOR') return r;
         const existing = r.content?.globalVars || [];
@@ -2043,8 +2128,11 @@ function App() {
             <button
               className="tb-btn tb-text tb-primary"
               onClick={isPlcConnected ? handleBuildAndSend : handleBuild}
-              disabled={isRunning}
-              title={isPlcConnected ? 'Build & Send to PLC' : (t('actions.build') || 'Build')}
+              disabled={isRunning || (isPlcConnected && isSimulationMode)}
+              title={
+                isPlcConnected && isSimulationMode ? 'Disabled during Simulation — turn Simulation OFF to Build & Send'
+                  : isPlcConnected ? 'Build & Send to PLC' : (t('actions.build') || 'Build')
+              }
             >
               {isPlcConnected ? <UploadIcon /> : <BuildIcon />}
               <span>{isPlcConnected ? 'Build & Send' : (t('actions.build') || 'Build')}</span>
@@ -2379,7 +2467,7 @@ function App() {
                     />
                   </div>
                   {rightTab === 'agent' && (
-                    <div style={{ flex: 1, overflow: 'hidden' }}>
+                    <div style={{ flex: 1, minHeight: 0, overflow: 'hidden', display: 'flex', flexDirection: 'column' }}>
                       <AiAgentPanel
                         activeItem={activeItem}
                         projectStructure={projectStructure}

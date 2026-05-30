@@ -1,6 +1,8 @@
 package main
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -11,7 +13,14 @@ import (
 	"strings"
 )
 
-const simBin = "runtime.bin"
+// Local-simulation binary. DISTINCT from the target/deploy "runtime.bin": the
+// sim is a host-arch (x86_64) build with -O0 -g, while compileForTarget /
+// hotswap cross-compile "runtime.bin" for the ARM board with -O3 (no -g). They
+// MUST NOT share a filename — a Build & Send would clobber the sim binary with a
+// wrong-arch, no-DWARF one, breaking local live-variable read (e.g. FB objects
+// like blink.Q never resolve). simBin is used only by compileSimulation +
+// handleRunSimulation; targets/deploy/hotswap keep the literal "runtime.bin".
+const simBin = "sim_runtime.bin"
 
 // ── compile_simulation ───────────────────────────────────────────────────────
 
@@ -32,6 +41,22 @@ func (s *Server) compileSimulation() (string, string, error) {
 	buildDir := s.paths.BuildDir()
 	plcC := filepath.Join(buildDir, "plc.c")
 	outFile := filepath.Join(buildDir, simBin)
+
+	// Build cache: the bundled clang is ~242 MB, so its cold load (first compile,
+	// or after the page cache is evicted) dominates the perceived "compiling…"
+	// time — the actual codegen is ~60 ms. When the transpiled inputs (plc.c +
+	// plc.h, which fully determine the binary) are byte-identical to the last
+	// successful build AND the binary still exists, skip clang entirely. This
+	// makes a re-toggle of Simulation (off→on without code changes) near-instant.
+	curHash := simInputsHash(buildDir)
+	hashFile := outFile + ".hash"
+	if curHash != "" {
+		if prev, e := os.ReadFile(hashFile); e == nil && string(prev) == curHash {
+			if _, e := os.Stat(outFile); e == nil {
+				return outFile, "(cached — inputs unchanged, skipped clang)", nil
+			}
+		}
+	}
 
 	resourceTarget := "x86_64/linux"
 	if runtime.GOOS == "darwin" {
@@ -61,11 +86,17 @@ func (s *Server) compileSimulation() (string, string, error) {
 		"-fuse-ld=lld",
 		"-ffunction-sections",
 		"-fdata-sections",
-		"-O3",
+		// -O0 for the SIMULATION build: it is a correctness/logic test, not a
+		// perf target, and -O3 is the dominant compile-time cost on large
+		// projects (motion/EtherCAT pull kron_nc.c etc. in as inline headers, and
+		// optimizing all of that per sim-start is slow). -O0 compiles much faster
+		// and keeps real-time scan timing (driven by us_tick, not CPU speed).
+		// (The cross-compiled TARGET/deploy build below stays -O3.)
+		"-O0",
 		// -g emits DWARF so the agent can resolve PlcState member offsets: all
-		// PLC variables are now fields of `static PlcState __plc_state` (hot-swap
+		// PLC variables are now fields of `PlcState __plc_state` (hot-swap
 		// refactor), not standalone globals, so /proc/mem live-read needs the
-		// struct layout. Layout is ABI-fixed, unaffected by -O3.
+		// struct layout.
 		"-g",
 		"-o", outFile,
 		plcC,
@@ -91,7 +122,26 @@ func (s *Server) compileSimulation() (string, string, error) {
 	if runErr != nil {
 		return "", string(out), fmt.Errorf("clang simulation build failed: %v", runErr)
 	}
+	if curHash != "" {
+		_ = os.WriteFile(hashFile, []byte(curHash), 0o644) // record for the next build-cache check
+	}
 	return outFile, string(out), nil
+}
+
+// simInputsHash returns a SHA-256 over the transpiled inputs (plc.c + plc.h)
+// that fully determine the simulation binary. Empty string on any read error
+// (caller then just rebuilds — never a false cache hit).
+func simInputsHash(buildDir string) string {
+	h := sha256.New()
+	for _, name := range []string{"plc.c", "plc.h"} {
+		b, err := os.ReadFile(filepath.Join(buildDir, name))
+		if err != nil {
+			return ""
+		}
+		h.Write([]byte(name))
+		h.Write(b)
+	}
+	return hex.EncodeToString(h.Sum(nil))
 }
 
 // ── compile_for_target ───────────────────────────────────────────────────────
