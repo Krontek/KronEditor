@@ -66,7 +66,11 @@
         "openProject": "Open Project",
         "close": "Close",
         "project": "Project",
-        "plc": "PLC"
+        "plc": "PLC",
+        "paste": "Paste",
+        "library": "Library",
+        "dragDrop": "Drag & Drop",
+        "blockCount": "{{count}} blocks"
     },
     "actions": {
         "add": "Add",
@@ -117,7 +121,11 @@
         "noMembers": "No members defined. Click \"Add Member\" to start.",
         "structTip": "Tip: Press Enter in the last Initial Value field to add a new row.",
         "confirmDelete": "Delete {{name}}?",
-        "confirmCloseProject": "Are you sure you want to close the current project? Any unsaved changes will be lost."
+        "confirmCloseProject": "Are you sure you want to close the current project? Any unsaved changes will be lost.",
+        "removeFieldbusConfirm": "Do you want to remove this fieldbus connection?",
+        "removeFieldbusTitle": "Remove Fieldbus",
+        "deleteSlaveConfirm": "Delete \"{{name}}\"?",
+        "deleteSlaveTitle": "Delete Slave"
     },
     "resources": {
         "globalVariables": "Global Variables"

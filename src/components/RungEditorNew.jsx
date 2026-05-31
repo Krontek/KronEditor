@@ -1,4 +1,5 @@
 import { useState, useCallback, useRef, useEffect } from 'react';
+import { useTranslation } from 'react-i18next';
 import { Editor } from '@monaco-editor/react';
 import RungContainer, { blockConfig } from './RungContainer';
 import ErrorBoundary from './ErrorBoundary';
@@ -208,6 +209,7 @@ EMPTY_IMG.src = 'data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAA
 
 // Dashed line appearing on hover "insert here"
 const InsertZone = ({ onInsert, onPaste, canPaste, disabled }) => {
+  const { t } = useTranslation();
   const [hovered, setHovered] = useState(false);
   if (disabled) return <div style={{ height: 6 }} />;
   return (
@@ -238,7 +240,7 @@ const InsertZone = ({ onInsert, onPaste, canPaste, disabled }) => {
             <div
               onClick={(e) => { e.stopPropagation(); onPaste && onPaste(); }}
               style={{ position: 'relative', zIndex: 1, width: 18, height: 18, background: '#4caf50', borderRadius: '50%', display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#fff', fontSize: 11, fontWeight: 'bold', lineHeight: 1, cursor: 'pointer' }}
-              title="Yapıştır"
+              title={t('common.paste') || 'Paste'}
             >📋</div>
           )}
         </>
@@ -255,6 +257,7 @@ const InsertZone = ({ onInsert, onPaste, canPaste, disabled }) => {
  */
 
 const RungEditorNew = ({ variables, setVariables, rungs, setRungs, availableBlocks, globalVars = [], dataTypes = [], liveVariables = null, parentName = "", readOnly = false, onForceWrite = null, programType = 'LD', hwPortVars = [], errorCodeService = null }) => {
+  const { t } = useTranslation();
   // Undo/Redo history - each snapshot stores { rungs, variables } pair
   const historyRef = useRef([{
     rungs: JSON.parse(JSON.stringify(rungs)),
@@ -729,13 +732,6 @@ const RungEditorNew = ({ variables, setVariables, rungs, setRungs, availableBloc
     saveHistory(newRungs, variables);
   }, [readOnly, programType, rungs, variables, focusedRungId, saveHistory]);
 
-  const toggleRungLang = useCallback((rungId) => {
-    if (readOnly) return;
-    const newRungs = rungs.map(r => r.id === rungId ? { ...r, lang: r.lang === 'ST' ? 'LD' : 'ST' } : r);
-    setRungs(newRungs);
-    saveHistory(newRungs, variables);
-  }, [readOnly, rungs, variables, saveHistory]);
-
   const updateRungCode = useCallback((rungId, code) => {
     if (readOnly) return;
     const newRungs = rungs.map(r => r.id === rungId ? { ...r, code } : r);
@@ -1154,7 +1150,11 @@ const RungEditorNew = ({ variables, setVariables, rungs, setRungs, availableBloc
 
   return (
     <div
-      onMouseDown={() => setEditorScope(EDITOR_SCOPE.LD)}
+      // Capture phase: ReactFlow (d3-drag) calls stopPropagation on a node's
+      // mousedown, which would prevent a bubble-phase handler from ever setting
+      // the scope — so clicking an LD block left the scope on SIDEBAR and Ctrl+C
+      // copied the whole program instead of the block. Capturing fixes that.
+      onMouseDownCapture={() => setEditorScope(EDITOR_SCOPE.LD)}
       style={{ display: 'flex', flexDirection: 'column', width: '100%', height: '100%', background: '#1e1e1e' }}
     >
 
@@ -1219,31 +1219,27 @@ const RungEditorNew = ({ variables, setVariables, rungs, setRungs, availableBloc
                       style={{ cursor: 'grab', color: '#555', fontSize: 14, padding: '0 2px', lineHeight: 1, userSelect: 'none' }}
                     >⠿</div>
                     <span style={{ fontSize: 10, color: '#888' }}>Rung {index}:</span>
-                    {['LD', 'ST'].map(l => (
-                      <button
-                        key={l}
-                        disabled={readOnly}
-                        onClick={() => toggleRungLang(rung.id)}
-                        style={{
-                          padding: '1px 8px', fontSize: 11, borderRadius: 3, border: 'none', cursor: readOnly ? 'default' : 'pointer',
-                          background: (rung.lang || 'LD') === l ? '#007acc' : '#3a3a3a',
-                          color: (rung.lang || 'LD') === l ? '#fff' : '#aaa',
-                          fontWeight: (rung.lang || 'LD') === l ? 'bold' : 'normal',
-                        }}
-                      >{l}</button>
-                    ))}
-                    {(rung.lang || 'LD') === 'ST' && !readOnly && (
+                    {/* Read-only language indicator — the language is chosen when the
+                        rung is created and is NOT switchable afterwards. */}
+                    <span
+                      title={(rung.lang || 'LD') === 'ST' ? 'Structured Text' : 'Ladder Diagram'}
+                      style={{
+                        padding: '1px 8px', fontSize: 11, borderRadius: 3,
+                        background: '#007acc', color: '#fff', fontWeight: 'bold',
+                      }}
+                    >{rung.lang || 'LD'}</span>
+                    {!readOnly && (
                       <div style={{ marginLeft: 'auto', display: 'flex', gap: 4 }}>
                         <button
                           onClick={() => moveRung(rung.id, 'up')}
                           disabled={index === 0}
                           style={{ background: index === 0 ? '#444' : '#0d47a1', color: '#fff', border: 'none', padding: '2px 7px', borderRadius: 3, cursor: index === 0 ? 'not-allowed' : 'pointer', fontSize: 10 }}
-                        >↑ Yukarı</button>
+                        >↑ {t('common.moveUp') || 'Move Up'}</button>
                         <button
                           onClick={() => moveRung(rung.id, 'down')}
                           disabled={index === rungs.length - 1}
                           style={{ background: index === rungs.length - 1 ? '#444' : '#0d47a1', color: '#fff', border: 'none', padding: '2px 7px', borderRadius: 3, cursor: index === rungs.length - 1 ? 'not-allowed' : 'pointer', fontSize: 10 }}
-                        >↓ Aşağı</button>
+                        >↓ {t('common.moveDown') || 'Move Down'}</button>
                         <button
                           onClick={() => deleteRung(rung.id)}
                           style={{ background: '#c62828', color: '#fff', border: 'none', padding: '2px 7px', borderRadius: 3, cursor: 'pointer', fontSize: 10 }}
@@ -1282,6 +1278,7 @@ const RungEditorNew = ({ variables, setVariables, rungs, setRungs, availableBloc
                       rung={rung}
                       index={index}
                       totalRungs={rungs.length}
+                      hideHeader={programType === 'SCL'}
                       isFocused={focusedRungId === rung.id}
                       onDelete={() => deleteRung(rung.id)}
                       onMoveUp={() => moveRung(rung.id, 'up')}

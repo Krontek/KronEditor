@@ -1,4 +1,5 @@
 import React, { useState, useCallback, useRef, useEffect } from 'react';
+import { useTranslation } from 'react-i18next';
 import ForceWriteModal from './common/ForceWriteModal';
 import { formatTimeUs } from '../utils/plcStandards';
 import { ErrorCodeService } from '../services/ErrorCodeService';
@@ -1254,8 +1255,10 @@ const RungContainer = ({
   isFocused = false,
   onFocusRung,
   errorCodeService = null,
+  hideHeader = false,
 
 }) => {
+  const { t } = useTranslation();
   const containerRef = useRef(null);
   const [containerWidth, setContainerWidth] = React.useState(800);
 
@@ -1283,16 +1286,22 @@ const RungContainer = ({
     };
   }, []);
 
-  // Track container width
+  // Track container width with a ResizeObserver so scaleFactor stays in sync on
+  // ANY layout change (sidebar/toolbox toggle, panel resize, tab switch), not
+  // just window resizes. A stale width was what made the power rails and the
+  // ReactFlow handles drift apart — the rails are positioned by scaleFactor while
+  // the flow viewport zoom is scaleFactor too, so both must reflect the live width.
   React.useEffect(() => {
-    const updateWidth = () => {
-      if (containerRef.current) {
-        setContainerWidth(containerRef.current.clientWidth);
-      }
-    };
-    updateWidth();
-    window.addEventListener('resize', updateWidth);
-    return () => window.removeEventListener('resize', updateWidth);
+    const el = containerRef.current;
+    if (!el) return undefined;
+    const measure = () => setContainerWidth(el.clientWidth);
+    measure();
+    const ro = new ResizeObserver(() => {
+      // rAF avoids the benign "ResizeObserver loop" warning and coalesces bursts.
+      window.requestAnimationFrame(measure);
+    });
+    ro.observe(el);
+    return () => ro.disconnect();
   }, []);
 
   // Constants moved/stabilized
@@ -2211,7 +2220,8 @@ const RungContainer = ({
       overflow: 'hidden',
       boxShadow: '0 4px 6px rgba(0,0,0,0.3)'
     }}>
-      {/* RUNG HEADER */}
+      {/* RUNG HEADER — hidden in SCL mode, where the lang/drag/move bar above provides it */}
+      {!hideHeader && (
       <div
         onClick={(e) => { e.stopPropagation(); if (onFocusRung) onFocusRung(); }}
         style={{
@@ -2225,7 +2235,7 @@ const RungContainer = ({
         <div style={{ display: 'flex', alignItems: 'center', gap: 15 }}>
           <div
             className="rung-drag-handle"
-            title="Sürükleyip Bırak"
+            title={t('common.dragDrop') || 'Drag & Drop'}
             style={{
               padding: '4px',
               cursor: readOnly ? 'default' : 'grab',
@@ -2252,7 +2262,7 @@ const RungContainer = ({
             Rung {index}: {rung.label}
           </span>
           <span style={{ color: '#888', fontSize: 8 }}>
-            ({rung.blocks.length} blok)
+            ({t('common.blockCount', { count: rung.blocks.length }) || `${rung.blocks.length} blocks`})
           </span>
         </div>
 
@@ -2272,7 +2282,7 @@ const RungContainer = ({
               fontWeight: 'bold'
             }}
           >
-            ↑ Yukarı
+            ↑ {t('common.moveUp') || 'Move Up'}
           </button>
           <button
             onClick={onMoveDown}
@@ -2288,7 +2298,7 @@ const RungContainer = ({
               fontWeight: 'bold'
             }}
           >
-            ↓ Aşağı
+            ↓ {t('common.moveDown') || 'Move Down'}
           </button>
           <button
             onClick={onDelete}
@@ -2307,6 +2317,7 @@ const RungContainer = ({
           </button>
         </div>
       </div>
+      )}
 
       {/* RUNG EDITOR CANVAS */}
       <div
@@ -2401,6 +2412,8 @@ const RungContainer = ({
           autoPanOnNodeDrag={false}
           preventScrolling={false}
           zoomOnScroll={false}
+          zoomOnPinch={false}
+          zoomOnDoubleClick={false}
           edgesUpdatable={true}
           edgesFocusable={true}
           edgesSelectable={true}

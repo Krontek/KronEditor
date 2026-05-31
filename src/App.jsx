@@ -36,7 +36,7 @@ import { exportProjectToXml, importProjectFromXml } from './services/XmlService'
 import { libraryService } from './services/LibraryService'; // Import Service
 import { errorCodeService } from './services/ErrorCodeService';
 import { loadAllEsiDevices, saveEsiFile } from './services/EsiLibraryService';
-import { openFile, saveFile, ask, readTextFile, writeTextFile } from './services/browserFs';
+import { openFile, saveFile, ask, readTextFile, writeTextFile, clearActiveFileHandle } from './services/browserFs';
 import { transpileToC, validateProjectST } from './services/CTranspilerService';
 import { PLCClient } from './services/PLCClient';
 import { host } from './services/HostClient';
@@ -371,8 +371,8 @@ function App() {
   }, [buses]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const handleDeleteBus = useCallback(async (busId) => {
-    const confirmed = await ask('Bu fieldbus bağlantısını kaldırmak istiyor musunuz?', {
-      title: 'Fieldbus Kaldır', type: 'warning'
+    const confirmed = await ask(t('messages.removeFieldbusConfirm') || 'Do you want to remove this fieldbus connection?', {
+      title: t('messages.removeFieldbusTitle') || 'Remove Fieldbus', type: 'warning'
     });
     if (confirmed) {
       const removedBus = buses.find(b => b.id === busId);
@@ -495,7 +495,7 @@ function App() {
 
   const handleDeleteSlave = useCallback(async (busId, slaveId) => {
     const slave = (busConfigs[busId]?.slaves || []).find(s => s.id === slaveId);
-    const confirmed = await ask(`"${slave?.name || 'Slave'}" silinsin mi?`, { title: 'Slave Sil', type: 'warning' });
+    const confirmed = await ask(t('messages.deleteSlaveConfirm', { name: slave?.name || 'Slave' }) || `Delete "${slave?.name || 'Slave'}"?`, { title: t('messages.deleteSlaveTitle') || 'Delete Slave', type: 'warning' });
     if (!confirmed) return;
     setBusConfigs(prev => ({
       ...prev,
@@ -789,27 +789,25 @@ function App() {
 
   // --- File Operations ---
 
-  const handleSaveAs = useCallback(async () => {
+  // Shared save routine. saveAs=false (Save) overwrites the open file in place
+  // via the retained FSA handle (no picker); saveAs=true always prompts.
+  const persistProject = useCallback(async (saveAs) => {
     try {
       const xmlContent = exportProjectToXml(projectStructure, selectedBoard, { plcAddress, sshUser, sshPort, apiPassword, autoRun }, buses, busConfigs, watchTable, hmiLayout);
       const suggestedName = (currentFilePath || 'project.xml').split('/').pop() || 'project.xml';
-      const savedName = await saveFile({ suggestedName, content: xmlContent });
+      const savedName = await saveFile({ suggestedName, content: xmlContent, saveAs });
       if (!savedName) return;
 
       hasUnsavedRef.current = false;
       setCurrentFilePath(savedName);
       addLog('success', t('logs.projectSaved', { path: savedName }) || `Project saved to ${savedName} `);
     } catch (error) {
-      addLog('error', t('logs.saveAsError', { error: error }) || `Save As Error: ${error} `);
+      addLog('error', t('logs.saveAsError', { error: error }) || `Save Error: ${error} `);
     }
   }, [projectStructure, selectedBoard, plcAddress, sshUser, sshPort, apiPassword, autoRun, buses, busConfigs, watchTable, hmiLayout, currentFilePath, addLog, t]);
 
-  const handleSave = useCallback(async () => {
-    // In browser there is no in-place path write — every save goes through the
-    // file picker / download path. Forward to handleSaveAs for both first and
-    // subsequent saves.
-    await handleSaveAs();
-  }, [handleSaveAs]);
+  const handleSaveAs = useCallback(() => persistProject(true), [persistProject]);
+  const handleSave = useCallback(() => persistProject(false), [persistProject]);
 
   // Keep ref up-to-date so onCloseRequested handler can call it without stale closure
   useEffect(() => { handleSaveRef.current = handleSave; }, [handleSave]);
@@ -827,6 +825,7 @@ function App() {
       setProjectStructure(defaultProjectStructure);
       setBuses([]);
       setCurrentFilePath(null);
+      clearActiveFileHandle();
       setActiveId(null);
       const boardInfo = getBoardById(boardId);
       setLogs([
@@ -855,6 +854,7 @@ function App() {
       setBuses([]);
       setBusConfigs({});
       setCurrentFilePath(null);
+      clearActiveFileHandle();
       setActiveId(null);
       setOpenTabs([]);
       setWatchTable([]);
@@ -916,6 +916,7 @@ function App() {
       // Load with a display label, then clear the path so Save → Save As.
       processFileContent(xml, `${plcAddress} (target)`);
       setCurrentFilePath(null);
+      clearActiveFileHandle();
       addLog('success', t('logs.pulled', { addr: plcAddress }) || `Project pulled from ${plcAddress}.`);
     } catch (err) {
       addLog('error', `Pull failed: ${err.message || err}`);
@@ -2433,7 +2434,7 @@ function App() {
                   {/* Tab strip: Kütüphane (blocks) | PLC Agent */}
                   <div style={{ display: 'flex', background: '#2d2d2d', borderBottom: '1px solid #1e1e1e', flexShrink: 0, height: 32 }}>
                     {[
-                      { id: 'blocks', label: 'Kütüphane', icon: '📦' },
+                      { id: 'blocks', label: t('common.library') || 'Library', icon: '📦' },
                       { id: 'agent', label: 'PLC Agent', icon: '🤖' },
                     ].map(tab => (
                       <div

@@ -566,7 +566,7 @@ func (s *Server) handleHotSwapSwap(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	if err := syscall.Kill(pid, syscall.SIGUSR1); err != nil {
+	if err := sendSwapSignal(pid); err != nil {
 		writeError(w, http.StatusInternalServerError, "signal failed: "+err.Error())
 		return
 	}

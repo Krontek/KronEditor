@@ -66,7 +66,11 @@
         "openProject": "Открыть проект",
         "close": "Закрыть",
         "project": "Проект",
-        "plc": "ПЛК"
+        "plc": "ПЛК",
+        "paste": "Вставить",
+        "library": "Библиотека",
+        "dragDrop": "Перетащить",
+        "blockCount": "{{count}} блоков"
     },
     "actions": {
         "add": "Добавить",
@@ -117,7 +121,11 @@
         "noMembers": "Члены не определены. Нажмите \"Добавить член\", чтобы начать.",
         "structTip": "Совет: Нажмите Enter в последнем поле значения по умолчанию, чтобы добавить новую строку.",
         "confirmDelete": "Удалить {{name}}?",
-        "confirmCloseProject": "Вы уверены, что хотите закрыть текущий проект? Любые несохраненные изменения будут потеряны."
+        "confirmCloseProject": "Вы уверены, что хотите закрыть текущий проект? Любые несохраненные изменения будут потеряны.",
+        "removeFieldbusConfirm": "Удалить это подключение fieldbus?",
+        "removeFieldbusTitle": "Удалить Fieldbus",
+        "deleteSlaveConfirm": "Удалить \"{{name}}\"?",
+        "deleteSlaveTitle": "Удалить Slave"
     },
     "resources": {
         "globalVariables": "Глобальные переменные"

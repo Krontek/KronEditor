@@ -66,7 +66,11 @@
         "openProject": "Proje Aç",
         "close": "Kapat",
         "project": "Proje",
-        "plc": "PLC"
+        "plc": "PLC",
+        "paste": "Yapıştır",
+        "library": "Kütüphane",
+        "dragDrop": "Sürükleyip Bırak",
+        "blockCount": "{{count}} blok"
     },
     "actions": {
         "add": "Ekle",
@@ -117,7 +121,11 @@
         "noMembers": "Üye tanımlanmadı. Başlamak için \"Üye Ekle\"ye tıklayın.",
         "structTip": "İpucu: Yeni bir satır eklemek için son Başlangıç Değeri alanında Enter'a basın.",
         "confirmDelete": "{{name}} öğesi silinsin mi?",
-        "confirmCloseProject": "Mevcut projeyi kapatmak istediğinize emin misiniz? Kaydedilmemiş değişiklikler kaybolacak."
+        "confirmCloseProject": "Mevcut projeyi kapatmak istediğinize emin misiniz? Kaydedilmemiş değişiklikler kaybolacak.",
+        "removeFieldbusConfirm": "Bu fieldbus bağlantısını kaldırmak istiyor musunuz?",
+        "removeFieldbusTitle": "Fieldbus Kaldır",
+        "deleteSlaveConfirm": "\"{{name}}\" silinsin mi?",
+        "deleteSlaveTitle": "Slave Sil"
     },
     "resources": {
         "globalVariables": "Global Değişkenler"
