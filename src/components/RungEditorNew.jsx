@@ -183,6 +183,48 @@ const SCLInlineEditor = ({ code, readOnly, onCodeChange, onBlur, variables = [],
         onMount={editor => {
           editorRef.current = editor;
           const mc = monacoRef.current;
+          // Explicit Ctrl/Cmd+V via the async Clipboard API. Monaco's default
+          // keyboard paste relies on the browser's native paste event reaching
+          // its hidden input, which does not fire reliably in this embedded
+          // setup (typing works, Ctrl+V does nothing). This guarantees a paste.
+          if (mc) {
+            editor.addCommand(mc.KeyMod.CtrlCmd | mc.KeyCode.KeyV, async () => {
+              if (editor.getOption(mc.editor.EditorOption.readOnly)) return;
+              let text = '';
+              try { text = await navigator.clipboard.readText(); } catch (err) { return; }
+              if (!text) return;
+              const sel = editor.getSelection();
+              editor.executeEdits('clipboard-paste', [{ range: sel, text, forceMoveMarkers: true }]);
+              editor.pushUndoStop();
+            });
+            // Ctrl/Cmd+C — write to the OS clipboard via the async API. Monaco's
+            // default copy relies on the native copy event, which (like paste)
+            // does not reach the OS clipboard in this embedded setup. Empty
+            // selection copies the whole current line (Monaco default behavior).
+            editor.addCommand(mc.KeyMod.CtrlCmd | mc.KeyCode.KeyC, async () => {
+              const model = editor.getModel();
+              const sel = editor.getSelection();
+              let text = model.getValueInRange(sel);
+              if (!text) text = model.getLineContent(sel.startLineNumber) + '\n';
+              try { await navigator.clipboard.writeText(text); } catch (err) {}
+            });
+            // Ctrl/Cmd+X — copy to OS clipboard then delete the selection (or line).
+            editor.addCommand(mc.KeyMod.CtrlCmd | mc.KeyCode.KeyX, async () => {
+              if (editor.getOption(mc.editor.EditorOption.readOnly)) return;
+              const model = editor.getModel();
+              const sel = editor.getSelection();
+              let text = model.getValueInRange(sel);
+              let range = sel;
+              if (!text) {
+                const ln = sel.startLineNumber;
+                text = model.getLineContent(ln) + '\n';
+                range = new mc.Range(ln, 1, ln + 1, 1);
+              }
+              try { await navigator.clipboard.writeText(text); } catch (err) {}
+              editor.executeEdits('clipboard-cut', [{ range, text: '' }]);
+              editor.pushUndoStop();
+            });
+          }
           const updateHeight = () => {
             const h = Math.max(60, editor.getContentHeight());
             setHeight(h);

@@ -65,6 +65,12 @@ type runtimeConfigUpdate struct {
 	AutoRun          *bool   `json:"auto_run,omitempty"`
 	StreamIntervalMs *uint32 `json:"stream_interval_ms,omitempty"`
 	HMIPort          *uint16 `json:"hmi_port,omitempty"`
+	// Restart is a transient ACTION flag (not persisted): when true, the
+	// runtime is (re)started with the freshly-deployed binary. Build & Send
+	// sets this as its final step so a new push actually takes effect — merely
+	// overwriting runtime.bin on disk does NOT swap the code of an
+	// already-running process.
+	Restart *bool `json:"restart,omitempty"`
 }
 
 // Server handles HTTP and ConnectRPC traffic.
@@ -375,12 +381,13 @@ func (s *Server) handleDeployConfig(w http.ResponseWriter, r *http.Request) {
 // pushes side-effects (streaming cadence) into the live atomic, and
 // returns the resulting snapshot. Implements RuntimeController.
 //
-// AutoRun side-effects (only when u.AutoRun is explicitly set):
-//   - true  + runtime not running → start runtime immediately
-//   - true  + runtime running     → no-op (already serving)
-//   - false                       → cancel any pending auto-restart timer;
-//     a currently running runtime is left
-//     alone (user manually stops if desired)
+// Side-effects:
+//   - Restart=true                → stop (if running) + start with the deployed
+//     binary (Build & Send's final step)
+//   - AutoRun=true  + not running  → start runtime (when Restart not set)
+//   - AutoRun=true  + running      → no-op (already serving; Restart restarts it)
+//   - AutoRun=false               → cancel any pending auto-restart timer;
+//     a currently running runtime is left alone (user manually stops if desired)
 func (s *Server) UpdateRuntimeConfig(u runtimeConfigUpdate) map[string]any {
 	s.rtMu.Lock()
 	if u.AutoRun != nil {
@@ -411,21 +418,36 @@ func (s *Server) UpdateRuntimeConfig(u runtimeConfigUpdate) map[string]any {
 		"stream_interval_ms", uint32(GetAPIStreamInterval()/time.Millisecond),
 	)
 
-	// Side effects of an explicit AutoRun toggle (skip if the request did
-	// not touch this field — e.g. a stream-interval-only update from the API).
-	if u.AutoRun != nil {
-		if autoRun {
-			if _, running := s.pm.Status(); !running {
-				slog.Info("AutoRun enabled — starting runtime")
-				s.ipc.WriteInitialValues()
-				if err := s.pm.Start(); err != nil {
-					slog.Warn("AutoRun: start failed", "err", err)
-				}
+	restartRequested := u.Restart != nil && *u.Restart
+
+	// AutoRun toggle side-effects (skip if the request did not touch the field
+	// — e.g. a stream-interval-only update from the API).
+	if u.AutoRun != nil && !autoRun {
+		// Toggle off: cancel any pending crash-restart. A currently running
+		// runtime is intentionally left alone — user stops it manually.
+		s.pm.CancelPendingRestart()
+	}
+
+	// Explicit restart (Build & Send's final step): swap the running runtime to
+	// the freshly-deployed binary. pm.Start() stops the current process first
+	// (and cancels any pending auto-restart), so this is a clean stop+start with
+	// the NEW runtime.bin + variable_table (both already deployed by now).
+	// Without this, overwriting runtime.bin on disk does NOT affect the
+	// already-running process — the classic "I pushed but it still runs the old
+	// code" trap, especially with AutoRun keeping a stale process alive.
+	if restartRequested {
+		slog.Info("Restart requested — (re)starting runtime with deployed binary")
+		if _, err := s.StartRuntime(); err != nil {
+			slog.Warn("Restart: start failed", "err", err)
+		}
+	} else if u.AutoRun != nil && autoRun {
+		// AutoRun turned on WITHOUT an explicit restart: start only when idle
+		// (don't disturb an already-running runtime).
+		if _, running := s.pm.Status(); !running {
+			slog.Info("AutoRun enabled — starting runtime")
+			if _, err := s.StartRuntime(); err != nil {
+				slog.Warn("AutoRun: start failed", "err", err)
 			}
-		} else {
-			// Toggle off: cancel any pending crash-restart. Running runtime
-			// is intentionally left alone — user must stop it manually.
-			s.pm.CancelPendingRestart()
 		}
 	}
 

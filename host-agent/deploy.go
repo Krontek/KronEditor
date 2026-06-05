@@ -93,14 +93,11 @@ func (s *Server) handleDeployToServer(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadGateway, "variable table deploy: "+err.Error())
 		return
 	}
-	// Hot-swap deploy: if logic_0.so was built (runtime.bin is the loader-host),
-	// push it too so KronServer runs in host mode and can later hot-swap.
-	if logicBytes, err := os.ReadFile(filepath.Join(buildDir, "logic_0.so")); err == nil {
-		if err := postBinary("http://"+req.ServerAddr+"/deploy/logic", "application/octet-stream", logicBytes); err != nil {
-			writeError(w, http.StatusBadGateway, "logic deploy: "+err.Error())
-			return
-		}
-	}
+	// NOTE: we deliberately do NOT push logic_0.so. Build & Send ships a
+	// self-contained runtime.bin (compileForTarget), and the sim hot-swap build
+	// leaves an x86 logic_0.so in the SAME build dir — uploading that to an ARM
+	// target would wrongly flip KronServer into host mode and start the runtime
+	// with a mismatched/extra arg. Remote hot reload is disabled (see App.jsx).
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "message": "Deployed successfully"})
 }
 

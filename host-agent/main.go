@@ -73,6 +73,7 @@ func main() {
 	// Runtime (simulation)
 	mux.HandleFunc("/api/host/run-simulation", srvState.handleRunSimulation)
 	mux.HandleFunc("/api/host/stop-simulation", srvState.handleStopSimulation)
+	mux.HandleFunc("/api/host/sim-status", srvState.handleSimStatus)
 	mux.HandleFunc("/api/host/write-variable", srvState.handleWriteVariable)
 	mux.HandleFunc("/api/host/plc-variables", srvState.handlePlcVariables) // SSE
 

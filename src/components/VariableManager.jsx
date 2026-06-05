@@ -9,6 +9,23 @@ import { setEditorScope, getEditorScope, EDITOR_SCOPE } from '../utils/editorSco
 
 const ALL_CLASSES = ['Local', 'Global', 'Input', 'Output', 'InOut', 'Temp'];
 
+// Excel-like compact grid cell styles (shared header + body)
+const hCell = {
+  padding: '3px 8px',
+  borderBottom: '1px solid #3a3a3a',
+  borderRight: '1px solid #333',
+  fontSize: 10,
+  fontWeight: 600,
+  textTransform: 'uppercase',
+  letterSpacing: '0.4px',
+  color: '#9a9a9a',
+  whiteSpace: 'nowrap',
+};
+// Body cell: vertical padding is 0 so the row height is driven by the input
+// (height 22) — gives a tight, uniform Excel-style row. Vertical grid lines via
+// borderRight; horizontal via the row's borderBottom.
+const bCell = { padding: '0 2px', borderRight: '1px solid #2c2c2c' };
+
 // IEC 61131-3 memory address formatting
 const IEC_TYPE_PREFIX = {
   'BOOL': 'X', 'BYTE': 'B', 'SINT': 'B', 'USINT': 'B',
@@ -44,13 +61,13 @@ const InsertZoneRow = ({ colSpan, onInsert }) => {
       onMouseEnter={() => setHovered(true)}
       onMouseLeave={() => setHovered(false)}
       onClick={onInsert}
-      style={{ cursor: 'pointer', height: hovered ? 22 : 4, transition: 'height 0.1s ease' }}
+      style={{ cursor: 'pointer', height: hovered ? 18 : 1, transition: 'height 0.1s ease' }}
     >
       <td colSpan={colSpan} style={{ padding: 0, position: 'relative' }}>
         {hovered && (
-          <div style={{ position: 'relative', display: 'flex', alignItems: 'center', justifyContent: 'center', height: 22 }}>
+          <div style={{ position: 'relative', display: 'flex', alignItems: 'center', justifyContent: 'center', height: 18 }}>
             <div style={{ position: 'absolute', left: 0, right: 0, height: 2, background: '#007acc', borderRadius: 1 }} />
-            <div style={{ position: 'relative', zIndex: 1, width: 16, height: 16, background: '#007acc', borderRadius: '50%', display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#fff', fontSize: 13, fontWeight: 'bold', lineHeight: 1 }}>+</div>
+            <div style={{ position: 'relative', zIndex: 1, width: 14, height: 14, background: '#007acc', borderRadius: '50%', display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#fff', fontSize: 12, fontWeight: 'bold', lineHeight: 1 }}>+</div>
           </div>
         )}
       </td>
@@ -95,8 +112,10 @@ const EditableCell = ({ value, onCommit, placeholder = '' }) => {
         outline: 'none',
         fontFamily: 'inherit',
         fontSize: 'inherit',
-        padding: '2px 4px',
-        borderRadius: '2px'
+        padding: '1px 6px',
+        borderRadius: '2px',
+        boxSizing: 'border-box',
+        height: 22
       }}
     />
   );
@@ -502,21 +521,21 @@ const VariableManager = ({
 
       {/* Table */}
       <div style={{ flex: 1, overflow: 'auto' }}>
-        <table style={{ width: '100%', borderCollapse: 'collapse', color: '#ccc', fontSize: '11px', textAlign: 'left' }}>
+        <table style={{ width: '100%', borderCollapse: 'collapse', color: '#ccc', fontSize: '12px', textAlign: 'left', tableLayout: 'auto' }}>
           <thead style={{ background: '#1e1e1e', position: 'sticky', top: 0, zIndex: 10 }}>
             <tr>
-              <th style={{ padding: '5px', borderBottom: '1px solid #444' }}>{t('tables.name')}</th>
-              {showClass && <th style={{ padding: '5px', borderBottom: '1px solid #444', minWidth: '70px' }}>{t('tables.class') || 'Class'}</th>}
-              <th style={{ padding: '5px', borderBottom: '1px solid #444', minWidth: '120px' }}>{t('tables.type')}</th>
-              <th style={{ padding: '5px', borderBottom: '1px solid #444' }}>{t('tables.initialValue')}</th>
+              <th style={hCell}>{t('tables.name')}</th>
+              {showClass && <th style={{ ...hCell, minWidth: '70px' }}>{t('tables.class') || 'Class'}</th>}
+              <th style={{ ...hCell, minWidth: '120px' }}>{t('tables.type')}</th>
+              <th style={hCell}>{t('tables.initialValue')}</th>
               {liveVariables && (
-                <th style={{ padding: '5px', borderBottom: '1px solid #444', color: '#00e676' }}>
-                  Live Value {onForceWrite && <span style={{ color: '#888', fontSize: 10, fontWeight: 'normal' }}>(click to set)</span>}
+                <th style={{ ...hCell, color: '#00e676' }}>
+                  Live {onForceWrite && <span style={{ color: '#888', fontSize: 9, fontWeight: 'normal' }}>(set)</span>}
                 </th>
               )}
-              <th style={{ padding: '5px', borderBottom: '1px solid #444', minWidth: '80px' }} title="IEC address — expose via REST API">Address</th>
-              <th style={{ padding: '5px', borderBottom: '1px solid #444' }}>{t('tables.description')}</th>
-              <th style={{ padding: '5px', borderBottom: '1px solid #444', width: 28 }}></th>
+              <th style={{ ...hCell, minWidth: '80px' }} title="IEC address — expose via REST API">Address</th>
+              <th style={hCell}>{t('tables.description')}</th>
+              <th style={{ ...hCell, width: 24, borderRight: 'none' }}></th>
             </tr>
           </thead>
           <tbody>
@@ -532,16 +551,16 @@ const VariableManager = ({
                 <tr
                   onClick={(e) => handleRowSelect(v.id, e)}
                   onContextMenu={(e) => handleContextMenu(e, v)}
-                  style={{ borderBottom: '1px solid #333', background: selectedIds.has(v.id) ? '#0d47a1' : 'transparent', cursor: 'pointer' }}
+                  style={{ borderBottom: '1px solid #303030', background: selectedIds.has(v.id) ? '#0d47a1' : (index % 2 ? '#2a2a2b' : 'transparent'), cursor: 'pointer' }}
                 >
-                  <td style={{ padding: '5px' }}>
+                  <td style={bCell}>
                     <EditableCell value={v.name} onCommit={(val) => !isSimulationMode && !disabled && validateAndSaveName(v.id, val)} />
                   </td>
                   {showClass && (() => {
                     const cls = v.class || allowedClasses[0] || 'Local';
                     const cc = CLASS_COLORS[cls] || CLASS_COLORS.Local;
                     return (
-                      <td style={{ padding: '3px 5px' }}>
+                      <td style={bCell}>
                         <select
                           value={cls}
                           disabled={disabled || isSimulationMode}
@@ -549,9 +568,9 @@ const VariableManager = ({
                           onClick={(e) => e.stopPropagation()}
                           style={{
                             background: cc.bg, color: cc.text, border: `1px solid ${cc.border}`,
-                            borderRadius: 3, fontSize: 10, fontWeight: 'bold', padding: '1px 3px',
-                            width: '100%', cursor: disabled || isSimulationMode ? 'default' : 'pointer',
-                            outline: 'none'
+                            borderRadius: 2, fontSize: 10, fontWeight: 'bold', padding: '0 2px',
+                            width: '100%', height: 20, cursor: disabled || isSimulationMode ? 'default' : 'pointer',
+                            outline: 'none', boxSizing: 'border-box'
                           }}
                         >
                           {allowedClasses.map(c => <option key={c} value={c}>{c}</option>)}
@@ -559,8 +578,9 @@ const VariableManager = ({
                       </td>
                     );
                   })()}
-                  <td style={{ padding: '5px' }}>
+                  <td style={bCell}>
                     <DataTypeSelector
+                      compact
                       value={v.type}
                       onChange={(newType) => {
                         if (isSimulationMode || disabled) return;
@@ -597,12 +617,12 @@ const VariableManager = ({
                       userDefinedTypes={userDefinedTypes}
                     />
                   </td>
-                  <td style={{ padding: '5px' }}>
+                  <td style={bCell}>
                     <EditableCell value={v.initialValue} onCommit={(val) => !disabled && onUpdate && onUpdate(v.id, 'initialValue', val)} />
                   </td>
                   {liveVariables && (
                     <td
-                      style={{ padding: '5px', cursor: (canForce || isComplex) ? 'pointer' : 'default' }}
+                      style={{ ...bCell, cursor: (canForce || isComplex) ? 'pointer' : 'default' }}
                       onClick={(e) => {
                         e.stopPropagation();
                         if (isComplex) {
@@ -634,7 +654,7 @@ const VariableManager = ({
                       </span>
                     </td>
                   )}
-                  <td style={{ padding: '3px' }}>
+                  <td style={bCell}>
                     <EditableCell
                       value={v.address || ''}
                       onCommit={(val, e) => {
@@ -655,15 +675,15 @@ const VariableManager = ({
                       placeholder=""
                     />
                   </td>
-                  <td style={{ padding: '5px' }}>
+                  <td style={bCell}>
                     <EditableCell value={v.description} onCommit={(val) => !disabled && onUpdate && onUpdate(v.id, 'description', val)} />
                   </td>
-                  <td style={{ padding: '3px', textAlign: 'center' }}>
+                  <td style={{ ...bCell, textAlign: 'center', borderRight: 'none' }}>
                     <button
                       onClick={(e) => { e.stopPropagation(); if (!disabled && !isSimulationMode && onDelete) { onDelete(v.id); setSelectedIds(prev => { const n = new Set(prev); n.delete(v.id); return n; }); } }}
                       disabled={disabled || isSimulationMode}
                       title={t('common.delete')}
-                      style={{ background: 'transparent', border: 'none', color: disabled || isSimulationMode ? '#444' : '#c62828', cursor: disabled || isSimulationMode ? 'default' : 'pointer', fontSize: 13, padding: '1px 3px', lineHeight: 1 }}
+                      style={{ background: 'transparent', border: 'none', color: disabled || isSimulationMode ? '#444' : '#c62828', cursor: disabled || isSimulationMode ? 'default' : 'pointer', fontSize: 12, padding: 0, lineHeight: 1 }}
                     >🗑</button>
                   </td>
                 </tr>

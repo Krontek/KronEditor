@@ -198,6 +198,21 @@ export const TOOL_DEFS = [
     parameters: S({}),
   },
   {
+    name: 'watch_live_variables',
+    description: 'ACTIVELY observe the running simulation/PLC for a real time window, then return a per-variable time-series summary. Unlike read_live_variables (an instant snapshot of whatever was already buffered), this WAITS and lets fresh samples accumulate — and EACH variable can be watched for its OWN duration. Use it to confirm time-dependent behaviour (a timer output toggling every 5 s, a value settling, a ramp rising) and ESPECIALLY to VERIFY a fix after an online change / deploy: watch the relevant variables, compare against the expected behaviour, and report whether it worked. Use the live keys exactly as they appear in read_live_variables (e.g. prog_Main_blink.Q). Only returns data while the program is running; keep durations short (a few seconds) unless a longer observation is genuinely needed.',
+    parameters: S({
+      variables: {
+        type: 'array',
+        description: 'Variables to watch, each with its own observation duration in seconds.',
+        items: S({
+          name: str('Live variable key as seen in read_live_variables (e.g. prog_Main_blink.Q)'),
+          seconds: { type: 'number', description: 'How long to observe THIS variable, in seconds (1-60)' },
+        }, ['name', 'seconds']),
+      },
+      maxSeconds: { type: 'number', description: 'Optional hard cap on total wait time in seconds (defaults to the largest per-variable duration; clamped to 60).' },
+    }, ['variables']),
+  },
+  {
     name: 'list_blocks',
     description: 'List the building blocks you can use, EACH WITH ITS INPUT AND OUTPUT PINS: the standard library function blocks & functions (timers TON/TOF, counters CTU/CTD, math, comparison, motion MC_*, communication, conversion, HAL I/O blocks) AND the project\'s own function blocks/functions. ALWAYS call this before using any function block or function in ST so you reference the correct pin names and types. Optionally filter by a name/category substring.',
     parameters: S({ filter: str('Optional case-insensitive substring to match block type or category (optional)') }),
@@ -327,6 +342,19 @@ export function applyToolCall(struct, name, args = {}) {
         return {
           mutation: false, ok: true,
           result: { running: true, values: current, history: live.history || null },
+        };
+      }
+
+      case 'watch_live_variables': {
+        // The panel does the actual real-time waiting (the agent loop is async),
+        // then injects { running, waitedSeconds, history: summarizeWatch(...) }.
+        const w = args.__watch || {};
+        if (!w.running) {
+          return { mutation: false, ok: true, result: { running: false, note: 'No live data — the program is not running.' } };
+        }
+        return {
+          mutation: false, ok: true,
+          result: { running: true, waitedSeconds: w.waitedSeconds, history: w.history || null },
         };
       }
 
@@ -807,6 +835,45 @@ function renderRungs(rungs) {
 // changed, a flag (constant / oscillating), and a short recent (down-sampled)
 // series — enough to see a value stuck, oscillating, drifting, or out of range
 // WITHOUT shipping hundreds of raw samples. `samples` = [{ t:ms, v:{name:val} }].
+// Condense ONE variable's value series into a compact stat block: first/last,
+// numeric min/max, change count, a classification flag, and a down-sampled tail.
+function summarizeSeries(series, maxRecent = 16) {
+  const num = (x) => (typeof x === 'boolean' ? (x ? 1 : 0) : (typeof x === 'number' ? x : Number(x)));
+  let min = Infinity, max = -Infinity, changes = 0, prev, prevN;
+  let nonDecr = true, nonIncr = true;
+  const distinct = new Set();
+  for (const raw of series) {
+    const n = num(raw);
+    if (Number.isFinite(n)) {
+      if (n < min) min = n; if (n > max) max = n;
+      if (prevN !== undefined) { if (n < prevN) nonDecr = false; if (n > prevN) nonIncr = false; }
+      prevN = n;
+    }
+    if (prev !== undefined && raw !== prev) changes++;
+    distinct.add(raw);
+    prev = raw;
+  }
+  // Down-sample the recent tail to at most maxRecent points.
+  const step = Math.max(1, Math.ceil(series.length / maxRecent));
+  const recent = series.filter((_, k) => k % step === 0).slice(-maxRecent);
+  // Classify the trace so the model gets a hint without parsing the series:
+  // constant (never changed), oscillating (few distinct values, many flips),
+  // or a monotonic rising/falling ramp.
+  const flags = [];
+  if (changes === 0) flags.push('constant');
+  else if (distinct.size <= 3 && changes >= 4) flags.push('oscillating');
+  else if (nonDecr) flags.push('rising');
+  else if (nonIncr) flags.push('falling');
+  return {
+    last: series[series.length - 1],
+    first: series[0],
+    ...(Number.isFinite(min) ? { min, max } : {}),
+    changes,
+    ...(flags.length ? { flags } : {}),
+    recent,
+  };
+}
+
 export function summarizeLiveSamples(samples, opts = {}) {
   const buf = Array.isArray(samples) ? samples : [];
   if (buf.length === 0) return null;
@@ -815,46 +882,39 @@ export function summarizeLiveSamples(samples, opts = {}) {
   const names = new Set();
   buf.forEach((s) => Object.keys(s.v || {}).forEach((n) => names.add(n)));
 
-  const num = (x) => (typeof x === 'boolean' ? (x ? 1 : 0) : (typeof x === 'number' ? x : Number(x)));
   const variables = {};
   for (const name of names) {
     const series = buf.map((s) => s.v?.[name]).filter((x) => x !== undefined && x !== null);
     if (series.length === 0) continue;
-    let min = Infinity, max = -Infinity, changes = 0, prev, prevN;
-    let nonDecr = true, nonIncr = true;
-    const distinct = new Set();
-    for (const raw of series) {
-      const n = num(raw);
-      if (Number.isFinite(n)) {
-        if (n < min) min = n; if (n > max) max = n;
-        if (prevN !== undefined) { if (n < prevN) nonDecr = false; if (n > prevN) nonIncr = false; }
-        prevN = n;
-      }
-      if (prev !== undefined && raw !== prev) changes++;
-      distinct.add(raw);
-      prev = raw;
-    }
-    // Down-sample the recent tail to at most maxRecent points.
-    const step = Math.max(1, Math.ceil(series.length / maxRecent));
-    const recent = series.filter((_, k) => k % step === 0).slice(-maxRecent);
-    // Classify the trace so the model gets a hint without parsing the series:
-    // constant (never changed), oscillating (few distinct values, many flips),
-    // or a monotonic rising/falling ramp.
-    const flags = [];
-    if (changes === 0) flags.push('constant');
-    else if (distinct.size <= 3 && changes >= 4) flags.push('oscillating');
-    else if (nonDecr) flags.push('rising');
-    else if (nonIncr) flags.push('falling');
-    variables[name] = {
-      last: series[series.length - 1],
-      first: series[0],
-      ...(Number.isFinite(min) ? { min, max } : {}),
-      changes,
-      ...(flags.length ? { flags } : {}),
-      recent,
-    };
+    variables[name] = summarizeSeries(series, maxRecent);
   }
   return { windowSeconds: Math.round((t1 - t0) / 100) / 10, samples: buf.length, variables };
+}
+
+// Per-variable trailing-window summary for the ACTIVE watch tool. Each spec
+// { name, seconds } is summarized over ONLY the last `seconds` of buffered
+// samples, so different variables can be observed for different durations in a
+// single watch call. The panel does the real-time waiting; this just slices.
+export function summarizeWatch(samples, specs, opts = {}) {
+  const buf = Array.isArray(samples) ? samples : [];
+  if (buf.length === 0) return null;
+  const maxRecent = opts.maxRecent || 24;
+  const tEnd = buf[buf.length - 1].t;
+  const variables = {};
+  for (const spec of (Array.isArray(specs) ? specs : [])) {
+    const name = spec?.name;
+    if (!name) continue;
+    const secs = Number(spec.seconds) > 0 ? Number(spec.seconds) : null;
+    const since = secs ? tEnd - secs * 1000 : -Infinity;
+    const series = buf.filter((s) => s.t >= since)
+      .map((s) => s.v?.[name]).filter((x) => x !== undefined && x !== null);
+    if (series.length === 0) {
+      variables[name] = { watchedSeconds: secs, samples: 0, note: 'no samples in window (name not streamed, or not running)' };
+      continue;
+    }
+    variables[name] = { watchedSeconds: secs, samples: series.length, ...summarizeSeries(series, maxRecent) };
+  }
+  return { variables };
 }
 
 // ── ladder compiler ──────────────────────────────────────────────────────────

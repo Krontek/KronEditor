@@ -63,7 +63,7 @@ export const STD_BLOCK_TYPES = [
     { name: 'MIN', category: 'Comparison & Selection / Selection' }
 ];
 
-export const DataTypeSelector = ({ value, onChange, derivedTypes = [], userDefinedTypes = [] }) => {
+export const DataTypeSelector = ({ value, onChange, derivedTypes = [], userDefinedTypes = [], compact = false }) => {
     const [isOpen, setIsOpen] = useState(false);
     const [searchTerm, setSearchTerm] = useState('');
     const [expandedCategories, setExpandedCategories] = useState({
@@ -546,20 +546,21 @@ export const DataTypeSelector = ({ value, onChange, derivedTypes = [], userDefin
                 onClick={toggleOpen}
                 style={{
                     cursor: 'pointer',
-                    padding: '6px 10px',
+                    padding: compact ? '1px 6px' : '6px 10px',
                     color: '#4ec9b0', // VS Code Type Color
                     display: 'flex',
                     justifyContent: 'space-between',
                     alignItems: 'center',
-                    border: isOpen ? '1px solid #007acc' : '1px solid #444',
-                    background: isOpen ? '#1e1e1e' : '#252526',
-                    borderRadius: 3,
+                    border: isOpen ? '1px solid #007acc' : `1px solid ${compact ? 'transparent' : '#444'}`,
+                    background: isOpen ? '#1e1e1e' : (compact ? 'transparent' : '#252526'),
+                    borderRadius: compact ? 2 : 3,
                     fontFamily: 'Consolas, monospace',
-                    fontSize: '13px'
+                    fontSize: compact ? '12px' : '13px',
+                    boxSizing: 'border-box'
                 }}
             >
-                <span>{value || 'Select Type...'}</span>
-                <span style={{ fontSize: '10px', color: '#888' }}>▼</span>
+                <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{value || 'Select Type...'}</span>
+                <span style={{ fontSize: '9px', color: '#888', flexShrink: 0, marginLeft: 4 }}>▼</span>
             </div>
             {isOpen && ReactDOM.createPortal(dropdownContent, document.body)}
         </div>

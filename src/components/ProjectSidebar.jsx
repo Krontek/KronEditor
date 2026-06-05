@@ -307,7 +307,8 @@ const ProjectSidebar = ({
        race with sidebar handlers on the shared system clipboard. */
     useEffect(() => {
         const handler = async (e) => {
-            if (document.activeElement?.tagName === 'INPUT' || document.activeElement?.tagName === 'TEXTAREA') return;
+            const el = document.activeElement;
+            if (el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.isContentEditable || el.closest?.('.monaco-editor'))) return;
             if (!(e.ctrlKey || e.metaKey)) return;
             const scope = getEditorScope();
             if (scope && scope !== EDITOR_SCOPE.SIDEBAR) return;

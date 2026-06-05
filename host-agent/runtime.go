@@ -135,6 +135,34 @@ func (s *Server) handleRunSimulation(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "pid": pid, "message": "Simulation started"})
 }
 
+// ── sim_status ───────────────────────────────────────────────────────────────
+// Reports whether a local simulation process is currently running. Used by the
+// editor on (re)load to re-attach to a sim it started before the tab was closed
+// — the host-agent keeps the sim + its /proc poller alive across browser reloads.
+func (s *Server) handleSimStatus(w http.ResponseWriter, r *http.Request) {
+	s.sim.mu.Lock()
+	plainCmd := s.sim.cmd
+	plainPid := s.sim.pid
+	s.sim.mu.Unlock()
+
+	s.hotswap.mu.Lock()
+	hsCmd := s.hotswap.cmd
+	hsPid := s.hotswap.pid
+	s.hotswap.mu.Unlock()
+
+	// The simulation now runs as a hot-swap loader-host by default, so report
+	// that too (mode "hotswap"). A plain sim (legacy path) reports mode "plain".
+	running := plainCmd != nil || hsCmd != nil
+	mode := ""
+	pid := 0
+	if hsCmd != nil {
+		mode, pid = "hotswap", hsPid
+	} else if plainCmd != nil {
+		mode, pid = "plain", plainPid
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"running": running, "pid": pid, "mode": mode})
+}
+
 // ── stop_simulation ──────────────────────────────────────────────────────────
 
 func (s *Server) handleStopSimulation(w http.ResponseWriter, r *http.Request) {

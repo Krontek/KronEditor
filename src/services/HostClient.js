@@ -105,7 +105,12 @@ export class HostClient {
     const j = await _post(this._p('/api/host/compile-for-target'), {
       header, source, variableTable, hal, boardId, outputName,
     });
-    if (!j.ok) throw new Error(j.error || 'compileForTarget failed');
+    if (!j.ok) {
+      // Attach the compiler output (clang stderr) so the UI can show WHY it failed.
+      const e = new Error(j.error || 'compileForTarget failed');
+      e.log = j.log || '';
+      throw e;
+    }
     return j.binaryPath;
   }
 
@@ -115,6 +120,11 @@ export class HostClient {
   }
   async stopSimulation() {
     return _post(this._p('/api/host/stop-simulation'), {});
+  }
+  // Is a local simulation still running in the host-agent? Used to re-attach
+  // after a browser reload (the sim + its poller outlive the tab). → {running, pid}
+  async simStatus() {
+    return _get(this._p('/api/host/sim-status'));
   }
   async writeVariable(name, value) {
     return _post(this._p('/api/host/write-variable'), { name, value: String(value) });

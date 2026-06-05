@@ -1,6 +1,8 @@
 import { useState, useRef, useEffect, useCallback } from 'react';
 import { host } from '../services/HostClient';
-import { TOOL_DEFS, applyToolCall, buildProjectOverview, findPOU, summarizeLiveSamples } from '../services/agentTools';
+import { TOOL_DEFS, applyToolCall, buildProjectOverview, findPOU, summarizeLiveSamples, summarizeWatch } from '../services/agentTools';
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 /*
  * AiAgentPanel — the PLC Agent: a project-editing tool-calling agent.
@@ -434,6 +436,8 @@ function buildSystemPrompt(projectStructure, board, activeItem, libraryData = []
     '- Every change is shown as a diff the user approves/rejects; if rejected, adapt. When done, reply with a short summary in the user\'s language.',
     '- To SEE the existing program before editing it, call read_pou: it returns the full ST code AND, for LD/SCL, each rung rendered as boolean logic (e.g. `Motor := (Start OR Motor) AND NOT Stop`) plus the variable table. Use get_project_overview for the project-wide picture.',
     '- While the program is RUNNING, read_live_variables returns the current values AND a buffered time-series `history` per variable (min/max/last, change count, flags like constant/oscillating/rising/falling, a recent sample series). Read it to diagnose real behaviour (a value stuck, oscillating, drifting, out of range) BEFORE proposing a fix, and refer to the concrete numbers when you explain the problem.',
+    '- For TIME-DEPENDENT behaviour use watch_live_variables: it actively WAITS a real window and returns a per-variable summary, and EACH variable can be watched for its own duration (e.g. watch a 5 s timer output for 12 s but a fast pulse for 2 s). read_live_variables is just an instant snapshot; watch_live_variables is for "does it toggle / settle / ramp over time".',
+    '- VERIFY-AFTER-CHANGE LOOP: live monitoring is automatic whenever the program is running (simulation or a connected PLC) — your edits are committed to the project on approval, but to take effect on the RUNNING target they must be DEPLOYED by the user (Build & Send). When the program is running, after your change is in effect call watch_live_variables on the variables your fix targets, compare the observed behaviour against what the user asked for, and report explicitly whether the desired result was achieved (if not, propose another fix). If the live values do NOT yet reflect your change, it has not been deployed — tell the user to Build & Send. Keep watch durations only as long as needed.',
     '',
     `Board: ${board || 'none'}. Currently open POU: ${active}.`,
     `POUs (${overview.pous.length}): ${pous}.`,
@@ -776,6 +780,25 @@ export default function AiAgentPanel({
       if (args.__parseError) { steps.push({ tc, args: {}, res: { ok: false, error: 'arguments were not valid JSON' } }); continue; }
       if (tc.name === 'get_project_overview') args.__board = selectedBoard;
       if (tc.name === 'read_live_variables') args.__live = { current: liveVariables, history: summarizeLiveSamples(liveBufRef.current) };
+      if (tc.name === 'watch_live_variables') {
+        // Active observation: actually WAIT real time so fresh samples land in
+        // liveBufRef (the SSE effect keeps filling it during this await), then
+        // summarize each variable over its own trailing window. The loop is
+        // async, so awaiting here pauses only this turn — not the whole app.
+        const running = liveVariables && Object.keys(liveVariables).length > 0;
+        if (!running) {
+          args.__watch = { running: false };
+        } else {
+          const specs = Array.isArray(args.variables) ? args.variables : [];
+          const durs = specs.map((s) => Number(s?.seconds)).filter((n) => n > 0);
+          let wait = Number(args.maxSeconds) > 0 ? Number(args.maxSeconds) : (durs.length ? Math.max(...durs) : 5);
+          wait = Math.min(60, Math.max(1, wait));
+          const names = specs.map((s) => s?.name).filter(Boolean).join(', ') || 'live variables';
+          pushView({ role: 'note', text: `Watching ${names} for ${wait}s…` });
+          await sleep(wait * 1000);
+          args.__watch = { running: true, waitedSeconds: wait, history: summarizeWatch(liveBufRef.current, specs) };
+        }
+      }
       if (tc.name === 'list_blocks') args.__library = libraryData;
       // Repair a missing/unresolvable local-scope POU target from context.
       if (needsLocalPou(tc.name, args) && !findPOU(working, args.pou)) {
@@ -874,14 +897,6 @@ export default function AiAgentPanel({
       <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '6px 10px', background: C.panel, borderBottom: `1px solid ${C.border}`, flexShrink: 0 }}>
         <span style={{ fontSize: 13 }}>🤖</span>
         <span style={{ fontWeight: 600, marginRight: 'auto' }}>PLC Agent</span>
-        {(onStartHotSwap || onStopHotSwap) && (
-          <button
-            onClick={() => { if (hotSwapActive) { onStopHotSwap && onStopHotSwap(); } else { onStartHotSwap && onStartHotSwap(); } }}
-            title={hotSwapActive ? 'Live online-change session running — approved edits hot-swap into the running PLC. Click to stop.' : 'Go live: build+run a hot-swap session so approved edits apply online (no restart).'}
-            style={{ background: hotSwapActive ? '#16271d' : 'transparent', border: `1px solid ${hotSwapActive ? '#2e5a3e' : C.border2}`, color: hotSwapActive ? C.green : C.sub, fontSize: 10, padding: '2px 8px', borderRadius: 10, cursor: 'pointer', whiteSpace: 'nowrap' }}>
-            {hotSwapActive ? '⚡ Live' : 'Go live'}
-          </button>
-        )}
         {activeOllamaModel && <RuntimeBadge rt={runtime} />}
         <button
           onClick={() => { setDraftCfg(config || draftCfg); setConfigOpen(o => !o); }}

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"os"
 	"path/filepath"
 	"strconv"
 	"sync/atomic"
@@ -42,7 +43,27 @@ func (s *Server) handleDeployLogic(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	slog.Info("logic.so uploaded", "dest", dest)
+	removeStaleLogicSO(s.cfg.DeployDir, ver)
 	jsonOK(w, map[string]string{"status": "ok", "logic": name, "path": dest})
+}
+
+// removeStaleLogicSO deletes leftover logic_*.so in dir, keeping only the
+// just-uploaded keepVer and the base logic_0.so (which the loader-host reloads
+// on a restart). Each online change uploads a new versioned .so, so without this
+// the deploy dir fills up with old ones. Removing a file the running host still
+// has dlopen'd is safe on Linux (the inode lives until it's dlclose'd).
+func removeStaleLogicSO(dir string, keepVer int64) {
+	matches, _ := filepath.Glob(filepath.Join(dir, "logic_*.so"))
+	for _, p := range matches {
+		var v int64
+		if _, err := fmt.Sscanf(filepath.Base(p), "logic_%d.so", &v); err != nil {
+			continue
+		}
+		if v == keepVer || v == 0 {
+			continue
+		}
+		_ = os.Remove(p)
+	}
 }
 
 func (s *Server) handleHotSwap(w http.ResponseWriter, r *http.Request) {

@@ -19,6 +19,28 @@ const SCALAR_IEC_TYPES = new Set([
   'STRING', 'WSTRING', 'CHAR', 'WCHAR',
 ]);
 
+// Replace ST `// line comments` and single-quoted string literals with spaces,
+// preserving length so Monaco column offsets stay valid. A variable NAME that
+// merely appears inside a comment or a string literal must NOT get a live-value
+// badge. (Block comments are already stripped from the source before this runs.)
+function blankCommentsAndStrings(line) {
+  const out = line.split('');
+  let inStr = false;
+  for (let k = 0; k < out.length; k++) {
+    if (inStr) {
+      if (out[k] === "'") inStr = false;
+      out[k] = ' ';
+    } else if (out[k] === "'") {
+      inStr = true;
+      out[k] = ' ';
+    } else if (out[k] === '/' && out[k + 1] === '/') {
+      for (let m = k; m < out.length; m++) out[m] = ' ';
+      break;
+    }
+  }
+  return out.join('');
+}
+
 // Render a live FB/struct/array value as Markdown for the Monaco hover tooltip.
 function formatLiveHoverMd(name, val) {
   const fmt = (v) => (typeof v === 'boolean' ? (v ? 'TRUE' : 'FALSE') : String(v));
@@ -80,6 +102,24 @@ const EditorPane = ({
     globalVarsRef.current = globalVars;
     projectStructureRef.current = projectStructure;
   }, [variables, globalVars, projectStructure]);
+
+  // Sync EXTERNAL code changes (undo/redo, programmatic) into Monaco WITHOUT
+  // moving the cursor. We use defaultValue (uncontrolled) on the Editor instead
+  // of a controlled `value` prop, because @monaco-editor/react's controlled-value
+  // reconciliation calls model.setValue() on re-render and jerks the cursor to
+  // the top (1,1). The guard skips the no-op case (user typing already updated
+  // the model), so setValue only runs for genuinely external changes. Mirrors
+  // SCLInlineEditor's approach.
+  useEffect(() => {
+    const ed = editorRef.current;
+    if (!ed) return;
+    const model = ed.getModel();
+    if (model && model.getValue() !== (code || '')) {
+      const pos = ed.getPosition();
+      model.setValue(code || '');
+      if (pos) ed.setPosition(pos);
+    }
+  }, [code]);
 
   // --- SYNC WITH PARENT ---
   useEffect(() => {
@@ -289,7 +329,10 @@ const EditorPane = ({
           });
         };
 
-        lines.forEach((line, i) => {
+        lines.forEach((rawLine, i) => {
+          // Blank `// comments` and 'string literals' (length-preserving) so a
+          // variable name written inside a comment/string never gets a badge.
+          const line = blankCommentsAndStrings(rawLine);
           const regex = /\b[a-zA-Z_][a-zA-Z0-9_]*\b/g;
           let match;
           while ((match = regex.exec(line)) !== null) {
@@ -506,6 +549,11 @@ const EditorPane = ({
         if (!ctx || !ctx.live) return null;
         const wi = model.getWordAtPosition(position);
         if (!wi) return null;
+        // Skip words sitting inside a // comment or a 'string literal' — they are
+        // not live variables even if the text matches a variable name.
+        const lineText = model.getLineContent(position.lineNumber);
+        if (blankCommentsAndStrings(lineText)[wi.startColumn - 1] === ' '
+            && lineText[wi.startColumn - 1] !== ' ') return null;
         const word = wi.word;
         const live = ctx.live;
         const pk = `prog_${ctx.prog}_${word}`, gk = `prog__${word}`;
@@ -547,6 +595,46 @@ const EditorPane = ({
     editorRef.current = editor;
     setMonacoInstance(monaco);
     window.stEditor = editor;
+
+    // Explicit Ctrl/Cmd+V via the async Clipboard API. Monaco's default
+    // keyboard paste relies on the browser's native paste event reaching its
+    // hidden input, which does not fire reliably in this embedded setup
+    // (typing works, Ctrl+V does nothing). This guarantees a paste.
+    editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyV, async () => {
+      if (editor.getOption(monaco.editor.EditorOption.readOnly)) return;
+      let text = '';
+      try { text = await navigator.clipboard.readText(); } catch (err) { return; }
+      if (!text) return;
+      const sel = editor.getSelection();
+      editor.executeEdits('clipboard-paste', [{ range: sel, text, forceMoveMarkers: true }]);
+      editor.pushUndoStop();
+    });
+    // Ctrl/Cmd+C — write to the OS clipboard via the async API. Monaco's default
+    // copy relies on the native copy event, which (like paste) does not reach the
+    // OS clipboard in this embedded setup. Empty selection copies the whole line.
+    editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyC, async () => {
+      const model = editor.getModel();
+      const sel = editor.getSelection();
+      let text = model.getValueInRange(sel);
+      if (!text) text = model.getLineContent(sel.startLineNumber) + '\n';
+      try { await navigator.clipboard.writeText(text); } catch (err) {}
+    });
+    // Ctrl/Cmd+X — copy to OS clipboard then delete the selection (or line).
+    editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyX, async () => {
+      if (editor.getOption(monaco.editor.EditorOption.readOnly)) return;
+      const model = editor.getModel();
+      const sel = editor.getSelection();
+      let text = model.getValueInRange(sel);
+      let range = sel;
+      if (!text) {
+        const ln = sel.startLineNumber;
+        text = model.getLineContent(ln) + '\n';
+        range = new monaco.Range(ln, 1, ln + 1, 1);
+      }
+      try { await navigator.clipboard.writeText(text); } catch (err) {}
+      editor.executeEdits('clipboard-cut', [{ range, text: '' }]);
+      editor.pushUndoStop();
+    });
 
     // ── Register IEC 61131-3 Structured Text language & plc-dark theme ──
     registerIECSTLanguage(monaco);
@@ -896,7 +984,7 @@ const EditorPane = ({
               height="100%"
               defaultLanguage="iec-st"
               theme="plc-dark"
-              value={code || ''}
+              defaultValue={code || ''}
               onChange={(val) => setCode(val)}
               options={{
                 minimap: { enabled: false },

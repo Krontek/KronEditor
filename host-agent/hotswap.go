@@ -98,6 +98,25 @@ func buildShmSpecs(variableTableJSON string) []ShmSpec {
 	return specs
 }
 
+// removeStaleLogicSO deletes leftover logic_*.so files in dir, keeping only the
+// just-built keepVer and the base logic_0.so (the one a fresh run reloads). Each
+// hot reload bumps the version, so without this the build dir fills up with old
+// .so's. Deleting a file that the running loader-host still has dlopen'd is safe
+// on Linux (the inode lives until it's unmapped/dlclose'd).
+func removeStaleLogicSO(dir string, keepVer int) {
+	matches, _ := filepath.Glob(filepath.Join(dir, "logic_*.so"))
+	for _, p := range matches {
+		var v int
+		if _, err := fmt.Sscanf(filepath.Base(p), "logic_%d.so", &v); err != nil {
+			continue
+		}
+		if v == keepVer || v == 0 {
+			continue
+		}
+		_ = os.Remove(p)
+	}
+}
+
 // compileLogic builds logic_<ver>.so from the plc.c already in buildDir.
 func (s *Server) compileLogic(buildDir string, ver int) (string, string, error) {
 	resInclude, err := s.paths.ResourceTargetIncludeDir("x86_64/linux")
@@ -128,6 +147,7 @@ func (s *Server) compileLogic(buildDir string, ver int) (string, string, error) 
 	if out, err := exec.Command(compiler, args...).CombinedOutput(); err != nil {
 		return "", "", fmt.Errorf("logic.so build failed: %v\n%s", err, out)
 	}
+	removeStaleLogicSO(buildDir, ver)
 	return logicSO, "", nil
 }
 
@@ -236,6 +256,7 @@ func (s *Server) compileLogicForTarget(buildDir, boardID string, ver int) (strin
 	if out, err := exec.Command(compiler, args...).CombinedOutput(); err != nil {
 		return "", fmt.Errorf("target logic.so build failed: %v\n%s", err, out)
 	}
+	removeStaleLogicSO(buildDir, ver)
 	return logicSO, nil
 }
 

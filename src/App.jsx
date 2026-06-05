@@ -45,6 +45,18 @@ import EtherCATIconSrc from './assets/icons/ethercat.png';
 const EtherCATTabIcon = <img src={EtherCATIconSrc} height="13" style={{ objectFit: 'contain', verticalAlign: 'middle' }} alt="EtherCAT" />;
 import './App.css';
 
+// Signature of the task scheduling config (interval/duration, count, priority,
+// program assignment). Task timing is part of the runtime's fixed layout and is
+// NOT hot-reloadable — a change needs a cold restart (Build & Send), not an
+// online swap. Used to refuse a hot-swap when this signature has changed.
+const taskSignature = (struct) => JSON.stringify(
+  (struct?.taskConfig?.tasks || []).map((t) => ({
+    name: t.name,
+    interval: t.interval,
+    programs: (t.programs || []).map((p) => ({ program: p.program, priority: p.priority })),
+  }))
+);
+
 function App() {
   const { t } = useTranslation();
 
@@ -787,6 +799,38 @@ function App() {
     return () => stop();
   }, [addLog, t]);
 
+  // --- Re-attach to a local simulation left running by a previous session ---
+  // The simulation runs as a separate host-agent process with its own /proc
+  // poller, so it survives a browser tab close/reload. On (re)load — once a
+  // project is open and the editor isn't already tracking a run — we ask the
+  // agent whether a sim is still running and, if so, restore the running state
+  // instead of erroring with "Simulation is already running" on the next start.
+  // Live values resume automatically over the existing simulation-output SSE.
+  // (The remote/KronServer case is handled separately by the 3s status poll.)
+  const simReattachedRef = React.useRef(false);
+  useEffect(() => {
+    if (!isProjectOpen || simReattachedRef.current) return;
+    if (isRunningRef.current || isSimulationModeRef.current) return;
+    simReattachedRef.current = true;
+    host.simStatus()
+      .then((res) => {
+        const st = typeof res === 'string' ? JSON.parse(res) : res;
+        if (st && st.running && !isRunningRef.current && !isSimulationModeRef.current) {
+          setIsSimulationMode(true);
+          setIsRunning(true);
+          // The default sim is a hot-swap loader-host, so a re-attached sim stays
+          // reloadable — restore the flags so an agent change can still hot reload.
+          if (st.mode === 'hotswap') {
+            hotSwapActiveRef.current = true;
+            setIsHotSwap(true);
+            taskSigRef.current = taskSignature(projectStructure);
+          }
+          addLog('info', 'Simulation already running — re-attached (live values resuming).');
+        }
+      })
+      .catch(() => { simReattachedRef.current = false; }); // agent not ready yet → allow a retry
+  }, [isProjectOpen, addLog]);
+
   // --- File Operations ---
 
   // Shared save routine. saveAs=false (Save) overwrites the open file in place
@@ -800,7 +844,9 @@ function App() {
 
       hasUnsavedRef.current = false;
       setCurrentFilePath(savedName);
-      addLog('success', t('logs.projectSaved', { path: savedName }) || `Project saved to ${savedName} `);
+      // No success notification on save — it just clutters the output (user asked
+      // for silent saves). Failures still surface below; the unsaved-changes
+      // warnings on close/unload stay so closing without saving is still caught.
     } catch (error) {
       addLog('error', t('logs.saveAsError', { error: error }) || `Save Error: ${error} `);
     }
@@ -998,7 +1044,13 @@ function App() {
     setIsRunning(true);
     addLog('success', 'Running Simulation Execution...');
     try {
-      await host.runSimulation();
+      // The simulation runs as a hot-swap loader-host (built by handleToggleSimulation),
+      // so live code is reloadable — an agent change while running can be applied
+      // without a restart. hotswapRun is idempotent (returns alreadyRunning).
+      await host.hotswapRun();
+      hotSwapActiveRef.current = true;
+      setIsHotSwap(true);
+      taskSigRef.current = taskSignature(projectStructure);
     } catch (err) {
       addLog('error', `Failed to start simulation: ${err.message || err}`);
       setIsRunning(false);
@@ -1031,18 +1083,18 @@ function App() {
           addLog('warning', `Not assigned to any task — will NOT run: ${notRunning.join(', ')}. Assign them in Task Manager.`);
         }
 
-        const writeRes = await host.writePlcFiles({
+        // Build the simulation as a HOT-SWAP loader-host (+ logic.so), not a plain
+        // binary — so the running sim is reloadable and an agent change can be
+        // applied live (with a confirm). hotswapBuild writes the C files itself.
+        addLog('info', t('logs.compilingSimulation') || 'Compiling simulation executable...');
+        await host.hotswapBuild({
           header: cCode.header,
           source: cCode.source,
           variableTable: JSON.stringify(cCode.variableTable, null, 2),
-          hal: cCode.hal || ''
+          hal: cCode.hal || '',
+          hostGlue: cCode.hostGlue || '',
         });
-        const outPath = writeRes.buildDir;
-        addLog('success', t('logs.transpiledSaved', { path: outPath }) || `Transpiled C header and source successfully saved to ${outPath}`);
-
-        addLog('info', t('logs.compilingSimulation') || 'Compiling simulation executable...');
-        const exePath = await host.compileSimulation();
-        addLog('success', t('logs.simulationCompiled', { path: exePath }) || `Simulation executable compiled: ${exePath}`);
+        addLog('success', 'Simulation built (hot-swap enabled — live code is reloadable).');
 
         setIsSimulationMode(true);
 
@@ -1072,6 +1124,9 @@ function App() {
       addLog('info', t('logs.simulationDisabled') || 'Simulation Mode Disabled.');
       liveVarsRef.current = {};
       setLiveVariables({});
+      hotSwapActiveRef.current = false;
+      setIsHotSwap(false);
+      taskSigRef.current = null;
     }
   };
 
@@ -1137,10 +1192,13 @@ function App() {
 
       if (isSimulationMode) {
         try {
-          await host.stopSimulation();
+          await host.hotswapStop(); // sim runs the hot-swap loader-host now
         } catch (err) {
           addLog('error', `Failed to stop simulation: ${err.message || err}`);
         }
+        hotSwapActiveRef.current = false;
+        setIsHotSwap(false);
+        taskSigRef.current = null;
       } else if (plcClientRef.current) {
         // Stop the variable stream first.
         if (stopStreamRef.current) {
@@ -1287,6 +1345,18 @@ function App() {
       addLog('error', `Build aborted: ${stErrors.length} ST validation error(s). Fix before building.`);
       return;
     }
+    // The runtime may be live (local simulation, or a running remote PLC). A full
+    // Build & Send recompiles and RESTARTS the target runtime, so outputs reset
+    // and running state (timers/counters/latches) is lost. Don't block it — just
+    // confirm before disrupting a live system. (For a state-preserving update use
+    // the PLC Agent's online change / "Go live" instead.)
+    if (isRunning || isSimulationMode) {
+      const where = isPlcConnected ? `the PLC at ${plcAddress}` : 'the local simulation';
+      if (!window.confirm(`The runtime on ${where} is RUNNING.\n\nBuild & Send will recompile and RESTART it with the new program — outputs reset and current state (timers, counters, latches) is lost.\n\nProceed?`)) {
+        addLog('info', 'Build & Send cancelled.');
+        return;
+      }
+    }
     const boardInfo = getBoardById(selectedBoard);
     checkBaremetalConcurrency();
     addLog('info', `Build & Send for ${boardInfo?.name || selectedBoard}...`);
@@ -1305,6 +1375,11 @@ function App() {
         cCode.variableTable.api_password_salt = saltHex;
       }
 
+      // Cross-compile a SELF-CONTAINED runtime.bin (NOT the hot-swap loader-host).
+      // Remote hot reload was reverted: the loader-host is unverified on real
+      // hardware and was crashing on the target (it needs a logic.so arg that the
+      // deploy mis-named). Build & Send is a full deploy + restart; live reload
+      // stays a SIMULATION-only feature.
       addLog('info', 'Cross-compiling for target...');
       await host.compileForTarget({
         header: cCode.header,
@@ -1358,13 +1433,20 @@ function App() {
         addLog('warning', `HMI layout deploy skipped: ${hmiErr.message}`);
       }
 
-      // Deploy autorun + HMI port config
+      // Deploy autorun + HMI port config. `restart` makes the server swap the
+      // running runtime to the binary we just deployed — without it, a Build &
+      // Send while a runtime is already running (or under AutoRun) leaves the
+      // OLD code executing (overwriting runtime.bin on disk doesn't touch the
+      // live process). Restart only when it SHOULD run: AutoRun on, or it was
+      // already running (the confirm dialog already warned state is lost).
+      const shouldRestart = autoRun || isRunning;
       try {
         await fetch(`http://${plcAddress}/deploy/config`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ auto_run: autoRun, hmi_port: hmiPort }),
+          body: JSON.stringify({ auto_run: autoRun, hmi_port: hmiPort, restart: shouldRestart }),
         });
+        if (shouldRestart) addLog('info', 'Restarting runtime with new code...');
       } catch (cfgErr) {
         addLog('warning', `Runtime config deploy skipped: ${cfgErr.message}`);
       }
@@ -1386,6 +1468,9 @@ function App() {
       }
     } catch (err) {
       addLog('error', `Build & Send failed: ${err.message || err}`);
+      if (err && err.log && String(err.log).trim()) {
+        String(err.log).trim().split('\n').forEach(line => addLog('error', line));
+      }
     }
   };
 
@@ -1792,6 +1877,21 @@ function App() {
   };
 
   const activeItem = getActiveItem();
+
+  // Tab labels resolve LIVE from the project by id, so a rename (or a name set
+  // after the tab was opened) updates the tab. openTab() snapshots the label
+  // only at open time and never refreshes it, which left renamed/late-named
+  // POUs showing a stale or blank tab title.
+  const resolveTabLabel = (id, fallback) => {
+    for (const key of Object.keys(projectStructure)) {
+      if (!Array.isArray(projectStructure[key])) continue;
+      const item = projectStructure[key].find(i => i.id === id);
+      if (item) return item.name || fallback;
+    }
+    return fallback;
+  };
+  const displayTabs = openTabs.map(t => ({ ...t, label: resolveTabLabel(t.id, t.label) }));
+
   const deviceInterfaceConfig =
     projectStructure.resources?.find(r => r.id === 'res_config')?.content?.deviceInterfaceConfig || {};
 
@@ -1890,6 +1990,12 @@ function App() {
   // the running PLC without a restart (state preserved). Live values keep
   // flowing on the existing simulation-output SSE (the host-agent's SHM poller).
   const hotSwapActiveRef = React.useRef(false);
+  // Task scheduling (interval / count / priority / program-assignment) is part of
+  // the runtime's fixed layout — it CANNOT be hot-swapped (needs a cold restart;
+  // see CLAUDE.md). We snapshot the task signature when a hot-swap session starts
+  // and refuse to push an online change if it has since changed: the edit is kept
+  // (accepted) but NOT deployed — the user re-deploys via Build & Send.
+  const taskSigRef = React.useRef(null);
 
   // "Go live": if connected to a remote PLC, deploy a hot-swap-capable runtime
   // (loader-host + logic_0.so) to the field; otherwise start a LOCAL sim
@@ -1922,6 +2028,8 @@ function App() {
       setIsRunning(true);
       addLog('success', 'Hot-swap session started (simulation) — online change enabled.');
     }
+    // Baseline for the "task timing can't be hot-swapped" guard below.
+    taskSigRef.current = taskSignature(projectStructure);
   }, [projectStructure, selectedBoard, buses, busConfigs, isPlcConnected, plcAddress, addLog]);
 
   const stopHotSwapSession = useCallback(async () => {
@@ -1938,14 +2046,27 @@ function App() {
   // surface it; the user should redeploy). Field swaps confirm first (live HW).
   const handleAgentHotSwap = useCallback(async (touchedPous) => {
     const what = (touchedPous || []).join(', ') || 'logic';
+    // Task scheduling changes (interval/duration, task count, priority, program
+    // assignment) are NOT hot-reloadable — they change the runtime's fixed task
+    // layout and need a cold restart. If the task signature changed since the
+    // session started, KEEP the edit (it's already accepted into the project) but
+    // do NOT push it online; the user deploys it themselves via Build & Send.
+    if (taskSigRef.current !== null && taskSignature(projectStructure) !== taskSigRef.current) {
+      addLog('warning', `Task timing/scheduling changed — not applied as an online change (task durations are not hot-reloadable). The change is kept; use Build & Send to deploy it (the runtime will restart).`);
+      return;
+    }
     const standardHeaders = await host.getStandardHeaders().catch(() => []);
     try {
       if (hotSwapActiveRef.current) {
+        if (!window.confirm(`The simulation is RUNNING.\n\nApply this change LIVE as a HOT RELOAD — the logic is swapped without stopping the run, so state (timers/counters/latches) is preserved.\n\nChanged: ${what}\n\nHot reload now?`)) {
+          addLog('info', 'Hot reload cancelled — change kept; it will apply on the next restart/Build & Send.');
+          return;
+        }
         const cCode = transpileToC(projectStructure, standardHeaders, selectedBoard, true, buses, busConfigs);
         await host.hotswapSwap({ header: cCode.header, source: cCode.source });
-        addLog('success', `Online change applied (sim): ${what}`);
+        addLog('success', `Hot reload applied (sim): ${what}`);
       } else if (isHotSwap && isPlcConnected && plcAddress) {
-        if (!window.confirm(`Apply this change to the RUNNING PLC at ${plcAddress} now (online change)?\n\n${what}`)) {
+        if (!window.confirm(`The PLC at ${plcAddress} is RUNNING.\n\nThis applies your change LIVE as an online change — the logic is swapped without stopping the runtime, so outputs may change immediately on real hardware (timers/counters/latches are preserved).\n\nChanged: ${what}\n\nApply to the live PLC now?`)) {
           addLog('info', 'Online change to target cancelled.');
           return;
         }
@@ -2105,6 +2226,15 @@ function App() {
               )}
             </div>
 
+            {/* Quick Save (floppy disk) — one click, same as Ctrl+S */}
+            <button
+              className="tb-btn tb-icon"
+              onClick={handleSave}
+              title={`${t('common.save') || 'Save'} (Ctrl+S)`}
+            >
+              <SaveIcon />
+            </button>
+
             <div className="tb-divider" />
 
             {/* ── Group: App-level ────────────────────────────────────── */}
@@ -2129,9 +2259,12 @@ function App() {
             <button
               className="tb-btn tb-text tb-primary"
               onClick={isPlcConnected ? handleBuildAndSend : handleBuild}
-              disabled={isRunning || (isPlcConnected && isSimulationMode)}
+              // When connected, Build & Send stays available even during Simulation /
+              // while running — it confirms (and restarts the runtime) instead of
+              // being blocked. Local Build (not connected) still waits for the sim to stop.
+              disabled={isPlcConnected ? false : isRunning}
               title={
-                isPlcConnected && isSimulationMode ? 'Disabled during Simulation — turn Simulation OFF to Build & Send'
+                isPlcConnected && (isRunning || isSimulationMode) ? 'Build & Send to PLC (runtime is running — you will be asked to confirm)'
                   : isPlcConnected ? 'Build & Send to PLC' : (t('actions.build') || 'Build')
               }
             >
@@ -2261,7 +2394,7 @@ function App() {
 
               {/* EDITOR TABS */}
               <EditorTabs
-                tabs={openTabs}
+                tabs={displayTabs}
                 activeId={activeId}
                 onActivate={(id) => setActiveId(id)}
                 onClose={closeTab}

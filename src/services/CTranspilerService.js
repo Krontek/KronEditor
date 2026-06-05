@@ -2690,6 +2690,41 @@ const transpileSTLogics = (code, stdFunctions = {}, parentName = '', category = 
         for (const ln of expanded) lines.push(ln);
     }
 
+    // Split lines that pack multiple `;`-separated statements onto one physical
+    // line, e.g. the body of a single-line `IF … THEN fb(); x := 1; END_IF`
+    // (after control-keyword normalization the body survives as
+    // `fb(); x := 1;`). The FB-call detector (regex anchored with `$`) matches
+    // a WHOLE line as exactly one `inst(args);` call, so a trailing second
+    // statement made it fall through to transformExpr — which mangles a named
+    // FB call `init_wait(IN := FALSE)` into `init_wait(IN = false)` (undeclared
+    // `IN`). Splitting on TOP-LEVEL `;` (paren depth 0, outside '…' strings)
+    // gives each statement its own line; control-flow headers (IF/FOR/END_*)
+    // carry no internal `;` so they're untouched, and a lone single-statement
+    // line is preserved verbatim (keeps its trailing `;`).
+    {
+        const expanded = [];
+        for (const ln of lines) {
+            if (ln.indexOf(';') < 0) { expanded.push(ln); continue; }
+            const parts = [];
+            let buf = '', depth = 0, inStr = false;
+            for (let k = 0; k < ln.length; k++) {
+                const ch = ln[k];
+                if (inStr) { buf += ch; if (ch === "'") inStr = false; continue; }
+                if (ch === "'") { inStr = true; buf += ch; continue; }
+                if (ch === '(') depth++;
+                else if (ch === ')' && depth > 0) depth--;
+                if (ch === ';' && depth === 0) { parts.push(buf); buf = ''; continue; }
+                buf += ch;
+            }
+            if (buf.trim()) parts.push(buf);
+            const real = parts.filter(p => p.trim());
+            if (real.length <= 1) { expanded.push(ln); continue; }
+            for (const p of real) expanded.push(p.trim() + ';');
+        }
+        lines.length = 0;
+        for (const ln of expanded) lines.push(ln);
+    }
+
     let out = '';
     let indentLevel = 1; // 1 = inside function body (4 spaces)
     // Block nesting stack — each entry represents an open control structure.
