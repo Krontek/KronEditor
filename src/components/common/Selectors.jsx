@@ -69,6 +69,7 @@ export const DataTypeSelector = ({ value, onChange, derivedTypes = [], userDefin
     const [expandedCategories, setExpandedCategories] = useState({
         elementary: false,
         derived: false,
+        hardware: false,
         user: false
     });
     const [expandedUserMain, setExpandedUserMain] = useState({});
@@ -115,6 +116,7 @@ export const DataTypeSelector = ({ value, onChange, derivedTypes = [], userDefin
             setExpandedCategories({
                 elementary: false,
                 derived: false,
+                hardware: false,
                 user: false
             });
             setExpandedUserMain({});
@@ -216,14 +218,31 @@ export const DataTypeSelector = ({ value, onChange, derivedTypes = [], userDefin
         if (matching.length > 0) filteredProjectDefined[k] = matching;
     });
 
-    // Only standard blocks go to structuredUserTypes (FunctionBlock section)
+    // Standard blocks go to structuredUserTypes (FunctionBlock section); board /
+    // hardware blocks (category "Hardware / <iface>") are split out into their own
+    // top-level "Hardware" section so they sit one level shallower (Hardware ->
+    // subcat -> block) and are easy to find.
     const structuredUserTypes = {};
+    const structuredHardwareTypes = {}; // subCat -> [names]
+    const hardwareItems = [];           // hardware blocks with no subcategory
     standardBlocks.forEach(curr => {
         if (!curr.name) return;
         if (!curr.name.toLowerCase().includes(term)) return;
         const parts = curr.category ? curr.category.split(' / ') : ['FunctionBlocks'];
         const mainCat = parts[0];
         const subCat = parts.length > 1 ? parts[1] : null;
+
+        if (mainCat === 'Hardware') {
+            if (subCat) {
+                if (!structuredHardwareTypes[subCat]) structuredHardwareTypes[subCat] = [];
+                if (!structuredHardwareTypes[subCat].includes(curr.name)) {
+                    structuredHardwareTypes[subCat].push(curr.name);
+                }
+            } else if (!hardwareItems.includes(curr.name)) {
+                hardwareItems.push(curr.name);
+            }
+            return;
+        }
 
         if (!structuredUserTypes[mainCat]) structuredUserTypes[mainCat] = { items: [], subCats: {} };
 
@@ -238,11 +257,13 @@ export const DataTypeSelector = ({ value, onChange, derivedTypes = [], userDefin
             }
         }
     });
+    const hasHardware = hardwareItems.length > 0 || Object.keys(structuredHardwareTypes).length > 0;
 
     // Auto-expand if searching
     const showElementary = isSearching || expandedCategories.elementary;
     const showDerived = isSearching || expandedCategories.derived;
     const showUser = isSearching || expandedCategories.user;
+    const showHardware = isSearching || expandedCategories.hardware;
 
     const dropdownContent = (
         <div
@@ -289,6 +310,12 @@ export const DataTypeSelector = ({ value, onChange, derivedTypes = [], userDefin
                             const projKeys = Object.keys(filteredProjectDefined);
                             if (projKeys.length > 0 && filteredProjectDefined[projKeys[0]].length > 0) {
                                 handleSelect(filteredProjectDefined[projKeys[0]][0]); return;
+                            }
+                            // First hardware item
+                            if (hardwareItems.length > 0) { handleSelect(hardwareItems[0]); return; }
+                            const hwKeys = Object.keys(structuredHardwareTypes);
+                            if (hwKeys.length > 0 && structuredHardwareTypes[hwKeys[0]].length > 0) {
+                                handleSelect(structuredHardwareTypes[hwKeys[0]][0]); return;
                             }
                             // First standard item
                             const stdKeys = Object.keys(structuredUserTypes);
@@ -418,7 +445,99 @@ export const DataTypeSelector = ({ value, onChange, derivedTypes = [], userDefin
                     )}
                 </>
 
-                {/* 3. FUNCTION BLOCKS (STANDARD) */}
+                {/* 3. HARDWARE (BOARD) FUNCTION BLOCKS */}
+                {hasHardware && (
+                    <>
+                        <div
+                            onClick={() => !isSearching && toggleCategory('hardware')}
+                            style={{
+                                padding: '6px 10px',
+                                background: '#333',
+                                borderBottom: '1px solid #2d2d2d',
+                                borderTop: '1px solid #2d2d2d',
+                                color: '#eee',
+                                fontSize: '11px',
+                                fontWeight: 'bold',
+                                cursor: isSearching ? 'default' : 'pointer',
+                                display: 'flex',
+                                justifyContent: 'space-between',
+                                alignItems: 'center'
+                            }}
+                        >
+                            <span>Hardware</span>
+                            {!isSearching && <span>{showHardware ? '▼' : '►'}</span>}
+                        </div>
+                        {showHardware && (
+                            <div style={{ padding: '0', background: '#1e1e1e' }}>
+                                {hardwareItems.map(t => (
+                                    <div
+                                        key={t}
+                                        onClick={() => handleSelect(t)}
+                                        style={{
+                                            padding: '6px 20px',
+                                            cursor: 'pointer',
+                                            fontSize: '13px',
+                                            color: value === t ? '#4ec9b0' : '#ccc',
+                                            background: value === t ? '#2d2d2d' : 'transparent',
+                                            fontFamily: 'Consolas, monospace'
+                                        }}
+                                        onMouseEnter={(e) => e.target.style.background = '#2d2d2d'}
+                                        onMouseLeave={(e) => e.target.style.background = value === t ? '#2d2d2d' : 'transparent'}
+                                    >
+                                        {t}
+                                    </div>
+                                ))}
+                                {Object.entries(structuredHardwareTypes).map(([subCat, blocks]) => {
+                                    const subCatKey = `hw-${subCat}`;
+                                    const isSubExpanded = isSearching || expandedUserSub[subCatKey];
+                                    return (
+                                        <div key={subCatKey}>
+                                            <div
+                                                onClick={() => !isSearching && toggleUserSub(subCatKey)}
+                                                style={{
+                                                    padding: '4px 15px',
+                                                    color: '#888',
+                                                    fontSize: '11px',
+                                                    fontWeight: 'bold',
+                                                    textTransform: 'uppercase',
+                                                    background: '#252526',
+                                                    borderBottom: '1px solid #333',
+                                                    cursor: isSearching ? 'default' : 'pointer',
+                                                    display: 'flex',
+                                                    justifyContent: 'space-between',
+                                                    alignItems: 'center'
+                                                }}
+                                            >
+                                                <span>{subCat}</span>
+                                                {!isSearching && <span>{isSubExpanded ? '▼' : '►'}</span>}
+                                            </div>
+                                            {isSubExpanded && blocks.map(t => (
+                                                <div
+                                                    key={t}
+                                                    onClick={() => handleSelect(t)}
+                                                    style={{
+                                                        padding: '6px 20px',
+                                                        cursor: 'pointer',
+                                                        fontSize: '13px',
+                                                        color: value === t ? '#4ec9b0' : '#ccc',
+                                                        background: value === t ? '#2d2d2d' : 'transparent',
+                                                        fontFamily: 'Consolas, monospace'
+                                                    }}
+                                                    onMouseEnter={(e) => e.target.style.background = '#2d2d2d'}
+                                                    onMouseLeave={(e) => e.target.style.background = value === t ? '#2d2d2d' : 'transparent'}
+                                                >
+                                                    {t}
+                                                </div>
+                                            ))}
+                                        </div>
+                                    );
+                                })}
+                            </div>
+                        )}
+                    </>
+                )}
+
+                {/* 4. FUNCTION BLOCKS (STANDARD) */}
                 <>
                     <div
                         onClick={() => !isSearching && toggleCategory('user')}
