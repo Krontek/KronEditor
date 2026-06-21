@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(bash experiments/transpiler-check/compile-gate.sh)",
+      "Bash(echo \"EXIT=$?\")",
+      "Read(//tmp/**)",
+      "Bash(node experiments/transpiler-check/bundle.mjs)",
+      "Bash(node experiments/transpiler-check/_run.mjs)",
+      "Bash(node -e ' *)",
+      "Bash(rm -f experiments/transpiler-check/_run.mjs /tmp/now.json)"
+    ]
+  }
+}
