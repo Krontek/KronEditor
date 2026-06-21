@@ -4,6 +4,49 @@ import { TOOL_DEFS, applyToolCall, buildProjectOverview, findPOU, summarizeLiveS
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
+// Image-attachment support. Only the providers below accept multimodal
+// content blocks on the wire (see host-agent/ai.go: callAnthropic and
+// callOpenAI — the latter also covers "custom" and "gemini"/"google", which
+// route through the same OpenAI-compatible /chat/completions shape). Ollama
+// is excluded for now — its /api/chat image field is a different scheme.
+const IMAGE_CAPABLE_PROVIDERS = new Set(['anthropic', 'anthropic-oauth', 'openai', 'custom', 'gemini', 'google']);
+const MAX_IMAGE_BYTES = 8 * 1024 * 1024;   // 8MB per image — generous but catches accidental huge pastes early
+const MAX_IMAGES = 5;                       // mirrors typical chat-UI limits (VS Code Copilot Chat, Claude.ai)
+
+let _attachId = 0;
+const nextAttachId = () => ++_attachId;
+
+function fileToAttachment(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      const dataUrl = String(reader.result || '');
+      const comma = dataUrl.indexOf(',');
+      resolve({
+        id: nextAttachId(),
+        name: file.name || 'image',
+        mimeType: file.type || 'image/png',
+        size: file.size,
+        data: comma >= 0 ? dataUrl.slice(comma + 1) : '',
+        previewUrl: dataUrl,
+      });
+    };
+    reader.onerror = () => reject(reader.error || new Error('FileReader error'));
+    reader.readAsDataURL(file);
+  });
+}
+
+// Abortable wait, used for the watch_live_variables real-time pause so Stop
+// can cut it short instead of having to wait out the full window.
+const sleepAbortable = (ms, signal) => new Promise((resolve, reject) => {
+  if (signal?.aborted) { reject(new DOMException('Aborted', 'AbortError')); return; }
+  const id = setTimeout(resolve, ms);
+  signal?.addEventListener('abort', () => {
+    clearTimeout(id);
+    reject(new DOMException('Aborted', 'AbortError'));
+  }, { once: true });
+});
+
 /*
  * AiAgentPanel — the PLC Agent: a project-editing tool-calling agent.
  * ------------------------------------------------------------------
@@ -436,7 +479,7 @@ function buildSystemPrompt(projectStructure, board, activeItem, libraryData = []
     '- Every change is shown as a diff the user approves/rejects; if rejected, adapt. When done, reply with a short summary in the user\'s language.',
     '- To SEE the existing program before editing it, call read_pou: it returns the full ST code AND, for LD/SCL, each rung rendered as boolean logic (e.g. `Motor := (Start OR Motor) AND NOT Stop`) plus the variable table. Use get_project_overview for the project-wide picture.',
     '- While the program is RUNNING, read_live_variables returns the current values AND a buffered time-series `history` per variable (min/max/last, change count, flags like constant/oscillating/rising/falling, a recent sample series). Read it to diagnose real behaviour (a value stuck, oscillating, drifting, out of range) BEFORE proposing a fix, and refer to the concrete numbers when you explain the problem.',
-    '- For TIME-DEPENDENT behaviour use watch_live_variables: it actively WAITS a real window and returns a per-variable summary, and EACH variable can be watched for its own duration (e.g. watch a 5 s timer output for 12 s but a fast pulse for 2 s). read_live_variables is just an instant snapshot; watch_live_variables is for "does it toggle / settle / ramp over time".',
+    '- For TIME-DEPENDENT behaviour use watch_live_variables: it actively WAITS a real window and returns a per-variable summary, and EACH variable can be watched for its own duration (e.g. watch a 5 s timer output for 12 s but a fast pulse for 2 s). read_live_variables is just an instant snapshot; watch_live_variables is for "does it toggle / settle / ramp over time". A single call is capped at 60 s — default to the SHORTEST window that actually answers the question (most checks need only a few seconds). Only for the rare case where the behaviour genuinely unfolds over minutes (slow drift, a long multi-step sequence, a startup delay) should you chain consecutive watch_live_variables calls back-to-back across turns to extend the effective observation window — tell the user you are doing an extended watch and why, watch in 60 s segments, and stop chaining as soon as you have enough signal to conclude. Do not chain by default.',
     '- VERIFY-AFTER-CHANGE LOOP: live monitoring is automatic whenever the program is running (simulation or a connected PLC) — your edits are committed to the project on approval, but to take effect on the RUNNING target they must be DEPLOYED by the user (Build & Send). When the program is running, after your change is in effect call watch_live_variables on the variables your fix targets, compare the observed behaviour against what the user asked for, and report explicitly whether the desired result was achieved (if not, propose another fix). If the live values do NOT yet reflect your change, it has not been deployed — tell the user to Build & Send. Keep watch durations only as long as needed.',
     '',
     `Board: ${board || 'none'}. Currently open POU: ${active}.`,
@@ -528,9 +571,23 @@ export default function AiAgentPanel({
       m.role === 'proposal' && m.status === 'pending' ? { ...m, status: 'rejected' } : m)
   );
   const [input, setInput] = useState('');
+  const [attachments, setAttachments] = useState([]); // pending image attachments for the NEXT message
+  const [attachError, setAttachError] = useState('');
+  const fileInputRef = useRef(null);
   const [busy, setBusy] = useState(false);          // waiting on a model turn
+  const [running, setRunning] = useState(false);    // agent loop is active (busy, or between turns/waits) — Stop is shown whenever this is true
   const [pending, setPending] = useState(null);     // a proposal awaiting approve/reject
   const scrollRef = useRef(null);
+  // The AbortController for the in-flight fetch/wait of the CURRENT turn, and a
+  // flag checked between turns so Stop also breaks the auto-continue recursion
+  // (read-only turns that chain into the next runTurn with no fetch in flight).
+  const turnControllerRef = useRef(null);
+  const stopRequestedRef = useRef(false);
+
+  const stopAgent = () => {
+    stopRequestedRef.current = true;
+    turnControllerRef.current?.abort();
+  };
   if (_restored.current?.messages?.length) {
     _mid = Math.max(_mid, ...(_restored.current.messages.map((m) => (m.id || 0) + 1)));
     _restored.current = { ..._restored.current, messages: null }; // bump once
@@ -678,7 +735,7 @@ export default function AiAgentPanel({
 
   useEffect(() => {
     if (scrollRef.current) scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
-  }, [messages, busy]);
+  }, [messages, busy, running]);
 
   // Persist the conversation (view + API history) so it survives the panel
   // unmounting on a tab switch and a full reload. convoRef is updated alongside
@@ -692,6 +749,40 @@ export default function AiAgentPanel({
     (config.provider === 'anthropic-oauth' && oauth.connected) ||
     config.apiKey || config.baseUrl
   ));
+  const imagesSupported = IMAGE_CAPABLE_PROVIDERS.has(config?.provider);
+
+  // Validate + add files as pending attachments (paste or the file picker).
+  // Non-image files are silently skipped; oversize/over-count are surfaced as
+  // a visible error under the input bar instead of a failed network call.
+  const addAttachments = async (files) => {
+    setAttachError('');
+    const images = Array.from(files || []).filter((f) => f.type && f.type.startsWith('image/'));
+    if (images.length === 0) return;
+    if (attachments.length + images.length > MAX_IMAGES) {
+      setAttachError(`Up to ${MAX_IMAGES} images per message.`);
+      return;
+    }
+    const tooBig = images.find((f) => f.size > MAX_IMAGE_BYTES);
+    if (tooBig) {
+      setAttachError(`"${tooBig.name}" is too large (max ${Math.round(MAX_IMAGE_BYTES / 1024 / 1024)}MB).`);
+      return;
+    }
+    try {
+      const added = await Promise.all(images.map(fileToAttachment));
+      setAttachments((a) => [...a, ...added]);
+    } catch (e) {
+      setAttachError(e.message || 'Failed to read image.');
+    }
+  };
+  const removeAttachment = (id) => setAttachments((a) => a.filter((x) => x.id !== id));
+  const handlePaste = (e) => {
+    if (!imagesSupported) return;
+    const files = Array.from(e.clipboardData?.items || [])
+      .filter((it) => it.kind === 'file' && it.type.startsWith('image/'))
+      .map((it) => it.getAsFile())
+      .filter(Boolean);
+    if (files.length > 0) addAttachments(files);
+  };
 
   const pushView = (item) => setMessages((m) => [...m, { id: nextId(), ...item }]);
   const setViewStatus = (viewId, status) =>
@@ -700,11 +791,21 @@ export default function AiAgentPanel({
   // One model turn: ask the provider for the assistant's next message, run any
   // read tools automatically, and surface write tools as a proposal to approve.
   const runTurn = useCallback(async (apiMessages, turn) => {
+    if (stopRequestedRef.current) {
+      stopRequestedRef.current = false;
+      setBusy(false);
+      setRunning(false);
+      pushView({ role: 'note', text: 'Stopped.' });
+      return;
+    }
     if (turn > MAX_AGENT_TURNS) {
       pushView({ role: 'note', text: 'Stopped — too many tool iterations. Ask me to continue if needed.' });
+      setRunning(false);
       return;
     }
     setBusy(true);
+    const controller = new AbortController();
+    turnControllerRef.current = controller;
     let assistant;
     try {
       assistant = await host.aiChat({
@@ -712,10 +813,16 @@ export default function AiAgentPanel({
         system: buildSystemPrompt(psRef.current, selectedBoard, activeItem, libraryData),
         messages: apiMessages,
         tools: TOOL_DEFS,
-      });
+      }, controller.signal);
     } catch (e) {
       setBusy(false);
-      pushView({ role: 'note', text: `Error: ${e.message}` });
+      setRunning(false);
+      if (e.name === 'AbortError') {
+        stopRequestedRef.current = false;
+        pushView({ role: 'note', text: 'Stopped.' });
+      } else {
+        pushView({ role: 'note', text: `Error: ${e.message}` });
+      }
       return;
     }
     setBusy(false);
@@ -753,7 +860,7 @@ export default function AiAgentPanel({
     convoRef.current = [...apiMessages, assistantMsg];
     if (assistantText && assistantText.trim()) pushView({ role: 'assistant', text: assistantText });
 
-    if (calls.length === 0) return; // final answer, loop ends
+    if (calls.length === 0) { setRunning(false); return; } // final answer, loop ends
 
     // Dry-run every call in order, chaining mutations through a working copy so
     // composed diffs (e.g. add_variable then set_st_code) are computed correctly.
@@ -795,10 +902,15 @@ export default function AiAgentPanel({
           wait = Math.min(60, Math.max(1, wait));
           const names = specs.map((s) => s?.name).filter(Boolean).join(', ') || 'live variables';
           pushView({ role: 'note', text: `Watching ${names} for ${wait}s…` });
-          await sleep(wait * 1000);
-          args.__watch = { running: true, waitedSeconds: wait, history: summarizeWatch(liveBufRef.current, specs) };
+          try {
+            await sleepAbortable(wait * 1000, controller.signal);
+            args.__watch = { running: true, waitedSeconds: wait, history: summarizeWatch(liveBufRef.current, specs) };
+          } catch {
+            // Stop was pressed mid-watch — abandon this turn entirely below.
+          }
         }
       }
+      if (controller.signal.aborted) break;
       if (tc.name === 'list_blocks') args.__library = libraryData;
       // Repair a missing/unresolvable local-scope POU target from context.
       if (needsLocalPou(tc.name, args) && !findPOU(working, args.pou)) {
@@ -817,6 +929,12 @@ export default function AiAgentPanel({
       steps.push({ tc, args, res });
     }
 
+    if (controller.signal.aborted) {
+      setRunning(false);
+      pushView({ role: 'note', text: 'Stopped.' });
+      return;
+    }
+
     const hasMutations = steps.some((s) => s.res?.mutation && s.res.ok);
     if (!hasMutations) {
       // Reads / errors only — feed results back and keep going automatically.
@@ -829,21 +947,29 @@ export default function AiAgentPanel({
     const viewId = nextId();
     setMessages((m) => [...m, { id: viewId, role: 'proposal', steps, status: 'pending' }]);
     setPending({ steps, dryStruct: working, viewId, turn });
+    setRunning(false);
   }, [config, selectedBoard, activeItem, liveVariables]);
 
   const send = (text) => {
     const prompt = (text ?? input).trim();
-    if (!prompt || busy || pending) return;
+    const imgs = attachments;
+    if ((!prompt && imgs.length === 0) || running || pending) return;
     setInput('');
+    setAttachments([]);
+    setAttachError('');
     if (!configured) {
-      pushView({ role: 'user', text: prompt });
+      pushView({ role: 'user', text: prompt, images: imgs });
       pushView({ role: 'note', text: 'No model configured yet. Click the ⚙ gear above to connect a model, then ask again.' });
       return;
     }
-    pushView({ role: 'user', text: prompt });
+    pushView({ role: 'user', text: prompt, images: imgs });
     // Start a fresh agent run from the latest committed project state.
     workingRef.current = psRef.current;
-    const apiMessages = [...convoRef.current, { role: 'user', content: prompt }];
+    stopRequestedRef.current = false;
+    setRunning(true);
+    const userMsg = { role: 'user', content: prompt };
+    if (imgs.length > 0) userMsg.images = imgs.map((a) => ({ mimeType: a.mimeType, data: a.data }));
+    const apiMessages = [...convoRef.current, userMsg];
     runTurn(apiMessages, 0);
   };
 
@@ -868,7 +994,7 @@ export default function AiAgentPanel({
   };
 
   const resetChat = () => {
-    if (busy) return;
+    if (running) return;
     convoRef.current = [];
     liveBufRef.current = [];           // drop buffered live samples for the fresh chat
     setPending(null);
@@ -1023,7 +1149,15 @@ export default function AiAgentPanel({
               : <Bubble key={m.id} msg={m} />
           ))
         )}
-        {busy && <div style={{ color: C.muted, fontSize: 11, fontStyle: 'italic' }}>● ● ●  thinking…</div>}
+        {running && (
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+            <span style={{ color: C.muted, fontSize: 11, fontStyle: 'italic' }}>● ● ●  {busy ? 'thinking…' : 'working…'}</span>
+            <button onClick={stopAgent} title="Stop the agent"
+              style={{ background: 'transparent', border: `1px solid ${C.border2}`, color: '#e06c75', fontSize: 10, padding: '1px 8px', borderRadius: 10, cursor: 'pointer' }}>
+              ■ Stop
+            </button>
+          </div>
+        )}
         </div>
       </div>
 
@@ -1041,26 +1175,46 @@ export default function AiAgentPanel({
             ⤓ Save log
           </button>
           {messages.length > 0 && (
-            <button onClick={resetChat} disabled={busy} title="New chat (also clears the agent log)"
-              style={{ background: 'transparent', border: `1px solid ${C.border2}`, color: C.sub, fontSize: 10, padding: '1px 8px', borderRadius: 10, cursor: busy ? 'default' : 'pointer' }}>
+            <button onClick={resetChat} disabled={running} title="New chat (also clears the agent log)"
+              style={{ background: 'transparent', border: `1px solid ${C.border2}`, color: C.sub, fontSize: 10, padding: '1px 8px', borderRadius: 10, cursor: running ? 'default' : 'pointer' }}>
               ＋ New chat
             </button>
           )}
         </div>
         <div style={{ border: `1px solid ${C.border2}`, borderRadius: 6, background: C.input, padding: 6, opacity: pending ? 0.55 : 1 }}>
+          {attachments.length > 0 && (
+            <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', marginBottom: 6 }}>
+              {attachments.map((a) => (
+                <div key={a.id} style={{ position: 'relative' }}>
+                  <img src={a.previewUrl} alt={a.name} style={{ width: 44, height: 44, objectFit: 'cover', borderRadius: 4, border: `1px solid ${C.border2}` }} />
+                  <button onClick={() => removeAttachment(a.id)} title="Remove"
+                    style={{ position: 'absolute', top: -6, right: -6, width: 16, height: 16, borderRadius: '50%', background: '#c62828', color: '#fff', border: 'none', fontSize: 9, lineHeight: 1, cursor: 'pointer' }}>✕</button>
+                </div>
+              ))}
+            </div>
+          )}
+          {attachError && <div style={{ fontSize: 10, color: '#e06c75', marginBottom: 6 }}>{attachError}</div>}
           <textarea
             value={input}
             onChange={e => setInput(e.target.value)}
             onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); } }}
+            onPaste={handlePaste}
             placeholder={pending ? 'Approve or reject the proposed changes first…' : 'Describe the change you want…'}
             rows={2}
             disabled={!!pending}
             style={{ width: '100%', resize: 'none', background: 'transparent', border: 'none', outline: 'none', color: C.text, fontSize: 12, fontFamily: 'inherit' }}
           />
           <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginTop: 4 }}>
+            <input ref={fileInputRef} type="file" accept="image/*" multiple style={{ display: 'none' }}
+              onChange={(e) => { addAttachments(e.target.files); e.target.value = ''; }} />
+            <button onClick={() => fileInputRef.current?.click()} disabled={!imagesSupported || running || !!pending}
+              title={imagesSupported ? 'Attach an image' : 'This provider does not support image input'}
+              style={{ background: 'transparent', border: `1px solid ${C.border2}`, color: imagesSupported ? C.sub : '#555', fontSize: 12, width: 26, height: 26, borderRadius: 4, cursor: imagesSupported ? 'pointer' : 'not-allowed' }}>
+              🖼
+            </button>
             <span style={{ marginLeft: 'auto', fontSize: 10, color: '#666' }}>↵ send · ⇧↵ newline</span>
-            <button onClick={() => send()} disabled={!input.trim() || busy || !!pending}
-              style={{ background: input.trim() && !busy && !pending ? C.accentBtn : '#333', border: 'none', color: input.trim() && !busy && !pending ? '#fff' : '#777', width: 26, height: 26, borderRadius: 4, cursor: input.trim() && !busy && !pending ? 'pointer' : 'default', fontSize: 13 }}>
+            <button onClick={() => send()} disabled={(!input.trim() && attachments.length === 0) || running || !!pending}
+              style={{ background: (input.trim() || attachments.length > 0) && !running && !pending ? C.accentBtn : '#333', border: 'none', color: (input.trim() || attachments.length > 0) && !running && !pending ? '#fff' : '#777', width: 26, height: 26, borderRadius: 4, cursor: (input.trim() || attachments.length > 0) && !running && !pending ? 'pointer' : 'default', fontSize: 13 }}>
               ➤
             </button>
           </div>
@@ -1131,6 +1285,14 @@ function Bubble({ msg }) {
     <div style={{ display: 'flex', flexDirection: 'column', gap: 4, alignItems: isUser ? 'flex-end' : 'flex-start' }}>
       <div style={{ fontSize: 10, color: C.muted }}>{isUser ? 'You' : 'Agent'}</div>
       <div style={{ maxWidth: '92%', background: isUser ? C.user : C.input, border: `1px solid ${C.border2}`, borderRadius: 6, padding: '7px 10px', whiteSpace: 'pre-wrap', lineHeight: 1.45 }}>
+        {msg.images && msg.images.length > 0 && (
+          <div style={{ display: 'flex', gap: 6, marginBottom: msg.text ? 6 : 0, flexWrap: 'wrap' }}>
+            {msg.images.map((img, i) => (
+              <img key={i} src={`data:${img.mimeType};base64,${img.data}`} alt="attachment"
+                style={{ width: 64, height: 64, objectFit: 'cover', borderRadius: 4, border: `1px solid ${C.border2}` }} />
+            ))}
+          </div>
+        )}
         {msg.text}
       </div>
     </div>

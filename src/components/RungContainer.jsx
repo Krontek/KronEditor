@@ -2213,7 +2213,7 @@ const RungContainer = ({
   }, [rubberBand, scaleFactor]);
 
   return (
-    <div style={{
+    <div style={hideHeader ? { background: '#2a2a2a' } : {
       background: '#2a2a2a',
       border: '2px solid #444',
       borderRadius: 8,
@@ -2328,7 +2328,7 @@ const RungContainer = ({
           height: Math.ceil(RUNG_HEIGHT * scaleFactor),
           background: '#1e1e1e',
           position: 'relative',
-          border: '1px dashed #444',
+          border: hideHeader ? 'none' : '1px dashed #444',
           overflow: 'hidden',
           cursor: 'default'
         }}

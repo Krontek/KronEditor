@@ -65,6 +65,7 @@ func main() {
 	mux.HandleFunc("/api/host/read-file", srvState.handleReadFile)
 	mux.HandleFunc("/api/host/write-file", srvState.handleWriteFile)
 	mux.HandleFunc("/api/host/list-dir", srvState.handleListDir)
+	mux.HandleFunc("/api/host/home-dir", srvState.handleHomeDir)
 
 	// Compile
 	mux.HandleFunc("/api/host/compile-simulation", srvState.handleCompileSimulation)

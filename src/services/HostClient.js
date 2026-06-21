@@ -32,12 +32,13 @@ function _wrap(promise) {
   });
 }
 
-function _post(path, body) {
+function _post(path, body, signal) {
   return _wrap(
     fetch(path, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body ?? {}),
+      signal,
     })
   );
 }
@@ -82,6 +83,10 @@ export class HostClient {
   async listDir(path) {
     const j = await _post(this._p('/api/host/list-dir'), { path });
     return j.entries || [];
+  }
+  async homeDir() {
+    const j = await _get(this._p('/api/host/home-dir'));
+    return j.home;
   }
 
   // ── compile ───────────────────────────────────────────────────────────────
@@ -263,8 +268,8 @@ export class HostClient {
    * Returns the normalized assistant message:
    *   { role:'assistant', content, toolCalls:[{id,name,arguments}] }
    */
-  async aiChat(payload) {
-    const j = await _post(this._p('/api/host/ai/chat'), payload);
+  async aiChat(payload, signal) {
+    const j = await _post(this._p('/api/host/ai/chat'), payload, signal);
     if (!j.ok) throw new Error(j.error || 'aiChat failed');
     return j.message;
   }

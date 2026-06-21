@@ -1,7 +1,12 @@
 // Shared Structured Text identifier/parameter validator used by both the ST
 // editor (EditorPane) and the SCL inline rung editor (RungEditorNew).
 //
-// It does two things per line, in a single forward token scan:
+// It does two things in a single forward token scan over the WHOLE source
+// (not line-by-line — an FB call's argument list is routinely wrapped across
+// several lines, e.g. `usb_tx(Execute := TRUE, Port_ID := USB0_PORT,\n
+// pTxBuffer := cmd_buf, Length := 2);`, and the open-call-paren stack must
+// stay alive across that line break or the continuation line's keys get
+// misread as bare identifier references and flagged):
 //   1. flags genuinely undefined identifiers (not a declared var, keyword, type,
 //      standard FB/function, conversion or member access), and
 //   2. validates NAMED ARGUMENTS in a call — `IN := …` inside `TON(…)` — against
@@ -34,61 +39,76 @@ export function findStMarkers(code, { allowedLower, conversionPattern, varTypes 
     return null;
   };
 
-  const markers = [];
-  // Strip whole-text block comments first (keep line count for accurate rows).
-  const stripped = String(code || '').replace(/\(\*[\s\S]*?\*\)/g, (m) => '\n'.repeat((m.match(/\n/g) || []).length));
-  stripped.split('\n').forEach((rawLine, i) => {
-    const line = rawLine
-      .replace(/\/\/.*$/, '')
-      .replace(/\(\*.*?\*\)/g, '')
-      .replace(TIME_LITERAL, (m) => ' '.repeat(m.length))
-      .replace(RADIX_LITERAL, (m) => ' '.repeat(m.length));
+  // Strip block comments whole-text first (keep line count for accurate rows),
+  // then line comments (line-anchored) and literal placeholders — all on the
+  // full text so byte offsets stay valid for the single tokenizer pass below.
+  const text = String(code || '')
+    .replace(/\(\*[\s\S]*?\*\)/g, (m) => '\n'.repeat((m.match(/\n/g) || []).length))
+    .replace(/\/\/.*$/gm, '')
+    .replace(TIME_LITERAL, (m) => ' '.repeat(m.length))
+    .replace(RADIX_LITERAL, (m) => ' '.repeat(m.length));
 
-    const tok = /([A-Za-z_][A-Za-z0-9_]*)|(:=)|(\()|(\))/g;
-    const stack = [];                    // { pins, targetName } per call paren, or { grouping:true }
-    let m, lastIdent = null, lastIdentEnd = -1;
-    const push = (word, idx, message) => markers.push({
-      message,
-      startLineNumber: i + 1,
-      startColumn: idx + 1,
-      endLineNumber: i + 1,
-      endColumn: idx + 1 + word.length,
-    });
-
-    while ((m = tok.exec(line)) !== null) {
-      if (m[1]) {                        // identifier
-        const word = m[1];
-        const idx = m.index;
-        let j = tok.lastIndex;           // peek next non-space for `:=`
-        while (j < line.length && /\s/.test(line[j])) j++;
-        const isNamedArgKey = line.slice(j, j + 2) === ':=';
-        const top = stack[stack.length - 1];
-        const inCall = top && !top.grouping;
-        if (isNamedArgKey && inCall) {
-          if (top.pins && !top.pins.has(word.toLowerCase())) {
-            push(word, idx, `'${word}' is not a parameter of ${top.targetName}`);
-          }
-        } else if (line[idx - 1] !== '.') {   // skip member access (x.Q)
-          if (!allowedLower.has(word.toLowerCase()) && !conversionPattern.test(word) && isNaN(word)) {
-            push(word, idx, `Undefined identifier: '${word}'`);
-          }
-        }
-        lastIdent = word; lastIdentEnd = idx + word.length;
-      } else if (m[3]) {                 // '('
-        const between = line.slice(lastIdentEnd, m.index);
-        if (lastIdent && /^\s*$/.test(between)) {
-          stack.push({ pins: resolvePins(lastIdent), targetName: lastIdent });
-        } else {
-          stack.push({ grouping: true });
-        }
-        lastIdent = null;
-      } else if (m[4]) {                 // ')'
-        stack.pop();
-        lastIdent = null;
-      } else {                           // ':='
-        lastIdent = null;
-      }
+  // Absolute-offset → {line, col} (both 0-based), for marker positions.
+  const lineStarts = [0];
+  for (let k = 0; k < text.length; k++) if (text[k] === '\n') lineStarts.push(k + 1);
+  const posAt = (absIdx) => {
+    let lo = 0, hi = lineStarts.length - 1;
+    while (lo < hi) {
+      const mid = (lo + hi + 1) >> 1;
+      if (lineStarts[mid] <= absIdx) lo = mid; else hi = mid - 1;
     }
-  });
+    return { line: lo, col: absIdx - lineStarts[lo] };
+  };
+
+  const markers = [];
+  const push = (word, idx, message) => {
+    const { line, col } = posAt(idx);
+    markers.push({
+      message,
+      startLineNumber: line + 1,
+      startColumn: col + 1,
+      endLineNumber: line + 1,
+      endColumn: col + 1 + word.length,
+    });
+  };
+
+  const tok = /([A-Za-z_][A-Za-z0-9_]*)|(:=)|(\()|(\))/g;
+  const stack = [];                    // { pins, targetName } per call paren, or { grouping:true }
+  let m, lastIdent = null, lastIdentEnd = -1;
+
+  while ((m = tok.exec(text)) !== null) {
+    if (m[1]) {                        // identifier
+      const word = m[1];
+      const idx = m.index;
+      let j = tok.lastIndex;           // peek next non-space for `:=` (may cross a line break)
+      while (j < text.length && /\s/.test(text[j])) j++;
+      const isNamedArgKey = text.slice(j, j + 2) === ':=';
+      const top = stack[stack.length - 1];
+      const inCall = top && !top.grouping;
+      if (isNamedArgKey && inCall) {
+        if (top.pins && !top.pins.has(word.toLowerCase())) {
+          push(word, idx, `'${word}' is not a parameter of ${top.targetName}`);
+        }
+      } else if (text[idx - 1] !== '.') {   // skip member access (x.Q)
+        if (!allowedLower.has(word.toLowerCase()) && !conversionPattern.test(word) && isNaN(word)) {
+          push(word, idx, `Undefined identifier: '${word}'`);
+        }
+      }
+      lastIdent = word; lastIdentEnd = idx + word.length;
+    } else if (m[3]) {                 // '('
+      const between = text.slice(lastIdentEnd, m.index);
+      if (lastIdent && /^\s*$/.test(between)) {
+        stack.push({ pins: resolvePins(lastIdent), targetName: lastIdent });
+      } else {
+        stack.push({ grouping: true });
+      }
+      lastIdent = null;
+    } else if (m[4]) {                 // ')'
+      stack.pop();
+      lastIdent = null;
+    } else {                           // ':='
+      lastIdent = null;
+    }
+  }
   return markers;
 }

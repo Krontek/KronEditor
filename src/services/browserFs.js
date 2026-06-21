@@ -22,11 +22,36 @@ import { host } from './HostClient';
 // set, Save (saveAs=false) writes straight back to it with no picker — a real
 // in-place Save. Cleared on New Project / Pull-from-Target so the next Save
 // correctly behaves as Save As. null when the browser lacks the FSA API
-// (e.g. Firefox) — there Save always falls back to a download.
+// (e.g. Firefox) — there we fall back to activeAgentPath below.
 let activeHandle = null;
+
+// Absolute path of the currently-open project file, used when the browser has
+// no File System Access API (Firefox). Save (saveAs=false) writes straight
+// back to this path via the host-agent, with no prompt — the in-place Save
+// equivalent of activeHandle. Set by openFile()/saveFile() in the agent-path
+// branch; cleared together with activeHandle.
+let activeAgentPath = null;
 
 export function clearActiveFileHandle() {
   activeHandle = null;
+  activeAgentPath = null;
+}
+
+// A modal UI (registered by the app shell) that lets the user browse the
+// local filesystem via the host-agent and pick/confirm a path. Needed because
+// Firefox implements neither showOpenFilePicker nor showSaveFilePicker, so
+// there is no native dialog to fall back to.
+let pathPickerImpl = null;
+
+export function registerPathPicker(fn) {
+  pathPickerImpl = fn;
+}
+
+// opts: { mode: 'open'|'save', suggestedName?, initialPath? }
+// Resolves to an absolute path string, or null if the user cancelled.
+async function promptForPath(opts) {
+  if (!pathPickerImpl) return null;
+  return pathPickerImpl(opts);
 }
 
 // Ensure we hold the requested permission on a handle, prompting once if needed.
@@ -40,12 +65,15 @@ async function verifyPermission(handle, writable) {
 
 /**
  * Show an "open file" picker. Returns `null` if the user cancelled, otherwise
- * `{ name, path, content }`. `path` is the display name in browser mode
- * (browsers do not expose real paths) — pass it to processFileContent as the
- * filePath argument; it's only used for display + the "current file" label.
+ * `{ name, path, content }`. `path` is an absolute filesystem path when
+ * available (FSA handle name, or the host-agent browse dialog on Firefox) —
+ * pass it to processFileContent as the filePath argument.
  *
  * Prefers showOpenFilePicker so the returned handle can be reused for in-place
- * Save; falls back to <input type=file> (no handle → Save acts as Save As).
+ * Save. Falls back to the host-agent browse dialog (registerPathPicker) which
+ * also yields a real path, so Save still works in-place afterwards. Falls
+ * back further to <input type=file> only if no picker is registered (no
+ * handle, no path → Save acts as Save As via a download).
  */
 export async function openFile({ accept = '.xml' } = {}) {
   if (typeof window.showOpenFilePicker === 'function') {
@@ -57,12 +85,23 @@ export async function openFile({ accept = '.xml' } = {}) {
       const file = await handle.getFile();
       const content = await file.text();
       activeHandle = handle; // reuse for subsequent in-place Save
+      activeAgentPath = null;
       return { name: handle.name, path: handle.name, content };
     } catch (err) {
       if (err && (err.name === 'AbortError' || err.code === 20)) return null;
-      // Fall through to the <input> path on any other failure.
+      // Fall through to the host-agent / <input> path on any other failure.
     }
   }
+
+  if (pathPickerImpl) {
+    const path = await promptForPath({ mode: 'open' });
+    if (!path) return null;
+    const content = await host.readFile(path);
+    activeHandle = null;
+    activeAgentPath = path;
+    return { name: path.split(/[/\\]/).pop(), path, content };
+  }
+
   return new Promise((resolve, reject) => {
     const input = document.createElement('input');
     input.type = 'file';
@@ -76,6 +115,7 @@ export async function openFile({ accept = '.xml' } = {}) {
       const reader = new FileReader();
       reader.onload = (e) => {
         activeHandle = null; // no writable handle from <input> → Save = Save As
+        activeAgentPath = null;
         resolve({ name: file.name, path: file.name, content: String(e.target.result) });
       };
       reader.onerror = () => reject(reader.error || new Error('FileReader error'));
@@ -117,11 +157,13 @@ async function writeToHandle(handle, content) {
 
 /**
  * Save the current project.
- *  - saveAs=false (Save): if we hold the open file's handle, write straight back
- *    to it with NO picker (true in-place Save). Otherwise behaves like Save As.
- *  - saveAs=true (Save As): always shows the picker and adopts the chosen handle.
- * Falls back to a triggered download when the File System Access API is absent.
- * Returns the saved filename (or null if the user cancelled the picker).
+ *  - saveAs=false (Save): if we hold the open file's handle or a known agent
+ *    path, write straight back to it with NO picker (true in-place Save).
+ *    Otherwise behaves like Save As.
+ *  - saveAs=true (Save As): always shows a picker and adopts the chosen target.
+ * Falls back to a triggered download only when neither the File System Access
+ * API nor the host-agent browse dialog is available.
+ * Returns the saved filename/path (or null if the user cancelled the picker).
  */
 export async function saveFile({ suggestedName = 'project.xml', content, saveAs = false }) {
   // Plain Save with a known target → overwrite it silently.
@@ -129,6 +171,14 @@ export async function saveFile({ suggestedName = 'project.xml', content, saveAs 
     const name = await writeToHandle(activeHandle, content);
     if (name) return name;
     // Permission lost / handle stale → fall through to the picker below.
+  }
+  if (!saveAs && activeAgentPath) {
+    try {
+      await host.writeFile(activeAgentPath, content);
+      return activeAgentPath;
+    } catch {
+      // Path no longer writable → fall through to the picker below.
+    }
   }
 
   // Modern browsers (Chromium): showSaveFilePicker — allows real overwrite UX.
@@ -142,12 +192,26 @@ export async function saveFile({ suggestedName = 'project.xml', content, saveAs 
       await writable.write(content);
       await writable.close();
       activeHandle = handle; // remember it so later Saves overwrite in place
+      activeAgentPath = null;
       return handle.name;
     } catch (err) {
       if (err && (err.name === 'AbortError' || err.code === 20)) return null;
-      // Fall through to download path
+      // Fall through to the host-agent / download path
     }
   }
+
+  // Firefox (no FSA API): browse + confirm a real path via the host-agent,
+  // then write directly to disk — this is what fixes Save/Save As always
+  // landing in the Downloads folder.
+  if (pathPickerImpl) {
+    const path = await promptForPath({ mode: 'save', suggestedName, initialPath: activeAgentPath });
+    if (!path) return null;
+    await host.writeFile(path, content);
+    activeHandle = null;
+    activeAgentPath = path;
+    return path;
+  }
+
   downloadFile(suggestedName, content);
   return suggestedName;
 }

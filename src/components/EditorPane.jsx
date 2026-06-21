@@ -239,6 +239,10 @@ const EditorPane = ({
       const allowedLower = new Set([
         ...variables.map(v => (v.name || '').toLowerCase()),
         ...globalVars.map(v => (v.name || '').toLowerCase()),
+        // Hardware port system vars (UART0_PORT, USB2_PORT, …) generated from
+        // the board's interface config — referenced as Port_ID values in ST
+        // but never added to the project's own variable table.
+        ...hwPortVars.map(v => (v.name || '').toLowerCase()),
         // control flow keywords
         'if', 'then', 'elsif', 'else', 'end_if',
         'case', 'of', 'end_case',
@@ -596,45 +600,17 @@ const EditorPane = ({
     setMonacoInstance(monaco);
     window.stEditor = editor;
 
-    // Explicit Ctrl/Cmd+V via the async Clipboard API. Monaco's default
-    // keyboard paste relies on the browser's native paste event reaching its
-    // hidden input, which does not fire reliably in this embedded setup
-    // (typing works, Ctrl+V does nothing). This guarantees a paste.
-    editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyV, async () => {
-      if (editor.getOption(monaco.editor.EditorOption.readOnly)) return;
-      let text = '';
-      try { text = await navigator.clipboard.readText(); } catch (err) { return; }
-      if (!text) return;
-      const sel = editor.getSelection();
-      editor.executeEdits('clipboard-paste', [{ range: sel, text, forceMoveMarkers: true }]);
-      editor.pushUndoStop();
-    });
-    // Ctrl/Cmd+C — write to the OS clipboard via the async API. Monaco's default
-    // copy relies on the native copy event, which (like paste) does not reach the
-    // OS clipboard in this embedded setup. Empty selection copies the whole line.
-    editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyC, async () => {
-      const model = editor.getModel();
-      const sel = editor.getSelection();
-      let text = model.getValueInRange(sel);
-      if (!text) text = model.getLineContent(sel.startLineNumber) + '\n';
-      try { await navigator.clipboard.writeText(text); } catch (err) {}
-    });
-    // Ctrl/Cmd+X — copy to OS clipboard then delete the selection (or line).
-    editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyX, async () => {
-      if (editor.getOption(monaco.editor.EditorOption.readOnly)) return;
-      const model = editor.getModel();
-      const sel = editor.getSelection();
-      let text = model.getValueInRange(sel);
-      let range = sel;
-      if (!text) {
-        const ln = sel.startLineNumber;
-        text = model.getLineContent(ln) + '\n';
-        range = new monaco.Range(ln, 1, ln + 1, 1);
-      }
-      try { await navigator.clipboard.writeText(text); } catch (err) {}
-      editor.executeEdits('clipboard-cut', [{ range, text: '' }]);
-      editor.pushUndoStop();
-    });
+    // NOTE: this editor used to override Ctrl+V/C/X with the async Clipboard
+    // API because Monaco's default copy/paste relies on the browser's native
+    // clipboard events, which didn't reach the OS clipboard inside Tauri's
+    // embedded webview. Tauri has been removed — the app now runs in a real
+    // browser tab, where Monaco's built-in clipboard handling works natively.
+    // The override was removed because it actively made cross-browser
+    // behavior WORSE: writeText (copy/cut) is unprompted in both Chrome and
+    // Firefox, but readText (paste) requires a "clipboard-read" permission
+    // Firefox does not grant by default — so paste silently no-opped there
+    // while working in Chrome. Native paste (via the real browser paste
+    // event) needs no such permission in either browser.
 
     // ── Register IEC 61131-3 Structured Text language & plc-dark theme ──
     registerIECSTLanguage(monaco);

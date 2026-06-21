@@ -36,7 +36,8 @@ import { exportProjectToXml, importProjectFromXml } from './services/XmlService'
 import { libraryService } from './services/LibraryService'; // Import Service
 import { errorCodeService } from './services/ErrorCodeService';
 import { loadAllEsiDevices, saveEsiFile } from './services/EsiLibraryService';
-import { openFile, saveFile, ask, readTextFile, writeTextFile, clearActiveFileHandle } from './services/browserFs';
+import { openFile, saveFile, ask, readTextFile, writeTextFile, clearActiveFileHandle, registerPathPicker } from './services/browserFs';
+import SavePathModal from './components/SavePathModal';
 import { transpileToC, validateProjectST } from './services/CTranspilerService';
 import { PLCClient } from './services/PLCClient';
 import { host } from './services/HostClient';
@@ -72,8 +73,49 @@ function App() {
     loadAllEsiDevices().then(setEsiLibrary).catch(() => {});
   }, []);
 
+  // Host-agent-backed path picker for browsers without the File System Access
+  // API (Firefox) — browserFs.js calls this to resolve a real save/open path
+  // instead of falling back to a Downloads-folder download.
+  const [pathPickerRequest, setPathPickerRequest] = useState(null);
+  useEffect(() => {
+    registerPathPicker((opts) => new Promise((resolve) => {
+      setPathPickerRequest({ ...opts, resolve });
+    }));
+  }, []);
+
   useEffect(() => {
     errorCodeService.load().catch(err => console.warn('Error codes load failed:', err));
+  }, []);
+
+  // Suppress the browser's native right-click context menu app-wide. Several
+  // components (ProjectSidebar tree rows, VariableManager rows) already show
+  // their OWN custom menu and call preventDefault()/stopPropagation() locally,
+  // but large areas (toolbox, output panel, LD canvas background, config
+  // pages) had no handler at all — there the native menu leaked through, with
+  // a browser "Paste" entry that reads the OS clipboard directly instead of
+  // going through the app's own clipboard handling. This catch-all listener
+  // closes that gap; components with their own menu still work the same
+  // (their handler runs first and may stopPropagation, this one is harmless
+  // to call preventDefault twice).
+  //
+  // EXCEPT over editable text fields (input/textarea/contentEditable, incl.
+  // Monaco's hidden input) — there the native Cut/Copy/Paste menu IS the
+  // correct interaction (typing a value needs real OS-clipboard paste, not
+  // the app's structured POU/rung/variable clipboard). Chrome fully respects
+  // preventDefault here so this used to silently kill native paste on every
+  // text field in Chrome only — Firefox does not allow suppressing this menu
+  // on editable elements at all, so the same blanket preventDefault left
+  // Firefox showing it anyway. Excluding editable targets makes both browsers
+  // behave the same way instead of just papering over Firefox's exception.
+  useEffect(() => {
+    const onContextMenu = (e) => {
+      const t = e.target;
+      const editable = t && t.closest && t.closest('input, textarea, [contenteditable="true"]');
+      if (editable) return;
+      e.preventDefault();
+    };
+    document.addEventListener('contextmenu', onContextMenu);
+    return () => document.removeEventListener('contextmenu', onContextMenu);
   }, []);
 
   useEffect(() => {
@@ -622,7 +664,7 @@ function App() {
   const [layout, setLayout] = useState({
     leftWidth: 250,
     rightWidth: 250,
-    consoleHeight: 150
+    consoleHeight: 128
   });
   const [isResizing, setIsResizing] = useState(null); // 'left', 'right', 'console'
   const [rightTab, setRightTab] = useState('blocks'); // 'blocks' | 'agent' — right sidebar tabs
@@ -2180,6 +2222,11 @@ function App() {
         <div className="titlebar-title">
           <img src={PlcIcon} alt="Logo" style={{ height: '18px', marginRight: '8px', pointerEvents: 'none' }} />
           <span>KronEditor</span>
+          {isProjectOpen && (
+            <span style={{ marginLeft: '10px', color: '#888', fontWeight: 400 }}>
+              — {currentFilePath || 'Untitled'}
+            </span>
+          )}
         </div>
       </div>
 
@@ -2697,6 +2744,21 @@ function App() {
         }}
         currentBoard={selectedBoard}
         onSelect={handleBoardSelected}
+      />
+
+      <SavePathModal
+        isOpen={!!pathPickerRequest}
+        mode={pathPickerRequest?.mode}
+        suggestedName={pathPickerRequest?.suggestedName}
+        initialPath={pathPickerRequest?.initialPath}
+        onConfirm={(path) => {
+          pathPickerRequest?.resolve(path);
+          setPathPickerRequest(null);
+        }}
+        onCancel={() => {
+          pathPickerRequest?.resolve(null);
+          setPathPickerRequest(null);
+        }}
       />
 
     </div>

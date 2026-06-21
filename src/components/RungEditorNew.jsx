@@ -36,12 +36,15 @@ const ST_ALWAYS_ALLOWED = new Set([
 // Accept any TYPE_TO_TYPE pair without listing all 90+ combinations.
 const ST_CONVERSION_REGEX = /^(?:BOOL|BYTE|WORD|DWORD|LWORD|SINT|USINT|INT|UINT|DINT|UDINT|LINT|ULINT|REAL|LREAL)_TO_(?:BOOL|BYTE|WORD|DWORD|LWORD|SINT|USINT|INT|UINT|DINT|UDINT|LINT|ULINT|REAL|LREAL)$/i;
 
-function validateSCLCode(code, variables, globalVars, monaco, model) {
+function validateSCLCode(code, variables, globalVars, monaco, model, hwPortVars = []) {
   const allowedLower = new Set(ST_ALWAYS_ALLOWED);
   const varTypes = new Map();
   [...variables, ...globalVars].forEach(v => {
     if (v.name) { allowedLower.add(v.name.toLowerCase()); varTypes.set(v.name.toLowerCase(), String(v.type || '').trim()); }
   });
+  // Hardware port system vars (UART0_PORT, USB2_PORT, …) — referenced as
+  // Port_ID values in ST but never added to the project's own variable table.
+  hwPortVars.forEach(v => { if (v.name) allowedLower.add(v.name.toLowerCase()); });
   // Shared scan: undefined identifiers + named-argument (pin) validation, so
   // valid FB pins (IN, PT, …) are never flagged and only unknown ones are.
   const markers = findStMarkers(code, { allowedLower, conversionPattern: ST_CONVERSION_REGEX, varTypes })
@@ -52,7 +55,7 @@ function validateSCLCode(code, variables, globalVars, monaco, model) {
 // Auto-sizing Monaco editor for SCL ST rungs.
 // IMPORTANT: must stop mouse event propagation to prevent the outer
 // draggable rung div from intercepting clicks and blocking Monaco input.
-const SCLInlineEditor = ({ code, readOnly, onCodeChange, onBlur, variables = [], globalVars = [], liveVariables = null, parentName = '' }) => {
+const SCLInlineEditor = ({ code, readOnly, onCodeChange, onBlur, variables = [], globalVars = [], liveVariables = null, parentName = '', hwPortVars = [] }) => {
   const [height, setHeight] = useState(60);
   const editorRef = useRef(null);
   const monacoRef = useRef(null);
@@ -76,8 +79,8 @@ const SCLInlineEditor = ({ code, readOnly, onCodeChange, onBlur, variables = [],
     const mc = monacoRef.current;
     if (!ed || !mc) return;
     const model = ed.getModel();
-    if (model) validateSCLCode(model.getValue(), variables, globalVars, mc, model);
-  }, [variables, globalVars]);
+    if (model) validateSCLCode(model.getValue(), variables, globalVars, mc, model, hwPortVars);
+  }, [variables, globalVars, hwPortVars]);
 
   // Live variable decorations
   useEffect(() => {
@@ -183,48 +186,16 @@ const SCLInlineEditor = ({ code, readOnly, onCodeChange, onBlur, variables = [],
         onMount={editor => {
           editorRef.current = editor;
           const mc = monacoRef.current;
-          // Explicit Ctrl/Cmd+V via the async Clipboard API. Monaco's default
-          // keyboard paste relies on the browser's native paste event reaching
-          // its hidden input, which does not fire reliably in this embedded
-          // setup (typing works, Ctrl+V does nothing). This guarantees a paste.
-          if (mc) {
-            editor.addCommand(mc.KeyMod.CtrlCmd | mc.KeyCode.KeyV, async () => {
-              if (editor.getOption(mc.editor.EditorOption.readOnly)) return;
-              let text = '';
-              try { text = await navigator.clipboard.readText(); } catch (err) { return; }
-              if (!text) return;
-              const sel = editor.getSelection();
-              editor.executeEdits('clipboard-paste', [{ range: sel, text, forceMoveMarkers: true }]);
-              editor.pushUndoStop();
-            });
-            // Ctrl/Cmd+C — write to the OS clipboard via the async API. Monaco's
-            // default copy relies on the native copy event, which (like paste)
-            // does not reach the OS clipboard in this embedded setup. Empty
-            // selection copies the whole current line (Monaco default behavior).
-            editor.addCommand(mc.KeyMod.CtrlCmd | mc.KeyCode.KeyC, async () => {
-              const model = editor.getModel();
-              const sel = editor.getSelection();
-              let text = model.getValueInRange(sel);
-              if (!text) text = model.getLineContent(sel.startLineNumber) + '\n';
-              try { await navigator.clipboard.writeText(text); } catch (err) {}
-            });
-            // Ctrl/Cmd+X — copy to OS clipboard then delete the selection (or line).
-            editor.addCommand(mc.KeyMod.CtrlCmd | mc.KeyCode.KeyX, async () => {
-              if (editor.getOption(mc.editor.EditorOption.readOnly)) return;
-              const model = editor.getModel();
-              const sel = editor.getSelection();
-              let text = model.getValueInRange(sel);
-              let range = sel;
-              if (!text) {
-                const ln = sel.startLineNumber;
-                text = model.getLineContent(ln) + '\n';
-                range = new mc.Range(ln, 1, ln + 1, 1);
-              }
-              try { await navigator.clipboard.writeText(text); } catch (err) {}
-              editor.executeEdits('clipboard-cut', [{ range, text: '' }]);
-              editor.pushUndoStop();
-            });
-          }
+          // NOTE: this used to override Ctrl+V/C/X with the async Clipboard API
+          // because Monaco's default copy/paste relies on native clipboard
+          // events, which didn't reach the OS clipboard inside Tauri's embedded
+          // webview. Tauri has been removed (real browser tab now), and the
+          // override actively made cross-browser behavior worse: writeText
+          // (copy/cut) is unprompted in both Chrome and Firefox, but readText
+          // (paste) needs a "clipboard-read" permission Firefox doesn't grant
+          // by default — so paste silently no-opped there while working in
+          // Chrome. Native paste (the real browser paste event) needs no such
+          // permission in either browser, so we now let Monaco handle it.
           const updateHeight = () => {
             const h = Math.max(60, editor.getContentHeight());
             setHeight(h);
@@ -235,9 +206,9 @@ const SCLInlineEditor = ({ code, readOnly, onCodeChange, onBlur, variables = [],
           // Initial validation
           const model = editor.getModel();
           if (model && mc) {
-            validateSCLCode(model.getValue(), variables, globalVars, mc, model);
+            validateSCLCode(model.getValue(), variables, globalVars, mc, model, hwPortVars);
             editor.onDidChangeModelContent(() => {
-              validateSCLCode(model.getValue(), variables, globalVars, mc, model);
+              validateSCLCode(model.getValue(), variables, globalVars, mc, model, hwPortVars);
             });
           }
         }}
@@ -1239,23 +1210,15 @@ const RungEditorNew = ({ variables, setVariables, rungs, setRungs, availableBloc
               {draggedRungIndex !== null && dragOverRungIndex === index && (
                 <div style={{ height: 3, background: '#007acc', borderRadius: 2, margin: '0 4px' }} />
               )}
-              <div
-                draggable={!readOnly}
-                onMouseDown={(e) => { dragAllowedRef.current = !!e.target.closest('.rung-drag-handle'); }}
-                onDragStart={(e) => handleDragStart(e, index)}
-                onDragOver={(e) => handleDragOver(e, index)}
-                onDrop={handleDrop}
-                onDragEnd={handleDragEnd}
-                style={{
-                  opacity: draggedRungIndex === index ? 0.4 : 1,
-                  border: focusedRungId === rung.id ? '1px solid #007acc' : '1px solid transparent',
-                  borderRadius: '4px',
-                  transition: 'border 0.2s',
-                }}
-              >
-                {/* SCL lang toggle bar */}
-                {programType === 'SCL' && (
-                  <div style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '2px 8px', background: '#2d2d2d', borderBottom: '1px solid #3a3a3a' }}>
+              {(() => {
+                const isSclSt = programType === 'SCL' && (rung.lang || 'LD') === 'ST';
+                // SCL lang toggle bar. For an ST rung this is rendered INSIDE the
+                // same bordered/rounded card as the code below (no own border-bottom,
+                // no own border-radius — the card's overflow:hidden clips it to the
+                // shared rounded corners), so the header reads as part of the rung
+                // instead of a floating bar sitting above a visually disconnected box.
+                const headerBar = programType === 'SCL' && (
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '2px 8px', background: '#2d2d2d' }}>
                     <div
                       className="rung-drag-handle"
                       style={{ cursor: 'grab', color: '#555', fontSize: 14, padding: '0 2px', lineHeight: 1, userSelect: 'none' }}
@@ -1289,14 +1252,53 @@ const RungEditorNew = ({ variables, setVariables, rungs, setRungs, availableBloc
                       </div>
                     )}
                   </div>
-                )}
-                <ErrorBoundary>
-                  {programType === 'SCL' && (rung.lang || 'LD') === 'ST' ? (
+                );
+                return (
+                  <div
+                    draggable={!readOnly}
+                    onMouseDown={(e) => { dragAllowedRef.current = !!e.target.closest('.rung-drag-handle'); }}
+                    onDragStart={(e) => handleDragStart(e, index)}
+                    onDragOver={(e) => handleDragOver(e, index)}
+                    onDrop={handleDrop}
+                    onDragEnd={handleDragEnd}
+                    style={{
+                      opacity: draggedRungIndex === index ? 0.4 : 1,
+                      transition: 'border 0.2s',
+                    }}
+                  >
+                    <ErrorBoundary>
+                      {isSclSt ? (
+                        <div
+                          style={{
+                            border: focusedRungId === rung.id ? '2px solid #007acc' : '2px solid #444',
+                            borderRadius: 8,
+                            overflow: 'hidden',
+                            boxShadow: '0 4px 6px rgba(0,0,0,0.3)',
+                            transition: 'border-color 0.2s',
+                          }}
+                        >
+                          {headerBar}
+                          <div
+                            draggable={false}
+                            onClick={() => setFocusedRungId(rung.id)}
+                            style={{ background: '#2a2a2a' }}
+                          >
+                            <SCLInlineEditor
+                              code={rung.code || ''}
+                              readOnly={readOnly}
+                              onCodeChange={val => updateRungCode(rung.id, val)}
+                              onBlur={() => saveHistory(rungs, variables)}
+                              variables={variables}
+                              globalVars={globalVars}
+                              liveVariables={liveVariables}
+                              parentName={parentName}
+                              hwPortVars={hwPortVars}
+                            />
+                          </div>
+                        </div>
+                      ) : (
                     <div
-                      draggable={false}
-                      onClick={() => setFocusedRungId(rung.id)}
                       style={{
-                        background: '#2a2a2a',
                         border: focusedRungId === rung.id ? '2px solid #007acc' : '2px solid #444',
                         borderRadius: 8,
                         overflow: 'hidden',
@@ -1304,19 +1306,8 @@ const RungEditorNew = ({ variables, setVariables, rungs, setRungs, availableBloc
                         transition: 'border-color 0.2s',
                       }}
                     >
-                      <SCLInlineEditor
-                        code={rung.code || ''}
-                        readOnly={readOnly}
-                        onCodeChange={val => updateRungCode(rung.id, val)}
-                        onBlur={() => saveHistory(rungs, variables)}
-                        variables={variables}
-                        globalVars={globalVars}
-                        liveVariables={liveVariables}
-                        parentName={parentName}
-                      />
-                    </div>
-                  ) : (
-                    <RungContainer
+                      {headerBar}
+                      <RungContainer
                       rung={rung}
                       index={index}
                       totalRungs={rungs.length}
@@ -1337,6 +1328,12 @@ const RungEditorNew = ({ variables, setVariables, rungs, setRungs, availableBloc
                         if (!node) {
                           selectedNodeRef.current = null;
                           setGlobalSelectedBlockId(null);
+                          // A click on empty canvas (or deselecting a block/edge) still
+                          // lands inside this rung — focus it. In SCL mode the rung
+                          // header is hidden (hideHeader=true), so its own onFocusRung
+                          // click target never renders; this canvas-click path is the
+                          // only way an LD rung can become focusedRungId there.
+                          if (!readOnly) setFocusedRungId(rung.id);
                         } else {
                           setFocusedRungId(null);
                           selectedNodeRef.current = { rungId, ...node };
@@ -1360,9 +1357,12 @@ const RungEditorNew = ({ variables, setVariables, rungs, setRungs, availableBloc
                         setFocusedRungId(rung.id);
                       }}
                     />
-                  )}
-                </ErrorBoundary>
-              </div>
+                    </div>
+                      )}
+                    </ErrorBoundary>
+                  </div>
+                );
+              })()}
               {index < rungs.length - 1 && (
                 <InsertZone onInsert={() => addRung(rung.id, false)} onPaste={() => pasteRungAt(rung.id, false)} canPaste={canPasteRung} disabled={readOnly || draggedRungIndex !== null} />
               )}

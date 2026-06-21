@@ -48,9 +48,18 @@ type aiToolCall struct {
 	Arguments json.RawMessage `json:"arguments"` // a JSON object
 }
 
+// aiImage is a user-turn image attachment (Anthropic + OpenAI-compatible
+// providers only — see callAnthropic/buildOpenAIMessages). Data is the raw
+// base64 payload with no "data:" URI prefix.
+type aiImage struct {
+	MimeType string `json:"mimeType"`
+	Data     string `json:"data"`
+}
+
 type aiMessage struct {
 	Role       string       `json:"role"`                 // user | assistant | tool
 	Content    string       `json:"content"`              // text (may be empty on tool-only turns)
+	Images     []aiImage    `json:"images,omitempty"`     // user-turn image attachments
 	ToolCalls  []aiToolCall `json:"toolCalls,omitempty"`  // assistant turns
 	ToolCallID string       `json:"toolCallId,omitempty"` // tool-result turns (OpenAI correlation)
 	Name       string       `json:"name,omitempty"`       // tool name on tool-result turns
@@ -164,7 +173,11 @@ func (s *Server) logAIChat(req aiChatReq, msg aiMessage, callErr error) {
 	fmt.Fprintf(&b, "--- request: system ---\n%s\n", truncForLog(req.System, 4000))
 	fmt.Fprintf(&b, "--- request: messages (%d) ---\n", len(req.Messages))
 	for _, m := range req.Messages {
-		fmt.Fprintf(&b, "[%s] %s\n", m.Role, truncForLog(m.Content, 1500))
+		imgNote := ""
+		if len(m.Images) > 0 {
+			imgNote = fmt.Sprintf(" [+%d image(s), not logged]", len(m.Images))
+		}
+		fmt.Fprintf(&b, "[%s] %s%s\n", m.Role, truncForLog(m.Content, 1500), imgNote)
 		for _, tc := range m.ToolCalls {
 			fmt.Fprintf(&b, "   ↳ tool_call %s(%s)\n", tc.Name, truncForLog(string(tc.Arguments), 800))
 		}
@@ -307,7 +320,19 @@ func callAnthropic(ctx context.Context, req aiChatReq, oauthToken string) (aiMes
 			}
 			push("assistant", blocks)
 		default: // user
-			push("user", []block{{"type": "text", "text": m.Content}})
+			var blocks []block
+			for _, img := range m.Images {
+				blocks = append(blocks, block{
+					"type": "image",
+					"source": block{
+						"type":       "base64",
+						"media_type": img.MimeType,
+						"data":       img.Data,
+					},
+				})
+			}
+			blocks = append(blocks, block{"type": "text", "text": m.Content})
+			push("user", blocks)
 		}
 	}
 
@@ -474,7 +499,13 @@ func callOpenAI(ctx context.Context, req aiChatReq, defaultBase string) (aiMessa
 // buildOpenAIMessages renders the conversation in OpenAI chat format. Ollama's
 // /api/chat uses the same envelope EXCEPT tool-call arguments are an object
 // (not a JSON string) and tool results carry no tool_call_id — argsAsString
-// toggles that.
+// toggles that. It also gates image attachments: Ollama's /api/chat has its
+// own different image scheme (a top-level "images" array of bare base64
+// strings, no media type and no "image_url" content part), so when
+// argsAsString is false (the Ollama caller) any attached images are silently
+// dropped rather than sent in a shape Ollama doesn't understand — the
+// frontend already only lets the user attach images for Anthropic/OpenAI-
+// compatible providers, this is just a defensive backstop.
 func buildOpenAIMessages(req aiChatReq, argsAsString bool) []map[string]any {
 	var msgs []map[string]any
 	if strings.TrimSpace(req.System) != "" {
@@ -512,7 +543,21 @@ func buildOpenAIMessages(req aiChatReq, argsAsString bool) []map[string]any {
 			}
 			msgs = append(msgs, am)
 		default:
-			msgs = append(msgs, map[string]any{"role": "user", "content": m.Content})
+			if argsAsString && len(m.Images) > 0 {
+				parts := make([]map[string]any, 0, len(m.Images)+1)
+				if strings.TrimSpace(m.Content) != "" {
+					parts = append(parts, map[string]any{"type": "text", "text": m.Content})
+				}
+				for _, img := range m.Images {
+					parts = append(parts, map[string]any{
+						"type":      "image_url",
+						"image_url": map[string]any{"url": "data:" + img.MimeType + ";base64," + img.Data},
+					})
+				}
+				msgs = append(msgs, map[string]any{"role": "user", "content": parts})
+			} else {
+				msgs = append(msgs, map[string]any{"role": "user", "content": m.Content})
+			}
 		}
 	}
 	return msgs

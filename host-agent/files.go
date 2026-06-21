@@ -136,6 +136,15 @@ type writeFileReq struct {
 	Content string `json:"content"`
 }
 
+func (s *Server) handleHomeDir(w http.ResponseWriter, r *http.Request) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "home": home})
+}
+
 func (s *Server) handleReadFile(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeError(w, http.StatusMethodNotAllowed, "POST required")
