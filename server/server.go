@@ -498,7 +498,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	autoRun := s.rtCfg.AutoRun
 	hmiPort := s.rtCfg.HMIPort
 	s.rtMu.Unlock()
-	jsonOK(w, map[string]any{
+	resp := map[string]any{
 		"running":            running,
 		"pid":                pid,
 		"variable_count":     s.ipc.VariableCount(),
@@ -507,7 +507,15 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		"auto_run":           autoRun,
 		"stream_interval_ms": uint32(GetAPIStreamInterval() / time.Millisecond),
 		"hmi_port":           hmiPort,
-	})
+	}
+	// Last swap/cold-start/crash outcome — the editor's existing 3s /status
+	// poll is the only channel back from the field side for this (no
+	// persistent SSE connection here), so surface it inline rather than
+	// adding a new streaming mechanism.
+	if ev := s.pm.LastEvent(); ev != nil {
+		resp["last_runtime_event"] = ev
+	}
+	jsonOK(w, resp)
 }
 
 // saveUpload writes raw bytes from HTTP body to disk atomically.

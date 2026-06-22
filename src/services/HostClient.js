@@ -339,6 +339,15 @@ export class HostClient {
   async hotswapTargetLogic({ header, source, boardId }) {
     return _post(this._p('/api/host/hotswap/target-logic'), { header, source, boardId });
   }
+  /**
+   * Upload the hot-swap loader-host runtime.bin + variables.json + the
+   * currently-discovered logic_<gen>.so to a deployed KronServer, as one
+   * atomic sequence. Deliberately separate from deployToServer (the plain
+   * Build & Send path) so the two binary shapes can never be conflated.
+   */
+  async hotswapTargetDeploy(serverAddr) {
+    return _post(this._p('/api/host/hotswap/target-deploy'), { serverAddr });
+  }
   /** Push the latest logic.so to a deployed KronServer and trigger a live swap. */
   async hotswapDeploySwap(serverAddr) {
     return _post(this._p('/api/host/hotswap/deploy-swap'), { serverAddr });

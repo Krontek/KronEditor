@@ -11,6 +11,35 @@ const getBoardFamilyDefine = (boardId) => {
     return null;
 };
 
+// FNV-1a 64-bit over a UTF-8 string, used to fingerprint the PlcState struct
+// SHAPE (the joined "<ctype> <name>;" field declarations, in order — never
+// values) so a hot-swap loader-host can refuse a layout-incompatible swap
+// before it touches the live state arena. Plain accidental-collision-avoidance
+// hash, not cryptographic — there is no adversary here, only the need to
+// reliably detect "this struct shape differs from that one". Implemented
+// identically (same algorithm, same constants) in C by the loader-host
+// (host-agent/hotswaphost/host.c) so both sides agree bit-for-bit; JS numbers
+// can't hold a 64-bit value precisely, so this returns a hex string and the
+// caller emits it as a `0x...ULL` C literal rather than doing arithmetic on it.
+const FNV1A64_OFFSET = 0xcbf29ce484222325n;
+const FNV1A64_PRIME = 0x100000001b3n;
+const FNV1A64_MASK = 0xffffffffffffffffn;
+export const fnv1a64Hex = (str) => {
+    let hash = FNV1A64_OFFSET;
+    for (let i = 0; i < str.length; i++) {
+        hash ^= BigInt(str.charCodeAt(i) & 0xff);
+        hash = (hash * FNV1A64_PRIME) & FNV1A64_MASK;
+        const cc = str.charCodeAt(i);
+        if (cc > 0xff) {
+            // Non-ASCII char (shouldn't occur in generated C identifiers/types,
+            // but guard anyway): fold in the remaining byte deterministically.
+            hash ^= BigInt((cc >> 8) & 0xff);
+            hash = (hash * FNV1A64_PRIME) & FNV1A64_MASK;
+        }
+    }
+    return hash.toString(16).padStart(16, '0');
+};
+
 const parseNumeric = (value, fallback = 0) => {
     if (value === undefined || value === null || value === '') return fallback;
     if (typeof value === 'number' && Number.isFinite(value)) return value;
@@ -930,6 +959,16 @@ ${boardDefines}${runtimePortHelpers}${customIncludes}${ecCfgEarly.motionIncludes
         return { progName: pName, cSym, liveKey };
     });
 
+    // Fingerprint of the PlcState SHAPE (field decls, in order — not values),
+    // exported under PLC_HOTSWAP (in generateMainLoop, below) as
+    // plc_state_layout_hash(). The loader-host compares this between the
+    // running and a candidate-swap .so and refuses the swap on any mismatch —
+    // the hard safety net for "an edit changed the variable table/FB
+    // instances/UDTs without anyone updating the hot-swap layout guard".
+    // stateFields is fully finalized by this point — every push site runs
+    // earlier than this in transpilePOUSource/this function.
+    const plcStateLayoutHash = fnv1a64Hex(stateFields.join('\n'));
+
     // --- 6. BUILD SERVER VARIABLES ARRAY ---
     const IEC_TO_SERVER_TYPE = {
         'BOOL': 'bool',
@@ -1015,7 +1054,8 @@ ${boardDefines}${runtimePortHelpers}${customIncludes}${ecCfgEarly.motionIncludes
         ecCfg.ecThreadStartCode || '',
         ecCfg.ecThreadJoinCode  || '',
         !!ecCfg.halContent,         // gpiMutexEnabled: true when IO_Bus thread owns the bus
-        shmEntries
+        shmEntries,
+        plcStateLayoutHash
     );
     source += mainLoop.src;
     variableTable.tasks = mainLoop.programTasks.map(pt => ({
@@ -1106,7 +1146,7 @@ ${boardDefines}${runtimePortHelpers}${customIncludes}${ecCfgEarly.motionIncludes
     // Run the cold-init once at startup (sets non-zero initial values into S).
     source = source.replace('void PLC_Init(void) {\n', 'void PLC_Init(void) {\n    plc_state_init();\n');
 
-    return { header, source, variableTable, hal: ecCfg.halContent || '', hostGlue };
+    return { header, source, variableTable, hal: ecCfg.halContent || '', hostGlue, plcStateLayoutHash };
 };
 
 const isFBType = (type, structure) => {
@@ -1654,7 +1694,7 @@ ${ncWriteBridge}` : ''}        /* Step 4: Propagate HW-updated staging to the ba
     return { headerDecl, headerExtern, gpiMacros, motionIncludes, initCode, cleanupCode, pdoReadCode, pdoWriteCode, ecThreadCode, ecThreadStartCode, ecThreadJoinCode, halContent };
 };
 
-const generateMainLoop = (projectStructure, config, boardId = null, shmEnabled = false, execTimeVars = [], initCode = '', cleanupCode = '', ecPdoReadCode = '', ecPdoWriteCode = '', ecThreadCode = '', ecThreadStartCode = '', ecThreadJoinCode = '', gpiMutexEnabled = false, shmEntries = []) => {
+const generateMainLoop = (projectStructure, config, boardId = null, shmEnabled = false, execTimeVars = [], initCode = '', cleanupCode = '', ecPdoReadCode = '', ecPdoWriteCode = '', ecThreadCode = '', ecThreadStartCode = '', ecThreadJoinCode = '', gpiMutexEnabled = false, shmEntries = [], plcStateLayoutHash = '0') => {
     let mainSrc = `\n// --- DETERMINISTIC SCAN LOOP ---\n`;
 
     // --- 1. Discover task→program groupings (priority: taskConfig > res_config > fallback) ---
@@ -1867,6 +1907,11 @@ const generateMainLoop = (projectStructure, config, boardId = null, shmEnabled =
     mainSrc += `#ifdef PLC_HOTSWAP\n`;
     mainSrc += `#include <stddef.h>\n`;
     mainSrc += `unsigned long plc_state_size(void) { return (unsigned long)sizeof(PlcState); }\n`;
+    // PlcState shape fingerprint (see plcStateLayoutHash above) — the
+    // loader-host refuses a swap whose .so reports a different hash than the
+    // one it cold-started with, regardless of what the editor's own
+    // pre-flight check concluded.
+    mainSrc += `unsigned long long plc_state_layout_hash(void) { return 0x${plcStateLayoutHash}ULL; }\n`;
     mainSrc += `int plc_task_count(void) { return ${taskGroups.length}; }\n`;
     mainSrc += `unsigned long plc_task_interval_us(int i) {\n`;
     mainSrc += `    switch (i) {\n`;

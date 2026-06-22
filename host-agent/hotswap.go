@@ -13,6 +13,8 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	"github.com/krontek/hotswaplib"
 )
 
 // hotswap.go — live ("online change") PLC logic update for the local simulation.
@@ -25,6 +27,15 @@ import (
 // (rolls back on a bad .so). The editor keeps reading live variables from the
 // host-owned /dev/shm mirror by variables.json offset throughout.
 //
+// Generation numbers (logic_<n>.so) are NEVER trusted from an in-memory
+// counter — they are always re-derived by scanning the build dir via
+// hotswaplib.DiscoverGeneration/NextGeneration, which is what the field-path's
+// sibling (server/hotswap.go) does too, so the two can never desync the way
+// the old in-memory-counter scheme did. Cleanup of an old .so happens ONLY
+// after the loader-host has CONFIRMED (via the swap_result file protocol,
+// hotswaplib.PollSwapResult) that the new generation is actually running —
+// never optimistically right after a compile.
+//
 //   POST /api/host/hotswap/build {header, source, variableTable, hal}
 //        → writes plc.* + variables.json, compiles the host (once) + logic_0.so
 //   POST /api/host/hotswap/run   {}                  → spawns the host, polls SHM
@@ -36,6 +47,12 @@ var hotswapHostC string
 
 const hotswapShmName = "/plc_runtime" // matches PLC_SHM_NAME in generated plc.c
 
+// swapResultTimeout bounds how long we wait for the loader-host to report a
+// swap/cold-start outcome before giving up and reporting "unknown" (never
+// silently assuming success). Swaps are human/agent-paced, not a hot path —
+// generous headroom over the sub-100ms cost typically observed.
+const swapResultTimeout = 5 * time.Second
+
 type ShmSpec struct {
 	Key    string
 	Offset uint64
@@ -43,13 +60,19 @@ type ShmSpec struct {
 }
 
 // HotSwapState owns the running loader-host process + the SHM poller.
+//
+// swapMu is DELIBERATELY separate from mu: a swap attempt holds swapMu for
+// its whole duration (compile + signal + poll-for-result, up to
+// swapResultTimeout) so two concurrent swap requests can never interleave
+// their swap_request writes — but Stop() only ever needs mu, briefly, so an
+// operator's Stop is never blocked behind a hung swap poll.
 type HotSwapState struct {
-	mu       sync.Mutex
-	cmd      *exec.Cmd
-	pid      int
-	logicVer int
-	specs    []ShmSpec
-	stopCh   chan struct{}
+	mu     sync.Mutex
+	swapMu sync.Mutex
+	cmd    *exec.Cmd
+	pid    int
+	specs  []ShmSpec
+	stopCh chan struct{}
 }
 
 func NewHotSwapState() *HotSwapState { return &HotSwapState{} }
@@ -98,26 +121,12 @@ func buildShmSpecs(variableTableJSON string) []ShmSpec {
 	return specs
 }
 
-// removeStaleLogicSO deletes leftover logic_*.so files in dir, keeping only the
-// just-built keepVer and the base logic_0.so (the one a fresh run reloads). Each
-// hot reload bumps the version, so without this the build dir fills up with old
-// .so's. Deleting a file that the running loader-host still has dlopen'd is safe
-// on Linux (the inode lives until it's unmapped/dlclose'd).
-func removeStaleLogicSO(dir string, keepVer int) {
-	matches, _ := filepath.Glob(filepath.Join(dir, "logic_*.so"))
-	for _, p := range matches {
-		var v int
-		if _, err := fmt.Sscanf(filepath.Base(p), "logic_%d.so", &v); err != nil {
-			continue
-		}
-		if v == keepVer || v == 0 {
-			continue
-		}
-		_ = os.Remove(p)
-	}
-}
+func swapResultPath(buildDir string) string { return filepath.Join(buildDir, "swap_result") }
+func swapRequestPath(buildDir string) string { return filepath.Join(buildDir, "swap_request") }
 
-// compileLogic builds logic_<ver>.so from the plc.c already in buildDir.
+// compileLogic builds logic_<ver>.so from the plc.c already in buildDir. The
+// caller decides ver (via hotswaplib.NextGeneration) and is responsible for
+// cleanup — this function only compiles, it never deletes anything.
 func (s *Server) compileLogic(buildDir string, ver int) (string, string, error) {
 	resInclude, err := s.paths.ResourceTargetIncludeDir("x86_64/linux")
 	if err != nil {
@@ -133,7 +142,7 @@ func (s *Server) compileLogic(buildDir string, ver int) (string, string, error) 
 	}
 	simInc := filepath.Join(s.paths.LLVMSysroot("simulation_env"), "include")
 	plcC := filepath.Join(buildDir, "plc.c")
-	logicSO := filepath.Join(buildDir, fmt.Sprintf("logic_%d.so", ver))
+	logicSO := hotswaplib.GenerationPath(buildDir, ver)
 
 	args := append([]string{}, baseArgs...)
 	args = append(args,
@@ -147,7 +156,6 @@ func (s *Server) compileLogic(buildDir string, ver int) (string, string, error) 
 	if out, err := exec.Command(compiler, args...).CombinedOutput(); err != nil {
 		return "", "", fmt.Errorf("logic.so build failed: %v\n%s", err, out)
 	}
-	removeStaleLogicSO(buildDir, ver)
 	return logicSO, "", nil
 }
 
@@ -221,7 +229,8 @@ func targetTriples(boardID string) (string, string, error) {
 }
 
 // compileLogicForTarget cross-compiles logic_<ver>.so for the deployed target.
-// Used for both the initial deploy (ver 0) and every online change.
+// Used for both the initial deploy (ver 0) and every online change. Caller
+// decides ver and owns cleanup, same contract as compileLogic.
 func (s *Server) compileLogicForTarget(buildDir, boardID string, ver int) (string, error) {
 	llvmTarget, resourceTarget, err := targetTriples(boardID)
 	if err != nil {
@@ -239,7 +248,7 @@ func (s *Server) compileLogicForTarget(buildDir, boardID string, ver int) (strin
 	if err != nil {
 		return "", err
 	}
-	logicSO := filepath.Join(buildDir, fmt.Sprintf("logic_%d.so", ver))
+	logicSO := hotswaplib.GenerationPath(buildDir, ver)
 	args := append([]string{}, baseArgs...)
 	args = append(args, "-shared", "-fPIC", "-DPLC_HOTSWAP", "-O2", "-ffunction-sections", "-fdata-sections", "-fuse-ld=lld")
 	for _, inc := range sysIncs {
@@ -256,7 +265,6 @@ func (s *Server) compileLogicForTarget(buildDir, boardID string, ver int) (strin
 	if out, err := exec.Command(compiler, args...).CombinedOutput(); err != nil {
 		return "", fmt.Errorf("target logic.so build failed: %v\n%s", err, out)
 	}
-	removeStaleLogicSO(buildDir, ver)
 	return logicSO, nil
 }
 
@@ -303,12 +311,18 @@ func (s *Server) compileHostForTarget(buildDir, boardID string) (string, error) 
 	if out, err := exec.Command(compiler, args...).CombinedOutput(); err != nil {
 		return "", fmt.Errorf("target host build failed: %v\n%s", err, out)
 	}
+	// Marker so handleHotSwapTargetDeploy can refuse to upload a build dir
+	// whose runtime.bin is actually the PLAIN self-contained binary (Build &
+	// Send's compileForTarget writes to this SAME path/filename) — the two
+	// binary shapes must never be conflated, which is exactly how the
+	// original field hot-swap regression happened.
+	_ = os.WriteFile(filepath.Join(buildDir, "runtime.bin.kind"), []byte("hotswap-host\n"), 0o644)
 	return outFile, nil
 }
 
 // handleHotSwapTargetBuild cross-compiles the hot-swap runtime for the deployed
 // board: runtime.bin (loader-host) + logic_0.so. The editor then deploys both
-// to KronServer (/deploy/runtime + /deploy/logic). Subsequent online changes
+// to KronServer via /api/host/hotswap/target-deploy. Subsequent online changes
 // recompile only logic_<n>.so via /api/host/hotswap/target-logic.
 func (s *Server) handleHotSwapTargetBuild(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
@@ -340,6 +354,12 @@ func (s *Server) handleHotSwapTargetBuild(w http.ResponseWriter, r *http.Request
 			return
 		}
 	}
+	// Cold build = fresh process start downstream: reset to generation 0,
+	// wiping any leftover logic_*.so from a previous session (decision: reset
+	// on cold build, since there's no dlopen path-cache risk across a process
+	// restart — only across dlclose+dlopen WITHIN one running process).
+	_ = hotswaplib.CleanupExcept(buildDir, -1)
+	_ = hotswaplib.ClearResultFile(swapResultPath(buildDir))
 	hostBin, err := s.compileHostForTarget(buildDir, req.BoardID)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
@@ -350,15 +370,13 @@ func (s *Server) handleHotSwapTargetBuild(w http.ResponseWriter, r *http.Request
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	s.hotswap.mu.Lock()
-	s.hotswap.logicVer = 0
-	s.hotswap.mu.Unlock()
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "runtime": hostBin, "logic": logicSO})
 }
 
 // handleHotSwapTargetLogic recompiles only logic_<n>.so for the target (an
-// online change). The editor uploads it to KronServer /deploy/logic and calls
-// /hotswap/swap.
+// online change). The editor uploads it to KronServer via
+// /api/host/hotswap/deploy-swap, which polls for the remote swap's confirmed
+// outcome.
 func (s *Server) handleHotSwapTargetLogic(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeError(w, http.StatusMethodNotAllowed, "POST required")
@@ -380,10 +398,7 @@ func (s *Server) handleHotSwapTargetLogic(w http.ResponseWriter, r *http.Request
 	if req.Header != "" {
 		_ = os.WriteFile(filepath.Join(buildDir, "plc.h"), []byte(req.Header), 0o644)
 	}
-	s.hotswap.mu.Lock()
-	s.hotswap.logicVer++
-	ver := s.hotswap.logicVer
-	s.hotswap.mu.Unlock()
+	ver := hotswaplib.NextGeneration(buildDir)
 	logicSO, err := s.compileLogicForTarget(buildDir, req.BoardID, ver)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
@@ -393,8 +408,10 @@ func (s *Server) handleHotSwapTargetLogic(w http.ResponseWriter, r *http.Request
 }
 
 // handleHotSwapDeploySwap pushes the latest logic_<n>.so to a deployed
-// KronServer (/deploy/logic) and triggers a live swap (/hotswap/swap). Used by
-// the editor/agent to apply an online change to the field.
+// KronServer (/deploy/logic) and triggers a live swap (/hotswap/swap),
+// surfacing the REMOTE server's confirmed outcome (it now polls its own
+// swap_result before responding — see server/hotswap.go) rather than just
+// "the HTTP call succeeded".
 func (s *Server) handleHotSwapDeploySwap(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeError(w, http.StatusMethodNotAllowed, "POST required")
@@ -407,10 +424,12 @@ func (s *Server) handleHotSwapDeploySwap(w http.ResponseWriter, r *http.Request)
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	s.hotswap.mu.Lock()
-	ver := s.hotswap.logicVer
-	s.hotswap.mu.Unlock()
-	logicPath := filepath.Join(s.paths.BuildDir(), fmt.Sprintf("logic_%d.so", ver))
+	buildDir := s.paths.BuildDir()
+	_, logicPath, ok := hotswaplib.DiscoverGeneration(buildDir)
+	if !ok {
+		writeError(w, http.StatusBadRequest, "no logic.so built yet — call target-build/target-logic first")
+		return
+	}
 	logicBytes, err := os.ReadFile(logicPath)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "read logic.so: "+err.Error())
@@ -428,7 +447,10 @@ func (s *Server) handleHotSwapDeploySwap(w http.ResponseWriter, r *http.Request)
 	}
 	_ = json.NewDecoder(resp.Body).Decode(&up)
 	resp.Body.Close()
-	// 2) swap
+	// 2) swap — the server-side handler now blocks until it has polled its
+	// own swap_result, so a non-2xx here (or an "ok":false body) means the
+	// swap was actually attempted and REJECTED (e.g. a layout mismatch), not
+	// merely that the HTTP request failed.
 	body, _ := json.Marshal(map[string]string{"logic": up.Logic})
 	resp2, err := client.Post("http://"+req.ServerAddr+"/hotswap/swap", "application/json", bytes.NewReader(body))
 	if err != nil {
@@ -436,11 +458,14 @@ func (s *Server) handleHotSwapDeploySwap(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	defer resp2.Body.Close()
+	var swapResp map[string]any
+	_ = json.NewDecoder(resp2.Body).Decode(&swapResp)
 	if resp2.StatusCode >= 400 {
-		writeError(w, http.StatusBadGateway, fmt.Sprintf("hotswap/swap HTTP %d", resp2.StatusCode))
+		reason, _ := swapResp["reason"].(string)
+		writeError(w, http.StatusBadGateway, fmt.Sprintf("hotswap/swap rejected: HTTP %d %s", resp2.StatusCode, reason))
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "logic": up.Logic})
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "logic": up.Logic, "remote": swapResp})
 }
 
 func (s *Server) handleHotSwapBuild(w http.ResponseWriter, r *http.Request) {
@@ -476,13 +501,17 @@ func (s *Server) handleHotSwapBuild(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	// Cold build resets to generation 0 (see handleHotSwapTargetBuild comment
+	// for the reasoning) — wipe any leftover logic_*.so and stale result file
+	// from a previous session first.
+	_ = hotswaplib.CleanupExcept(buildDir, -1)
+	_ = hotswaplib.ClearResultFile(swapResultPath(buildDir))
 	logicSO, _, err := s.compileLogic(buildDir, 0)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 	s.hotswap.mu.Lock()
-	s.hotswap.logicVer = 0
 	s.hotswap.specs = buildShmSpecs(req.VariableTable)
 	s.hotswap.mu.Unlock()
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "logic": logicSO})
@@ -495,7 +524,7 @@ func (s *Server) handleHotSwapRun(w http.ResponseWriter, r *http.Request) {
 	}
 	buildDir := s.paths.BuildDir()
 	hostBin := filepath.Join(buildDir, "plc_host")
-	logicSO := filepath.Join(buildDir, "logic_0.so")
+	logicSO := hotswaplib.GenerationPath(buildDir, 0)
 	if _, err := os.Stat(hostBin); err != nil {
 		writeError(w, http.StatusBadRequest, "not built — call hotswap/build first")
 		return
@@ -509,8 +538,11 @@ func (s *Server) handleHotSwapRun(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "alreadyRunning": true, "pid": s.hotswap.pid})
 		return
 	}
+	// Clear any stale result from a previous run BEFORE spawning, so a
+	// leftover file can never be misread as THIS run's cold-start outcome.
+	_ = hotswaplib.ClearResultFile(swapResultPath(buildDir))
 	cmd := exec.Command(hostBin, logicSO)
-	cmd.Dir = buildDir // so the host reads ./swap_request here
+	cmd.Dir = buildDir // so the host reads ./swap_request (and writes ./swap_result) here
 	if err := cmd.Start(); err != nil {
 		s.hotswap.mu.Unlock()
 		writeError(w, http.StatusInternalServerError, err.Error())
@@ -524,17 +556,37 @@ func (s *Server) handleHotSwapRun(w http.ResponseWriter, r *http.Request) {
 	pid := s.hotswap.pid
 	s.hotswap.mu.Unlock()
 
-	s.events.Emit("simulation-output", map[string]any{"status": "started", "mode": "hotswap"})
-	go s.hotswapPoller(specs, stopCh)
 	go func() {
 		_ = cmd.Wait()
 		s.hotswap.mu.Lock()
-		if s.hotswap.cmd == cmd {
+		wasCurrent := s.hotswap.cmd == cmd
+		if wasCurrent {
 			s.hotswap.cmd, s.hotswap.pid = nil, 0
 		}
 		s.hotswap.mu.Unlock()
+		if wasCurrent {
+			s.events.Emit("simulation-output", map[string]any{"status": "crashed"})
+		}
 	}()
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "pid": pid})
+
+	// Confirm the loader-host actually bound its first logic module before
+	// declaring "started" — a fresh run that can't even bind logic_0.so
+	// (e.g. a stale/mismatched build) exits almost immediately; without this
+	// poll that would look identical to a normal successful start.
+	status, detail, perr := hotswaplib.PollSwapResult(swapResultPath(buildDir), 0, swapResultTimeout)
+	if perr != nil {
+		s.events.Emit("simulation-output", map[string]any{"status": "hotswap-unknown", "phase": "coldstart"})
+		writeJSON(w, http.StatusGatewayTimeout, map[string]any{"ok": false, "error": "cold-start outcome unknown (timeout)", "pid": pid, "confirmed": false})
+		return
+	}
+	if status != "OK" {
+		s.events.Emit("simulation-output", map[string]any{"status": "hotswap-failed", "phase": "coldstart", "reason": detail})
+		writeJSON(w, http.StatusConflict, map[string]any{"ok": false, "error": "cold-start failed: " + detail, "pid": pid, "confirmed": true, "reason": detail})
+		return
+	}
+	s.events.Emit("simulation-output", map[string]any{"status": "started", "mode": "hotswap"})
+	go s.hotswapPoller(specs, stopCh)
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "pid": pid, "confirmed": true})
 }
 
 type hotSwapSwapReq struct {
@@ -561,8 +613,19 @@ func (s *Server) handleHotSwapSwap(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "not running — call hotswap/run first")
 		return
 	}
-	// New logic source overwrites plc.* (same layout assumed; a layout change is
-	// the editor's responsibility to detect → cold restart, not a swap).
+
+	// Hold the swap-serialization lock for the ENTIRE operation (discover →
+	// compile → write request → signal → poll for result) — this is what
+	// fixes the documented race where two near-simultaneous swap calls could
+	// overwrite each other's swap_request. A concurrent Stop() is unaffected
+	// (it only ever needs the separate, short-held `mu`).
+	s.hotswap.swapMu.Lock()
+	defer s.hotswap.swapMu.Unlock()
+
+	// New logic source overwrites plc.* (same layout assumed; a layout
+	// change is caught by the editor's pre-flight check AND, unconditionally,
+	// by the loader-host's plc_state_layout_hash comparison — see
+	// CTranspilerService.js / hotswaphost/host.c).
 	if req.Source != "" {
 		if err := os.WriteFile(filepath.Join(buildDir, "plc.c"), []byte(req.Source), 0o644); err != nil {
 			writeError(w, http.StatusInternalServerError, err.Error())
@@ -572,18 +635,19 @@ func (s *Server) handleHotSwapSwap(w http.ResponseWriter, r *http.Request) {
 	if req.Header != "" {
 		_ = os.WriteFile(filepath.Join(buildDir, "plc.h"), []byte(req.Header), 0o644)
 	}
-	s.hotswap.mu.Lock()
-	s.hotswap.logicVer++
-	ver := s.hotswap.logicVer
-	s.hotswap.mu.Unlock()
 
+	ver := hotswaplib.NextGeneration(buildDir)
 	logicSO, _, err := s.compileLogic(buildDir, ver)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	// Signal the running host: write the new .so path, then SIGUSR1.
-	if err := os.WriteFile(filepath.Join(buildDir, "swap_request"), []byte(logicSO+"\n"), 0o644); err != nil {
+
+	// Clear any stale result BEFORE requesting this swap, so a leftover
+	// outcome from a PREVIOUS attempt can never be misattributed to this one.
+	resultPath := swapResultPath(buildDir)
+	_ = hotswaplib.ClearResultFile(resultPath)
+	if err := os.WriteFile(swapRequestPath(buildDir), []byte(logicSO+"\n"), 0o644); err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -591,8 +655,23 @@ func (s *Server) handleHotSwapSwap(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "signal failed: "+err.Error())
 		return
 	}
-	s.events.Emit("simulation-output", map[string]any{"status": "hotswapped", "version": ver})
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "version": ver, "logic": logicSO})
+
+	status, detail, perr := hotswaplib.PollSwapResult(resultPath, ver, swapResultTimeout)
+	switch {
+	case perr != nil:
+		// Outcome unknown — never assume success, never delete anything. Non-2xx
+		// so HostClient's _wrap throws instead of silently resolving "ok".
+		s.events.Emit("simulation-output", map[string]any{"status": "hotswap-unknown", "version": ver})
+		writeJSON(w, http.StatusGatewayTimeout, map[string]any{"ok": false, "error": "hot-swap outcome unknown (timeout)", "version": ver, "confirmed": false, "reason": "timeout"})
+	case status == "OK":
+		_ = hotswaplib.CleanupExcept(buildDir, ver)
+		s.events.Emit("simulation-output", map[string]any{"status": "hotswapped", "version": ver})
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "version": ver, "logic": logicSO})
+	default: // FAIL — the PREVIOUS generation is still running (loader-host already rolled back itself).
+		_ = os.Remove(logicSO) // only the rejected candidate; never touch the still-running old one
+		s.events.Emit("simulation-output", map[string]any{"status": "hotswap-failed", "version": ver, "reason": detail})
+		writeJSON(w, http.StatusConflict, map[string]any{"ok": false, "error": "hot-swap rejected: " + detail, "version": ver, "confirmed": true, "reason": detail})
+	}
 }
 
 func (s *Server) handleHotSwapStop(w http.ResponseWriter, r *http.Request) {

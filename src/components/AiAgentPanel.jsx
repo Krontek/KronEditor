@@ -479,7 +479,7 @@ function buildSystemPrompt(projectStructure, board, activeItem, libraryData = []
     '- Every change is shown as a diff the user approves/rejects; if rejected, adapt. When done, reply with a short summary in the user\'s language.',
     '- To SEE the existing program before editing it, call read_pou: it returns the full ST code AND, for LD/SCL, each rung rendered as boolean logic (e.g. `Motor := (Start OR Motor) AND NOT Stop`) plus the variable table. Use get_project_overview for the project-wide picture.',
     '- While the program is RUNNING, read_live_variables returns the current values AND a buffered time-series `history` per variable (min/max/last, change count, flags like constant/oscillating/rising/falling, a recent sample series). Read it to diagnose real behaviour (a value stuck, oscillating, drifting, out of range) BEFORE proposing a fix, and refer to the concrete numbers when you explain the problem.',
-    '- For TIME-DEPENDENT behaviour use watch_live_variables: it actively WAITS a real window and returns a per-variable summary, and EACH variable can be watched for its own duration (e.g. watch a 5 s timer output for 12 s but a fast pulse for 2 s). read_live_variables is just an instant snapshot; watch_live_variables is for "does it toggle / settle / ramp over time". A single call is capped at 60 s — default to the SHORTEST window that actually answers the question (most checks need only a few seconds). Only for the rare case where the behaviour genuinely unfolds over minutes (slow drift, a long multi-step sequence, a startup delay) should you chain consecutive watch_live_variables calls back-to-back across turns to extend the effective observation window — tell the user you are doing an extended watch and why, watch in 60 s segments, and stop chaining as soon as you have enough signal to conclude. Do not chain by default.',
+    '- For TIME-DEPENDENT behaviour use watch_live_variables: it actively WAITS a real window and returns a per-variable summary, and EACH variable can be watched for its own duration (e.g. watch a 5 s timer output for 12 s but a fast pulse for 2 s). read_live_variables is just an instant snapshot; watch_live_variables is for "does it toggle / settle / ramp over time". There is NO fixed cap — pick whatever window the behaviour under diagnosis actually needs (a few seconds for a fast pulse, minutes for a slow ramp/drift/long sequence), but default to the SHORTEST window that answers the question; do not pick a long duration "just in case". The user sees a live elapsed-time counter while you watch and can stop it early, so an overly long pick wastes their time waiting on you, not just yours.',
     '- VERIFY-AFTER-CHANGE LOOP: live monitoring is automatic whenever the program is running (simulation or a connected PLC) — your edits are committed to the project on approval, but to take effect on the RUNNING target they must be DEPLOYED by the user (Build & Send). When the program is running, after your change is in effect call watch_live_variables on the variables your fix targets, compare the observed behaviour against what the user asked for, and report explicitly whether the desired result was achieved (if not, propose another fix). If the live values do NOT yet reflect your change, it has not been deployed — tell the user to Build & Send. Keep watch durations only as long as needed.',
     '',
     `Board: ${board || 'none'}. Currently open POU: ${active}.`,
@@ -898,15 +898,37 @@ export default function AiAgentPanel({
         } else {
           const specs = Array.isArray(args.variables) ? args.variables : [];
           const durs = specs.map((s) => Number(s?.seconds)).filter((n) => n > 0);
+          // No upper cap — the model picks whatever window the behaviour under
+          // diagnosis actually needs (a slow ramp may genuinely take minutes).
+          // Stop is always available to cut a watch short if it picks badly.
           let wait = Number(args.maxSeconds) > 0 ? Number(args.maxSeconds) : (durs.length ? Math.max(...durs) : 5);
-          wait = Math.min(60, Math.max(1, wait));
+          wait = Math.max(1, wait);
           const names = specs.map((s) => s?.name).filter(Boolean).join(', ') || 'live variables';
-          pushView({ role: 'note', text: `Watching ${names} for ${wait}s…` });
+
+          // Live-ticking note so the user can see logging is actually in
+          // progress and for how long, not just a static "thinking" spinner.
+          const watchViewId = nextId();
+          const startTs = Date.now();
+          const elapsedText = () => {
+            const elapsed = Math.floor((Date.now() - startTs) / 1000);
+            return `📡 Logging ${names} — ${elapsed}s / ${wait}s elapsed…`;
+          };
+          setMessages((m) => [...m, { id: watchViewId, role: 'note', text: elapsedText() }]);
+          const tickId = setInterval(() => {
+            setMessages((m) => m.map((x) => (x.id === watchViewId ? { ...x, text: elapsedText() } : x)));
+          }, 1000);
+
           try {
             await sleepAbortable(wait * 1000, controller.signal);
             args.__watch = { running: true, waitedSeconds: wait, history: summarizeWatch(liveBufRef.current, specs) };
           } catch {
             // Stop was pressed mid-watch — abandon this turn entirely below.
+          } finally {
+            clearInterval(tickId);
+            const finalElapsed = Math.floor((Date.now() - startTs) / 1000);
+            setMessages((m) => m.map((x) => (x.id === watchViewId
+              ? { ...x, text: `📡 Logged ${names} for ${finalElapsed}s.` }
+              : x)));
           }
         }
       }

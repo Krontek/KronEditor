@@ -54,6 +54,13 @@ static body_fn        g_body[MAXT];
 static unsigned long  g_interval[MAXT];
 static int            g_ntask;
 
+/* The layout hash of the FIRST successfully bound .so (cold start). Every
+ * later swap is checked against THIS reference, never the previous swap's —
+ * so a chain of small "compatible" edits cannot drift into an undetected
+ * incompatibility one swap at a time. */
+static unsigned long long g_layout_hash = 0;
+static int                g_layout_hash_set = 0;
+
 static volatile sig_atomic_t g_swap_req = 0;
 static pthread_barrier_t     g_barrier;
 
@@ -64,27 +71,76 @@ static uint64_t mono_us(void) {
     return (uint64_t)t.tv_sec * 1000000ULL + (uint64_t)t.tv_nsec / 1000ULL;
 }
 
+/* Parses the generation number out of a "<dir>/logic_<N>.so" path. Returns -1
+ * if the basename doesn't match that pattern (defensive — should never
+ * happen since we only ever write paths we generated ourselves). */
+static int parse_gen_from_path(const char *path) {
+    const char *base = strrchr(path, '/');
+    base = base ? base + 1 : path;
+    int gen = -1;
+    if (sscanf(base, "logic_%d.so", &gen) == 1) return gen;
+    return -1;
+}
+
+/* Reports a swap/cold-start outcome to the Go supervisor via a small result
+ * file, written atomically (write to a .tmp then rename — POSIX rename() is
+ * atomic on the same filesystem, so a concurrent poller never observes a
+ * half-written file). This is the ONLY way the Go side learns whether a swap
+ * actually applied — it must never delete an old/new .so based on anything
+ * other than reading this back. */
+static void write_swap_result(const char *status, int gen, const char *detail) {
+    FILE *f = fopen("./swap_result.tmp", "w");
+    if (!f) return;
+    if (detail && detail[0]) fprintf(f, "%s %d %s\n", status, gen, detail);
+    else                     fprintf(f, "%s %d\n", status, gen);
+    fclose(f);
+    rename("./swap_result.tmp", "./swap_result");
+}
+
+#define RB_OK            0
+#define RB_ERR_SYMBOL    1   /* a required export is missing (old/incompatible build) */
+#define RB_ERR_TASKCOUNT 2   /* plc_task_count() out of range */
+#define RB_ERR_LAYOUT    3   /* PlcState shape differs from the cold-start reference */
+
 /* Resolve the ABI exports from a loaded handle and re-bind the live state.
- * Returns 0 on success. Never calls plc_state_init (state must persist). */
+ * Returns RB_OK on success, else one of the RB_ERR_* codes above — the
+ * specific code becomes the FAIL reason in the swap_result file. Never calls
+ * plc_state_init (state must persist). */
 static int resolve_and_bind(void *h) {
     unsigned long (*ssize)(void)        = (unsigned long(*)(void))      dlsym(h, "plc_state_size");
     void          (*bind)(void*)        = (void(*)(void*))             dlsym(h, "plc_bind");
     int           (*tcount)(void)       = (int(*)(void))              dlsym(h, "plc_task_count");
     unsigned long (*tiv)(int)           = (unsigned long(*)(int))     dlsym(h, "plc_task_interval_us");
-    if (!ssize || !bind || !tcount || !tiv) return -1;
+    unsigned long long (*lhash)(void)   = (unsigned long long(*)(void)) dlsym(h, "plc_state_layout_hash");
+    if (!ssize || !bind || !tcount || !tiv || !lhash) return RB_ERR_SYMBOL;
+
+    /* Hard safety net: refuse a layout-incompatible swap BEFORE touching
+     * g_body/g_ntask/the state arena. Skipped only on the very first bind
+     * (nothing to compare against yet — that bind itself becomes the
+     * reference, set by the caller once this returns RB_OK). */
+    if (g_layout_hash_set && lhash() != g_layout_hash) return RB_ERR_LAYOUT;
 
     int n = tcount();
-    if (n < 0 || n > MAXT) return -1;
+    if (n < 0 || n > MAXT) return RB_ERR_TASKCOUNT;
     for (int i = 0; i < n; i++) {
         char nm[32]; snprintf(nm, sizeof nm, "plc_task_body_%d", i);
         body_fn b = (body_fn)dlsym(h, nm);
-        if (!b) return -1;
+        if (!b) return RB_ERR_SYMBOL;
         g_body[i] = b;
         g_interval[i] = tiv(i);
     }
     g_ntask = n;
     bind(g_state);   /* adopt the SAME arena — preserves all state across swaps */
-    return 0;
+    if (!g_layout_hash_set) { g_layout_hash = lhash(); g_layout_hash_set = 1; }
+    return RB_OK;
+}
+
+static const char *rb_reason(int rc) {
+    switch (rc) {
+        case RB_ERR_LAYOUT:    return "LAYOUT";
+        case RB_ERR_TASKCOUNT: return "TASKCOUNT";
+        default:                return "SYMBOL";
+    }
 }
 
 /* Performed by task thread 0 only, with all threads parked on the barrier. */
@@ -97,22 +153,31 @@ static void do_swap(void) {
         close(fd);
     }
     if (!path[0]) return;
+    int gen = parse_gen_from_path(path);
 
     void *nh = dlopen(path, RTLD_NOW | RTLD_GLOBAL);
-    if (!nh) { fprintf(stderr, "[host] swap dlopen failed: %s (keeping current)\n", dlerror()); return; }
+    if (!nh) {
+        fprintf(stderr, "[host] swap dlopen failed: %s (keeping current)\n", dlerror());
+        write_swap_result("FAIL", gen, "DLOPEN");
+        return;
+    }
 
     void *old = g_handle;
     g_handle = nh;
-    if (resolve_and_bind(nh) != 0) {            /* validate; roll back on failure */
-        fprintf(stderr, "[host] swap resolve failed — rolling back\n");
+    int rc = resolve_and_bind(nh);
+    if (rc != RB_OK) {            /* validate; roll back on failure */
+        const char *reason = rb_reason(rc);
+        fprintf(stderr, "[host] swap resolve failed (%s) — rolling back\n", reason);
         dlclose(nh);
         g_handle = old;
-        resolve_and_bind(old);
+        resolve_and_bind(old);    /* old already satisfied the layout check once; this re-bind cannot itself fail on RB_ERR_LAYOUT */
+        write_swap_result("FAIL", gen, reason);
         return;
     }
     if (old) dlclose(old);
     printf("[host] >>> HOT-SWAPPED to %s\n", path);
     fflush(stdout);
+    write_swap_result("OK", gen, NULL);
 }
 
 /* Demo/debug only (env HS_MONITOR=1): periodically dump the first bytes of the
@@ -171,7 +236,17 @@ int main(int argc, char **argv) {
     g_state = calloc(1, ssize());
     if (!g_state) { fprintf(stderr, "state calloc failed\n"); return 1; }
 
-    if (resolve_and_bind(g_handle) != 0) { fprintf(stderr, "resolve failed\n"); return 1; }
+    int rc0 = resolve_and_bind(g_handle);
+    if (rc0 != RB_OK) {
+        fprintf(stderr, "resolve failed (%s)\n", rb_reason(rc0));
+        write_swap_result("FAIL", parse_gen_from_path(argv[1]), rb_reason(rc0));
+        return 1;
+    }
+    /* Confirms to the Go supervisor that the FIRST logic module is loaded and
+     * bound — handleHotSwapRun polls for this before declaring "started", so
+     * a fresh run that can't even bind its initial .so is caught immediately
+     * instead of looking like a normal start. */
+    write_swap_result("OK", parse_gen_from_path(argv[1]), "COLDSTART");
 
     /* Open the /dev/shm mirror once (host-owned, survives swaps). The editor /
      * agent reads live variables from here by variables.json offset. */

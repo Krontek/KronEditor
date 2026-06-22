@@ -8,4 +8,9 @@ require (
 	google.golang.org/protobuf v1.36.9
 )
 
-require golang.org/x/text v0.35.0 // indirect
+require (
+	github.com/krontek/hotswaplib v0.0.0
+	golang.org/x/text v0.35.0 // indirect
+)
+
+replace github.com/krontek/hotswaplib => ../hotswaplib

@@ -46,10 +46,25 @@ import EtherCATIconSrc from './assets/icons/ethercat.png';
 const EtherCATTabIcon = <img src={EtherCATIconSrc} height="13" style={{ objectFit: 'contain', verticalAlign: 'middle' }} alt="EtherCAT" />;
 import './App.css';
 
-// Signature of the task scheduling config (interval/duration, count, priority,
-// program assignment). Task timing is part of the runtime's fixed layout and is
-// NOT hot-reloadable — a change needs a cold restart (Build & Send), not an
-// online swap. Used to refuse a hot-swap when this signature has changed.
+// Pre-flight layout signature gating hot-swap — a FAST, FRIENDLY UX layer
+// only, not the safety boundary. If any of these sub-signatures change since
+// a hot-swap session started, the edit altered something a `swap` cannot
+// apply (the runtime's fixed task table / PlcState layout / the loader-host
+// binary itself), so we keep the edit (already accepted into the project)
+// but refuse to push it online and tell the user which part changed — they
+// re-deploy via Build & Send (cold restart) instead.
+//
+// This guard can have gaps (an edge case it doesn't model) and that's
+// acceptable: the actual, unconditional safety boundary is the C-level
+// plc_state_layout_hash check baked into every hot-swap build (see
+// CTranspilerService.js + host-agent/hotswaphost/host.c) — it runs on every
+// swap attempt regardless of what this JS guard concluded, and is what
+// actually prevents a layout-incompatible swap from corrupting the live
+// PlcState arena. This layer only saves a wasted compile+swap round-trip and
+// gives a precise message instead of a generic "swap failed".
+
+// Task scheduling (interval/duration, count, priority, program assignment) —
+// part of the runtime's fixed task table, never hot-swappable.
 const taskSignature = (struct) => JSON.stringify(
   (struct?.taskConfig?.tasks || []).map((t) => ({
     name: t.name,
@@ -57,6 +72,60 @@ const taskSignature = (struct) => JSON.stringify(
     programs: (t.programs || []).map((p) => ({ program: p.program, priority: p.priority })),
   }))
 );
+
+// Variable table shape — name + declared type only (NOT address/comment,
+// which are HMI/REST metadata that doesn't affect the PlcState struct
+// layout at all). Covers globals, program/FB/function locals, AND FB/UDT
+// instance variables (an instance is just a variable whose type is an FB/UDT
+// name) — an add/remove/retype of any of these shifts the struct.
+const variableTableSignature = (struct) => {
+  const norm = (v) => ({ name: v.name, type: v.type });
+  const globals = (struct?.resources || [])
+    .flatMap((r) => r.content?.globalVars || [])
+    .map(norm);
+  const locals = [
+    ...(struct?.programs || []),
+    ...(struct?.functionBlocks || []),
+    ...(struct?.functions || []),
+  ].flatMap((p) => (p.variables || []).map((v) => ({ owner: p.name, ...norm(v) })));
+  return JSON.stringify({ globals, locals });
+};
+
+// UDT (struct/array/enum) definitions — a field/member added/removed/retyped
+// on a UDT changes the size of every variable of that type WITHOUT the
+// variable's own {name,type} signature above changing at all, so this needs
+// its own check. Broad whole-array stringify (not hand-picking fields) is
+// deliberate: over-triggering a "needs Build & Send" message on a cosmetic
+// UDT edit is harmless (the C hash never even gets exercised by a swap
+// attempt that was never made); under-triggering is the only real risk.
+const udtSignature = (struct) => JSON.stringify(struct?.dataTypes || []);
+
+// Board + EtherCAT/bus config — these don't live in PlcState at all, but
+// changing them requires rebuilding the LOADER-HOST binary itself (HAL
+// trampolines compiled into host_glue.c), which a logic-only `swap` can
+// never do regardless of what the PlcState hash says.
+const ioEcSignature = (boardId, buses, busConfigs) =>
+  JSON.stringify({ boardId, buses: buses || [], busConfigs: busConfigs || {} });
+
+const layoutSignature = (struct, boardId, buses, busConfigs) => ({
+  task: taskSignature(struct),
+  variables: variableTableSignature(struct),
+  udts: udtSignature(struct),
+  ioEc: ioEcSignature(boardId, buses, busConfigs),
+});
+
+// Compares two layoutSignature() results and returns a list of human-readable
+// reasons for whichever sub-signatures differ (empty array = fully compatible
+// with the snapshot taken when the hot-swap session started).
+const layoutSignatureDiff = (a, b) => {
+  if (!a || !b) return [];
+  const reasons = [];
+  if (a.task !== b.task) reasons.push('task timing/scheduling changed (task durations are not hot-reloadable)');
+  if (a.variables !== b.variables) reasons.push('variable table changed (a variable or FB/UDT instance was added, removed, or retyped)');
+  if (a.udts !== b.udts) reasons.push('a data type (struct/array/enum) definition changed');
+  if (a.ioEc !== b.ioEc) reasons.push('board or EtherCAT/bus configuration changed (the runtime binary itself needs rebuilding)');
+  return reasons;
+};
 
 function App() {
   const { t } = useTranslation();
@@ -865,7 +934,7 @@ function App() {
           if (st.mode === 'hotswap') {
             hotSwapActiveRef.current = true;
             setIsHotSwap(true);
-            taskSigRef.current = taskSignature(projectStructure);
+            layoutSigRef.current = layoutSignature(projectStructure, selectedBoard, buses, busConfigs);
           }
           addLog('info', 'Simulation already running — re-attached (live values resuming).');
         }
@@ -1092,7 +1161,7 @@ function App() {
       await host.hotswapRun();
       hotSwapActiveRef.current = true;
       setIsHotSwap(true);
-      taskSigRef.current = taskSignature(projectStructure);
+      layoutSigRef.current = layoutSignature(projectStructure, selectedBoard, buses, busConfigs);
     } catch (err) {
       addLog('error', `Failed to start simulation: ${err.message || err}`);
       setIsRunning(false);
@@ -1168,7 +1237,7 @@ function App() {
       setLiveVariables({});
       hotSwapActiveRef.current = false;
       setIsHotSwap(false);
-      taskSigRef.current = null;
+      layoutSigRef.current = null;
     }
   };
 
@@ -1240,7 +1309,7 @@ function App() {
         }
         hotSwapActiveRef.current = false;
         setIsHotSwap(false);
-        taskSigRef.current = null;
+        layoutSigRef.current = null;
       } else if (plcClientRef.current) {
         // Stop the variable stream first.
         if (stopStreamRef.current) {
@@ -2032,46 +2101,55 @@ function App() {
   // the running PLC without a restart (state preserved). Live values keep
   // flowing on the existing simulation-output SSE (the host-agent's SHM poller).
   const hotSwapActiveRef = React.useRef(false);
-  // Task scheduling (interval / count / priority / program-assignment) is part of
-  // the runtime's fixed layout — it CANNOT be hot-swapped (needs a cold restart;
-  // see CLAUDE.md). We snapshot the task signature when a hot-swap session starts
-  // and refuse to push an online change if it has since changed: the edit is kept
-  // (accepted) but NOT deployed — the user re-deploys via Build & Send.
-  const taskSigRef = React.useRef(null);
+  // Snapshot of layoutSignature() taken when a hot-swap session starts. Any
+  // sub-signature changing since (task table / variable table / UDTs /
+  // board-EC config) means the edit altered something a `swap` cannot apply —
+  // the edit is kept (accepted into the project) but NOT pushed online; the
+  // user re-deploys via Build & Send (cold restart) instead. Fast UX layer
+  // only — see layoutSignature's own comment for the real safety boundary.
+  const layoutSigRef = React.useRef(null);
 
   // "Go live": if connected to a remote PLC, deploy a hot-swap-capable runtime
   // (loader-host + logic_0.so) to the field; otherwise start a LOCAL sim
   // hot-swap session. Either way, agent-approved edits then apply online.
   const startHotSwapSession = useCallback(async () => {
     const standardHeaders = await host.getStandardHeaders().catch(() => []);
-    if (isPlcConnected && plcAddress) {
-      addLog('info', 'Deploying hot-swap runtime to target…');
-      const cCode = transpileToC(projectStructure, standardHeaders, selectedBoard, false, buses, busConfigs);
-      await host.hotswapTargetBuild({
-        header: cCode.header, source: cCode.source,
-        variableTable: JSON.stringify(cCode.variableTable, null, 2), hal: cCode.hal || '',
-        hostGlue: cCode.hostGlue || '', boardId: selectedBoard,
-      });
-      await host.deployToServer(plcAddress); // runtime.bin(host) + variable-table + logic_0.so
-      hotSwapActiveRef.current = false;       // field mode (not local sim)
-      setIsHotSwap(true);
-      addLog('success', 'Field hot-swap runtime deployed — online change enabled on the target.');
-    } else {
-      const cCode = transpileToC(projectStructure, standardHeaders, selectedBoard, true, buses, busConfigs);
-      await host.hotswapBuild({
-        header: cCode.header, source: cCode.source,
-        variableTable: JSON.stringify(cCode.variableTable, null, 2), hal: cCode.hal || '',
-        hostGlue: cCode.hostGlue || '',
-      });
-      await host.hotswapRun();
-      hotSwapActiveRef.current = true;
-      setIsHotSwap(true);
-      setIsSimulationMode(true);
-      setIsRunning(true);
-      addLog('success', 'Hot-swap session started (simulation) — online change enabled.');
+    try {
+      if (isPlcConnected && plcAddress) {
+        addLog('info', 'Deploying hot-swap runtime to target…');
+        const cCode = transpileToC(projectStructure, standardHeaders, selectedBoard, false, buses, busConfigs);
+        await host.hotswapTargetBuild({
+          header: cCode.header, source: cCode.source,
+          variableTable: JSON.stringify(cCode.variableTable, null, 2), hal: cCode.hal || '',
+          hostGlue: cCode.hostGlue || '', boardId: selectedBoard,
+        });
+        // Dedicated hot-swap deploy path (NOT plain deployToServer, which is
+        // Build & Send's self-contained-binary path and deliberately never
+        // uploads a logic.so) — uploads runtime.bin(loader-host) + variables +
+        // logic_0.so as one atomic sequence.
+        await host.hotswapTargetDeploy(plcAddress);
+        hotSwapActiveRef.current = false;       // field mode (not local sim)
+        setIsHotSwap(true);
+        addLog('success', 'Field hot-swap runtime deployed — online change enabled on the target.');
+      } else {
+        const cCode = transpileToC(projectStructure, standardHeaders, selectedBoard, true, buses, busConfigs);
+        await host.hotswapBuild({
+          header: cCode.header, source: cCode.source,
+          variableTable: JSON.stringify(cCode.variableTable, null, 2), hal: cCode.hal || '',
+          hostGlue: cCode.hostGlue || '',
+        });
+        await host.hotswapRun();
+        hotSwapActiveRef.current = true;
+        setIsHotSwap(true);
+        setIsSimulationMode(true);
+        setIsRunning(true);
+        addLog('success', 'Hot-swap session started (simulation) — online change enabled.');
+      }
+      // Baseline for the layout-change guard below.
+      layoutSigRef.current = layoutSignature(projectStructure, selectedBoard, buses, busConfigs);
+    } catch (err) {
+      addLog('error', `Failed to start hot-swap session: ${err.message || err}`);
     }
-    // Baseline for the "task timing can't be hot-swapped" guard below.
-    taskSigRef.current = taskSignature(projectStructure);
   }, [projectStructure, selectedBoard, buses, busConfigs, isPlcConnected, plcAddress, addLog]);
 
   const stopHotSwapSession = useCallback(async () => {
@@ -2088,13 +2166,19 @@ function App() {
   // surface it; the user should redeploy). Field swaps confirm first (live HW).
   const handleAgentHotSwap = useCallback(async (touchedPous) => {
     const what = (touchedPous || []).join(', ') || 'logic';
-    // Task scheduling changes (interval/duration, task count, priority, program
-    // assignment) are NOT hot-reloadable — they change the runtime's fixed task
-    // layout and need a cold restart. If the task signature changed since the
-    // session started, KEEP the edit (it's already accepted into the project) but
-    // do NOT push it online; the user deploys it themselves via Build & Send.
-    if (taskSigRef.current !== null && taskSignature(projectStructure) !== taskSigRef.current) {
-      addLog('warning', `Task timing/scheduling changed — not applied as an online change (task durations are not hot-reloadable). The change is kept; use Build & Send to deploy it (the runtime will restart).`);
+    // A layout-changing edit (task table / variable table / UDTs / board-EC
+    // config) is NOT hot-reloadable — it needs a cold restart. KEEP the edit
+    // (already accepted into the project) but do NOT push it online; report
+    // precisely which part changed instead of a generic message. This is the
+    // fast UX pre-check only — the unconditional safety boundary is the
+    // C-level plc_state_layout_hash check every swap attempt still goes
+    // through regardless (see layoutSignature's comment).
+    const layoutReasons = layoutSignatureDiff(
+      layoutSigRef.current,
+      layoutSigRef.current && layoutSignature(projectStructure, selectedBoard, buses, busConfigs)
+    );
+    if (layoutReasons.length > 0) {
+      addLog('warning', `Not applied as an online change — ${layoutReasons.join('; ')}. The change is kept; use Build & Send to deploy it (the runtime will restart).`);
       return;
     }
     const standardHeaders = await host.getStandardHeaders().catch(() => []);

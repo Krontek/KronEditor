@@ -22,6 +22,8 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	"github.com/krontek/hotswaplib"
 )
 
 const (
@@ -44,14 +46,32 @@ var restartBackoffDelays = []time.Duration{
 	30 * time.Second,
 }
 
+// RuntimeEvent records the outcome of the last swap/cold-start/crash, so the
+// existing /status poll (the editor's only channel back from the field side
+// for this kind of event — there is no persistent SSE connection here) can
+// surface it without a new streaming mechanism.
+type RuntimeEvent struct {
+	Kind   string    `json:"kind"`   // "swap" | "coldstart" | "crashed"
+	Status string    `json:"status"` // "OK" | "FAIL" | "unknown"
+	Detail string    `json:"detail,omitempty"`
+	At     time.Time `json:"at"`
+}
+
 // ProcessManager controls the lifecycle of the PLC runtime binary.
 type ProcessManager struct {
-	mu         sync.Mutex
+	mu sync.Mutex
+	// swapMu is DELIBERATELY separate from mu: SwapLogic holds it for the
+	// entire compile-free swap operation (write request → signal → poll for
+	// confirmation, up to swapResultTimeout) so two concurrent swap requests
+	// can never interleave — but an operator's Stop() only ever needs mu,
+	// briefly, so it is never blocked behind a hung swap poll.
+	swapMu     sync.Mutex
 	deployDir  string
 	cmd        *exec.Cmd
 	done       chan struct{} // Closed when the process exits
 	stdoutFile *os.File
 	stderrFile *os.File
+	lastEvent  *RuntimeEvent // guarded by mu; last swap/coldstart/crash outcome
 
 	// AutoRun crash-restart state. All fields below are guarded by mu.
 	intentionalStop    bool        // set by Stop() so watchProcess won't auto-restart
@@ -59,6 +79,25 @@ type ProcessManager struct {
 	restartTimer       *time.Timer // pending auto-restart, nil if none scheduled
 	lastStartedAt      time.Time   // for backoff reset logic
 	consecutiveCrashes int         // current index into restartBackoffDelays
+}
+
+// swapResultTimeout bounds how long SwapLogic/Start wait for the loader-host
+// to report a swap/cold-start outcome. Mirrors host-agent/hotswap.go's
+// identical constant — both wrap the same loader-host binary.
+const swapResultTimeout = 5 * time.Second
+
+// LastEvent returns the last recorded swap/cold-start/crash outcome, or nil
+// if none has happened yet this agent run. Thread-safe.
+func (pm *ProcessManager) LastEvent() *RuntimeEvent {
+	pm.mu.Lock()
+	defer pm.mu.Unlock()
+	return pm.lastEvent
+}
+
+func (pm *ProcessManager) recordEvent(kind, status, detail string) {
+	pm.mu.Lock()
+	pm.lastEvent = &RuntimeEvent{Kind: kind, Status: status, Detail: detail, At: time.Now()}
+	pm.mu.Unlock()
 }
 
 func NewProcessManager(deployDir string) *ProcessManager {
@@ -235,14 +274,13 @@ func (pm *ProcessManager) Start() error {
 		return fmt.Errorf("failed to create stderr log file: %w", err)
 	}
 
-	// Hot-swap (online change) mode: if a logic_0.so is present, runtime.bin is
-	// the loader-host and takes the logic .so as its argument. Otherwise it is a
-	// classic self-contained binary. Presence of logic_0.so is the switch.
-	logic0 := filepath.Join(pm.deployDir, "logic_0.so")
-	hotSwap := false
-	if _, err := os.Stat(logic0); err == nil {
-		hotSwap = true
-	}
+	// Hot-swap (online change) mode: if ANY logic_<n>.so is present, runtime.bin
+	// is the loader-host and takes the highest-generation logic .so as its
+	// argument. Otherwise it is a classic self-contained binary. Discovered
+	// from disk (never a hardcoded "logic_0.so" literal, and never an
+	// in-memory counter) — this is what makes the switch correct after an
+	// agent restart or when generation 0 has since been cleaned up.
+	hotSwapGen, logicPath, hotSwap := hotswaplib.DiscoverGeneration(pm.deployDir)
 
 	// SOEM requires CAP_NET_RAW (raw socket access for EtherCAT).
 	// If this process is already root (uid=0), spawn directly.
@@ -251,7 +289,10 @@ func (pm *ProcessManager) Start() error {
 	var cmd *exec.Cmd
 	var binArgs []string
 	if hotSwap {
-		binArgs = []string{logic0}
+		binArgs = []string{logicPath}
+		// Clear any stale result from a previous run BEFORE spawning, so a
+		// leftover file can never be misread as THIS run's cold-start outcome.
+		_ = hotswaplib.ClearResultFile(filepath.Join(pm.deployDir, "swap_result"))
 	}
 	if os.Getuid() == 0 {
 		cmd = exec.Command(binPath, binArgs...)
@@ -288,37 +329,102 @@ func (pm *ProcessManager) Start() error {
 		"stdout_log", stdoutPath,
 		"stderr_log", stderrPath,
 	)
+
+	if hotSwap {
+		// Confirm the loader-host actually bound its first logic module
+		// before returning — a fresh start that can't even bind logic_<gen>
+		// (e.g. a stale/mismatched upload) exits almost immediately; without
+		// this poll that would look identical to a normal successful start
+		// until the NEXT /status check. Informational only: a timeout here
+		// does not fail Start() (the process did spawn), just records the
+		// outcome for /status to surface.
+		resultPath := filepath.Join(pm.deployDir, "swap_result")
+		status, detail, perr := hotswaplib.PollSwapResult(resultPath, hotSwapGen, swapResultTimeout)
+		if perr != nil {
+			slog.Warn("hot-swap cold-start outcome unknown", "gen", hotSwapGen)
+			pm.lastEvent = &RuntimeEvent{Kind: "coldstart", Status: "unknown", At: time.Now()}
+		} else {
+			if status != "OK" {
+				slog.Error("hot-swap cold-start failed", "gen", hotSwapGen, "reason", detail)
+			}
+			pm.lastEvent = &RuntimeEvent{Kind: "coldstart", Status: status, Detail: detail, At: time.Now()}
+		}
+	}
 	return nil
 }
 
 // SwapLogic pushes an ONLINE CHANGE to the running loader-host: it writes the
 // new logic .so path to deploy-dir/swap_request and sends SIGUSR1 so the host
 // swaps it at the next scan boundary, preserving PlcState (it rolls back a bad
-// .so itself). Only valid when the runtime was started in hot-swap mode.
+// .so itself) — then BLOCKS until the loader-host's swap_result file confirms
+// the outcome, and only then cleans up (the confirmed-running generation's
+// siblings on success, or just the rejected candidate on failure — never the
+// still-running old one). Only valid when the runtime was started in
+// hot-swap mode.
+//
+// Returns (status, detail, nil) for a definite outcome ("OK"/"" or
+// "FAIL"/<reason>), or ("", "", err) when the runtime isn't running, the file
+// is missing, signaling failed, or the outcome timed out (err is then
+// hotswaplib.ErrTimeout — the caller must treat this as UNKNOWN, never as
+// success or failure, and must not delete anything).
+//
+// Uses pm.swapMu (NOT pm.mu) for the poll, so a hung swap can never block an
+// operator's Stop() — see the swapMu field comment.
 //
 // NOTE: when the agent runs the runtime via "sudo -n", the tracked process is
 // sudo, which does not forward SIGUSR1 — for field hot-swap the agent should
 // run as root (or be granted the runtime via setcap), so the signal reaches the
 // loader-host directly.
-func (pm *ProcessManager) SwapLogic(logicFile string) error {
+func (pm *ProcessManager) SwapLogic(logicFile string) (status, detail string, err error) {
+	pm.swapMu.Lock()
+	defer pm.swapMu.Unlock()
+
 	pm.mu.Lock()
-	defer pm.mu.Unlock()
 	if !pm.isRunning() || pm.cmd == nil || pm.cmd.Process == nil {
-		return fmt.Errorf("runtime is not running")
+		pm.mu.Unlock()
+		return "", "", fmt.Errorf("runtime is not running")
 	}
+	proc := pm.cmd.Process
+	pm.mu.Unlock()
+
 	abs := filepath.Join(pm.deployDir, logicFile)
-	if _, err := os.Stat(abs); err != nil {
-		return fmt.Errorf("logic not found: %s", abs)
+	if _, statErr := os.Stat(abs); statErr != nil {
+		return "", "", fmt.Errorf("logic not found: %s", abs)
 	}
+	gen, ok := hotswaplib.ParseGenFromName(logicFile)
+	if !ok {
+		return "", "", fmt.Errorf("unrecognized logic filename: %s", logicFile)
+	}
+
+	resultPath := filepath.Join(pm.deployDir, "swap_result")
+	// Clear any stale result BEFORE requesting this swap, so a leftover
+	// outcome from a PREVIOUS attempt can never be misattributed to this one.
+	_ = hotswaplib.ClearResultFile(resultPath)
+
 	reqPath := filepath.Join(pm.deployDir, "swap_request")
-	if err := os.WriteFile(reqPath, []byte(abs+"\n"), 0644); err != nil {
-		return fmt.Errorf("write swap_request: %w", err)
+	if writeErr := os.WriteFile(reqPath, []byte(abs+"\n"), 0644); writeErr != nil {
+		return "", "", fmt.Errorf("write swap_request: %w", writeErr)
 	}
-	if err := pm.cmd.Process.Signal(syscall.SIGUSR1); err != nil {
-		return fmt.Errorf("signal SIGUSR1: %w", err)
+	if sigErr := proc.Signal(syscall.SIGUSR1); sigErr != nil {
+		return "", "", fmt.Errorf("signal SIGUSR1: %w", sigErr)
 	}
-	slog.Info("Hot-swap signaled", "logic", logicFile)
-	return nil
+	slog.Info("Hot-swap signaled", "logic", logicFile, "generation", gen)
+
+	st, det, pollErr := hotswaplib.PollSwapResult(resultPath, gen, swapResultTimeout)
+	if pollErr != nil {
+		pm.recordEvent("swap", "unknown", "")
+		slog.Warn("hot-swap outcome unknown (timeout)", "generation", gen)
+		return "", "", pollErr
+	}
+	pm.recordEvent("swap", st, det)
+	if st == "OK" {
+		_ = hotswaplib.CleanupExcept(pm.deployDir, gen)
+		slog.Info("Hot-swap confirmed", "generation", gen)
+	} else {
+		_ = os.Remove(abs) // only the rejected candidate; the previous generation is still running
+		slog.Error("Hot-swap rejected by loader-host", "generation", gen, "reason", det)
+	}
+	return st, det, nil
 }
 
 // Stop terminates the running PLC runtime safely.
@@ -433,6 +539,11 @@ func (pm *ProcessManager) watchProcess(cmd *exec.Cmd, done chan struct{}) {
 				"pid", cmd.Process.Pid,
 				"exit_code", exitErr.ExitCode(),
 			)
+			if !pm.intentionalStop {
+				// pm.mu is already held by this function — direct field
+				// write, NOT recordEvent() (which would self-deadlock).
+				pm.lastEvent = &RuntimeEvent{Kind: "crashed", Status: "unknown", Detail: fmt.Sprintf("exit code %d", exitErr.ExitCode()), At: time.Now()}
+			}
 		} else {
 			slog.Error("PLC Runtime wait error", "err", err)
 		}
