@@ -28,6 +28,19 @@ const RESOURCE_TYPE = 'RESOURCE_EDITOR';
 const IEC_NAME_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const isValidIecName = (n) => IEC_NAME_RE.test(String(n || '').trim());
 
+// Scalar IEC 61131-3 types the transpiler's mapType() resolves directly
+// (CTranspilerService.js's typeMap). Anything NOT in this set must be either
+// an existing data-type NAME (Array/Structure/Enumerated, created via
+// create_data_type) or an existing FB/function/POU name (an instance type) —
+// never an inline literal like "ARRAY[0..31] OF BYTE" typed straight into a
+// variable's `type` field, which the transpiler does not parse and which
+// silently produces a struct field the rest of the generated code can't find
+// (e.g. "no member named prog_X_rxBuffer in struct PlcState").
+const SCALAR_IEC_TYPES = new Set([
+  'BOOL', 'SINT', 'INT', 'DINT', 'LINT', 'USINT', 'UINT', 'UDINT', 'ULINT',
+  'REAL', 'LREAL', 'BYTE', 'WORD', 'DWORD', 'LWORD', 'TIME', 'STRING',
+]);
+
 export function findPOU(struct, name) {
   // Trim + case-insensitive so whitespace/case differences never cause a miss.
   const lname = String(name || '').trim().toLowerCase();
@@ -38,6 +51,83 @@ export function findPOU(struct, name) {
     if (idx >= 0) return { category, index: idx, item: list[idx] };
   }
   return null;
+}
+
+// Case-insensitive lookup of a data type by name (mirrors findPOU's pattern).
+function findDataType(struct, name) {
+  const lname = String(name || '').trim().toLowerCase();
+  if (!lname) return null;
+  const list = struct.dataTypes || [];
+  const idx = list.findIndex((d) => (d.name || '').trim().toLowerCase() === lname);
+  return idx >= 0 ? { index: idx, item: list[idx] } : null;
+}
+
+// Parses an inline "ARRAY[m..n] OF TYPE" (optionally multi-dim,
+// "ARRAY[0..3,0..7] OF TYPE") literal — the one IEC array form that's
+// unambiguous enough to auto-recover. Returns { baseType, dimensions:
+// [{min,max}, ...] } or null if it doesn't match.
+function parseInlineArrayType(typeStr) {
+  const m = /^ARRAY\s*\[\s*([0-9\s,.\-]+)\]\s*OF\s+([A-Za-z_]\w*)\s*$/i.exec(String(typeStr || '').trim());
+  if (!m) return null;
+  const dimensions = [];
+  for (const part of m[1].split(',')) {
+    const dm = /^\s*(-?\d+)\s*\.\.\s*(-?\d+)\s*$/.exec(part);
+    if (!dm) return null;
+    dimensions.push({ min: Number(dm[1]), max: Number(dm[2]) });
+  }
+  if (dimensions.length === 0) return null;
+  return { baseType: m[2].toUpperCase(), dimensions };
+}
+
+// Builds a unique data-type name for an auto-recovered inline array, e.g.
+// "Array_BYTE_0_31", appending _2/_3/... on collision.
+function uniqueArrayTypeName(struct, baseType, dimensions) {
+  const dims = dimensions.map((d) => `${d.min}_${d.max}`).join('_');
+  const base = `Array_${baseType}_${dims}`;
+  if (!findDataType(struct, base)) return base;
+  let n = 2;
+  while (findDataType(struct, `${base}_${n}`)) n++;
+  return `${base}_${n}`;
+}
+
+function buildArrayDataType(name, baseType, dimensions) {
+  return {
+    id: newVarId(),
+    name,
+    type: 'Array',
+    content: {
+      baseType,
+      dimensions: dimensions.map((d) => ({ id: newVarId(), min: d.min, max: d.max })),
+    },
+  };
+}
+
+// Resolves a variable's requested `type` string into either a known scalar,
+// an existing data-type/FB-instance name, or — for the one recoverable inline
+// form (ARRAY[..] OF TYPE) — a newly auto-created named Array data type. This
+// is the single choke point add_variable/update_variable funnel `type`
+// through, so an unrecognized/inline-composite type is caught and either
+// fixed transparently (array literal) or REJECTED with actionable guidance,
+// instead of silently flowing into broken generated C the way it used to.
+// Returns { ok:true, type, newDataType? } or { ok:false, error }.
+function resolveVarType(struct, rawType) {
+  const t = String(rawType || '').trim();
+  if (!t) return { ok: true, type: 'BOOL' };
+  const upper = t.toUpperCase();
+  if (SCALAR_IEC_TYPES.has(upper)) return { ok: true, type: upper };
+  const dt = findDataType(struct, t);
+  if (dt) return { ok: true, type: dt.item.name };
+  const pou = findPOU(struct, t);
+  if (pou) return { ok: true, type: pou.item.name };
+  const arr = parseInlineArrayType(t);
+  if (arr) {
+    const name = uniqueArrayTypeName(struct, arr.baseType, arr.dimensions);
+    return { ok: true, type: name, newDataType: buildArrayDataType(name, arr.baseType, arr.dimensions) };
+  }
+  return {
+    ok: false,
+    error: `Unknown type "${t}". Scalars are ${[...SCALAR_IEC_TYPES].join(', ')}. For an array/struct/enum, call create_data_type first (kind ARRAY, STRUCT, or ENUM) and reference its NAME here — do not write the array/struct/enum shape inline into a variable's type.`,
+  };
 }
 
 function configResource(struct) {
@@ -315,6 +405,35 @@ export const TOOL_DEFS = [
       name: str('Variable name to remove'),
     }, ['scope', 'name']),
   },
+  {
+    name: 'create_data_type',
+    description:
+      'Create a named ARRAY, STRUCT, or ENUM data type under the project\'s Data Types. ' +
+      'A variable can then use it by setting its `type` to this NAME (e.g. add_variable type:"RxFrame") — NEVER write the array/struct/enum shape inline into a variable\'s own type field (e.g. never set a variable\'s type to the literal "ARRAY[0..31] OF BYTE"); the transpiler only understands a type that is either a scalar IEC type or the NAME of a data type created here. ' +
+      'ARRAY: give baseType + dimensions (one entry per dimension, e.g. [{"min":0,"max":31}] for ARRAY[0..31]). ' +
+      'STRUCT: give members (each {name, type, initialValue?} — type can itself be a scalar, another data-type name, or an FB type). ' +
+      'ENUM: give values (a list of member names, e.g. ["IDLE","RUNNING","FAULT"]).',
+    parameters: S({
+      name: str('Unique data type name (e.g. "RxFrame", "MotorState")'),
+      kind: { type: 'string', enum: ['ARRAY', 'STRUCT', 'ENUM'] },
+      baseType: str('ARRAY only: element type — a scalar (e.g. BYTE, INT) or another data-type/FB name'),
+      dimensions: {
+        type: 'array',
+        description: 'ARRAY only: one entry per dimension, in order.',
+        items: S({ min: { type: 'number' }, max: { type: 'number' } }, ['min', 'max']),
+      },
+      members: {
+        type: 'array',
+        description: 'STRUCT only: the struct\'s fields, in order.',
+        items: S({ name: str('Member name'), type: str('Member type — scalar, data-type name, or FB name'), initialValue: str('Optional initial value') }, ['name', 'type']),
+      },
+      values: {
+        type: 'array',
+        description: 'ENUM only: member names, in order (e.g. ["IDLE","RUNNING","FAULT"]).',
+        items: { type: 'string' },
+      },
+    }, ['name', 'kind']),
+  },
 ];
 
 // ── executor ─────────────────────────────────────────────────────────────────
@@ -551,26 +670,37 @@ export function applyToolCall(struct, name, args = {}) {
         const scope = args.scope === 'global' ? 'global' : 'local';
         if (!args.name || !args.name.trim()) return { ok: false, error: 'name is required' };
         if (!isValidIecName(args.name)) return { ok: false, error: `invalid variable name "${args.name}" — must be an IEC identifier (no spaces; can't start with a digit)` };
-        const v = makeVar(scope, { ...args, name: args.name.trim() });
+        const resolved = resolveVarType(struct, args.type);
+        if (!resolved.ok) return { ok: false, error: resolved.error };
+        // An inline "ARRAY[..] OF TYPE" got auto-recovered into a real named
+        // data type — fold it into the base struct BEFORE building/placing the
+        // variable so both land in the same mutation/diff.
+        let base = struct;
+        const extraLines = [];
+        if (resolved.newDataType) {
+          base = { ...struct, dataTypes: [...(struct.dataTypes || []), resolved.newDataType] };
+          extraLines.push({ type: 'add', text: `data type  ${resolved.newDataType.name} = ARRAY[${resolved.newDataType.content.dimensions.map((d) => `${d.min}..${d.max}`).join(',')}] OF ${resolved.newDataType.content.baseType}` });
+        }
+        const v = makeVar(scope, { ...args, name: args.name.trim(), type: resolved.type });
         if (scope === 'global') {
-          const globals = getGlobals(struct);
+          const globals = getGlobals(base);
           if (globals.some((g) => (g.name || '').toLowerCase() === v.name.toLowerCase()))
             return { ok: false, error: `global "${v.name}" already exists` };
-          const next = withGlobals(struct, [...globals, v]);
+          const next = withGlobals(base, [...globals, v]);
           return {
             mutation: true, ok: true, summary: `Add global ${v.name} : ${v.type}`,
-            diff: { kind: 'var-add', target: `global ${v.name}`, lines: [{ type: 'add', text: varLine(v) }] }, next,
+            diff: { kind: 'var-add', target: `global ${v.name}`, lines: [...extraLines, { type: 'add', text: varLine(v) }] }, next,
           };
         }
-        const hit = findPOU(struct, args.pou);
+        const hit = findPOU(base, args.pou);
         if (!hit) return { ok: false, error: `POU "${args.pou}" not found (required for local scope)` };
         const vars = hit.item.content?.variables || [];
         if (vars.some((x) => (x.name || '').toLowerCase() === v.name.toLowerCase()))
           return { ok: false, error: `"${args.pou}" already has a variable named "${v.name}"` };
-        const next = withPOUContent(struct, hit.category, hit.index, { ...hit.item.content, variables: [...vars, v] });
+        const next = withPOUContent(base, hit.category, hit.index, { ...hit.item.content, variables: [...vars, v] });
         return {
           mutation: true, ok: true, summary: `Add ${v.name} : ${v.type} to ${hit.item.name}`,
-          diff: { kind: 'var-add', target: `${hit.item.name}.${v.name}`, lines: [{ type: 'add', text: varLine(v) }] }, next,
+          diff: { kind: 'var-add', target: `${hit.item.name}.${v.name}`, lines: [...extraLines, { type: 'add', text: varLine(v) }] }, next,
         };
       }
 
@@ -578,35 +708,45 @@ export function applyToolCall(struct, name, args = {}) {
         const scope = args.scope === 'global' ? 'global' : 'local';
         const changes = {};
         if (args.newName != null) changes.name = String(args.newName).trim();
-        if (args.type != null) changes.type = args.type;
         if (args.initialValue != null) changes.initialValue = args.initialValue;
         if (args.address != null) changes.address = args.address;
         if (args.description != null) changes.description = args.description;
+        let base = struct;
+        const extraLines = [];
+        if (args.type != null) {
+          const resolved = resolveVarType(struct, args.type);
+          if (!resolved.ok) return { ok: false, error: resolved.error };
+          changes.type = resolved.type;
+          if (resolved.newDataType) {
+            base = { ...struct, dataTypes: [...(struct.dataTypes || []), resolved.newDataType] };
+            extraLines.push({ type: 'add', text: `data type  ${resolved.newDataType.name} = ARRAY[${resolved.newDataType.content.dimensions.map((d) => `${d.min}..${d.max}`).join(',')}] OF ${resolved.newDataType.content.baseType}` });
+          }
+        }
         if (Object.keys(changes).length === 0) return { ok: false, error: 'no changes provided' };
 
         if (scope === 'global') {
-          const globals = getGlobals(struct);
+          const globals = getGlobals(base);
           const idx = globals.findIndex((g) => (g.name || '').toLowerCase() === String(args.name).toLowerCase());
           if (idx < 0) return { ok: false, error: `global "${args.name}" not found` };
           const before = globals[idx];
           const after = { ...before, ...changes };
-          const next = withGlobals(struct, globals.map((g, i) => (i === idx ? after : g)));
+          const next = withGlobals(base, globals.map((g, i) => (i === idx ? after : g)));
           return {
             mutation: true, ok: true, summary: `Update global ${before.name}`,
-            diff: { kind: 'var-update', target: `global ${before.name}`, lines: [{ type: 'del', text: varLine(before) }, { type: 'add', text: varLine(after) }] }, next,
+            diff: { kind: 'var-update', target: `global ${before.name}`, lines: [...extraLines, { type: 'del', text: varLine(before) }, { type: 'add', text: varLine(after) }] }, next,
           };
         }
-        const hit = findPOU(struct, args.pou);
+        const hit = findPOU(base, args.pou);
         if (!hit) return { ok: false, error: `POU "${args.pou}" not found` };
         const vars = hit.item.content?.variables || [];
         const idx = vars.findIndex((x) => (x.name || '').toLowerCase() === String(args.name).toLowerCase());
         if (idx < 0) return { ok: false, error: `"${args.pou}" has no variable "${args.name}"` };
         const before = vars[idx];
         const after = { ...before, ...changes };
-        const next = withPOUContent(struct, hit.category, hit.index, { ...hit.item.content, variables: vars.map((x, i) => (i === idx ? after : x)) });
+        const next = withPOUContent(base, hit.category, hit.index, { ...hit.item.content, variables: vars.map((x, i) => (i === idx ? after : x)) });
         return {
           mutation: true, ok: true, summary: `Update ${hit.item.name}.${before.name}`,
-          diff: { kind: 'var-update', target: `${hit.item.name}.${before.name}`, lines: [{ type: 'del', text: varLine(before) }, { type: 'add', text: varLine(after) }] }, next,
+          diff: { kind: 'var-update', target: `${hit.item.name}.${before.name}`, lines: [...extraLines, { type: 'del', text: varLine(before) }, { type: 'add', text: varLine(after) }] }, next,
         };
       }
 
@@ -633,6 +773,76 @@ export function applyToolCall(struct, name, args = {}) {
         return {
           mutation: true, ok: true, summary: `Remove ${hit.item.name}.${before.name}`,
           diff: { kind: 'var-remove', target: `${hit.item.name}.${before.name}`, lines: [{ type: 'del', text: varLine(before) }] }, next,
+        };
+      }
+
+      case 'create_data_type': {
+        if (!args.name || !args.name.trim()) return { ok: false, error: 'name is required' };
+        if (!isValidIecName(args.name)) return { ok: false, error: `invalid data type name "${args.name}" — must be an IEC identifier (no spaces; can't start with a digit)` };
+        const trimmedName = args.name.trim();
+        if (SCALAR_IEC_TYPES.has(trimmedName.toUpperCase())) return { ok: false, error: `"${trimmedName}" is a reserved scalar IEC type name — pick a different name` };
+        if (findDataType(struct, trimmedName)) return { ok: false, error: `a data type named "${trimmedName}" already exists` };
+
+        const kind = String(args.kind || '').toUpperCase();
+        let dtType, content, summaryShape;
+        if (kind === 'ARRAY') {
+          const baseRaw = String(args.baseType || '').trim();
+          if (!baseRaw) return { ok: false, error: 'baseType is required for an ARRAY data type' };
+          const dims = Array.isArray(args.dimensions) ? args.dimensions : [];
+          if (dims.length === 0) return { ok: false, error: 'dimensions is required for an ARRAY data type (e.g. [{"min":0,"max":31}])' };
+          for (const d of dims) {
+            if (!Number.isFinite(d?.min) || !Number.isFinite(d?.max) || d.min > d.max)
+              return { ok: false, error: `invalid dimension ${JSON.stringify(d)} — min/max must be numbers with min <= max` };
+          }
+          // baseType may itself be a scalar, another data-type name, or an FB name.
+          const baseResolved = resolveVarType(struct, baseRaw);
+          if (!baseResolved.ok) return { ok: false, error: `baseType: ${baseResolved.error}` };
+          dtType = 'Array';
+          content = { baseType: baseResolved.type, dimensions: dims.map((d) => ({ id: newVarId(), min: d.min, max: d.max })) };
+          summaryShape = `ARRAY[${dims.map((d) => `${d.min}..${d.max}`).join(',')}] OF ${baseResolved.type}`;
+        } else if (kind === 'STRUCT') {
+          const members = Array.isArray(args.members) ? args.members : [];
+          if (members.length === 0) return { ok: false, error: 'members is required for a STRUCT data type' };
+          const seen = new Set();
+          const builtMembers = [];
+          for (const m of members) {
+            if (!m?.name || !isValidIecName(m.name)) return { ok: false, error: `invalid struct member name "${m?.name}"` };
+            const lname = m.name.trim().toLowerCase();
+            if (seen.has(lname)) return { ok: false, error: `duplicate struct member name "${m.name}"` };
+            seen.add(lname);
+            const memberResolved = resolveVarType(struct, m.type);
+            if (!memberResolved.ok) return { ok: false, error: `member "${m.name}": ${memberResolved.error}` };
+            builtMembers.push({ id: newVarId(), name: m.name.trim(), type: memberResolved.type, initialValue: m.initialValue ?? '' });
+          }
+          dtType = 'Structure';
+          content = { members: builtMembers };
+          summaryShape = `STRUCT { ${builtMembers.map((m) => `${m.name}:${m.type}`).join('; ')} }`;
+        } else if (kind === 'ENUM') {
+          const values = Array.isArray(args.values) ? args.values : [];
+          if (values.length === 0) return { ok: false, error: 'values is required for an ENUM data type' };
+          const seen = new Set();
+          const builtValues = [];
+          for (const raw of values) {
+            const vname = String(typeof raw === 'string' ? raw : raw?.name || '').trim();
+            if (!vname || !isValidIecName(vname)) return { ok: false, error: `invalid enum member name "${vname}"` };
+            const lname = vname.toLowerCase();
+            if (seen.has(lname)) return { ok: false, error: `duplicate enum member name "${vname}"` };
+            seen.add(lname);
+            builtValues.push({ id: newVarId(), name: vname, value: (typeof raw === 'object' && raw?.value != null) ? raw.value : '' });
+          }
+          dtType = 'Enumerated';
+          content = { values: builtValues };
+          summaryShape = `ENUM (${builtValues.map((v) => v.name).join(', ')})`;
+        } else {
+          return { ok: false, error: `kind must be ARRAY, STRUCT, or ENUM (got "${args.kind}")` };
+        }
+
+        const entry = { id: newVarId(), name: trimmedName, type: dtType, content };
+        const next = { ...struct, dataTypes: [...(struct.dataTypes || []), entry] };
+        return {
+          mutation: true, ok: true, summary: `Create data type ${trimmedName} = ${summaryShape}`,
+          diff: { kind: 'datatype-add', target: trimmedName, lines: [{ type: 'add', text: `${trimmedName} : ${summaryShape}` }] },
+          next,
         };
       }
 
