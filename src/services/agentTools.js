@@ -18,6 +18,8 @@
  * context but cannot change hardware.
  */
 
+import { isReservedTranspilerName } from '../utils/reservedNames';
+
 const POU_CATEGORIES = ['programs', 'functionBlocks', 'functions'];
 const RESOURCE_TYPE = 'RESOURCE_EDITOR';
 
@@ -406,6 +408,15 @@ export const TOOL_DEFS = [
     }, ['scope', 'name']),
   },
   {
+    name: 'check_compile',
+    description:
+      'Transpile the CURRENT project to C and run an actual compile (the same compile-check the toolbar\'s "Build" button performs, using the real bundled clang). ' +
+      'Use this when you cannot find the problem by reading the ST/LD source alone, or whenever the user explicitly asks you to check for compile/build errors. ' +
+      'On failure you get the real C compiler diagnostics (file:line:col, the offending generated-C line, and a caret) — read the error text for identifiers/values you recognize from the IEC source (a variable name, an FB instance, a struct member) to map it back to the actual POU/line the user should fix, then propose that fix. ' +
+      'On success it just confirms there are no compile errors — it does NOT prove the LOGIC is correct, only that it compiles.',
+    parameters: S({}),
+  },
+  {
     name: 'create_data_type',
     description:
       'Create a named ARRAY, STRUCT, or ENUM data type under the project\'s Data Types. ' +
@@ -518,6 +529,7 @@ export function applyToolCall(struct, name, args = {}) {
           : 'programs';
         if (!args.name || !args.name.trim()) return { ok: false, error: 'name is required' };
         if (!isValidIecName(args.name)) return { ok: false, error: `invalid name "${args.name}" — POU names must be IEC identifiers (letters, digits, underscore; no spaces; can't start with a digit)` };
+        if (isReservedTranspilerName(args.name)) return { ok: false, error: `"${args.name}" is reserved by the transpiler/runtime — pick a different POU name` };
         if (findPOU(struct, args.name)) return { ok: false, error: `a POU named "${args.name}" already exists` };
         const language = (args.language === 'LD' || args.language === 'SCL') ? args.language : 'ST';
         // LD + SCL store logic as rungs; ST stores a single code body.
@@ -543,6 +555,7 @@ export function applyToolCall(struct, name, args = {}) {
         if (!hit) return { ok: false, error: `POU "${args.name}" not found` };
         if (!args.newName || !args.newName.trim()) return { ok: false, error: 'newName is required' };
         if (!isValidIecName(args.newName)) return { ok: false, error: `invalid name "${args.newName}" — must be an IEC identifier (no spaces; can't start with a digit)` };
+        if (isReservedTranspilerName(args.newName)) return { ok: false, error: `"${args.newName}" is reserved by the transpiler/runtime — pick a different name` };
         if (findPOU(struct, args.newName)) return { ok: false, error: `name "${args.newName}" is already taken` };
         const list = struct[hit.category].map((p, i) => (i === hit.index ? { ...p, name: args.newName.trim() } : p));
         let next = { ...struct, [hit.category]: list };
@@ -670,6 +683,7 @@ export function applyToolCall(struct, name, args = {}) {
         const scope = args.scope === 'global' ? 'global' : 'local';
         if (!args.name || !args.name.trim()) return { ok: false, error: 'name is required' };
         if (!isValidIecName(args.name)) return { ok: false, error: `invalid variable name "${args.name}" — must be an IEC identifier (no spaces; can't start with a digit)` };
+        if (isReservedTranspilerName(args.name)) return { ok: false, error: `"${args.name}" is reserved by the transpiler/runtime (e.g. "S" is the internal PlcState pointer) — pick a different name` };
         const resolved = resolveVarType(struct, args.type);
         if (!resolved.ok) return { ok: false, error: resolved.error };
         // An inline "ARRAY[..] OF TYPE" got auto-recovered into a real named
@@ -707,7 +721,12 @@ export function applyToolCall(struct, name, args = {}) {
       case 'update_variable': {
         const scope = args.scope === 'global' ? 'global' : 'local';
         const changes = {};
-        if (args.newName != null) changes.name = String(args.newName).trim();
+        if (args.newName != null) {
+          const newName = String(args.newName).trim();
+          if (!isValidIecName(newName)) return { ok: false, error: `invalid variable name "${newName}" — must be an IEC identifier (no spaces; can't start with a digit)` };
+          if (isReservedTranspilerName(newName)) return { ok: false, error: `"${newName}" is reserved by the transpiler/runtime (e.g. "S" is the internal PlcState pointer) — pick a different name` };
+          changes.name = newName;
+        }
         if (args.initialValue != null) changes.initialValue = args.initialValue;
         if (args.address != null) changes.address = args.address;
         if (args.description != null) changes.description = args.description;
@@ -776,11 +795,18 @@ export function applyToolCall(struct, name, args = {}) {
         };
       }
 
+      case 'check_compile': {
+        const cc = args.__compile;
+        if (!cc) return { mutation: false, ok: true, result: { note: 'Compile check unavailable — host-agent not reachable or project not open.' } };
+        return { mutation: false, ok: true, result: cc };
+      }
+
       case 'create_data_type': {
         if (!args.name || !args.name.trim()) return { ok: false, error: 'name is required' };
         if (!isValidIecName(args.name)) return { ok: false, error: `invalid data type name "${args.name}" — must be an IEC identifier (no spaces; can't start with a digit)` };
         const trimmedName = args.name.trim();
         if (SCALAR_IEC_TYPES.has(trimmedName.toUpperCase())) return { ok: false, error: `"${trimmedName}" is a reserved scalar IEC type name — pick a different name` };
+        if (isReservedTranspilerName(trimmedName)) return { ok: false, error: `"${trimmedName}" is reserved by the transpiler/runtime — pick a different name` };
         if (findDataType(struct, trimmedName)) return { ok: false, error: `a data type named "${trimmedName}" already exists` };
 
         const kind = String(args.kind || '').toUpperCase();

@@ -6,6 +6,7 @@ import { formatTimeUs } from '../utils/plcStandards';
 import { blockConfig } from './RungContainer';
 import { writeClipboard, readClipboard, useKronClipboard, CLIP_KIND } from '../utils/kronClipboard';
 import { setEditorScope, getEditorScope, EDITOR_SCOPE } from '../utils/editorScope';
+import { isReservedTranspilerName } from '../utils/reservedNames';
 
 const ALL_CLASSES = ['Local', 'Global', 'Input', 'Output', 'InOut', 'Temp'];
 
@@ -381,6 +382,14 @@ const VariableManager = ({
     if (!trimmed) return;
     const currentVar = variables.find(v => v.id === id);
     if (!currentVar || currentVar.name === trimmed) return;
+    // Block names the transpiler/runtime reserve at C file scope (e.g. "S" is
+    // the internal PlcState pointer) — using one produces broken generated C
+    // that only fails at compile time (see reservedNames.js for the full list
+    // and why).
+    if (isReservedTranspilerName(trimmed)) {
+      alert(`"${trimmed}" is reserved by the transpiler/runtime and can't be used as a variable name.`);
+      return;
+    }
     // Block duplicate within same scope
     if (variables.some(v => v.id !== id && v.name === trimmed)) {
       alert(t('errors.varExistsScope', { name: trimmed }));

@@ -482,6 +482,7 @@ function buildSystemPrompt(projectStructure, board, activeItem, libraryData = []
     '- While the program is RUNNING, read_live_variables returns the current values AND a buffered time-series `history` per variable (min/max/last, change count, flags like constant/oscillating/rising/falling, a recent sample series). Read it to diagnose real behaviour (a value stuck, oscillating, drifting, out of range) BEFORE proposing a fix, and refer to the concrete numbers when you explain the problem.',
     '- For TIME-DEPENDENT behaviour use watch_live_variables: it actively WAITS a real window and returns a per-variable summary, and EACH variable can be watched for its own duration (e.g. watch a 5 s timer output for 12 s but a fast pulse for 2 s). read_live_variables is just an instant snapshot; watch_live_variables is for "does it toggle / settle / ramp over time". There is NO fixed cap — pick whatever window the behaviour under diagnosis actually needs (a few seconds for a fast pulse, minutes for a slow ramp/drift/long sequence), but default to the SHORTEST window that answers the question; do not pick a long duration "just in case". The user sees a live elapsed-time counter while you watch and can stop it early, so an overly long pick wastes their time waiting on you, not just yours.',
     '- VERIFY-AFTER-CHANGE LOOP: live monitoring is automatic whenever the program is running (simulation or a connected PLC) — your edits are committed to the project on approval, but to take effect on the RUNNING target they must be DEPLOYED by the user (Build & Send). When the program is running, after your change is in effect call watch_live_variables on the variables your fix targets, compare the observed behaviour against what the user asked for, and report explicitly whether the desired result was achieved (if not, propose another fix). If the live values do NOT yet reflect your change, it has not been deployed — tell the user to Build & Send. Keep watch durations only as long as needed.',
+    '- C-LEVEL DIAGNOSTICS: call check_compile to transpile the project to C and run the REAL bundled clang on it. Use it when (a) you cannot spot the problem by reading the ST/LD source, or (b) the user asks you to check for compile/build errors. On failure the result contains the raw compiler output (file:line:col + offending C line + caret) — scan it for identifiers, FB names, or struct members you recognise from the IEC source to pinpoint which POU/line to fix, then propose and apply the fix. On success it confirms no compile errors exist (NOT that the logic is correct). Do NOT call it as a routine "verification" after every change — it is a diagnostic tool for when source-level reading is insufficient.',
     '',
     `Board: ${board || 'none'}. Currently open POU: ${active}.`,
     `POUs (${overview.pous.length}): ${pous}.`,
@@ -504,6 +505,7 @@ export default function AiAgentPanel({
   hotSwapActive = false,       // a live hot-swap session is running
   onStartHotSwap = null,       // () → build+run a hot-swap session (online change)
   onStopHotSwap = null,        // () → stop the hot-swap session
+  onCheckCompile = null,       // async () → transpile + compile; returns {ok, stage, message?, error?, log?, errors?}
 }) {
   const [config, setConfig] = useState(loadConfig);
   const [configOpen, setConfigOpen] = useState(false);
@@ -934,6 +936,16 @@ export default function AiAgentPanel({
         }
       }
       if (controller.signal.aborted) break;
+      if (tc.name === 'check_compile') {
+        pushView({ role: 'note', text: 'Transpiling and compiling — checking for C compiler errors…' });
+        if (onCheckCompile) {
+          try {
+            args.__compile = await onCheckCompile();
+          } catch (e) {
+            args.__compile = { ok: false, stage: 'compile', error: e?.message || String(e), log: '' };
+          }
+        }
+      }
       if (tc.name === 'list_blocks') args.__library = libraryData;
       // Repair a missing/unresolvable local-scope POU target from context.
       if (needsLocalPou(tc.name, args) && !findPOU(working, args.pou)) {

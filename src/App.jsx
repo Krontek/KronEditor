@@ -24,6 +24,7 @@ import {
 import SaveConfirmDialog from './components/SaveConfirmDialog';
 import VisualizationEditor from './components/visualization/VisualizationEditor';
 import { getEditorScope, EDITOR_SCOPE } from './utils/editorScope';
+import { isReservedTranspilerName } from './utils/reservedNames';
 import { getBoardById } from './utils/boardDefinitions';
 import { getBoardFamilyDefine } from './utils/devicePortMapping';
 import { buildHardwarePortVars } from './utils/hwPortVars';
@@ -1444,6 +1445,32 @@ function App() {
     }
   };
 
+  const handleAgentCheckCompile = useCallback(async () => {
+    const stErrors = validateProjectST(projectStructure, [], hwPortVars);
+    if (stErrors.length > 0) {
+      return {
+        ok: false,
+        stage: 'st-validation',
+        errors: stErrors.map(e => `[${e.context}] Line ${e.line}:${e.column} — ${e.word}`),
+        note: `${stErrors.length} ST identifier error(s) found before reaching the C compiler.`,
+      };
+    }
+    try {
+      const standardHeaders = await host.getStandardHeaders().catch(() => []);
+      const cCode = transpileToC(projectStructure, standardHeaders, selectedBoard, true, buses, busConfigs);
+      await host.writePlcFiles({
+        header: cCode.header,
+        source: cCode.source,
+        variableTable: JSON.stringify(cCode.variableTable, null, 2),
+        hal: cCode.hal || '',
+      });
+      await host.compileSimulation();
+      return { ok: true, stage: 'compile', message: 'Compiled successfully — no errors.' };
+    } catch (err) {
+      return { ok: false, stage: 'compile', error: err.message || String(err), log: err.log || '' };
+    }
+  }, [projectStructure, selectedBoard, buses, busConfigs, hwPortVars]);
+
   const handleBuildAndSend = async () => {
     if (!checkTaskAssignments()) return;
     if (!isPlcConnected || !plcAddress) {
@@ -1695,6 +1722,13 @@ function App() {
     // stray whitespace so names like "Program0 " never reach the project (they
     // break the C symbol mapping and POU lookups).
     const name = String(rawName || '').trim().replace(/\s+/g, '_');
+
+    // Block names the transpiler/runtime reserve at C file scope (e.g. "S" is
+    // the internal PlcState pointer) — see reservedNames.js for the full list.
+    if (isReservedTranspilerName(name)) {
+      alert(`"${name}" is reserved by the transpiler/runtime and can't be used as a name.`);
+      return false;
+    }
 
     // Check if name already exists in this category
     const isDuplicate = projectStructure[category].some(item =>
@@ -2745,6 +2779,7 @@ function App() {
                         hotSwapActive={isHotSwap}
                         onStartHotSwap={startHotSwapSession}
                         onStopHotSwap={stopHotSwapSession}
+                        onCheckCompile={handleAgentCheckCompile}
                       />
                     </div>
                   )}
