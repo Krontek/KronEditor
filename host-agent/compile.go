@@ -230,6 +230,9 @@ func (s *Server) compileForTarget(req *compileForTargetReq) (string, string, err
 	if req.BoardID == "rpi_5" {
 		args = append(args, `-DKRON_GPIO_CHIP="/dev/gpiochip4"`)
 	}
+	if strings.HasPrefix(req.BoardID, "jetson_orin") || strings.HasPrefix(req.BoardID, "jetson_agx_orin") {
+		args = append(args, "-DKRON_JETSON_ORIN=1")
+	}
 
 	needsEC := strings.Contains(req.Source, "kron_ec_init(") ||
 		strings.Contains(req.Source, "kron_ec_pdo_read(") ||

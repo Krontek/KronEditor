@@ -217,6 +217,10 @@ func corsMiddleware(next http.Handler) http.Handler {
 				"Grpc-Timeout, X-Grpc-Web, X-User-Agent")
 		w.Header().Set("Access-Control-Expose-Headers",
 			"Grpc-Status, Grpc-Message, Grpc-Status-Details-Bin")
+		// Chrome 98+ Private Network Access: requests from http://localhost to a
+		// private-range IP (192.168.x.x, 10.x.x.x, …) are blocked unless the
+		// server echoes this header in the CORS preflight response.
+		w.Header().Set("Access-Control-Allow-Private-Network", "true")
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)
 			return

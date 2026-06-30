@@ -368,7 +368,17 @@ function App() {
   useEffect(() => {
     if (!plcAddress || !connectionEnabled) {
       setIsPlcConnected(false);
+      // Clear the client so reconnect (possibly to a new IP) always gets a fresh one.
+      if (plcClientRef.current) {
+        plcClientRef.current.close();
+        plcClientRef.current = null;
+      }
       return;
+    }
+    // If the address changed while still connected, replace the stale client.
+    if (plcClientRef.current && plcClientRef.current._base !== `http://${plcAddress}`) {
+      plcClientRef.current.close();
+      plcClientRef.current = null;
     }
     // Hysteresis: require 2 consecutive failures before flipping to "Disconnected".
     // Single-packet jitter / agent under load shouldn't blink the indicator.
@@ -1445,32 +1455,6 @@ function App() {
     }
   };
 
-  const handleAgentCheckCompile = useCallback(async () => {
-    const stErrors = validateProjectST(projectStructure, [], hwPortVars);
-    if (stErrors.length > 0) {
-      return {
-        ok: false,
-        stage: 'st-validation',
-        errors: stErrors.map(e => `[${e.context}] Line ${e.line}:${e.column} — ${e.word}`),
-        note: `${stErrors.length} ST identifier error(s) found before reaching the C compiler.`,
-      };
-    }
-    try {
-      const standardHeaders = await host.getStandardHeaders().catch(() => []);
-      const cCode = transpileToC(projectStructure, standardHeaders, selectedBoard, true, buses, busConfigs);
-      await host.writePlcFiles({
-        header: cCode.header,
-        source: cCode.source,
-        variableTable: JSON.stringify(cCode.variableTable, null, 2),
-        hal: cCode.hal || '',
-      });
-      await host.compileSimulation();
-      return { ok: true, stage: 'compile', message: 'Compiled successfully — no errors.' };
-    } catch (err) {
-      return { ok: false, stage: 'compile', error: err.message || String(err), log: err.log || '' };
-    }
-  }, [projectStructure, selectedBoard, buses, busConfigs, hwPortVars]);
-
   const handleBuildAndSend = async () => {
     if (!checkTaskAssignments()) return;
     if (!isPlcConnected || !plcAddress) {
@@ -2044,6 +2028,32 @@ function App() {
     () => buildHardwarePortVars(deviceInterfaceConfig, getBoardFamilyDefine(selectedBoard)),
     [deviceInterfaceConfig, selectedBoard]
   );
+
+  const handleAgentCheckCompile = useCallback(async () => {
+    const stErrors = validateProjectST(projectStructure, [], hwPortVars);
+    if (stErrors.length > 0) {
+      return {
+        ok: false,
+        stage: 'st-validation',
+        errors: stErrors.map(e => `[${e.context}] Line ${e.line}:${e.column} — ${e.word}`),
+        note: `${stErrors.length} ST identifier error(s) found before reaching the C compiler.`,
+      };
+    }
+    try {
+      const standardHeaders = await host.getStandardHeaders().catch(() => []);
+      const cCode = transpileToC(projectStructure, standardHeaders, selectedBoard, true, buses, busConfigs);
+      await host.writePlcFiles({
+        header: cCode.header,
+        source: cCode.source,
+        variableTable: JSON.stringify(cCode.variableTable, null, 2),
+        hal: cCode.hal || '',
+      });
+      await host.compileSimulation();
+      return { ok: true, stage: 'compile', message: 'Compiled successfully — no errors.' };
+    } catch (err) {
+      return { ok: false, stage: 'compile', error: err.message || String(err), log: err.log || '' };
+    }
+  }, [projectStructure, selectedBoard, buses, busConfigs, hwPortVars]);
 
   const boardBlocks = useMemo(() => {
     if (!selectedBoard) return [];

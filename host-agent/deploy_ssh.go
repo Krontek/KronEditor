@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -266,12 +267,10 @@ func startCronSupervisor(client *ssh.Client, sudo, remoteDir string) {
 
 // tofuHostKeyCallback returns a trust-on-first-use host-key verifier backed by
 // an agent-managed known_hosts file (AppDataDir/known_hosts):
-//   - unknown host  → accept and remember it (so a never-before-SSH'd device
-//     just works on the first deploy, like answering "yes" to the ssh prompt);
-//   - known host, same key → accept;
-//   - known host, DIFFERENT key → reject with a clear message (possible MITM, or
-//     the device was reinstalled — the user removes the line to re-trust).
-// This is both first-time-friendly AND safer than ignoring keys outright.
+//   - unknown host       → accept and remember (first deploy to a new device just works)
+//   - known host, same key → accept
+//   - known host, DIFFERENT key → remove the stale entry, persist the new key, and
+//     accept (device was reinstalled/re-imaged; auto-retrust is intentional)
 func (s *Server) tofuHostKeyCallback(progress func(string)) (ssh.HostKeyCallback, error) {
 	path := filepath.Join(s.paths.AppDataDir, "known_hosts")
 	if _, err := os.Stat(path); os.IsNotExist(err) {
@@ -292,26 +291,60 @@ func (s *Server) tofuHostKeyCallback(progress func(string)) (ssh.HostKeyCallback
 			return nil
 		}
 		var keyErr *knownhosts.KeyError
-		if errors.As(err, &keyErr) {
-			if len(keyErr.Want) == 0 {
-				// First time we see this host → trust and persist it.
-				line := knownhosts.Line([]string{knownhosts.Normalize(hostname)}, key)
-				f, oerr := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o600)
-				if oerr != nil {
-					return oerr
-				}
-				defer f.Close()
-				if _, werr := f.WriteString(line + "\n"); werr != nil {
-					return werr
-				}
-				progress(fmt.Sprintf("New host %s — trusting its key (%s) on first use.", hostname, key.Type()))
-				return nil
-			}
-			// Host known but the key changed.
-			return fmt.Errorf("host key for %s changed (possible man-in-the-middle, or the device was reinstalled). To re-trust, remove its line from %s", hostname, path)
+		if !errors.As(err, &keyErr) {
+			return err
 		}
-		return err
+		norm := knownhosts.Normalize(hostname)
+		if len(keyErr.Want) > 0 {
+			// Stale key (device reinstalled) — remove old line(s) for this host,
+			// then fall through to append the new key below.
+			if rerr := removeKnownHostsEntry(path, norm); rerr != nil {
+				return fmt.Errorf("could not update known_hosts for %s: %w", hostname, rerr)
+			}
+			progress(fmt.Sprintf("Host %s key changed (device reinstalled?) — updating stored key.", hostname))
+		}
+		// First-use or just-cleared entry → trust and persist the new key.
+		line := knownhosts.Line([]string{norm}, key)
+		f, oerr := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o600)
+		if oerr != nil {
+			return oerr
+		}
+		defer f.Close()
+		if _, werr := f.WriteString(line + "\n"); werr != nil {
+			return werr
+		}
+		if len(keyErr.Want) == 0 {
+			progress(fmt.Sprintf("New host %s — trusting its key (%s) on first use.", hostname, key.Type()))
+		}
+		return nil
 	}, nil
+}
+
+// removeKnownHostsEntry removes all lines that match the given normalized
+// hostname from the known_hosts file (rewrites in place).
+func removeKnownHostsEntry(path, norm string) error {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	var kept []byte
+	for _, raw := range bytes.Split(data, []byte("\n")) {
+		line := string(raw)
+		// A known_hosts line starts with the hostname (possibly hashed or
+		// comma-separated). Skip any line whose first field contains our host.
+		fields := strings.Fields(line)
+		if len(fields) >= 3 {
+			for _, h := range strings.Split(fields[0], ",") {
+				if strings.EqualFold(h, norm) {
+					goto skip
+				}
+			}
+		}
+		kept = append(kept, raw...)
+		kept = append(kept, '\n')
+	skip:
+	}
+	return os.WriteFile(path, bytes.TrimRight(kept, "\n"), 0o600)
 }
 
 // httpStatusOK GETs a URL and returns nil only on a 2xx response.

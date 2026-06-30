@@ -39,9 +39,9 @@ const BOARD_CHANNELS = {
   jetson_tx2:        { PWM: 2, SPI: 1, I2C: 2, UART: 4, CAN: 1, USB: 4 },
   jetson_xavier_nx:  { PWM: 2, SPI: 1, I2C: 2, UART: 4, CAN: 1, USB: 4 },
   jetson_agx_xavier: { PWM: 2, SPI: 1, I2C: 2, UART: 4, CAN: 2, USB: 3 },
-  jetson_orin_nano:  { PWM: 2, SPI: 1, I2C: 2, UART: 4, CAN: 1, USB: 5 },
-  jetson_orin_nx:    { PWM: 2, SPI: 1, I2C: 2, UART: 4, CAN: 1, USB: 5 },
-  jetson_agx_orin:   { PWM: 2, SPI: 1, I2C: 2, UART: 4, CAN: 2, USB: 5 },
+  jetson_orin_nano:  { PWM: 3, SPI: 1, I2C: 2, UART: 4, CAN: 1, USB: 5 },
+  jetson_orin_nx:    { PWM: 3, SPI: 1, I2C: 2, UART: 4, CAN: 1, USB: 5 },
+  jetson_agx_orin:   { PWM: 3, SPI: 1, I2C: 2, UART: 4, CAN: 2, USB: 5 },
 };
 
 // ─── Block templates per interface ──────────────────────────────────────────
@@ -105,14 +105,14 @@ const INTERFACE_BLOCKS = {
         blocks.push({
           blockType: `PWM${i}`,
           label: `PWM${i}`,
-          desc: `PWM Channel ${i} – Set duty cycle and frequency`,
+          desc: `PWM Channel ${i} – FREQ: Hz (e.g. 1000.0 = 1 kHz, 50.0 = servo), DUTY: % (0.0–100.0)`,
           inputs: [
-            { name: 'DUTY', type: 'REAL', default: '0.0' },
-            { name: 'FREQ', type: 'REAL', default: '1000.0' },
-            { name: 'EN', type: 'BOOL', default: 'TRUE' },
+            { name: 'DUTY', type: 'REAL', default: '0.0',    desc: 'Duty cycle (0.0–100.0 %)' },
+            { name: 'FREQ', type: 'REAL', default: '1000.0', desc: 'Frequency in Hz (e.g. 1000.0 = 1 kHz)' },
+            { name: 'EN',   type: 'BOOL', default: 'TRUE' },
           ],
           outputs: [
-            { name: 'ENO', type: 'BOOL' },
+            { name: 'ENO',    type: 'BOOL' },
             { name: 'ACTIVE', type: 'BOOL' },
           ],
           class: 'FunctionBlock',

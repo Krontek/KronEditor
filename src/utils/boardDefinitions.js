@@ -235,6 +235,56 @@ const JETSON_40PIN_HEADER = [
   { pin: 40, name: 'I2S_DOUT',  type: 'gpio',   alt: 'I2S / GPIO', color: '#4caf50' },
 ];
 
+// Jetson Orin Nano/NX/AGX Orin 40-pin header (Tegra234, AliCam overlay)
+// GPIO: SPI3→GPIO pins 13/16/18/22/37 (port Y, gpiochip0 lines 192-196).
+// PWM (verified on device): pin 15→pwm1/pwmchip0 (3280000.pwm), pin 32→pwm7/pwmchip3 (32e0000.pwm),
+//                            pin 33→pwm5/pwmchip2 (32c0000.pwm). Note: pwmchipN shifts per boot;
+//                            HAL resolves by controller address symlink, not chip number.
+// I2C: pins 3/5 (I2C8, bus 8) and 27/28 (I2C2, bus 2) on AON gpiochip1.
+// UART1: pins 8/10/11/36. SPI1: pins 19/21/23/24/26.
+const ORIN_40PIN_HEADER = [
+  { pin: 1,  name: '3V3',       type: 'power',  color: '#ff6b35' },
+  { pin: 2,  name: '5V',        type: 'power',  color: '#ff0000' },
+  { pin: 3,  name: 'I2C_SDA',   type: 'gpio',   alt: 'I2C8 SDA (bus 8)', color: '#4a90d9' },
+  { pin: 4,  name: '5V',        type: 'power',  color: '#ff0000' },
+  { pin: 5,  name: 'I2C_SCL',   type: 'gpio',   alt: 'I2C8 SCL (bus 8)', color: '#4a90d9' },
+  { pin: 6,  name: 'GND',       type: 'ground', color: '#333333' },
+  { pin: 7,  name: 'AUD_MCLK',  type: 'gpio',   alt: 'Audio MCLK (pac6)', color: '#4caf50' },
+  { pin: 8,  name: 'UART_TX',   type: 'gpio',   alt: 'UART1 TX (pr2)', color: '#9c27b0' },
+  { pin: 9,  name: 'GND',       type: 'ground', color: '#333333' },
+  { pin: 10, name: 'UART_RX',   type: 'gpio',   alt: 'UART1 RX (pr3)', color: '#9c27b0' },
+  { pin: 11, name: 'UART_RTS',  type: 'gpio',   alt: 'UART1 RTS (pr4)', color: '#9c27b0' },
+  { pin: 12, name: 'I2S_CLK',   type: 'gpio',   alt: 'I2S2 SCLK (ph7)', color: '#4caf50' },
+  { pin: 13, name: 'GPIO_PY0',  type: 'gpio',   alt: 'GPIO (py0 line 192)', color: '#4caf50' },
+  { pin: 14, name: 'GND',       type: 'ground', color: '#333333' },
+  { pin: 15, name: 'PWM0',      type: 'gpio',   alt: 'PWM0 – pwm1 controller (3280000.pwm) → pin 15', color: '#ff9800' },
+  { pin: 16, name: 'GPIO_PY4',  type: 'gpio',   alt: 'GPIO (py4 line 196)', color: '#4caf50' },
+  { pin: 17, name: '3V3',       type: 'power',  color: '#ff6b35' },
+  { pin: 18, name: 'GPIO_PY3',  type: 'gpio',   alt: 'GPIO (py3 line 195)', color: '#4caf50' },
+  { pin: 19, name: 'SPI_MOSI',  type: 'gpio',   alt: 'SPI1 MOSI (pz5)', color: '#ff9800' },
+  { pin: 20, name: 'GND',       type: 'ground', color: '#333333' },
+  { pin: 21, name: 'SPI_MISO',  type: 'gpio',   alt: 'SPI1 MISO (pz4)', color: '#ff9800' },
+  { pin: 22, name: 'GPIO_PY1',  type: 'gpio',   alt: 'GPIO (py1 line 193)', color: '#4caf50' },
+  { pin: 23, name: 'SPI_SCK',   type: 'gpio',   alt: 'SPI1 SCLK (pz3)', color: '#ff9800' },
+  { pin: 24, name: 'SPI_CS0',   type: 'gpio',   alt: 'SPI1 CS0 (pz6)', color: '#ff9800' },
+  { pin: 25, name: 'GND',       type: 'ground', color: '#333333' },
+  { pin: 26, name: 'SPI_CS1',   type: 'gpio',   alt: 'SPI1 CS1 (pz7)', color: '#ff9800' },
+  { pin: 27, name: 'I2C0_SDA',  type: 'gpio',   alt: 'I2C2 SDA (bus 2)', color: '#607d8b' },
+  { pin: 28, name: 'I2C0_SCL',  type: 'gpio',   alt: 'I2C2 SCL (bus 2)', color: '#607d8b' },
+  { pin: 29, name: 'MCLK3',     type: 'gpio',   alt: 'extperiph3 CLK (pq5)', color: '#4caf50' },
+  { pin: 30, name: 'GND',       type: 'ground', color: '#333333' },
+  { pin: 31, name: 'MCLK4',     type: 'gpio',   alt: 'extperiph4 CLK (pq6)', color: '#4caf50' },
+  { pin: 32, name: 'PWM1',      type: 'gpio',   alt: 'PWM1 – pwm7 controller (32e0000.pwm) → pin 32', color: '#ff9800' },
+  { pin: 33, name: 'PWM2',      type: 'gpio',   alt: 'PWM2 – pwm5 controller (32c0000.pwm) → pin 33', color: '#ff9800' },
+  { pin: 34, name: 'GND',       type: 'ground', color: '#333333' },
+  { pin: 35, name: 'I2S_FS',    type: 'gpio',   alt: 'I2S2 FS (pi2)', color: '#4caf50' },
+  { pin: 36, name: 'UART_CTS',  type: 'gpio',   alt: 'UART1 CTS (pr5)', color: '#9c27b0' },
+  { pin: 37, name: 'GPIO_PY2',  type: 'gpio',   alt: 'GPIO (py2 line 194)', color: '#4caf50' },
+  { pin: 38, name: 'I2S_DIN',   type: 'gpio',   alt: 'I2S2 DIN (pi1)', color: '#4caf50' },
+  { pin: 39, name: 'GND',       type: 'ground', color: '#333333' },
+  { pin: 40, name: 'I2S_DOUT',  type: 'gpio',   alt: 'I2S2 DOUT (pi0)', color: '#4caf50' },
+];
+
 // BeagleBone P8 header
 const BB_P8_HEADER = [
   { pin: 1,  name: 'GND',       type: 'ground', color: '#333333' },
@@ -644,7 +694,7 @@ export const BOARD_FAMILIES = [
         gpio: 40,
         usb: '4x USB 3.2 Gen 2, 1x USB 2.0 Micro-B',
         display: 'HDMI 2.1, DP 1.4',
-        pinout: JETSON_40PIN_HEADER,
+        pinout: ORIN_40PIN_HEADER,
         pinLayout: 'rpi40',
         interfaces: ['GPIO', 'I2C', 'SPI', 'UART', 'PWM', 'CAN', 'USB'],
         usbPorts: [
@@ -666,7 +716,7 @@ export const BOARD_FAMILIES = [
         gpio: 40,
         usb: '4x USB 3.2 Gen 2, 1x USB 2.0 Micro-B',
         display: 'HDMI 2.1, DP 1.4',
-        pinout: JETSON_40PIN_HEADER,
+        pinout: ORIN_40PIN_HEADER,
         pinLayout: 'rpi40',
         interfaces: ['GPIO', 'I2C', 'SPI', 'UART', 'PWM', 'CAN', 'USB'],
         usbPorts: [
@@ -688,7 +738,7 @@ export const BOARD_FAMILIES = [
         gpio: 40,
         usb: '4x USB 3.2 Gen 2 Type-A, 1x USB 3.2 Gen 2 Type-C',
         display: 'HDMI 2.1, DP 1.4, eDP 1.4',
-        pinout: JETSON_40PIN_HEADER,
+        pinout: ORIN_40PIN_HEADER,
         pinLayout: 'rpi40',
         interfaces: ['GPIO', 'I2C', 'SPI', 'UART', 'PWM', 'CAN', 'USB'],
         usbPorts: [
