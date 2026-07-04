@@ -9,6 +9,19 @@
  */
 
 export const BOARD_PORT_DETAILS = {
+  // NOTE: HAL_BOARD_FAMILY_RPI is also used by the third-party aarch64 SBC
+  // families (Orange Pi, Radxa, Odroid, Banana Pi, Libre Computer, Pine64 —
+  // see getBoardFamilyDefine below), which reuse the generic Linux HAL. The
+  // device paths here are the Raspberry Pi defaults and are a functional
+  // starting point, but the real bus numbers differ per SoC, e.g.:
+  //   - Rockchip (RK33xx/RK35xx): header UART is typically /dev/ttyS2 (RK3399)
+  //     or /dev/ttyS0..9 (RK3566/3568/3588); header I2C is often /dev/i2c-2,
+  //     /dev/i2c-3 or /dev/i2c-7 depending on the enabled overlay.
+  //   - Amlogic (S905X/S905X3/S922X): UARTs appear as /dev/ttyAML0..2 and
+  //     header I2C is usually /dev/i2c-0 or /dev/i2c-1.
+  //   - Allwinner (H618): UARTs are /dev/ttyS0..5, header I2C /dev/i2c-1..4.
+  // Check `ls /dev/i2c-* /dev/spidev* /dev/ttyS*` on the target and enable
+  // the vendor overlay for the bus wired to the 40-pin header.
   HAL_BOARD_FAMILY_RPI: {
     I2C: {
       I2C_1: { path: '/dev/i2c-1', pins: { SDA: 'Pin 3 / GPIO2', SCL: 'Pin 5 / GPIO3' } },
@@ -105,7 +118,12 @@ export const BOARD_PORT_MAP = Object.fromEntries(
   ])
 );
 
-/** All Linux board families that support device FB code generation. */
+/**
+ * All Linux board families that support device FB code generation.
+ * The third-party aarch64 SBC vendors (Orange Pi, Radxa, Odroid, Banana Pi,
+ * Libre Computer, Pine64) resolve to HAL_BOARD_FAMILY_RPI, so they are
+ * covered by this set without extra entries.
+ */
 export const LINUX_BOARD_FAMILIES = new Set([
   'HAL_BOARD_FAMILY_RPI',
   'HAL_BOARD_FAMILY_JETSON',
@@ -215,5 +233,16 @@ export const getBoardFamilyDefine = (boardId) => {
   if (boardId.startsWith('rpi_'))    return 'HAL_BOARD_FAMILY_RPI';
   if (boardId.startsWith('bb_'))     return 'HAL_BOARD_FAMILY_BB';
   if (boardId.startsWith('jetson_')) return 'HAL_BOARD_FAMILY_JETSON';
+  // Third-party aarch64 Linux SBCs (Orange Pi, Radxa, Odroid, Banana Pi,
+  // Libre Computer, Pine64) reuse the generic Linux userspace HAL
+  // (kronhal_rpi.h: gpiod + /dev/i2c-* + /dev/spidev* + /dev/tty*) until a
+  // board-specific HAL family is written. Their real bus numbers may differ
+  // from the RPi defaults in BOARD_PORT_DETAILS — see the note there.
+  if (boardId.startsWith('opi_'))    return 'HAL_BOARD_FAMILY_RPI';
+  if (boardId.startsWith('radxa_'))  return 'HAL_BOARD_FAMILY_RPI';
+  if (boardId.startsWith('odroid_')) return 'HAL_BOARD_FAMILY_RPI';
+  if (boardId.startsWith('bpi_'))    return 'HAL_BOARD_FAMILY_RPI';
+  if (boardId.startsWith('libre_'))  return 'HAL_BOARD_FAMILY_RPI';
+  if (boardId.startsWith('pine_'))   return 'HAL_BOARD_FAMILY_RPI';
   return null;
 };

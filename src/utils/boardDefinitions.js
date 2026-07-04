@@ -45,6 +45,14 @@ const RPI_40PIN_HEADER = [
   { pin: 40, name: 'GPIO21',   type: 'gpio',   alt: 'SPI1 SCLK', color: '#4caf50' },
 ];
 
+// Generic 40-pin RPi-compatible header, shared by third-party aarch64 SBCs
+// (Orange Pi, Radxa, Odroid, Banana Pi, Libre Computer, Pine64). These boards
+// advertise Raspberry Pi-compatible 40-pin headers, so the RPi layout is used
+// as a close-enough visual reference. Signal names are indicative only —
+// actual gpiochip line offsets and bus numbers are SoC-specific; run
+// `gpioinfo` / check /dev/i2c-* and /dev/ttyS* on the target to confirm.
+const GENERIC_40PIN_HEADER = RPI_40PIN_HEADER;
+
 // Raspberry Pi 5 40-pin GPIO Header — RP1 I/O controller.
 // PWM: 2 logical channels (PWM0, PWM1). Each channel can be routed to
 // exactly one of two candidate GPIOs, so PWM0 is EITHER on GPIO12 OR on
@@ -747,6 +755,298 @@ export const BOARD_FAMILIES = [
           { id: 'USB_2', type: 'USB 3.2 Gen 2', connector: 'Type-A' },
           { id: 'USB_3', type: 'USB 3.2 Gen 2', connector: 'Type-A' },
           { id: 'USB_4', type: 'USB 3.2 Gen 2', connector: 'Type-C' },
+        ],
+      },
+    ]
+  },
+  // ── Third-party aarch64 Linux SBC families ─────────────────────────────────
+  // These vendors are grouped as separate display families, but their board-id
+  // prefixes (opi_, radxa_, odroid_, bpi_, libre_, pine_) all map to
+  // HAL_BOARD_FAMILY_RPI in getBoardFamilyDefine: they reuse the generic Linux
+  // userspace HAL (kronhal_rpi.h — gpiod, /dev/i2c-*, /dev/spidev*, /dev/tty*)
+  // until board-specific HAL headers are written. All boards are aarch64, so
+  // the host-agent's default compile triple (aarch64-linux-gnu) and the
+  // prebuilt aarch64 server binary apply without changes.
+  {
+    name: 'Orange Pi',
+    icon: '🍊',
+    boards: [
+      {
+        id: 'opi_5',
+        name: 'Orange Pi 5',
+        cpu: 'Rockchip RK3588S (4x Cortex-A76 @ 2.4GHz + 4x Cortex-A55)',
+        arch: 'aarch64',
+        ram: '4GB / 8GB / 16GB LPDDR4X',
+        storage: 'microSD / M.2 NVMe',
+        connectivity: 'Gigabit Ethernet',
+        gpio: 40,
+        usb: '1x USB 3.0, 2x USB 2.0, 1x USB-C 3.0',
+        display: 'HDMI 2.1 (8K)',
+        pinout: GENERIC_40PIN_HEADER,
+        pinLayout: 'rpi40',
+        interfaces: ['GPIO', 'I2C', 'SPI', 'UART', 'PWM', 'USB'],
+        usbPorts: [
+          { id: 'USB_0', type: 'USB 3.0', connector: 'Type-A' },
+          { id: 'USB_1', type: 'USB 2.0', connector: 'Type-A' },
+          { id: 'USB_2', type: 'USB 2.0', connector: 'Type-A' },
+          { id: 'USB_3', type: 'USB 3.0', connector: 'Type-C' },
+        ],
+      },
+      {
+        id: 'opi_5_plus',
+        name: 'Orange Pi 5 Plus',
+        cpu: 'Rockchip RK3588 (4x Cortex-A76 @ 2.4GHz + 4x Cortex-A55)',
+        arch: 'aarch64',
+        ram: '4GB – 32GB LPDDR4X',
+        storage: 'eMMC socket / microSD / M.2 NVMe',
+        connectivity: '2x 2.5G Ethernet',
+        gpio: 40,
+        usb: '2x USB 3.0, 2x USB 2.0, 1x USB-C 3.0',
+        display: '2x HDMI 2.1 (8K)',
+        pinout: GENERIC_40PIN_HEADER,
+        pinLayout: 'rpi40',
+        interfaces: ['GPIO', 'I2C', 'SPI', 'UART', 'PWM', 'USB'],
+        usbPorts: [
+          { id: 'USB_0', type: 'USB 3.0', connector: 'Type-A' },
+          { id: 'USB_1', type: 'USB 3.0', connector: 'Type-A' },
+          { id: 'USB_2', type: 'USB 2.0', connector: 'Type-A' },
+          { id: 'USB_3', type: 'USB 2.0', connector: 'Type-A' },
+          { id: 'USB_4', type: 'USB 3.0', connector: 'Type-C' },
+        ],
+      },
+      {
+        id: 'opi_zero_2w',
+        name: 'Orange Pi Zero 2W',
+        cpu: 'Allwinner H618 (4x Cortex-A53 @ 1.5GHz)',
+        arch: 'aarch64',
+        ram: '1GB / 1.5GB / 2GB / 4GB LPDDR4',
+        storage: 'microSD',
+        connectivity: 'WiFi 5, BT 5.0',
+        gpio: 40,
+        usb: '1x USB-C 2.0 (OTG)',
+        display: 'mini HDMI 2.0',
+        pinout: GENERIC_40PIN_HEADER,
+        pinLayout: 'rpi40',
+        interfaces: ['GPIO', 'I2C', 'SPI', 'UART', 'PWM', 'USB'],
+        usbPorts: [
+          { id: 'USB_0', type: 'USB 2.0', connector: 'Type-C (OTG)' },
+        ],
+      },
+    ]
+  },
+  {
+    name: 'Radxa',
+    icon: '🪨',
+    boards: [
+      {
+        id: 'radxa_rock_5b',
+        name: 'Radxa ROCK 5B',
+        cpu: 'Rockchip RK3588 (4x Cortex-A76 @ 2.4GHz + 4x Cortex-A55)',
+        arch: 'aarch64',
+        ram: '4GB / 8GB / 16GB LPDDR4X',
+        storage: 'eMMC socket / microSD / M.2 NVMe',
+        connectivity: '2.5G Ethernet',
+        gpio: 40,
+        usb: '2x USB 3.0, 2x USB 2.0, 1x USB-C 3.0',
+        display: '2x HDMI 2.1 (8K)',
+        pinout: GENERIC_40PIN_HEADER,
+        pinLayout: 'rpi40',
+        interfaces: ['GPIO', 'I2C', 'SPI', 'UART', 'PWM', 'USB'],
+        usbPorts: [
+          { id: 'USB_0', type: 'USB 3.0', connector: 'Type-A' },
+          { id: 'USB_1', type: 'USB 3.0', connector: 'Type-A' },
+          { id: 'USB_2', type: 'USB 2.0', connector: 'Type-A' },
+          { id: 'USB_3', type: 'USB 2.0', connector: 'Type-A' },
+          { id: 'USB_4', type: 'USB 3.0', connector: 'Type-C' },
+        ],
+      },
+      {
+        id: 'radxa_rock_3a',
+        name: 'Radxa ROCK 3A',
+        cpu: 'Rockchip RK3568 (4x Cortex-A55 @ 2.0GHz)',
+        arch: 'aarch64',
+        ram: '2GB / 4GB / 8GB LPDDR4',
+        storage: 'eMMC socket / microSD / M.2 NVMe',
+        connectivity: 'Gigabit Ethernet',
+        gpio: 40,
+        usb: '2x USB 3.0, 2x USB 2.0',
+        display: 'HDMI 2.0 (4K)',
+        pinout: GENERIC_40PIN_HEADER,
+        pinLayout: 'rpi40',
+        interfaces: ['GPIO', 'I2C', 'SPI', 'UART', 'PWM', 'USB'],
+        usbPorts: [
+          { id: 'USB_0', type: 'USB 3.0', connector: 'Type-A' },
+          { id: 'USB_1', type: 'USB 3.0', connector: 'Type-A (OTG)' },
+          { id: 'USB_2', type: 'USB 2.0', connector: 'Type-A' },
+          { id: 'USB_3', type: 'USB 2.0', connector: 'Type-A' },
+        ],
+      },
+      {
+        id: 'radxa_zero_3w',
+        name: 'Radxa Zero 3W',
+        cpu: 'Rockchip RK3566 (4x Cortex-A55 @ 1.6GHz)',
+        arch: 'aarch64',
+        ram: '1GB – 8GB LPDDR4',
+        storage: 'eMMC / microSD',
+        connectivity: 'WiFi 4/5, BT 5.0',
+        gpio: 40,
+        usb: '1x USB-C 3.0, 1x USB-C 2.0 (OTG)',
+        display: 'micro HDMI (4K)',
+        pinout: GENERIC_40PIN_HEADER,
+        pinLayout: 'rpi40',
+        interfaces: ['GPIO', 'I2C', 'SPI', 'UART', 'PWM', 'USB'],
+        usbPorts: [
+          { id: 'USB_0', type: 'USB 3.0', connector: 'Type-C' },
+          { id: 'USB_1', type: 'USB 2.0', connector: 'Type-C (OTG)' },
+        ],
+      },
+    ]
+  },
+  {
+    name: 'Odroid',
+    icon: '🔷',
+    boards: [
+      {
+        id: 'odroid_c4',
+        name: 'Odroid C4',
+        cpu: 'Amlogic S905X3 (4x Cortex-A55 @ 2.0GHz)',
+        arch: 'aarch64',
+        ram: '4GB DDR4',
+        storage: 'eMMC socket / microSD',
+        connectivity: 'Gigabit Ethernet',
+        gpio: 40,
+        usb: '4x USB 3.0, 1x micro USB 2.0 (OTG)',
+        display: 'HDMI 2.0 (4K)',
+        pinout: GENERIC_40PIN_HEADER,
+        pinLayout: 'rpi40',
+        interfaces: ['GPIO', 'I2C', 'SPI', 'UART', 'PWM', 'USB'],
+        usbPorts: [
+          { id: 'USB_0', type: 'USB 3.0', connector: 'Type-A' },
+          { id: 'USB_1', type: 'USB 3.0', connector: 'Type-A' },
+          { id: 'USB_2', type: 'USB 3.0', connector: 'Type-A' },
+          { id: 'USB_3', type: 'USB 3.0', connector: 'Type-A' },
+        ],
+      },
+      {
+        id: 'odroid_n2_plus',
+        name: 'Odroid N2+',
+        cpu: 'Amlogic S922X (4x Cortex-A73 @ 2.4GHz + 2x Cortex-A53)',
+        arch: 'aarch64',
+        ram: '2GB / 4GB DDR4',
+        storage: 'eMMC socket / microSD',
+        connectivity: 'Gigabit Ethernet',
+        gpio: 40,
+        usb: '4x USB 3.0, 1x micro USB 2.0 (OTG)',
+        display: 'HDMI 2.0 (4K)',
+        pinout: GENERIC_40PIN_HEADER,
+        pinLayout: 'rpi40',
+        interfaces: ['GPIO', 'I2C', 'SPI', 'UART', 'PWM', 'USB'],
+        usbPorts: [
+          { id: 'USB_0', type: 'USB 3.0', connector: 'Type-A' },
+          { id: 'USB_1', type: 'USB 3.0', connector: 'Type-A' },
+          { id: 'USB_2', type: 'USB 3.0', connector: 'Type-A' },
+          { id: 'USB_3', type: 'USB 3.0', connector: 'Type-A' },
+        ],
+      },
+    ]
+  },
+  {
+    name: 'Banana Pi',
+    icon: '🍌',
+    boards: [
+      {
+        id: 'bpi_m5',
+        name: 'Banana Pi BPI-M5',
+        cpu: 'Amlogic S905X3 (4x Cortex-A55 @ 2.0GHz)',
+        arch: 'aarch64',
+        ram: '4GB LPDDR4',
+        storage: '16GB eMMC + microSD',
+        connectivity: 'Gigabit Ethernet',
+        gpio: 40,
+        usb: '4x USB 3.0',
+        display: 'HDMI 2.1 (4K)',
+        pinout: GENERIC_40PIN_HEADER,
+        pinLayout: 'rpi40',
+        interfaces: ['GPIO', 'I2C', 'SPI', 'UART', 'PWM', 'USB'],
+        usbPorts: [
+          { id: 'USB_0', type: 'USB 3.0', connector: 'Type-A' },
+          { id: 'USB_1', type: 'USB 3.0', connector: 'Type-A' },
+          { id: 'USB_2', type: 'USB 3.0', connector: 'Type-A' },
+          { id: 'USB_3', type: 'USB 3.0', connector: 'Type-A' },
+        ],
+      },
+    ]
+  },
+  {
+    name: 'Libre Computer',
+    icon: '🥔',
+    boards: [
+      {
+        id: 'libre_le_potato',
+        name: 'Le Potato (AML-S905X-CC)',
+        cpu: 'Amlogic S905X (4x Cortex-A53 @ 1.512GHz)',
+        arch: 'aarch64',
+        ram: '1GB / 2GB DDR3',
+        storage: 'eMMC socket / microSD',
+        connectivity: '100Mbps Ethernet',
+        gpio: 40,
+        usb: '4x USB 2.0',
+        display: 'HDMI 2.0 (4K)',
+        pinout: GENERIC_40PIN_HEADER,
+        pinLayout: 'rpi40',
+        interfaces: ['GPIO', 'I2C', 'SPI', 'UART', 'PWM', 'USB'],
+        usbPorts: [
+          { id: 'USB_0', type: 'USB 2.0', connector: 'Type-A' },
+          { id: 'USB_1', type: 'USB 2.0', connector: 'Type-A' },
+          { id: 'USB_2', type: 'USB 2.0', connector: 'Type-A' },
+          { id: 'USB_3', type: 'USB 2.0', connector: 'Type-A' },
+        ],
+      },
+    ]
+  },
+  {
+    name: 'Pine64',
+    icon: '🌲',
+    boards: [
+      {
+        id: 'pine_rock64',
+        name: 'Rock64',
+        cpu: 'Rockchip RK3328 (4x Cortex-A53 @ 1.5GHz)',
+        arch: 'aarch64',
+        ram: '1GB / 2GB / 4GB LPDDR3',
+        storage: 'eMMC socket / microSD',
+        connectivity: 'Gigabit Ethernet',
+        gpio: 40,
+        usb: '1x USB 3.0, 2x USB 2.0',
+        display: 'HDMI 2.0 (4K)',
+        pinout: GENERIC_40PIN_HEADER,
+        pinLayout: 'rpi40',
+        interfaces: ['GPIO', 'I2C', 'SPI', 'UART', 'PWM', 'USB'],
+        usbPorts: [
+          { id: 'USB_0', type: 'USB 3.0', connector: 'Type-A' },
+          { id: 'USB_1', type: 'USB 2.0', connector: 'Type-A' },
+          { id: 'USB_2', type: 'USB 2.0', connector: 'Type-A' },
+        ],
+      },
+      {
+        id: 'pine_rockpro64',
+        name: 'ROCKPro64',
+        cpu: 'Rockchip RK3399 (2x Cortex-A72 @ 1.8GHz + 4x Cortex-A53)',
+        arch: 'aarch64',
+        ram: '2GB / 4GB LPDDR4',
+        storage: 'eMMC socket / microSD / PCIe NVMe',
+        connectivity: 'Gigabit Ethernet',
+        gpio: 40,
+        usb: '1x USB 3.0, 2x USB 2.0, 1x USB-C 3.0',
+        display: 'HDMI 2.0 (4K)',
+        pinout: GENERIC_40PIN_HEADER,
+        pinLayout: 'rpi40',
+        interfaces: ['GPIO', 'I2C', 'SPI', 'UART', 'PWM', 'USB'],
+        usbPorts: [
+          { id: 'USB_0', type: 'USB 3.0', connector: 'Type-A' },
+          { id: 'USB_1', type: 'USB 2.0', connector: 'Type-A' },
+          { id: 'USB_2', type: 'USB 2.0', connector: 'Type-A' },
+          { id: 'USB_3', type: 'USB 3.0', connector: 'Type-C' },
         ],
       },
     ]

@@ -29,8 +29,10 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -206,11 +208,37 @@ func (s *Server) applyHMIPort(port uint16) {
 	}()
 }
 
-// corsMiddleware adds permissive CORS headers required by browser-based clients.
-// ConnectRPC's browser transport (connect-web) needs these.
+// corsMiddleware adds CORS headers required by browser-based clients
+// (ConnectRPC's connect-web transport and the editor's direct fetches).
+//
+// SECURITY: the previous blanket "*" policy wrapped the whole mux — including
+// the unauthenticated /deploy/* endpoints — so ANY web page could deploy and
+// (via restart/AutoRun) execute an arbitrary binary as root from a drive-by
+// request. Cross-origin browser traffic is therefore restricted to
+// local/private origins (the editor runs on localhost or a LAN IP; see
+// isAllowedCORSOrigin). Requests WITHOUT an Origin header (curl, the host
+// agent's Go HTTP client, native SCADA clients) pass through unchanged —
+// this is a browser-abuse defense, not general authentication.
 func corsMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Access-Control-Allow-Origin", "*")
+		origin := r.Header.Get("Origin")
+		if origin == "" {
+			// Non-browser (or same-origin) request: no CORS involved.
+			next.ServeHTTP(w, r)
+			return
+		}
+		// The response varies by Origin regardless of allow/deny.
+		w.Header().Add("Vary", "Origin")
+		if !isAllowedCORSOrigin(origin) {
+			// Reject on ALL methods, not just preflight: simple requests
+			// (e.g. a cross-site POST to /deploy/runtime) reach the server
+			// without a preflight, so denying only OPTIONS would still let
+			// the side effect execute.
+			http.Error(w, "origin not allowed", http.StatusForbidden)
+			return
+		}
+		// Reflect the specific allowed origin instead of "*".
+		w.Header().Set("Access-Control-Allow-Origin", origin)
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
 		w.Header().Set("Access-Control-Allow-Headers",
 			"Content-Type, Connect-Protocol-Version, Connect-Timeout-Ms, "+
@@ -219,7 +247,8 @@ func corsMiddleware(next http.Handler) http.Handler {
 			"Grpc-Status, Grpc-Message, Grpc-Status-Details-Bin")
 		// Chrome 98+ Private Network Access: requests from http://localhost to a
 		// private-range IP (192.168.x.x, 10.x.x.x, …) are blocked unless the
-		// server echoes this header in the CORS preflight response.
+		// server echoes this header in the CORS preflight response. Only sent
+		// for allowed (local/private) origins.
 		w.Header().Set("Access-Control-Allow-Private-Network", "true")
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)
@@ -227,6 +256,30 @@ func corsMiddleware(next http.Handler) http.Handler {
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+// isAllowedCORSOrigin reports whether a browser Origin is local/private:
+// localhost (any port), loopback (127.0.0.0/8, [::1]), RFC1918 / IPv6 ULA
+// ranges, link-local addresses, and ".local" mDNS hostnames. Public-internet
+// origins are rejected — a drive-by web page must not be able to reach the
+// unauthenticated deploy surface.
+func isAllowedCORSOrigin(origin string) bool {
+	u, err := url.Parse(origin)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") {
+		return false
+	}
+	host := strings.ToLower(u.Hostname())
+	if host == "" {
+		return false
+	}
+	if host == "localhost" || strings.HasSuffix(host, ".localhost") || strings.HasSuffix(host, ".local") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return false
+	}
+	return ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast()
 }
 
 // --- Deploy / status endpoints ---
@@ -372,6 +425,11 @@ func (s *Server) AutoRunEnabled() bool {
 //	POST /deploy/config
 //	Body: {"auto_run": true, "stream_interval_ms": 100}   (both fields optional)
 func (s *Server) handleDeployConfig(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "only POST is supported", http.StatusMethodNotAllowed)
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20) // config payload is tiny
 	var u runtimeConfigUpdate
 	if err := json.NewDecoder(r.Body).Decode(&u); err != nil {
 		jsonError(w, http.StatusBadRequest, "invalid JSON")
@@ -475,10 +533,11 @@ func (s *Server) runtimeConfigSnapshotLocked() map[string]any {
 	}
 }
 
-// StartRuntime mirrors the ConnectRPC Start: write initial values, then
-// spawn the runtime. Implements RuntimeController.
+// StartRuntime mirrors the ConnectRPC Start. Initial values are written by
+// pm's pre-start hook (see main.go) AFTER any previous process has stopped
+// and BEFORE the new one spawns — writing them here would let the dying
+// runtime's final shm sync overwrite them. Implements RuntimeController.
 func (s *Server) StartRuntime() (int, error) {
-	s.ipc.WriteInitialValues()
 	if err := s.pm.Start(); err != nil {
 		return 0, err
 	}

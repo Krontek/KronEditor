@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strconv"
+	"strings"
 )
 
 // Path resolver — mirrors the layout that lived under src-tauri/.
@@ -130,6 +132,8 @@ func (p *Paths) LLVMSysroot(triple string) string {
 }
 
 // LLVMClangResourceDir returns the highest-version Clang resource dir.
+// Version dirs are compared NUMERICALLY component-by-component ("18" > "9"),
+// not lexicographically — sort.Strings would pick "9" over "18".
 func (p *Paths) LLVMClangResourceDir() (string, error) {
 	base := filepath.Join(p.ToolchainsRoot, "lib", "clang")
 	entries, err := os.ReadDir(base)
@@ -139,14 +143,51 @@ func (p *Paths) LLVMClangResourceDir() (string, error) {
 	var versions []string
 	for _, e := range entries {
 		if e.IsDir() {
-			versions = append(versions, filepath.Join(base, e.Name()))
+			versions = append(versions, e.Name())
 		}
 	}
 	if len(versions) == 0 {
 		return "", fmt.Errorf("no Clang resource version under %s", base)
 	}
-	sort.Strings(versions)
-	return versions[len(versions)-1], nil
+	sort.Slice(versions, func(i, j int) bool {
+		return compareVersionStrings(versions[i], versions[j]) < 0
+	})
+	return filepath.Join(base, versions[len(versions)-1]), nil
+}
+
+// compareVersionStrings compares dotted version strings numerically per
+// component ("18.1.8" vs "9.0.1"); non-numeric components fall back to a
+// string comparison for that component.
+func compareVersionStrings(a, b string) int {
+	as, bs := strings.Split(a, "."), strings.Split(b, ".")
+	for i := 0; i < len(as) || i < len(bs); i++ {
+		var ac, bc string
+		if i < len(as) {
+			ac = as[i]
+		}
+		if i < len(bs) {
+			bc = bs[i]
+		}
+		an, aerr := strconv.Atoi(ac)
+		bn, berr := strconv.Atoi(bc)
+		switch {
+		case aerr == nil && berr == nil:
+			if an != bn {
+				if an < bn {
+					return -1
+				}
+				return 1
+			}
+		default:
+			if ac != bc {
+				if ac < bc {
+					return -1
+				}
+				return 1
+			}
+		}
+	}
+	return 0
 }
 
 // LLVMTargetIncludeDirs returns extra `-isystem` directories for a given triple.

@@ -40,10 +40,16 @@ export function findStMarkers(code, { allowedLower, conversionPattern, varTypes 
   };
 
   // Strip block comments whole-text first (keep line count for accurate rows),
-  // then line comments (line-anchored) and literal placeholders — all on the
-  // full text so byte offsets stay valid for the single tokenizer pass below.
+  // then single-quoted STRING literals (length-preserving, before line comments
+  // so a `//` INSIDE a string — 'http://host' — is never misread as a comment;
+  // the literal doesn't cross lines, and an apostrophe inside a comment simply
+  // fails to pair and is removed with the comment), then line comments
+  // (line-anchored) and literal placeholders — all on the full text so byte
+  // offsets stay valid for the single tokenizer pass below. Without the string
+  // blanking, words inside 'start motor' were flagged as undefined identifiers.
   const text = String(code || '')
     .replace(/\(\*[\s\S]*?\*\)/g, (m) => '\n'.repeat((m.match(/\n/g) || []).length))
+    .replace(/'[^'\n]*'/g, (m) => ' '.repeat(m.length))
     .replace(/\/\/.*$/gm, '')
     .replace(TIME_LITERAL, (m) => ' '.repeat(m.length))
     .replace(RADIX_LITERAL, (m) => ' '.repeat(m.length));

@@ -509,9 +509,11 @@ const ProjectSidebar = ({
                                 </span>
                                 {key === 'programs' && liveVariables && (() => {
                                     const pName = (item.name || '').trim().replace(/\s+/g, '_');
-                                    const ns = liveVariables[`prog____exec_us_${pName}`];
-                                    if (ns == null) return null;
-                                    const label = ns >= 1000000 ? `${(ns/1000000).toFixed(2)}ms` : ns >= 1000 ? `${(ns/1000).toFixed(1)}µs` : `${ns}ns`;
+                                    // __exec_us_<prog> is MICROseconds (matches its name; the
+                                    // transpiler divides the timespec delta by 1000).
+                                    const us = liveVariables[`prog____exec_us_${pName}`];
+                                    if (us == null) return null;
+                                    const label = us >= 1000000 ? `${(us/1000000).toFixed(2)}s` : us >= 1000 ? `${(us/1000).toFixed(2)}ms` : `${us}µs`;
                                     // Look up task interval for this program from taskConfig
                                     const taskForProg = (projectStructure.taskConfig?.tasks || [])
                                         .find(t => (t.programs || []).some(p => (p.program || '').replace(/\s+/g, '_') === pName));
@@ -520,7 +522,7 @@ const ProjectSidebar = ({
                                     const cycleUs = ivStr.endsWith('MS') ? parseFloat(ivStr)*1000
                                         : ivStr.endsWith('US') ? parseFloat(ivStr)
                                         : ivStr.endsWith('S') ? parseFloat(ivStr)*1000000 : 10000;
-                                    const overrun = ns / 1000 > cycleUs;
+                                    const overrun = us > cycleUs;
                                     return <span style={{ fontSize: 10, color: overrun ? '#f44747' : '#4ec9b0', marginLeft: 2 }}>{label}</span>;
                                 })()}
                                 {item.type && (

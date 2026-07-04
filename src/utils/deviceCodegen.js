@@ -129,6 +129,16 @@ const getBoardFamilyDefine = (boardId) => {
   if (boardId.startsWith('rpi_')) return 'HAL_BOARD_FAMILY_RPI';
   if (boardId.startsWith('bb_')) return 'HAL_BOARD_FAMILY_BB';
   if (boardId.startsWith('jetson_')) return 'HAL_BOARD_FAMILY_JETSON';
+  // Third-party aarch64 Linux SBCs (Orange Pi, Radxa, Odroid, Banana Pi,
+  // Libre Computer, Pine64) reuse the generic Linux userspace HAL
+  // (kronhal_rpi.h) until a board-specific HAL family is written.
+  // Keep in sync with devicePortMapping.js and CTranspilerService.js.
+  if (boardId.startsWith('opi_')) return 'HAL_BOARD_FAMILY_RPI';
+  if (boardId.startsWith('radxa_')) return 'HAL_BOARD_FAMILY_RPI';
+  if (boardId.startsWith('odroid_')) return 'HAL_BOARD_FAMILY_RPI';
+  if (boardId.startsWith('bpi_')) return 'HAL_BOARD_FAMILY_RPI';
+  if (boardId.startsWith('libre_')) return 'HAL_BOARD_FAMILY_RPI';
+  if (boardId.startsWith('pine_')) return 'HAL_BOARD_FAMILY_RPI';
   return null;
 };
 

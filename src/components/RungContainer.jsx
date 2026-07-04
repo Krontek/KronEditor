@@ -1426,6 +1426,15 @@ const RungContainer = ({
   React.useEffect(() => {
     const handleKeyDown = (e) => {
       if (e.code !== 'Space' || !onForceWrite || !liveVariables) return;
+      // Focus guard: never hijack a space typed into an input/textarea,
+      // contentEditable surface, or a Monaco editor.
+      const ae = document.activeElement;
+      if (ae && (
+        ae.tagName === 'INPUT' ||
+        ae.tagName === 'TEXTAREA' ||
+        ae.isContentEditable ||
+        ae.closest?.('.monaco-editor')
+      )) return;
       const safeProgName = (parentName || '').trim().replace(/\s+/g, '_');
       nodes.forEach(node => {
         if (!node.selected || node.data?.type !== 'Contact') return;
@@ -1948,29 +1957,22 @@ const RungContainer = ({
     if (isTargetTerminal && targetNode.data.position !== 'right') return false; // Left terminal target olamaz
 
     // 2. TYPE CHECK
+    // Handles are NAME-based (`in_PT`, `out_Q`, bare `in`/`out` for
+    // Contact/Coil), so resolve the pin by name — never by numeric index.
     const getBlockPinType = (node, handle, direction) => {
       if (!handle) return 'ANY';
-      const pinIndex = parseInt(handle.split('_')[1]);
+      // Contact/Coil power-flow handles carry boolean power.
+      if (handle === 'in' || handle === 'out') return 'BOOL';
       const pinListKey = direction === 'input' ? 'inputs' : 'outputs';
-      const flowPin = direction === 'input' ? 'EN' : 'ENO';
-
-      if (node.data.customData?.[pinListKey]) {
-        const pins = (node.data.customData[pinListKey] || [])
-          .filter((pin) => pin.name !== flowPin)
-          .map((pin) => getVisiblePinType(pin));
-        if (node.data.executionControl) {
-          if (pinIndex === 0) return 'BOOL';
-          return pins[pinIndex - 1] || 'ANY';
-        }
-        return pins[pinIndex] || 'ANY';
-      }
-
-      const config = blockConfig[node.data.type];
-      if (node.data.executionControl) {
-        if (pinIndex === 0) return 'BOOL';
-        return config?.[pinListKey]?.[pinIndex - 1]?.type || 'ANY';
-      }
-      return config?.[pinListKey]?.[pinIndex]?.type || 'ANY';
+      const prefix = direction === 'input' ? 'in_' : 'out_';
+      const pinName = handle.startsWith(prefix) ? handle.slice(prefix.length) : handle;
+      // EN/ENO (execution control) are power-flow pins.
+      if (pinName === 'EN' || pinName === 'ENO') return 'BOOL';
+      const pins = node.data.customData?.[pinListKey]
+        || blockConfig[node.data.type]?.[pinListKey]
+        || [];
+      const pin = pins.find((p) => p.name === pinName);
+      return pin ? getVisiblePinType(pin) : 'ANY';
     };
 
     const sourceType = isSourceTerminal ? 'BOOL' : (() => {
@@ -2388,13 +2390,6 @@ const RungContainer = ({
           isValidConnection={isValidConnection}
           onDrop={onDrop}
           onDragOver={throttleDragOver}
-          onDragLeave={(e) => {
-            // Fix: Only clear ghost if we genuinely leave the container
-            // (e.relatedTarget is the element we are entering)
-            if (!e.currentTarget.contains(e.relatedTarget)) {
-              setDragGhost(null);
-            }
-          }}
           onNodeDragStop={onNodeDragStop}
           onNodeDoubleClick={onNodeDoubleClick}
           snapToGrid={true}

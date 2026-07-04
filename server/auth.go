@@ -3,6 +3,7 @@ package main
 import (
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/hex"
 	"fmt"
 	"net/http"
@@ -83,7 +84,8 @@ func newSalt() string {
 }
 
 func (u *User) CheckPassword(password string) bool {
-	return hashPassword(u.Salt, password) == u.PasswordHash
+	// Constant-time compare to avoid leaking hash prefixes via timing.
+	return subtle.ConstantTimeCompare([]byte(hashPassword(u.Salt, password)), []byte(u.PasswordHash)) == 1
 }
 
 // ---------------------------------------------------------------------------

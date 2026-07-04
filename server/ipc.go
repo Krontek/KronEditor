@@ -11,6 +11,7 @@
 package main
 
 import (
+	"crypto/subtle"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
@@ -163,10 +164,21 @@ func (m *IPCManager) LoadVariableTable(path string) error {
 		if v.Size != expectedSize {
 			return fmt.Errorf("size mismatch: expected %d for %s, got %d", expectedSize, v.Name, v.Size)
 		}
-		end := v.Offset + v.Size
-		if end > m.shmSize {
+		// Offsets come from an uploaded file and must be treated as untrusted:
+		// a negative or overflowing offset would pass a naive `offset+size >
+		// shmSize` check and panic on the first slice access — with AutoRun
+		// that panic happens in WriteInitialValues on the MAIN goroutine at
+		// startup, crash-looping the agent as the bad table is rehydrated on
+		// every restart. The subtraction form avoids integer overflow.
+		if v.Offset < 0 || v.Size <= 0 || v.Offset > m.shmSize-v.Size {
 			return fmt.Errorf("variable '%s' exceeds shared memory bounds (offset=%d size=%d shm_size=%d)",
 				v.Name, v.Offset, v.Size, m.shmSize)
+		}
+		// Force flag is a single byte; 0 means "no force flag". Validate at
+		// load time so write paths can trust it.
+		if v.ForceFlagOffset < 0 || v.ForceFlagOffset >= m.shmSize {
+			return fmt.Errorf("variable '%s' force flag outside shared memory bounds (force_flag_offset=%d shm_size=%d)",
+				v.Name, v.ForceFlagOffset, m.shmSize)
 		}
 		if _, dup := newVars[v.Name]; dup {
 			return fmt.Errorf("duplicate variable name: %s", v.Name)
@@ -495,7 +507,8 @@ func (m *IPCManager) CheckAPIPassword(password string) bool {
 	if h == "" {
 		return false
 	}
-	return hashPassword(s, password) == h
+	// Constant-time compare to avoid leaking hash prefixes via timing.
+	return subtle.ConstantTimeCompare([]byte(hashPassword(s, password)), []byte(h)) == 1
 }
 
 // APIEnabled returns true if an API password is configured.

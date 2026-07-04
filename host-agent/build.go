@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 )
 
 // buildRequest is the JSON payload accepted by POST /api/host/build.
@@ -58,6 +59,17 @@ func handleBuild(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.Compiler == "" {
 		req.Compiler = "gcc"
+	}
+	// Hardening: the compiler name is exec'd — restrict it to a small allowlist
+	// of bare names (resolved via PATH), never a caller-supplied path.
+	if strings.ContainsAny(req.Compiler, "/\\") || !allowedCompilers[req.Compiler] {
+		writeError(w, http.StatusBadRequest, "compiler not allowed: "+req.Compiler)
+		return
+	}
+	// Hardening: the output name must stay inside the build dir.
+	if strings.Contains(req.Output, "..") || strings.ContainsAny(req.Output, "/\\") {
+		writeError(w, http.StatusBadRequest, "output must be a plain filename: "+req.Output)
+		return
 	}
 
 	buildDir, err := makeBuildDir()
@@ -115,6 +127,11 @@ func handleBuild(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, resp)
 }
 
+// allowedCompilers is the exec allowlist for POST /api/host/build.
+var allowedCompilers = map[string]bool{
+	"clang": true, "clang++": true, "gcc": true, "g++": true, "cc": true,
+}
+
 func makeBuildDir() (string, error) {
 	var idBytes [6]byte
 	if _, err := rand.Read(idBytes[:]); err != nil {
@@ -126,4 +143,27 @@ func makeBuildDir() (string, error) {
 		return "", err
 	}
 	return dir, nil
+}
+
+// sweepStaleBuildDirs removes leftover host-build-* temp dirs from previous
+// sessions. The build response returns BuildDir/BinaryPath to the caller, so
+// dirs can't be removed right after a build — instead they are reaped on the
+// NEXT agent start. An age guard (>1h) avoids clobbering a concurrently
+// running second agent instance.
+func sweepStaleBuildDirs() {
+	entries, err := os.ReadDir(os.TempDir())
+	if err != nil {
+		return
+	}
+	cutoff := time.Now().Add(-1 * time.Hour)
+	for _, e := range entries {
+		if !e.IsDir() || !strings.HasPrefix(e.Name(), "host-build-") {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil || info.ModTime().After(cutoff) {
+			continue
+		}
+		_ = os.RemoveAll(filepath.Join(os.TempDir(), e.Name()))
+	}
 }

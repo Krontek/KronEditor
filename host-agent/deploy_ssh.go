@@ -33,16 +33,29 @@ type deployServerReq struct {
 	BoardID  string `json:"boardId"`
 }
 
+// aarch64BoardPrefixes lists board-id prefixes that map to the aarch64 Linux
+// server binary. The third-party SBC prefixes (opi_, radxa_, odroid_, bpi_,
+// libre_, pine_ — Orange Pi, Radxa, Odroid, Banana Pi, Libre Computer,
+// Pine64) reuse the generic Linux HAL (RPi family) and the arm64 binary.
+var aarch64BoardPrefixes = []string{"rpi_", "jetson_", "opi_", "radxa_", "odroid_", "bpi_", "libre_", "pine_"}
+
 // serverBinaryForBoard maps a board id to (resource-target key, binary file name).
 // Mirrors the original Tauri selection: RPi/Jetson/BB-AI64 → arm64, other BB → armv7,
 // everything else → amd64. Pico has no OS to host a server.
 func serverBinaryForBoard(boardID string) (resourceTarget, binaryName string, err error) {
+	isAarch64 := boardID == "bb_ai64"
+	for _, p := range aarch64BoardPrefixes {
+		if strings.HasPrefix(boardID, p) {
+			isAarch64 = true
+			break
+		}
+	}
 	switch {
 	case strings.HasPrefix(boardID, "rpi_pico"):
 		return "", "", fmt.Errorf("Pico targets do not support remote server deployment")
 	case strings.HasPrefix(boardID, "bb_") && !strings.HasPrefix(boardID, "bb_ai64"):
 		return "arm/armv7", "plc-agent_linux_armv7", nil
-	case strings.HasPrefix(boardID, "rpi_") || boardID == "bb_ai64" || strings.HasPrefix(boardID, "jetson_"):
+	case isAarch64:
 		return "arm/aarch64", "plc-agent_linux_arm64", nil
 	default:
 		return "x86_64/linux", "plc-agent_linux_amd64", nil
@@ -114,7 +127,7 @@ func (s *Server) handleDeployServerToTarget(w http.ResponseWriter, r *http.Reque
 	defer client.Close()
 
 	progress("Connected. Detecting home directory...")
-	home := strings.TrimSpace(sshRun(client, "echo $HOME"))
+	home := strings.TrimSpace(sshRunLogged(client, "echo $HOME", progress, "home-dir detection"))
 	if home == "" {
 		home = "/home/" + req.Username
 	}
@@ -135,7 +148,8 @@ func (s *Server) handleDeployServerToTarget(w http.ResponseWriter, r *http.Reque
 			"%[1]spkill -f '%[2]s' 2>/dev/null; "+
 			"rm -f %[2]s; sleep 1; true",
 		sudo, remoteBin)
-	sshRun(client, stopCmd)
+	// Best-effort by design (nothing may be installed yet) — but log failures.
+	_ = sshRunLogged(client, stopCmd, progress, "stopping existing agent")
 
 	progress("Uploading server binary via SFTP...")
 	sc, err := sftp.NewClient(client)
@@ -157,24 +171,37 @@ func (s *Server) handleDeployServerToTarget(w http.ResponseWriter, r *http.Reque
 	}
 	rf.Close()
 	_ = sc.Chmod(remoteBin, 0o755)
-	sshRun(client, "chmod +x "+remoteBin) // belt-and-suspenders
+	_ = sshRunLogged(client, "chmod +x "+remoteBin, progress, "chmod") // belt-and-suspenders
 
 	// Install + start a supervisor: systemd when the target actually boots under
 	// it, else a cron @reboot script (works on BusyBox/Alpine/Yocto/OpenWRT).
-	systemd := strings.TrimSpace(sshRun(client,
-		"if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then echo systemd; else echo cron; fi")) == "systemd"
+	systemd := strings.TrimSpace(sshRunLogged(client,
+		"if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then echo systemd; else echo cron; fi",
+		progress, "init-system detection")) == "systemd"
 	var mode string
 	if systemd {
 		progress("systemd detected — installing service unit...")
-		installSystemdUnit(client, sudo, remoteBin, remoteDir)
+		if out, err := installSystemdUnit(client, sudo, remoteBin, remoteDir); err != nil {
+			writeError(w, http.StatusBadGateway, "systemd unit install failed: "+err.Error()+"\n"+out)
+			return
+		}
 		progress("Starting plc-agent (systemd)...")
-		sshRun(client, sudo+"systemctl restart plc-agent")
+		if out, err := sshRun(client, sudo+"systemctl restart plc-agent"); err != nil {
+			writeError(w, http.StatusBadGateway, "systemctl restart failed: "+err.Error()+"\n"+out)
+			return
+		}
 		mode = "systemd"
 	} else {
 		progress("systemd not found — installing cron @reboot supervisor...")
-		installCronSupervisor(client, sudo, remoteBin, remoteDir)
+		if out, err := installCronSupervisor(client, sudo, remoteBin, remoteDir); err != nil {
+			writeError(w, http.StatusBadGateway, "cron supervisor install failed: "+err.Error()+"\n"+out)
+			return
+		}
 		progress("Starting plc-agent supervisor...")
-		startCronSupervisor(client, sudo, remoteDir)
+		if out, err := startCronSupervisor(client, sudo, remoteDir); err != nil {
+			writeError(w, http.StatusBadGateway, "supervisor start failed: "+err.Error()+"\n"+out)
+			return
+		}
 		mode = "cron @reboot supervisor"
 	}
 
@@ -204,26 +231,55 @@ func (s *Server) handleDeployServerToTarget(w http.ResponseWriter, r *http.Reque
 			"ps -ef | grep -E 'plc-agent(-supervisor)?' | grep -v grep; echo '---'; "+
 				"%scrontab -l 2>&1 | grep plc-agent; echo '---'; tail -40 %s/plc-agent.log 2>&1", sudo, remoteDir)
 	}
-	if diag := strings.TrimSpace(sshRun(client, diagCmd)); diag != "" {
+	if diag := strings.TrimSpace(sshRunLogged(client, diagCmd, progress, "diagnostics collection")); diag != "" {
 		progress("Agent did not start. Diagnostics:\n" + diag)
 	}
 	writeError(w, http.StatusBadGateway, "Server deployed but agent did not respond after 10s: "+lastErr)
 }
 
-// sshRun runs one command and returns its combined stdout+stderr (best-effort).
-func sshRun(client *ssh.Client, cmd string) string {
+// sshRunTimeout bounds every remote command — a wedged target (dead sudo
+// prompt, hung service manager) must not hang the deploy handler forever.
+const sshRunTimeout = 30 * time.Second
+
+// sshRun runs one command and returns its combined stdout+stderr plus any
+// error (session failure, non-zero exit, or timeout).
+func sshRun(client *ssh.Client, cmd string) (string, error) {
 	sess, err := client.NewSession()
 	if err != nil {
-		return ""
+		return "", fmt.Errorf("ssh session: %w", err)
 	}
 	defer sess.Close()
-	out, _ := sess.CombinedOutput(cmd)
-	return string(out)
+	type result struct {
+		out []byte
+		err error
+	}
+	ch := make(chan result, 1)
+	go func() {
+		out, err := sess.CombinedOutput(cmd)
+		ch <- result{out, err}
+	}()
+	select {
+	case res := <-ch:
+		return string(res.out), res.err
+	case <-time.After(sshRunTimeout):
+		_ = sess.Close() // unblocks the goroutine's CombinedOutput
+		return "", fmt.Errorf("ssh command timed out after %s", sshRunTimeout)
+	}
+}
+
+// sshRunLogged is the best-effort variant: it logs a failure via progress and
+// returns the output (used where the old code deliberately ignored errors).
+func sshRunLogged(client *ssh.Client, cmd string, progress func(string), what string) string {
+	out, err := sshRun(client, cmd)
+	if err != nil {
+		progress(fmt.Sprintf("warning: %s failed: %v", what, err))
+	}
+	return out
 }
 
 // installSystemdUnit writes /etc/systemd/system/plc-agent.service and enables it.
 // Restart=always keeps the agent up across crashes.
-func installSystemdUnit(client *ssh.Client, sudo, remoteBin, remoteDir string) {
+func installSystemdUnit(client *ssh.Client, sudo, remoteBin, remoteDir string) (string, error) {
 	unit := fmt.Sprintf("[Unit]\nDescription=PLC Agent (KronServer)\nAfter=network.target\n\n"+
 		"[Service]\nExecStart=%s -addr :7070 -deploy-dir %s -shm-name plc_runtime -shm-size 65536\n"+
 		"Restart=always\nRestartSec=3\nWorkingDirectory=%s\nUser=root\n\n"+
@@ -232,12 +288,12 @@ func installSystemdUnit(client *ssh.Client, sudo, remoteBin, remoteDir string) {
 		"cat > /tmp/plc-agent.service << 'UNIT'\n%sUNIT\n"+
 			"%[2]scp /tmp/plc-agent.service /etc/systemd/system/plc-agent.service && "+
 			"%[2]ssystemctl daemon-reload && %[2]ssystemctl enable plc-agent", unit, sudo)
-	sshRun(client, cmd)
+	return sshRun(client, cmd)
 }
 
 // installCronSupervisor writes a POSIX-sh restart-on-crash supervisor and a
 // @reboot crontab entry (de-duplicated across re-deploys).
-func installCronSupervisor(client *ssh.Client, sudo, remoteBin, remoteDir string) {
+func installCronSupervisor(client *ssh.Client, sudo, remoteBin, remoteDir string) (string, error) {
 	sup := remoteDir + "/plc-agent-supervisor.sh"
 	content := "#!/bin/sh\n" +
 		"# plc-agent supervisor — restarts the agent on crash.\n" +
@@ -255,14 +311,14 @@ func installCronSupervisor(client *ssh.Client, sudo, remoteBin, remoteDir string
 		"cat > %[1]s << 'SUPERVISOR'\n%[2]sSUPERVISOR\nchmod +x %[1]s && "+
 			"( %[3]scrontab -l 2>/dev/null | grep -v plc-agent-supervisor ; echo '@reboot %[1]s >/dev/null 2>&1' ) | %[3]scrontab -",
 		sup, content, sudo)
-	sshRun(client, cmd)
+	return sshRun(client, cmd)
 }
 
 // startCronSupervisor (re)launches the supervisor detached so it survives our
 // SSH disconnect.
-func startCronSupervisor(client *ssh.Client, sudo, remoteDir string) {
+func startCronSupervisor(client *ssh.Client, sudo, remoteDir string) (string, error) {
 	sup := remoteDir + "/plc-agent-supervisor.sh"
-	sshRun(client, fmt.Sprintf("%[1]spkill -f plc-agent-supervisor 2>/dev/null; sleep 1; %[1]snohup %[2]s >/dev/null 2>&1 &", sudo, sup))
+	return sshRun(client, fmt.Sprintf("%[1]spkill -f plc-agent-supervisor 2>/dev/null; sleep 1; %[1]snohup %[2]s >/dev/null 2>&1 &", sudo, sup))
 }
 
 // tofuHostKeyCallback returns a trust-on-first-use host-key verifier backed by

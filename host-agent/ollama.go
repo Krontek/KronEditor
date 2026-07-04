@@ -58,10 +58,11 @@ const (
 
 // OllamaState owns the managed `ollama serve` process and tracks in-flight pulls.
 type OllamaState struct {
-	mu       sync.Mutex
-	serveCmd *exec.Cmd
-	inFlight map[string]bool
-	setting  bool // a setup run is in progress
+	mu        sync.Mutex
+	serveCmd  *exec.Cmd
+	serveDone chan struct{} // closed by the reaper goroutine (the ONLY cmd.Wait caller)
+	inFlight  map[string]bool
+	setting   bool // a setup run is in progress
 
 	// GPU totals parsed from the managed daemon's own startup logs — a fallback
 	// for when nvidia-smi is absent or broken (e.g. driver/NVML mismatch) yet
@@ -75,14 +76,21 @@ func NewOllamaState() *OllamaState {
 }
 
 // Stop kills the managed daemon (if we started one) on agent shutdown.
+// exec.Cmd.Wait must only ever be called once, so Stop never calls Wait —
+// the reaper in startOllamaServe owns Wait and closes serveDone.
 func (o *OllamaState) Stop() {
 	o.mu.Lock()
-	cmd := o.serveCmd
-	o.serveCmd = nil
+	cmd, done := o.serveCmd, o.serveDone
+	o.serveCmd, o.serveDone = nil, nil
 	o.mu.Unlock()
 	if cmd != nil && cmd.Process != nil {
 		_ = cmd.Process.Kill()
-		_ = cmd.Wait()
+		if done != nil {
+			select {
+			case <-done:
+			case <-time.After(5 * time.Second):
+			}
+		}
 	}
 }
 
@@ -427,9 +435,19 @@ func extractTarStream(r io.Reader, dest string) error {
 			}
 			out.Close()
 		case tar.TypeSymlink:
+			// Symlink-slip guard: reject absolute targets and relative targets
+			// that resolve outside dest — a hostile archive must not be able to
+			// plant a link that later writes/reads outside the install dir.
+			link := hdr.Linkname
+			if filepath.IsAbs(link) {
+				continue
+			}
+			if resolved := filepath.Join(filepath.Dir(target), link); !withinDir(dest, resolved) {
+				continue
+			}
 			_ = os.MkdirAll(filepath.Dir(target), 0o755)
 			_ = os.Remove(target)
-			_ = os.Symlink(hdr.Linkname, target)
+			_ = os.Symlink(link, target)
 		}
 	}
 	return nil
@@ -492,8 +510,14 @@ func (s *Server) startOllamaServe(bin, base string) error {
 	if err := cmd.Start(); err != nil {
 		return err
 	}
+	done := make(chan struct{})
 	s.ollama.serveCmd = cmd
-	go func() { _ = cmd.Wait() }() // reap when it exits
+	s.ollama.serveDone = done
+	// Reaper: the ONLY cmd.Wait caller (Stop() waits on `done`).
+	go func() {
+		_ = cmd.Wait()
+		close(done)
+	}()
 	return nil
 }
 

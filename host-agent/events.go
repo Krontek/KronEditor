@@ -3,9 +3,13 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
 	"sync"
 )
+
+// eventsMarshalLogOnce keeps a persistent marshal failure from flooding the log.
+var eventsMarshalLogOnce sync.Once
 
 // Events is a fan-out broadcaster used for build-command, library-update-progress,
 // server-update-progress, ec-state-changed, etc. Subscribers connect via SSE at
@@ -73,7 +77,15 @@ func (e *Events) handleSSE(w http.ResponseWriter, r *http.Request) {
 			if !ok {
 				return
 			}
-			payload, _ := json.Marshal(msg)
+			payload, err := json.Marshal(msg)
+			if err != nil {
+				// A single bad payload (e.g. a non-finite float) must not
+				// silently freeze the stream — drop the frame and log once.
+				eventsMarshalLogOnce.Do(func() {
+					log.Printf("events: marshal failed (frame dropped): %v", err)
+				})
+				continue
+			}
 			fmt.Fprintf(w, "data: %s\n\n", payload)
 			flusher.Flush()
 		}

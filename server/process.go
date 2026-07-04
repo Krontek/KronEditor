@@ -73,6 +73,12 @@ type ProcessManager struct {
 	stderrFile *os.File
 	lastEvent  *RuntimeEvent // guarded by mu; last swap/coldstart/crash outcome
 
+	// preStartHook runs inside Start() AFTER any previous process has been
+	// fully stopped and BEFORE the new one is spawned. Wired to
+	// ipc.WriteInitialValues so initial values can never be overwritten by
+	// the dying runtime's final shm sync (guarded by mu).
+	preStartHook func()
+
 	// AutoRun crash-restart state. All fields below are guarded by mu.
 	intentionalStop    bool        // set by Stop() so watchProcess won't auto-restart
 	autoRunGetter      func() bool // queried after a crash to decide whether to respawn
@@ -113,6 +119,16 @@ func (pm *ProcessManager) SetAutoRunGetter(f func() bool) {
 	pm.mu.Lock()
 	defer pm.mu.Unlock()
 	pm.autoRunGetter = f
+}
+
+// SetPreStartHook wires the callback invoked between "old process stopped"
+// and "new process spawned" inside Start(). Used for writing initial values
+// to shared memory at the only point where the dying runtime's final shm
+// sync cannot clobber them.
+func (pm *ProcessManager) SetPreStartHook(f func()) {
+	pm.mu.Lock()
+	defer pm.mu.Unlock()
+	pm.preStartHook = f
 }
 
 // CancelPendingRestart stops any pending auto-restart timer.
@@ -235,30 +251,87 @@ func (pm *ProcessManager) terminateOrphan(pid int) {
 // Start launches /opt/plc/runtime.bin.
 // If a process is already running, it stops it first.
 // Any pending auto-restart timer is canceled (a manual Start supersedes it).
+//
+// Holds swapMu for the whole operation so an AutoRun crash-restart (which
+// calls Start) can never interleave with SwapLogic's swap_result polling —
+// both read the same result file. Lock ordering is strictly swapMu → mu
+// (never mu → swapMu), matching SwapLogic, so no deadlock is possible.
+// pm.mu itself is only held for the spawn phase (spawnRuntimeLocked); the
+// informational cold-start poll below runs WITHOUT mu so Stop()/Status()
+// are never stalled behind the up-to-5s wait.
 func (pm *ProcessManager) Start() error {
+	pm.swapMu.Lock()
+	defer pm.swapMu.Unlock()
+
+	hotSwapGen, hotSwap, err := pm.spawnRuntime()
+	if err != nil {
+		return err
+	}
+
+	if hotSwap {
+		// Confirm the loader-host actually bound its first logic module
+		// before returning — a fresh start that can't even bind logic_<gen>
+		// (e.g. a stale/mismatched upload) exits almost immediately; without
+		// this poll that would look identical to a normal successful start
+		// until the NEXT /status check. Informational only: a timeout here
+		// does not fail Start() (the process did spawn), just records the
+		// outcome for /status to surface. pm.mu is NOT held during the poll;
+		// recordEvent reacquires it briefly.
+		resultPath := filepath.Join(pm.deployDir, "swap_result")
+		status, detail, perr := hotswaplib.PollSwapResult(resultPath, hotSwapGen, swapResultTimeout)
+		if perr != nil {
+			slog.Warn("hot-swap cold-start outcome unknown", "gen", hotSwapGen)
+			pm.recordEvent("coldstart", "unknown", "")
+		} else {
+			if status != "OK" {
+				slog.Error("hot-swap cold-start failed", "gen", hotSwapGen, "reason", detail)
+			}
+			pm.recordEvent("coldstart", status, detail)
+		}
+	}
+	return nil
+}
+
+// spawnRuntime is the mu-guarded phase of Start(): stop any previous process,
+// run the pre-start hook (initial values), spawn the new runtime. Returns the
+// discovered hot-swap generation so Start() can poll the cold-start outcome
+// after releasing mu. Caller must hold swapMu.
+func (pm *ProcessManager) spawnRuntime() (hotSwapGen int, hotSwap bool, err error) {
 	pm.mu.Lock()
 	defer pm.mu.Unlock()
 
 	// A manual start always supersedes a pending auto-restart.
 	pm.cancelRestartLocked()
+	// Clear the intentional-stop latch from a previous Stop(). Without this,
+	// a Stop() on which watchProcess never consumed the flag (stopLocked nils
+	// pm.cmd, so watchProcess returns early on its `pm.cmd != cmd` guard)
+	// would permanently mask the NEXT genuine crash: no crash event recorded
+	// and no AutoRun respawn.
+	pm.intentionalStop = false
 
 	// Stop the previous process safely if it is still running.
 	if pm.isRunning() {
 		slog.Info("Stopping current runtime (redeploy)")
 		if err := pm.stopLocked(); err != nil {
-			return fmt.Errorf("failed to stop previous process: %w", err)
+			return 0, false, fmt.Errorf("failed to stop previous process: %w", err)
 		}
+	}
+
+	// Initial values must land AFTER the old process has fully exited (its
+	// dying shm sync would overwrite them) and BEFORE the new one spawns.
+	if pm.preStartHook != nil {
+		pm.preStartHook()
 	}
 
 	binPath := filepath.Join(pm.deployDir, "runtime.bin")
 	if _, err := os.Stat(binPath); errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("runtime binary not found: %s", binPath)
+		return 0, false, fmt.Errorf("runtime binary not found: %s", binPath)
 	}
 
 	// Redirect PLC outputs to log files for persistent records and debugging.
 	logDir := filepath.Join(pm.deployDir, "logs")
 	if err := os.MkdirAll(logDir, 0755); err != nil {
-		return fmt.Errorf("failed to create log directory: %w", err)
+		return 0, false, fmt.Errorf("failed to create log directory: %w", err)
 	}
 	timestamp := time.Now().Format("20060102_150405")
 	stdoutPath := filepath.Join(logDir, "runtime_"+timestamp+"_stdout.log")
@@ -266,12 +339,12 @@ func (pm *ProcessManager) Start() error {
 
 	stdoutF, err := os.Create(stdoutPath)
 	if err != nil {
-		return fmt.Errorf("failed to create stdout log file: %w", err)
+		return 0, false, fmt.Errorf("failed to create stdout log file: %w", err)
 	}
 	stderrF, err := os.Create(stderrPath)
 	if err != nil {
 		stdoutF.Close()
-		return fmt.Errorf("failed to create stderr log file: %w", err)
+		return 0, false, fmt.Errorf("failed to create stderr log file: %w", err)
 	}
 
 	// Hot-swap (online change) mode: if ANY logic_<n>.so is present, runtime.bin
@@ -280,7 +353,8 @@ func (pm *ProcessManager) Start() error {
 	// from disk (never a hardcoded "logic_0.so" literal, and never an
 	// in-memory counter) — this is what makes the switch correct after an
 	// agent restart or when generation 0 has since been cleaned up.
-	hotSwapGen, logicPath, hotSwap := hotswaplib.DiscoverGeneration(pm.deployDir)
+	var logicPath string
+	hotSwapGen, logicPath, hotSwap = hotswaplib.DiscoverGeneration(pm.deployDir)
 
 	// SOEM requires CAP_NET_RAW (raw socket access for EtherCAT).
 	// If this process is already root (uid=0), spawn directly.
@@ -310,7 +384,7 @@ func (pm *ProcessManager) Start() error {
 	if err := cmd.Start(); err != nil {
 		stdoutF.Close()
 		stderrF.Close()
-		return fmt.Errorf("failed to start runtime: %w", err)
+		return 0, false, fmt.Errorf("failed to start runtime: %w", err)
 	}
 
 	pm.cmd = cmd
@@ -330,27 +404,7 @@ func (pm *ProcessManager) Start() error {
 		"stderr_log", stderrPath,
 	)
 
-	if hotSwap {
-		// Confirm the loader-host actually bound its first logic module
-		// before returning — a fresh start that can't even bind logic_<gen>
-		// (e.g. a stale/mismatched upload) exits almost immediately; without
-		// this poll that would look identical to a normal successful start
-		// until the NEXT /status check. Informational only: a timeout here
-		// does not fail Start() (the process did spawn), just records the
-		// outcome for /status to surface.
-		resultPath := filepath.Join(pm.deployDir, "swap_result")
-		status, detail, perr := hotswaplib.PollSwapResult(resultPath, hotSwapGen, swapResultTimeout)
-		if perr != nil {
-			slog.Warn("hot-swap cold-start outcome unknown", "gen", hotSwapGen)
-			pm.lastEvent = &RuntimeEvent{Kind: "coldstart", Status: "unknown", At: time.Now()}
-		} else {
-			if status != "OK" {
-				slog.Error("hot-swap cold-start failed", "gen", hotSwapGen, "reason", detail)
-			}
-			pm.lastEvent = &RuntimeEvent{Kind: "coldstart", Status: status, Detail: detail, At: time.Now()}
-		}
-	}
-	return nil
+	return hotSwapGen, hotSwap, nil
 }
 
 // SwapLogic pushes an ONLINE CHANGE to the running loader-host: it writes the
@@ -437,11 +491,14 @@ func (pm *ProcessManager) Stop() error {
 	// decision and any timer that hasn't fired yet.
 	pm.cancelRestartLocked()
 	pm.consecutiveCrashes = 0
-	pm.intentionalStop = true
 	if !pm.isRunning() {
+		// Nothing running: do NOT latch intentionalStop — a stale latch would
+		// suppress crash detection for the next run (the next Start() resets
+		// it anyway, but there is no reason to set it here at all).
 		slog.Debug("No active PLC process to stop")
 		return nil
 	}
+	pm.intentionalStop = true
 	return pm.stopLocked()
 }
 

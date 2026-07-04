@@ -73,8 +73,10 @@ func NewPLCService(ipc *IPCManager, pm *ProcessManager) *PLCService {
 }
 
 // Start launches the PLC runtime binary.
+// Initial values are written by pm's pre-start hook (see main.go) AFTER any
+// previous process has stopped — writing them here, before pm.Start()'s
+// internal stop, would let the dying runtime's final shm sync overwrite them.
 func (s *PLCService) Start(_ context.Context, _ *connect.Request[plcv1.StartRequest]) (*connect.Response[plcv1.StartResponse], error) {
-	s.ipc.WriteInitialValues()
 	if err := s.pm.Start(); err != nil {
 		slog.Error("Failed to start PLC runtime", "err", err)
 		return nil, connect.NewError(connect.CodeInternal, err)

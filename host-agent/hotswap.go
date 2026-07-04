@@ -54,9 +54,10 @@ const hotswapShmName = "/plc_runtime" // matches PLC_SHM_NAME in generated plc.c
 const swapResultTimeout = 5 * time.Second
 
 type ShmSpec struct {
-	Key    string
-	Offset uint64
-	VType  string
+	Key      string
+	Offset   uint64
+	VType    string
+	ForceOff uint64 // force-flag byte offset (0 = none; real flags live at >= 32768)
 }
 
 // HotSwapState owns the running loader-host process + the SHM poller.
@@ -73,14 +74,19 @@ type HotSwapState struct {
 	pid    int
 	specs  []ShmSpec
 	stopCh chan struct{}
+	done   chan struct{} // closed by the reaper goroutine (the ONLY cmd.Wait caller)
 }
 
 func NewHotSwapState() *HotSwapState { return &HotSwapState{} }
 
+// Stop kills the loader-host and waits for its reaper to confirm the process
+// is gone. exec.Cmd.Wait must only ever be called once, so Stop never calls
+// Wait itself — the reaper spawned in handleHotSwapRun owns Wait and closes
+// `done`.
 func (h *HotSwapState) Stop() {
 	h.mu.Lock()
-	cmd, ch := h.cmd, h.stopCh
-	h.cmd, h.pid, h.stopCh = nil, 0, nil
+	cmd, ch, done := h.cmd, h.stopCh, h.done
+	h.cmd, h.pid, h.stopCh, h.done = nil, 0, nil, nil
 	h.mu.Unlock()
 	if ch != nil {
 		select {
@@ -92,7 +98,12 @@ func (h *HotSwapState) Stop() {
 	if cmd != nil && cmd.Process != nil {
 		_ = cmd.Process.Signal(syscall.SIGTERM)
 		_ = cmd.Process.Kill()
-		_ = cmd.Wait()
+		if done != nil {
+			select {
+			case <-done:
+			case <-time.After(5 * time.Second):
+			}
+		}
 	}
 }
 
@@ -116,9 +127,59 @@ func buildShmSpecs(variableTableJSON string) []ShmSpec {
 		if vType == "" {
 			vType = "BOOL"
 		}
-		specs = append(specs, ShmSpec{Key: key, Offset: uint64(off), VType: vType})
+		forceOff, _ := em["force_flag_offset"].(float64)
+		specs = append(specs, ShmSpec{Key: key, Offset: uint64(off), VType: vType, ForceOff: uint64(forceOff)})
 	}
 	return specs
+}
+
+// writeHotSwapVariable force-writes a variable into the hot-swap loader-host's
+// /dev/shm mirror (the DEFAULT sim runtime). The generated plc_shm_pull only
+// copies a slot into PlcState when its force flag is set (and plc_shm_sync
+// skips forced slots), so a bare value write would be a no-op — value + flag
+// together are exactly what KronServer's WriteVar does on the target.
+func (s *Server) writeHotSwapVariable(w http.ResponseWriter, req writeVariableReq) {
+	s.hotswap.mu.Lock()
+	running := s.hotswap.cmd != nil
+	var spec ShmSpec
+	found := false
+	for _, sp := range s.hotswap.specs {
+		if sp.Key == req.Name {
+			spec, found = sp, true
+			break
+		}
+	}
+	s.hotswap.mu.Unlock()
+	if !running {
+		writeError(w, http.StatusBadRequest, "No simulation running")
+		return
+	}
+	if !found {
+		writeError(w, http.StatusNotFound, "Variable not found: "+req.Name)
+		return
+	}
+	data, ok := encodeValue(spec.VType, req.Value)
+	if !ok {
+		writeError(w, http.StatusBadRequest, fmt.Sprintf("Cannot encode %q as %s", req.Value, spec.VType))
+		return
+	}
+	f, err := os.OpenFile("/dev/shm"+hotswapShmName, os.O_WRONLY, 0)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "open shm mirror: "+err.Error())
+		return
+	}
+	defer f.Close()
+	if _, err := f.WriteAt(data, int64(spec.Offset)); err != nil {
+		writeError(w, http.StatusInternalServerError, fmt.Sprintf("shm write at 0x%x: %v", spec.Offset, err))
+		return
+	}
+	if spec.ForceOff > 0 {
+		if _, err := f.WriteAt([]byte{1}, int64(spec.ForceOff)); err != nil {
+			writeError(w, http.StatusInternalServerError, fmt.Sprintf("shm force flag at 0x%x: %v", spec.ForceOff, err))
+			return
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
 func swapResultPath(buildDir string) string { return filepath.Join(buildDir, "swap_result") }
@@ -447,6 +508,14 @@ func (s *Server) handleHotSwapDeploySwap(w http.ResponseWriter, r *http.Request)
 	}
 	_ = json.NewDecoder(resp.Body).Decode(&up)
 	resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		writeError(w, http.StatusBadGateway, fmt.Sprintf("deploy/logic rejected: HTTP %d", resp.StatusCode))
+		return
+	}
+	if up.Logic == "" {
+		writeError(w, http.StatusBadGateway, "deploy/logic returned no logic name — aborting swap")
+		return
+	}
 	// 2) swap — the server-side handler now blocks until it has polled its
 	// own swap_result, so a non-2xx here (or an "ok":false body) means the
 	// swap was actually attempted and REJECTED (e.g. a layout mismatch), not
@@ -529,8 +598,6 @@ func (s *Server) handleHotSwapRun(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "not built — call hotswap/build first")
 		return
 	}
-	// Fresh mirror each run.
-	_ = os.Remove("/dev/shm" + hotswapShmName)
 
 	s.hotswap.mu.Lock()
 	if s.hotswap.cmd != nil {
@@ -538,6 +605,10 @@ func (s *Server) handleHotSwapRun(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "alreadyRunning": true, "pid": s.hotswap.pid})
 		return
 	}
+	// Fresh mirror each run. This MUST happen after the already-running
+	// early-return above: the poller opens the mirror by path each tick, so
+	// removing it while a host is live would silently kill the live stream.
+	_ = os.Remove("/dev/shm" + hotswapShmName)
 	// Clear any stale result from a previous run BEFORE spawning, so a
 	// leftover file can never be misread as THIS run's cold-start outcome.
 	_ = hotswaplib.ClearResultFile(swapResultPath(buildDir))
@@ -549,21 +620,38 @@ func (s *Server) handleHotSwapRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	stopCh := make(chan struct{})
+	done := make(chan struct{})
 	s.hotswap.cmd = cmd
 	s.hotswap.pid = cmd.Process.Pid
 	s.hotswap.stopCh = stopCh
+	s.hotswap.done = done
 	specs := s.hotswap.specs
 	pid := s.hotswap.pid
 	s.hotswap.mu.Unlock()
 
+	// Reaper: the ONLY cmd.Wait caller for this process (Stop() waits on
+	// `done`). On an unexpected crash it also closes stopCh so the SHM poller
+	// stops instead of streaming frozen values forever (and a later run
+	// starting a SECOND poller).
 	go func() {
 		_ = cmd.Wait()
+		close(done)
 		s.hotswap.mu.Lock()
 		wasCurrent := s.hotswap.cmd == cmd
+		var ch chan struct{}
 		if wasCurrent {
-			s.hotswap.cmd, s.hotswap.pid = nil, 0
+			s.hotswap.cmd, s.hotswap.pid, s.hotswap.done = nil, 0, nil
+			ch = s.hotswap.stopCh
+			s.hotswap.stopCh = nil
 		}
 		s.hotswap.mu.Unlock()
+		if ch != nil {
+			select {
+			case <-ch:
+			default:
+				close(ch)
+			}
+		}
 		if wasCurrent {
 			s.events.Emit("simulation-output", map[string]any{"status": "crashed"})
 		}
@@ -575,8 +663,11 @@ func (s *Server) handleHotSwapRun(w http.ResponseWriter, r *http.Request) {
 	// poll that would look identical to a normal successful start.
 	status, detail, perr := hotswaplib.PollSwapResult(swapResultPath(buildDir), 0, swapResultTimeout)
 	if perr != nil {
+		// Outcome unknown: don't leave a half-tracked host running with no
+		// poller — kill it and clean up so the failure is deterministic.
+		s.hotswap.Stop()
 		s.events.Emit("simulation-output", map[string]any{"status": "hotswap-unknown", "phase": "coldstart"})
-		writeJSON(w, http.StatusGatewayTimeout, map[string]any{"ok": false, "error": "cold-start outcome unknown (timeout)", "pid": pid, "confirmed": false})
+		writeJSON(w, http.StatusGatewayTimeout, map[string]any{"ok": false, "error": "cold-start outcome unknown (timeout) — host killed", "pid": pid, "confirmed": false})
 		return
 	}
 	if status != "OK" {

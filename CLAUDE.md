@@ -1,661 +1,567 @@
-# KronEditor — Coding Rules & Architecture Reference
+# KronEditor — Architecture & Coding Reference
 
-## Rules
+KronEditor is a browser-based **IEC 61131-3 PLC editor**. You draw Ladder (LD) diagrams and write Structured Text (ST), it transpiles to C, compiles with a bundled clang, and either runs a local simulation or deploys to a Linux single-board computer (SBC) running the KronServer runtime agent.
 
-### Language
-All code must be written in English. Comments, variable names, function names, string literals, and any other text in source files must use English only.
+This file is the durable knowledge base for anyone (human or AI) working on the codebase. Read the section relevant to your task; the invariants marked **⚠️ INVARIANT** are things the code depends on that are easy to break silently.
 
-### Library Source Files
-- **Always** edit canonical C sources under `/home/fehim/Documents/KrontekLibraries/` first.
-- If the same file exists under `src-tauri/resources/.../include/`, apply the same change there too (keep in sync).
-- **Never** only edit `resources/include/` and skip KrontekLibraries.
-- **Never** generate `.a` static archive files. Only edit `.c` and `.h`. Rebuilding/deploying `.a` is the user's responsibility.
-- `src-tauri/target/release/resources/include/kronec.c` is a stale stub — never edit it.
-
-### Communication
-When uncertain about requirements, architecture decisions, or implementation direction, **always ask first** before proceeding. If you have questions, ask them **before** making any changes — never start implementing and ask later.
-
-### Self-Update of This File
-After every prompt, before ending your turn, briefly evaluate whether anything **durable** was learned that future sessions need to know — a new transpiler rule, a HAL behavior, a build-pipeline quirk, a non-obvious workaround. If yes, update this CLAUDE.md in the same turn. Do **not** record session-specific debugging details, in-progress task state, or things already derivable from the code. Only persist facts that would surprise a future Claude reading the codebase cold.
-
----
-
-## Technology Stack
-
-- **Frontend**: React (Vite), ReactFlow (LD diagram), Monaco (ST editor) — runs in a browser tab
-- **Host agent**: Go (`host-agent/`) — single binary, listens on **`:7171`**, embeds the Vite build via `embed.FS`. Replaces what Tauri's Rust backend used to do (file I/O, GCC/clang invocation, simulation spawn, shared memory, HMI server, deploy to remote device).
-- **PLC languages**: IEC 61131-3 LD + ST → transpiled to C → compiled with bundled clang (LLVM toolchains under `toolchains/`)
-- **Simulation**: compiled binary spawned by the host agent; variables read/written via `/proc/<pid>/mem` (Linux); live updates streamed to the browser over SSE (`/api/host/plc-variables` and `/api/host/events`)
-- **Deployment Server**: Go (KronServer, `server/`) — ConnectRPC/gRPC agent that runs on the **target device** for PLC runtime deployment, shared memory IPC, HMI serving. The host agent talks to it over HTTP for `Build & Send`.
-
-### Tauri removed
-The old Tauri v2 desktop wrapper (`src-tauri/`) has been deleted in favour of the browser+host-agent setup. All 24 `invoke('cmd', args)` calls were ported to `host.<method>(args)` (see `src/services/HostClient.js`); event listeners were ported to SSE via `host.streamEvents()`; `@tauri-apps/plugin-fs`, `plugin-dialog`, `plugin-clipboard-manager`, and `getCurrentWindow()` were replaced by `src/services/browserFs.js` and `navigator.clipboard`. **Some commands are intentionally stubbed (501 Not Implemented)** in `host-agent/`: `update_libraries`, `update_server`, `build_soem`, `build_canopen`, `ec_request_state`. Re-implementing them is a follow-up — the editor's core compile/run/deploy path does not depend on them. **`deploy_server_to_target` IS implemented** (`host-agent/deploy_ssh.go`, deps `golang.org/x/crypto/ssh` + `github.com/pkg/sftp`): SFTP-uploads the prebuilt `plc-agent` for the board to `<home>/plc/plc-agent`, installs a supervisor (systemd unit when `/run/systemd/system` exists, else a cron `@reboot` POSIX-sh restart loop), starts it, and polls `http://host:7070/status` (5×2 s) to verify. Progress streams on the `server-deploy-progress` SSE topic (the panel opens it before the POST). **Auth tries `ssh.Password` AND `ssh.KeyboardInteractive` (same password)** — PAM-only servers offer keyboard-interactive, not the raw password method, so a correct password fails without the fallback. **Host keys use agent-managed TOFU** (`tofuHostKeyCallback`, `AppDataDir/known_hosts` via `golang.org/x/crypto/ssh/knownhosts`): unknown host → accept + persist on first use (first deploy to a never-SSH'd device just works); same key later → accept; **changed key → reject** (MITM/reinstalled device; user removes the line to re-trust). This replaced the earlier blanket `InsecureIgnoreHostKey`. **The binary it ships comes from `resources/<triple>/server/plc-agent_linux_{arm64|armv7|amd64}` — `server/build.sh` now copies its `dist/` output there, so a server rebuild is actually what gets deployed; if you edit `server/` you MUST re-run `server/build.sh` or the deploy ships a stale binary.**
+## Table of Contents
+1. [Rules for contributors](#1-rules-for-contributors)
+2. [Technology stack & processes](#2-technology-stack--processes)
+3. [Repository layout](#3-repository-layout)
+4. [Dev workflow, versioning, packaging](#4-dev-workflow-versioning-packaging)
+5. [The transpiler (ST/LD → C)](#5-the-transpiler-stld--c)
+6. [Simulation, hot-swap & the PlcState model](#6-simulation-hot-swap--the-plcstate-model)
+7. [Frontend architecture](#7-frontend-architecture)
+8. [The AI agent panel](#8-the-ai-agent-panel)
+9. [Board support (adding a new SBC)](#9-board-support-adding-a-new-sbc)
+10. [HAL pattern](#10-hal-pattern)
+11. [KronServer (target-device agent)](#11-kronserver-target-device-agent)
+12. [Security model](#12-security-model)
+13. [EtherCAT & motion](#13-ethercat--motion)
+14. [Library system & clipboard](#14-library-system--clipboard)
 
 ---
 
-## Build Output Location
+## 1. Rules for contributors
 
-The compiled PLC artifacts (Build & Send target output) are written to:
-`~/.local/share/com.plceditor.app/build/`
-(absolute: `/home/fehim/.local/share/com.plceditor.app/build/`)
+**Language.** All code, comments, identifiers, and string literals are English only.
 
-Files generated there:
-- `plc.c` / `plc.h` — transpiled C output (CTranspilerService.js result)
-- `kron_hal.h` — auto-generated process image / HAL glue
-- `runtime.bin` — compiled binary (cross-compiled for the selected board family)
-- `variables.json` — symbol table for SHM offsets, addressed vars, password hashes
+**Library C sources.**
+- Edit the canonical C sources under `/home/fehim/Documents/KrontekLibraries/` **first**.
+- If the same file exists under `src-tauri/resources/.../include/`, apply the identical change there too (keep in sync).
+- Never edit only `resources/include/` and skip KrontekLibraries.
+- Never generate `.a` static archives — only `.c`/`.h`. Rebuilding/deploying `.a` is the user's job.
+- `src-tauri/target/release/resources/include/kronec.c` is a stale stub — never touch it.
 
-Use this directory when verifying transpiler output or diagnosing runtime behavior.
+**Ask before large or ambiguous changes.** When uncertain about requirements or direction, ask *before* implementing, not after.
+
+**Keep this file current.** After each task, if something *durable and surprising* was learned (a new transpiler rule, a HAL behavior, a build quirk, a non-obvious workaround), update the relevant section here in the same turn. Do **not** record session-specific debugging state or anything already obvious from the code.
 
 ---
 
-## Dev Workflow
+## 2. Technology stack & processes
+
+Three processes cooperate:
+
+| Process | Language | Role |
+|---|---|---|
+| **Frontend** | React (Vite), ReactFlow (LD), Monaco (ST) | The editor UI, runs in a browser tab |
+| **Host agent** | Go (`host-agent/`) | Local backend on **`:7171`**: file I/O, clang invocation, simulation spawn + `/proc` variable reads, SSE streaming, deploy-to-device. Embeds the Vite build via `embed.FS`. |
+| **KronServer** | Go (`server/`) | Runs **on the target SBC**: receives deployed runtime, manages its lifecycle, shared-memory IPC, HMI + REST API. Host agent talks to it over HTTP for Build & Send. |
+
+- **PLC languages:** IEC 61131-3 LD + ST → transpiled to C → compiled with bundled clang (LLVM toolchains under `toolchains/`).
+- **Simulation:** compiled binary spawned by the host agent; variables read/written via `/dev/shm` (hot-swap default) or `/proc/<pid>/mem` (legacy plain sim); live updates stream to the browser over SSE.
+
+### Tauri has been removed
+The old Tauri v2 desktop wrapper (`src-tauri/`) is gone in favour of browser + host-agent. All `invoke('cmd', args)` calls became `host.<method>(args)` (`src/services/HostClient.js`); event listeners became SSE via `host.streamEvents()`; the Tauri fs/dialog/clipboard plugins became `src/services/browserFs.js` + `navigator.clipboard`.
+
+**Intentionally stubbed (501)** in the host agent: `update_libraries`, `update_server`, `build_soem`, `build_canopen`, `ec_request_state`. The core compile/run/deploy path doesn't need them.
+
+**`deploy_server_to_target` IS implemented** (`host-agent/deploy_ssh.go`, uses `golang.org/x/crypto/ssh` + `github.com/pkg/sftp`): SFTP-uploads the prebuilt `plc-agent` for the board to `<home>/plc/plc-agent`, installs a supervisor (systemd unit if `/run/systemd/system` exists, else a cron `@reboot` restart loop), starts it, and polls `http://host:7070/status` (5×2s) to verify. Progress streams on the `server-deploy-progress` SSE topic.
+- **Auth tries `ssh.Password` AND `ssh.KeyboardInteractive` (same password)** — PAM-only servers offer only keyboard-interactive, so a correct password fails without the fallback.
+- **Host keys use agent-managed TOFU** (`tofuHostKeyCallback`, `AppDataDir/known_hosts`): unknown host → accept + persist; same key later → accept; **changed key → the current code auto-retrusts** (removes the old entry and accepts). ⚠️ This is *weaker* than pure TOFU and offers no MITM protection against a changed key; it is a deliberate usability tradeoff. Do not "fix" it without discussing — but be aware of the exposure (password-based auth means an MITM could harvest the device password).
+- **`serverBinaryForBoard` (deploy_ssh.go) maps board-id prefix → server binary arch.** aarch64 board prefixes → `plc-agent_linux_arm64`; `bb_` (armv7) → `plc-agent_linux_armv7`; default → amd64. ⚠️ When adding a new aarch64 board family, its prefix MUST be added here or the deploy ships the wrong-arch binary. The binary source is `resources/<triple>/server/plc-agent_linux_{arm64|armv7|amd64}` — `server/build.sh` copies its `dist/` output there, **so after editing `server/` you MUST re-run `server/build.sh` or the deploy ships a stale binary.**
+
+---
+
+## 3. Repository layout
 
 ```
-# Terminal 1: Go host agent (serves API + embedded frontend on :7171)
+src/                          React frontend
+  App.jsx                     Root state: isRunning, isSimulationMode, liveVariables, project tree
+  components/
+    EditorPane.jsx            Tabbed editor: ST (Monaco), LD (RungEditorNew), Resource; live badges
+    RungEditorNew.jsx         LD editor: rung list, block insertion, undo/redo
+    RungContainer.jsx         ReactFlow canvas for one rung (large)
+    VariableManager.jsx       Variable table (global + POU-local), IEC address formatting
+    ProjectSidebar.jsx        Project tree; add/delete POUs; structural undo/redo
+    Toolbox.jsx               Draggable block library (3-level hierarchy)
+    OutputPanel.jsx           Simulation log + live variable watch
+    BoardConfigPage.jsx       Board selection + interface (GPIO/I2C/SPI/UART/USB) config
+    TaskManager.jsx           PLC task scheduling
+    Slave/EtherCATEditor.jsx  EtherCAT master/slave config
+    AiAgentPanel.jsx          Tool-calling AI agent ("PLC Agent")
+  services/
+    CTranspilerService.js     ST→C and LD→C transpiler (the main compile path)
+    HostClient.js             HTTP client for the local host-agent
+    PLCClient.js              HTTP/SSE client for the remote KronServer
+    LibraryService.js         Loads XML block library from public/libraries/
+    browserFs.js              open/save/ask replacements for the Tauri fs/dialog plugins
+    agentTools.js             AI agent action surface (pure tool executor)
+  utils/
+    boardDefinitions.js       All boards: specs, pinout, usbPorts, interfaces
+    boardLibraryBlocks.js     Per-board channel counts (BOARD_CHANNELS)
+    devicePortMapping.js      Family → protocol → portId → Linux device path; getBoardFamilyDefine
+    deviceCodegen.js          EtherCAT device C codegen; ALSO has a copy of getBoardFamilyDefine
+    hwPortVars.js             System STRING vars from interfaceConfig
+    libraryTree.js            Static toolbox tree + GENERIC_FB_DEFS + PROTOCOL_BLOCKS
+    stValidation.js           Monaco "undefined identifier" markers for ST/SCL
+    plcStandards.js           IEC 61131-3 type definitions
+
+host-agent/                   Local Go agent (replaces Tauri's Rust backend)
+  main.go                     HTTP server, CORS/origin gating, lifecycle, body limits
+  paths.go                    Resolves resources/ + toolchains/ + app-data dir
+  files.go                    write_plc_files, get_standard_headers, generic FS ops
+  compile.go                  compile_simulation, compile_for_target (bundled clang)
+  runtime.go                  run/stop sim, write_variable, ELF/DWARF parse, /proc + /dev/shm
+  hotswap.go                  Hot-swap loader-host: build/run/swap/stop, /dev/shm poller
+  deploy.go                   check_server_status, deploy_to_server (HTTP to remote KronServer)
+  deploy_ssh.go               SSH/SFTP server deploy; serverBinaryForBoard
+  ai.go / anthropic_oauth.go / ollama.go   AI provider proxy, OAuth, local model setup
+  events.go                   SSE broadcaster
+  embed.go                    embed.FS for the Vite build → served at /
+
+server/                       KronServer (cross-compiled to target binaries)
+  main.go server.go service.go ipc.go process.go auth.go hmi.go api.go hotswap.go
+  build.sh                    Cross-compile ARM32/ARM64/x86_64 → dist/ AND resources/<triple>/server/
+  proto/ gen/                 Protobuf + ConnectRPC
+
+hotswaplib/                   Shared Go module (local-replaced into host-agent + server go.mod)
+                              Generation discovery + swap_result protocol
+
+resources/<triple>/           Krontek libraries + HAL headers + prebuilt .a + server binary
+toolchains/                   Bundled LLVM (clang, llvm-ar) + per-target sysroots (~5 GB)
+public/libraries/*.xml        Block library definitions loaded by LibraryService.js
+KrontekLibraries/             SOURCE OF TRUTH for all .c/.h HAL & library sources
+experiments/                  transpiler-check/ (compile gate), hotswap-v2/ (swap demo)
+```
+
+---
+
+## 4. Dev workflow, versioning, packaging
+
+### Local dev
+```
+# Terminal 1: Go host agent (API + embedded frontend on :7171)
 cd host-agent && go run .
 
 # Terminal 2: Vite dev server (hot-reload, proxies /api/host → :7171)
 npm run dev
 ```
+Open `http://localhost:1420` (Vite) for development. The host-agent's `:7171` serves the built frontend for production browsing.
 
-Open `http://localhost:1420` (Vite) for active development; the host-agent's `http://localhost:7171` serves the built frontend (after `npm run build:frontend`) for production-mode browsing.
-
-Single-binary production build:
+### Production build
 ```
 npm run build           # = build:frontend + build:host-agent
 ./dist-binary/kron-host-agent
 ```
-The resulting binary embeds the React app via `embed.FS` (see `host-agent/embed.go`) and looks for the `resources/` and `toolchains/` directories as siblings of the executable (or the working directory).
+The binary embeds the React app (`host-agent/embed.go`) and looks for `resources/` and `toolchains/` as siblings of the executable (or in the working directory).
 
-### Version — single source of truth = `package.json`
-Bump the app version in **one place: `package.json` `"version"`**. It propagates everywhere:
-- **Frontend** (About in `StartScreen.jsx` + `SettingsPage.jsx`): Vite injects `__APP_VERSION__` from package.json (`vite.config.ts` `define`); components import `APP_VERSION` from `src/version.js`. Never hardcode a version string in a component again.
-- **Go host-agent** (`/api/host/health` `version`): `main.go` has `var appVersion = "dev"`, overridden at build time via `-ldflags "-X main.appVersion=$npm_package_version"` in the `build:host-agent` npm script and `-X main.appVersion=$VERSION` in `packaging/*.sh` (which read it with `node -p`). `go run .` shows `"dev"`.
-- **Windows installer** (`kron-editor.iss` `AppVersion`): `build-windows.sh` generates `packaging/windows/version.iss` (`#define AppVersion "x.y.z"`) from package.json; the `.iss` `#include`s it (falls back to `0.0.0-dev` if absent). `version.iss` is gitignored.
+### Version — single source of truth = `package.json` `"version"`
+It propagates everywhere; never hardcode a version string:
+- **Frontend:** Vite injects `__APP_VERSION__` (`vite.config.ts`); components import `APP_VERSION` from `src/version.js`.
+- **Host agent** (`/api/host/health`): `main.go` `var appVersion = "dev"`, overridden at build via `-ldflags "-X main.appVersion=$npm_package_version"`. `go run .` shows `"dev"`.
+- **Windows installer** (`kron-editor.iss`): `build-windows.sh` generates `packaging/windows/version.iss` from package.json.
 
 ### Distributables (`packaging/`)
-Two end-user bundles, each = host-agent binary + `resources/` + a **host-specific** `toolchains/`:
-- `packaging/build-appimage.sh` → `KronEditor-x86_64.AppImage` (linux toolchains; `AppRun` opens a terminal and runs the agent; both simulation and Build & Send work).
-- `packaging/build-windows.sh` → `dist/windows/KronEditor/` payload (cross-built `.exe` + **windows** toolchains), packaged by `packaging/windows/kron-editor.iss` (Inno Setup, run on Windows) into `KronEditor-Setup.exe`.
+Each bundle = host-agent binary + `resources/` + a **host-specific** `toolchains/`:
+- `build-appimage.sh` → `KronEditor-x86_64.AppImage` (linux toolchains; sim + Build & Send work).
+- `build-windows.sh` → payload packaged by `kron-editor.iss` (Inno Setup) into `KronEditor-Setup.exe`.
 
-Key facts a future change must respect:
-- **Toolchains are per-host, sysroots are shared.** `setup_toolchain.py --host {linux|windows} --root <dir>` downloads the matching LLVM (`clang` vs `clang.exe`); target sysroots are identical. So Windows `clang.exe` cross-compiles to the Linux PLC targets — **Build & Send works on Windows**.
-- **Local simulation is Linux-only and stays that way on Windows**: `runtime.go` reads `/proc/<pid>/mem` and runs a host-compiled binary. The host-agent *does* cross-compile for Windows (`GOOS=windows go build` succeeds — `/proc` paths are runtime strings, not build-time), so the editor + Build & Send ship fine; only RUN/simulate is disabled there.
-- `setup_toolchain.py` emits to the repo-root `toolchains/` by default (the dir the host-agent resolves); packaging passes `--root <payload>/toolchains` to write into the bundle instead. `toolchains/` is ~5 GB and is embedded whole (no on-demand download), so artifacts are multi-GB.
-- Startup UX is **terminal-only** (no auto-browser, no tray): the agent logs ports/URL to stdout; the user opens `http://localhost:7171`.
+Facts a packaging change must respect:
+- **Toolchains are per-host; sysroots are shared.** `setup_toolchain.py --host {linux|windows}` downloads the matching LLVM; target sysroots are identical, so Windows `clang.exe` cross-compiles to the Linux PLC targets — **Build & Send works on Windows.**
+- **Local simulation is Linux-only** (`runtime.go` reads `/proc`/`/dev/shm`). The host-agent cross-builds for Windows fine (`GOOS=windows go build` succeeds — the `/proc` paths are runtime strings), so the editor + Build & Send ship on Windows; only RUN/simulate is disabled there. ⚠️ **`GOOS=windows go build ./...` must keep succeeding** — it's a release invariant.
+- `toolchains/` is embedded whole (no on-demand download), so artifacts are multi-GB.
+- Startup is **terminal-only**: the agent logs the URL to stdout; the user opens `http://localhost:7171`.
 
----
-
-## Key Directories
-
-```
-src/
-  App.jsx                   Root state: isRunning, isSimulationMode, liveVariables, project tree
-  components/
-    EditorPane.jsx          Tabbed editor: ST (Monaco), LD (RungEditorNew), Resource
-    RungEditorNew.jsx       LD editor: rung list, block insertion, undo/redo (useRef history)
-    RungContainer.jsx       ReactFlow canvas for a single rung (large file)
-    VariableManager.jsx     Variable table (global + POU-local)
-    ProjectSidebar.jsx      Left sidebar: project tree, add/delete POUs
-    Toolbox.jsx             Right sidebar: draggable block library, 3-level hierarchy
-    BlockSettingsModal.jsx  Pin assignment popup for LD blocks
-    BoardConfigPage.jsx     Hardware board selection + interface config (GPIO/I2C/SPI/UART/USB)
-    SlaveConfigPage.jsx     EtherCAT slave configuration
-    EtherCATEditor.jsx      EtherCAT master config editor
-    TaskManager.jsx         PLC task scheduling config
-    OutputPanel.jsx         Simulation log + live variable watch
-  services/
-    CTranspilerService.js   ST → C and LD → C transpiler (main compilation path)
-    LibraryService.js       Loads XML block library from public/libraries/
-    HostClient.js           HTTP client for the local host-agent (compile, run-sim, deploy, etc.)
-    browserFs.js            Browser replacements for plugin-fs / plugin-dialog (open/save/ask)
-    PLCClient.js            HTTP/SSE client for the **remote** KronServer on the target device
-    HmiExportService.js     HMI export
-    EsiLibraryService.js    EtherCAT ESI file reader (uses host-agent filesystem endpoints)
-  utils/
-    boardDefinitions.js     All supported boards: specs, pinout, usbPorts[], interfaces[]
-    boardLibraryBlocks.js   Channel-specific HAL blocks per board (UART0_Send, USB2_Receive, …)
-    devicePortMapping.js    Board family → protocol → portId → Linux device path
-    hwPortVars.js           Generates system STRING vars from interfaceConfig (USB2_PORT, UART1_PORT, …)
-    libraryTree.js          Static 3-level toolbox tree + GENERIC_FB_DEFS + PROTOCOL_BLOCKS
-    halBlockMeta.js         HAL block input/output metadata for LD pin rendering
-    deviceCodegen.js        C code generation for EtherCAT device config
-    plcStandards.js         IEC 61131-3 data type definitions
-    iecSTLanguage.js        Monaco language definition for ST
-
-host-agent/                 Local Go agent (replaces Tauri's Rust backend)
-  main.go                   HTTP server, flag parsing, lifecycle
-  paths.go                  Resolves resources/ + toolchains/ + app-data dir
-  files.go                  write_plc_files, get_standard_headers, generic FS ops
-  compile.go                compile_simulation, compile_for_target (bundled clang)
-  runtime.go                run/stop/sim-status_simulation, write_variable, ELF symbol parsing, /proc/<pid>/mem
-  deploy.go                 check_server_status, deploy_to_server (HTTP to remote KronServer)
-  hmi.go                    HMI in-memory state (server stubbed pending full HTML port)
-  libraries.go              update_libraries / update_server (stubbed)
-  ethercat.go               build_soem / build_canopen / ec_request_state (stubbed)
-  events.go                 SSE broadcaster for build-command, library-update-progress, etc.
-  embed.go                  embed.FS for the Vite build → served at /
-  dist/                     Vite build output (Go embed source)
-
-resources/<triple>/         Krontek libraries (was src-tauri/resources/)
-  include/HAL/
-    kronhal.h               HAL struct definitions + dispatch functions (SECONDARY COPY — edit KrontekLibraries/KronHAL/ first)
-    kronhal_sim.h           Simulation stubs
-    kronhal_rpi.h           Raspberry Pi HAL
-    kronhal_jetson.h        NVIDIA Jetson HAL
-    kronhal_bb.h            BeagleBone HAL
-  lib/                      Prebuilt .a libraries (do not edit)
-
-toolchains/                 Bundled LLVM (clang, llvm-ar) + harvested sysroots
-  bin/clang, llvm-ar
-  lib/clang/<ver>/include/
-  sysroots/<triple>/        Per-target sysroot (x86_64-linux-gnu, aarch64-linux-gnu, …)
-
-public/libraries/           XML block library definitions loaded by LibraryService.js
-
-server/ (in-tree at <repo>/server/ — Go agent sources, cross-compiled to target binaries)
-  main.go                   Entry point: CLI flags, logger, manager init, graceful shutdown
-  server.go                 HTTP server: ConnectRPC routes, deploy endpoints, CORS, h2c
-  service.go                PLCService RPC impl (Start/Stop/WriteVar/ClearAllForces/StreamVars)
-  ipc.go                    Shared memory (mmap) IPC: variable read/write, force flags, type decoding
-  process.go                PLC runtime process lifecycle: start, SIGTERM/SIGKILL, log redirect
-  auth.go                   Authentication: SHA-256 passwords, sessions (8h TTL), 4-tier RBAC
-  hmi.go                    HMI layout management: XML/JSON import, per-page permissions, web routes
-  build.sh                  Cross-compilation: ARM32, ARM64, x86_64 (CGO_ENABLED=0, static)
-  proto/plc/v1/plc.proto    Protobuf service & message definitions
-  gen/plc/v1/               Generated protobuf + ConnectRPC handler code
-  dist/                     Compiled binaries output
-
-KrontekLibraries/           SOURCE OF TRUTH for all .c/.h files
-  KronHAL/kronhal.h         Master HAL header
-  KronEthercatMaster/
-    kronethercatmaster.c    Real EC master (pdo_read/write, kron_ec_init)
-    kronethercatmaster.h    KRON_EC_Config, KRON_EC_Slave, KRON_EC_PDO_Entry
-  KronMotion/
-    kronmotion.c            MC_Power_Call, MC_Home_Call, etc.
-    kron_nc.c               NC Engine: NC_ProcessOne, CiA402 state machine
-  KronStandard/, KronLogic/, KronMathematic/, KronControl/, KronCompare/,
-  KronConverter/, KronCommunication/
-```
+### Build output location
+Build & Send artifacts go to `~/.local/share/com.plceditor.app/build/`:
+- `plc.c`/`plc.h` — transpiled C. `kron_hal.h` — HAL glue.
+- `sim_runtime.bin` — local sim binary (host x86_64, `-O0 -g`).
+- `runtime.bin` — target/hot-swap binary (cross-compiled, `-O3`). ⚠️ **These two MUST NOT share a name** (see §6).
+- `variables.json` — symbol table (SHM offsets, addresses, password hashes).
 
 ---
 
-## App State & Simulation Flow
+## 5. The transpiler (ST/LD → C)
 
-### Key States (App.jsx)
-- `isRunning` — simulation binary is running; all editors go readOnly
-- `isSimulationMode` — simulation mode is active
-- `liveVariables` — map of live variable values pushed from the host-agent SSE stream (`simulation-output` topic on `/api/host/events`)
+`src/services/CTranspilerService.js` is the heart of the compile path.
 
-### Simulation Flow
-```
-App.jsx: startSimulation()
-  → host.writePlcFiles({...})        POST /api/host/write-plc-files     (Go agent writes plc.c/h, variables.json)
-  → host.compileSimulation()         POST /api/host/compile-simulation  (Go agent invokes bundled clang → runtime.bin)
-  → host.runSimulation()             POST /api/host/run-simulation      (Go spawns binary, starts /proc/<pid>/mem poller)
-  → SSE `simulation-output` topic on /api/host/events → liveVariables state → watch panel
-isRunning=true → all editors go readOnly
-```
-**Auto-run on Simulation ON:** `handleToggleSimulation` (App.jsx), after transpile + `host.hotswapBuild` + `setIsSimulationMode(true)`, calls the shared `runSimulationNow()` helper (→ `host.hotswapRun`) — toggling Simulation Mode ON immediately starts the run (no separate Run click). `handleStartExecution`'s sim branch reuses the same helper. **NOTE: the sim is now built/run as a HOT-SWAP loader-host (not the plain `sim_runtime.bin` via `compileSimulation`/`runSimulation`) — see the hot-swap section.** The plain `compileSimulation` path now only serves the non-connected local "Build" button (a compile check; `sim_runtime.bin` is no longer actually run).
-
-**Re-attach to a running sim after a browser reload:** the simulation is a SEPARATE host-agent process (the hot-swap loader-host) with its own poller, so it OUTLIVES a tab close/reload — the old behavior was that reopening the editor lost track of it and the next start hit `409 "already running"`. Fixed with `GET /api/host/sim-status` (`handleSimStatus`) which reports BOTH the plain `SimState.cmd` and the `HotSwapState.cmd`, returning `{running, pid, mode}` (`mode` = `"hotswap"` for the default sim, `"plain"` for the legacy path) + `host.simStatus()`. On (re)load, once `isProjectOpen` and the editor isn't already tracking a run, an effect (guarded by `simReattachedRef`) calls `simStatus()` and, if running, restores `setIsSimulationMode(true)+setIsRunning(true)`; when `mode==="hotswap"` it ALSO restores `hotSwapActiveRef.current=true`/`setIsHotSwap(true)`/`taskSigRef` so a re-attached sim stays reloadable. Live values resume over the existing `simulation-output` SSE (the hot-swap poller emits `{vars}` every 200 ms regardless). The remote/KronServer running-state re-attach is separate (the 3 s `checkStatus` poll, guarded by `!isSimulationModeRef.current`).
-
-**ST editor inline live badges** (`EditorPane.jsx`, the CoDeSys-style decorations) — TYPE-AWARE via a `varTypeMap` (name→type) + `SCALAR_IEC_TYPES` (module-level set; anything not in it, or matching `ARRAY`/`[`, is COMPOSITE = FB instance / UDT / array): a **call site** (`blink(...)`, next char `(`) gets NO badge; a **member access** (`blink.Q`) always `continue`s after (optionally) showing the MEMBER's scalar value (`val.Q`) — so the base FB/struct is NEVER rendered as a bogus scalar (this is what caused `blink 0 .Q`); a **composite root** (FB/struct/array referenced whole) shows a `{ } struct` / `▦ array` icon (class `live-var-text-struct`), NOT a raw value; **scalars** render the value badge. **Comments & string literals are excluded** from both the badge scan and the hover: block comments `(* *)` were already blanked from the source, and a module-scope `blankCommentsAndStrings(line)` now ALSO length-preservingly blanks `// line comments` and single-quoted `'string'` literals before the per-line identifier scan (and the hover provider checks the word's start col against the blanked line). Without this, a variable NAME merely mentioned in a comment (e.g. `// reset blink here`) got a bogus live-value badge. **Live-value HOVER** (`registerHoverProvider('iec-st')`): hovering an FB/struct/array var shows its full contents as a Markdown table (`formatLiveHoverMd`) — members for a struct/FB object, or array elements gathered from the indexed `prog_X_arr[i]` live keys. The provider reads `window.stLiveCtx = { live, prog }` (refreshed each tick by the decoration effect; nulled when not running). The watch table (`VariableManager.formatLiveDisplay`) still formats whole FB objects as `Q=F ET=T#0s`. **FB outputs on the TARGET (Build & Send) vs local sim — two representations, overlay handles both:** the local sim reads the FB struct via DWARF and decodes it to an OBJECT at `prog_X_blink` (`{Q,ET}`); the target's KronServer reads `/dev/shm` by offset and can only stream SCALARS, so the FB struct itself isn't visible. To fix that, the transpiler (`CTranspilerService.js`, FB-instance loop) now also emits each FB scalar OUTPUT pin (`FB_OUTPUTS[type]` × `getOutputPinType`) as its own SHM-slotted variable, debug key `prog_X_<var>.<pin>` with c_symbol `prog_X_inst_<var>.<pin>` (so `plc_shm_sync` copies `S->…inst_blink.Q` to its slot) — so KronServer streams `prog_Blinker_blink.Q` as a flat bool. The ST overlay's member-access resolves BOTH: object `val.Q` (sim) OR the flat live key `prog_X_<var>.<pin>` (target); the hover provider reconstructs an object from those flat `.pin` keys too. No KronServer change (it already streams scalars by name). Requires a re-Build&Send (new `variable_table.json` + runtime.bin).
-
-### Read-Only Mode (isRunning=true)
-- `App.jsx` → passes `isRunning` to `EditorPane` and `ProjectSidebar`
-- `EditorPane` → Monaco `readOnly={isRunning}`, `RungEditorNew readOnly={isRunning}`
-- `RungEditorNew` → all add/delete/move/connect operations blocked
-- `VariableManager` → `disabled={isRunning}`
-- `ProjectSidebar` → add/delete/edit buttons disabled
-
----
-
-## Hot-Swap (Online Change) — Linux-only
-
-State-preserving live PLC code update: change logic while running, no restart, timers/counters/latches survive. **Developed on branch `feat/hotswap-plcstate`.** Linux-only by design — MCU/bare-metal (`arm-none-eabi`) compile targets were removed from `setup_toolchain.py` + `host-agent/compile.go`/`paths.go`.
-
-**Core idea — split the binary into a stable loader-host + a swappable `logic.so`:**
-- The transpiler now ALWAYS emits a single `PlcState` struct holding ALL mutable state (globals, program locals, FB instances, shadow vars, exec-time) reached through a file-scope `static PlcState *S`. Every state reference is `S->…` (varMap in `transpilePOUSource`, `resolveVar`/`getCallTarget`/shadow write-back in `transpileLDLogics`, SHM pull/sync, exec vars). FB-local vars stay `instance->…`; function/LD-transient locals stay bare. Declarations are collected into `stateFields` and emitted as the struct AFTER all type defs (UDTs, FB typedefs) + signatures but BEFORE function bodies; non-zero initials go to a `plc_state_init()` cold-init called from `PLC_Init`. The single instance is `static PlcState __plc_state;` with `static PlcState *S = &__plc_state;`. **Consequence for the regular (non-hot-swap) local sim:** PLC variables are now struct FIELDS, not standalone globals, so the old "look up each variable's C symbol in the ELF `.symtab`" live-read (`runtime.go` `buildVarSpecs`, reads `/proc/<pid>/mem`) finds nothing → `"No variables matched in symbol table"`. The fix has THREE interlocking parts: (1) **`__plc_state` must have EXTERNAL linkage** in the non-hot-swap build — `#ifdef PLC_HOTSWAP` keeps it `static` (host owns state), but otherwise it's a plain global `PlcState __plc_state;`. As `static`, `-O3` SROA-dissolves it entirely (the SHM pull→use→sync makes every field a pass-through redundant with `__plc_shm`), leaving NO symbol — verified: `static` → symbol absent in the `.o`, external → `B __plc_state` present. No-LTO external globals are observable so they can't be removed/scalarized, and layout stays ABI-fixed. (2) the sim is compiled with **`-g`** (`compile.go`) so DWARF carries the struct layout. (3) `parseELFSymbols` finds the `__plc_state` base address + each member's offset from **DWARF** (`plcStateMemberOffsets`, tolerates a clang `__plc_state.N` suffix), registering `memberName → absAddr` so `buildVarSpecs` matches `c_symbol`/`base_symbol` exactly as before. **The sim build now uses `-O0` (not `-O3`)** — the sim is a logic test, not a perf target, and `-O3` was the dominant compile-time cost on large projects (motion/EtherCAT inline headers); `-O0 -g` compiles much faster AND, as a bonus, would keep `__plc_state` even without the external-linkage fix (no SROA at `-O0`) — but keep external linkage anyway as belt-and-suspenders if `-O` is ever bumped. The cross-compiled **target/deploy** build (`compileForTarget`) stays `-O3`. The hot-swap path was unaffected because it reads the `/dev/shm` mirror by byte offset, not by symbol. **CRITICAL filename separation:** the local-sim binary is `simBin = "sim_runtime.bin"` (host x86_64, `-O0 -g`); the target/deploy + hot-swap binary is the literal `"runtime.bin"` (cross-compiled for the ARM board, `-O3`, no `-g`). They live in the SAME build dir but MUST NOT share a name — they used to both be `runtime.bin`, so a **Build & Send / Go-live clobbered the local sim binary with a wrong-arch, no-DWARF ARM one**, after which local simulation read garbage and FB objects (e.g. `blink.Q`) never resolved (the binary was literally `ELF … ARM aarch64`). `simBin` is referenced ONLY by `compileSimulation` (writes it) and `handleRunSimulation` (runs it). **Build cache:** the bundled clang is **~242 MB**, so its cold load (first compile / after the page cache is evicted) dominates the perceived "compiling…" time — the actual codegen is ~60 ms (measured). `compileSimulation` therefore SKIPS clang when the transpiled inputs are unchanged: `simInputsHash(buildDir)` = SHA-256 over `plc.c`+`plc.h` (they fully determine the binary), compared against `sim_runtime.bin.hash`; on a hit (and the binary exists) it returns `"(cached …)"` immediately. So re-toggling Simulation off→on without code changes is near-instant.
-
-**Simulation while PLC connected:** `handleToggleSimulation` no longer blocks when `isPlcConnected` — local sim and a remote PLC connection coexist (the status-poll that auto-attaches to a running remote already guards `!isSimulationModeRef.current`). **Build & Send is NOT disabled during sim/run anymore** — when connected, the button stays enabled (`disabled={isPlcConnected ? false : isRunning}`) and `handleBuildAndSend` instead `window.confirm`s when `isRunning || isSimulationMode` (a full Build & Send recompiles + RESTARTS the runtime → outputs reset, timer/counter/latch state lost). Deliberate change from the old "blocked mid-sim" rule — the user wanted to push without toggling Simulation off, just with a confirm. Build & Send deploys a SELF-CONTAINED runtime (`compileForTarget`) and is a full deploy + RESTART (state lost; the confirm says so) — it is NOT hot-swap. Field hot-swap is a SEPARATE path (`startHotSwapSession`'s field branch → `host.hotswapTargetDeploy`, see below) — see "Hot-swap redesign" for its current (fixed) status.
-- **`-DPLC_HOTSWAP`** turns the same `plc.c` into a loadable `logic.so`: `plc_stop`/`us_tick`/`__plc_shm` become host-owned (extern; declared in plc.h), `main()`+threads are `#ifndef PLC_HOTSWAP`, and it exports a fixed ABI — `plc_state_size`, `plc_bind(PlcState*)`, `plc_state_init`, `plc_init_hs`/`plc_cleanup_hs`, `plc_task_count`, `plc_task_interval_us(i)`, `plc_task_body_<i>()`, `plc_shm_name`/`plc_shm_size`. Without the define it builds as the normal single binary (unchanged behavior). Per-task scan was refactored into `plc_task_body_<i>()` shared by both modes.
-- **Loader-host** (`host-agent/hotswaphost/host.c`, embedded into the agent): owns `PlcState` (host memory → survives swap), the `/dev/shm` mirror (`__plc_shm`, so the editor keeps reading live vars across swaps), `us_tick`/`plc_stop`, the scan threads + timing, compiled `-rdynamic` (the `.so` resolves `us_tick`/lib symbols from it). On `SIGUSR1` it reads `./swap_request`, parks all task threads on a scan-boundary barrier, `dlclose`+`dlopen`s the new `.so`, re-binds the SAME `PlcState` (no `state_init`), and **rolls back** to the running `.so` on any failure.
-
-**Local sim (host-agent)** — `host-agent/hotswap.go`: `POST /api/host/hotswap/{build,run,swap,stop}` compiles host (once) + `logic_<n>.so` (`-shared -fPIC -DPLC_HOTSWAP` + libs), runs the host, pushes swaps (write `swap_request` + SIGUSR1), and a `/dev/shm` poller streams live vars on the existing `simulation-output` SSE. HostClient: `hotswapBuild/Run/Swap/Stop`. App.jsx: `startHotSwapSession`/`stopHotSwapSession` + `handleAgentHotSwap` (re-transpile → `hotswapSwap`). **HOT-SWAP IS THE DEFAULT RUNTIME for simulation** — there is no separate "Go live" session/button; toggling Simulation ON is what builds+runs the loader-host. (1) **Simulation ON** (`handleToggleSimulation`) transpiles with `simMode=true` and calls `host.hotswapBuild` (NOT `compileSimulation`/`writePlcFiles`) then `runSimulationNow` → `host.hotswapRun`; it sets `hotSwapActiveRef.current=true`, `setIsHotSwap(true)`, `layoutSigRef` (see below). Stop (`handleStopExecution` sim branch / toggle OFF) → `host.hotswapStop` + clears those flags. (2) **Build & Send** (`handleBuildAndSend`) deploys a SELF-CONTAINED runtime via `host.compileForTarget` + `deployToServer` — a full deploy + RESTART (NOT hot-swap), and it does NOT set `isHotSwap`. (3) **On an agent-approved change while a SIM is running, `handleAgentHotSwap` ASKS first** (`window.confirm` "Hot reload now?") via the sim branch (`hotSwapActiveRef`) → `hotswapSwap`. The field branch (`isHotSwap && isPlcConnected`) is code-complete and now FUNCTIONALLY CORRECT (see "Hot-swap redesign" below) but, same as before, **not wired to any UI control** — `startHotSwapSession` is passed to `AiAgentPanel` as `onStartHotSwap`/`onStopHotSwap` but nothing in that component currently calls it. Decline keeps the edit. **Live MONITORING (`read_live_variables`/`watch_live_variables`) is independent of all this — it reads the `liveVariables` SSE stream that flows for any run (sim or connected).** Caveat: in hot-swap sim, FB instance outputs stream as FLAT scalar keys (`prog_X_blink.Q`, read from `/dev/shm` by offset) rather than DWARF-decoded objects — same representation as the connected-PLC case; the ST overlay/hover handle flat keys, but the watch table shows them as individual pin rows, not a combined `{Q,ET}` object.
-
-**Hot-swap redesign (generation scheme + confirmed cleanup + layout-hash guard):** the original design (an in-memory `ver` counter per side, optimistic cleanup right after compiling, symbol-presence-only validation) had a confirmed, concrete bug — KronServer's `handleDeployLogic` numbered the FIRST uploaded `.so` `logic_1.so` (counter starts at 0, incremented before use) while `process.go`'s startup check looked ONLY for the literal `logic_0.so` → field hot-swap could never even start (`runtime.bin` launched with no logic arg → `host.c main()`'s `argc<2` → immediate exit). This was "fixed" by reverting the field path entirely. The actual fix (now in place) replaces the in-memory-counter scheme with disk-truth discovery + a confirmed-success-before-delete protocol, shared by both the sim and field loader-host supervisors:
-- **`hotswaplib/`** (new top-level Go module, local-`replace`d into both `host-agent/go.mod` and `server/go.mod`): `DiscoverGeneration(dir)`/`NextGeneration(dir)` scan for `logic_*.so` and return the highest generation found — NEVER an in-memory counter, so it can't desync from what's actually on disk after a restart (the root cause above). `CleanupExcept(dir, keepGen)` deletes every other `logic_*.so`. `PollSwapResult(path, expectGen, timeout)` polls the new `swap_result` file (below) for `<STATUS> <gen> [<detail>]`, returning `ErrTimeout` if nothing appears — callers MUST treat a timeout as **outcome unknown** and delete nothing.
-- **`swap_result` file** (written by `hotswaphost/host.c`'s new `write_swap_result()`, atomic tmp+rename): `do_swap()` writes `OK <gen>` on success or `FAIL <gen> <DLOPEN|SYMBOL|TASKCOUNT|LAYOUT>` on rollback; `main()` writes `OK <gen> COLDSTART` after the first successful bind. Both `host-agent/hotswap.go` (`handleHotSwapSwap`/`handleHotSwapRun`) and `server/process.go` (`ProcessManager.SwapLogic`/`Start()`) now POLL this file before reporting success, and clean up only AFTER a confirmed `OK` — never optimistically right after a compile. On `FAIL`, only the rejected candidate `.so` is deleted; the previous generation (still running, per the loader-host's own rollback) is untouched. On timeout, nothing is deleted and the result is surfaced as `"hotswap-unknown"`.
-- **`plc_state_layout_hash()`** (new `PLC_HOTSWAP`-only export, `CTranspilerService.js`): an FNV-1a 64-bit hash (`fnv1a64Hex`, also usable for other future fingerprinting) over the joined `stateFields` struct-body text — the `PlcState` SHAPE, never values. `host.c`'s `resolve_and_bind()` dlsyms it and refuses+rolls back a swap whose hash differs from the one captured at the FIRST successful cold-start bind (every later swap is checked against that ORIGINAL reference, not the previous swap's, so a chain of small "compatible" edits can't drift into an undetected incompatibility). This is the HARD safety net — it runs unconditionally on every swap regardless of whether the JS-side pre-flight check below is complete or even ran.
-- **`layoutSignature(struct, boardId, buses, busConfigs)`** (`App.jsx`, replaces the old `taskSignature`-only guard): a fast, friendly UX pre-check covering `{task, variables, udts, ioEc}` — `variables` is `{name,type}` per global/local/FB-instance var (an FB/UDT instance is just a variable typed as an FB/UDT name, so add/remove/retype is already covered without a separate signature); `udts` is a broad stringify of `dataTypes` (over-triggering on a cosmetic UDT edit is harmless, under-triggering is the real risk); `ioEc` covers board+bus config (changing these needs a loader-host REBUILD, not just a `swap`). Snapshotted into `layoutSigRef` when a hot-swap session starts; `handleAgentHotSwap` calls `layoutSignatureDiff` and reports precisely WHICH part changed (e.g. "variable table changed" vs the old generic "task timing changed" message regardless of actual cause) instead of pushing online. Two-layer by design: this guard can have gaps; `plc_state_layout_hash` is what actually prevents corruption no matter what this concludes.
-- **Concurrency**: `host-agent`'s `HotSwapState` and `server`'s `ProcessManager` each gained a DEDICATED `swapMu`, separate from the existing state-protecting `mu` — a swap holds it for the WHOLE operation (compile → write request → signal → poll, up to a 5s timeout), serializing concurrent swap requests (fixing a real interleaving race in the old code), while `Stop()` only ever needs the short-held `mu` so an operator's Stop is never blocked behind a hung swap.
-- **Field path is now fixed at the Go level**: `server/hotswap.go`'s `handleDeployLogic` uses `hotswaplib.NextGeneration` (first upload is correctly `logic_0.so`); `process.go`'s `Start()` uses `hotswaplib.DiscoverGeneration` instead of a hardcoded `logic_0.so` check. The SECOND bug that made the field path doubly-broken — `deployToServer` (Build & Send's plain self-contained-binary path) never uploaded any `logic_*.so` at all — is fixed by a NEW, structurally separate endpoint: `host-agent/deploy.go` `handleHotSwapTargetDeploy` (`POST /api/host/hotswap/target-deploy`, `HostClient.hotswapTargetDeploy`) uploads `runtime.bin`+`variables.json`+the discovered `logic_<gen>.so` as one sequence, refusing if the build dir's `runtime.bin.kind` marker (written by `compileHostForTarget`) doesn't say `"hotswap-host"` — i.e. it detects and refuses if a plain Build & Send overwrote the build dir's `runtime.bin` with the self-contained binary in between, which is exactly how the original regression happened. `startHotSwapSession`'s field branch now calls this instead of plain `deployToServer`. `handleHotSwapDeploySwap`/`server`'s `/hotswap/swap` now both BLOCK on the confirmed swap outcome and return non-2xx on failure (so `HostClient`'s `_wrap` actually throws instead of silently resolving "ok" — this was a separate, quieter bug: the old handlers returned HTTP 200 with `"ok":false` bodies that the frontend's error-throwing convention doesn't catch). **Still unverified on real hardware** (compile- and logic-verified only) — the redesign fixes the Go-level logic and is exercised against the server's HTTP endpoints directly, but on-device timing (barrier wait under real task load, `sudo`/signal-forwarding per the existing caveat, real flash/storage latency for the `swap_result` poll) remains unconfirmed until tested on physical hardware.
-- **Crash/failure surfacing**: `server/process.go`'s `ProcessManager` gained a `lastEvent *RuntimeEvent` (`{kind, status, detail, at}`) updated on cold-start confirmation, swap outcome, and unexpected crash (`watchProcess`); `/status` now includes it as `last_runtime_event` — the editor's existing 3s reconnect poll is the only channel back from the field side for this, so no new streaming mechanism was added. `host-agent`'s `handleHotSwapRun` similarly emits `"crashed"`/`"hotswap-unknown"`/`"hotswap-failed"` on the existing `simulation-output` SSE instead of silently continuing on a dead process (the old `cmd.Wait()` goroutine just cleared `pid` with no event).
-
-**Edge cases requiring a cold restart, NOT a hot-swap**: task-config change (count/interval/priority), any variable-table change (add/remove/retype/re-address a var, esp. globals — N.B. address changes don't actually affect `PlcState` layout, so `layoutSignature`'s `variables` sub-signature deliberately ignores address, matching what `plc_state_layout_hash` cares about), FB instance add/remove/retype, board/IO/HAL config, EtherCAT/PDO, UDT change, SHM size. Rule: hot-swap only when the `PlcState` layout + variable table + task/IO/EC config are byte-identical to the running one; only POU logic bodies differ. Both layers now cover this (see "Hot-swap redesign" above): `layoutSignature`/`layoutSignatureDiff` (`App.jsx`) is the fast pre-flight that names which part changed; `plc_state_layout_hash` (`host.c`) is the unconditional backstop.
-
-**HAL-to-host (done for HAL):** HAL functions are `static inline` with file-scope `static` fd arrays (e.g. `_rpi_uart_fd[6]`), so a naive split loses IO state on swap. Fix (codegen-partition, no canonical HAL edits): in hot-swap mode the transpiler emits a guarded macro block in plc.h — `extern void __hs_F(void*); #define F __hs_F` placed AFTER `kronhal.h` (real defs) but before the bodies — so the logic.so's HAL calls become `__hs_*` with NO call-site changes; the transpiler also returns `hostGlue` (a `host_glue.c` that `#define PLC_HOST_GLUE` + includes the HAL preamble + defines `void __hs_F(void*i){F(i);}` trampolines). The host-agent compiles `host.c`+`host_glue.c` together (`-rdynamic`, HAL + its fds live in the host); `logic.so` resolves `__hs_*` from the host at dlopen. HAL state survives swaps. **Verified end-to-end on the local sim** (build→run→swap, cnt continuous, HAL untouched). Trampolined surface = HAL block `_Call`s + `HAL_Init`/`HAL_Cleanup`/`KRON_UART_RuntimeInit`/`Cleanup`.
-
-**Known gaps before field use:** (1) **EtherCAT/motion are NOT trampolined** — `__ec_cfg`/`Kron_PI`/PDO state still lives in `logic.so`, and in hot-swap mode the PDO read/write (host-thread-loop, `#ifndef PLC_HOTSWAP`) don't run, so a project using EtherCAT/motion can't hot-swap that IO (full redeploy + restart); pure logic + HAL works. (2) `sudo -n`-spawned runtime won't receive SIGUSR1 — agent must run as root on target. (3) The loader-host is cached per build dir, so a HAL/board change needs a clean build to rebuild the host. (4) The whole field path is **compile- and logic-verified only** (ARM artifacts build, the Go-level swap protocol is fixed and exercised via direct HTTP calls); on-hardware testing (real fds, real swap, real-time jitter during the barrier) + a proper operator-confirm/safe-state review are still required. (5) The field branch is not wired to any UI control yet (see above) — it would need a button calling `startHotSwapSession`/`stopHotSwapSession` before it's reachable at all.
-
-**Verification harness:** `experiments/transpiler-check/` (`compile-gate.sh` compiles real transpiler output with bundled clang — the completeness gate for the `S->` migration) and `experiments/hotswap-v2/` (`demo.sh` proves live swap with state preserved + `/dev/shm` live read, using real codegen).
-
----
-
-## Transpiler (CTranspilerService.js)
-
-### Entry Points & Signatures
+### Entry points
 ```js
 transpileToC(projectStructure, standardHeaders, boardId, simMode, buses=[], busConfigs={})
   → per-POU: transpilePOUSource(pou, globalVarNames, stdFunctions, interfaceConfig)
     → ST: transpileSTLogics(code, stdFunctions, parentName, category, varMap)
     → LD: transpileLDLogics(rungs, blockType, parentName, category, varMap)
 ```
-All 3 `transpileToC` call sites in `App.jsx` pass `buses` and `busConfigs` as args 5 and 6.
+All three `transpileToC` call sites in `App.jsx` pass `buses` and `busConfigs` as args 5 and 6.
 
-### Variable Scoping
-- Global vars → no prefix (looked up via `globalVarNames[]`)
-- Local vars → `prog_NAME_` prefix
-- Instance vars → `instance->` prefix
-- `varMap`: IEC variable name → C symbol; built automatically in `transpilePOUSource`
+### Variable scoping
+- Global vars → no prefix (looked up via `globalVarNames[]`), mapped to `S->${name}`.
+- Local vars → `prog_NAME_` prefix, mapped to `S->prog_NAME_${name}`.
+- FB-instance-local vars → `instance->${name}`.
+- `varMap` (IEC name → C symbol) is built in `transpilePOUSource`.
 
-### IEC Type Lookup Tables (must stay in sync)
-When adding a new IEC primitive type, update **all four** tables in `CTranspilerService.js`:
-- `IEC_TYPE_SIZES` — byte size; missing entry = no SHM slot, no force flag, var invisible to KronServer/REST API
-- `IEC_TO_SERVER_TYPE` — KronServer type name (`bool`, `int8/16/32/64`, `uint8/16/32/64`, `float32/64`); wrong signedness silently corrupts values displayed in HMI/REST
-- `IEC_TO_KRON_TYPE` (inside `transformExpr`) — KRON converter library suffix (e.g. `INT64`); truncated entry causes ST `X_TO_Y(...)` to silently lose precision
-- `IEC_CAST_C` (inside `transformExpr`) — C cast type for `INT(x)` style coercions; also update the regex listing the type names
+### ⚠️ INVARIANT — the four IEC type tables must stay in sync
+When adding a new IEC primitive type, update **all four** in `CTranspilerService.js`:
+| Table | Purpose | Failure if missing |
+|---|---|---|
+| `IEC_TYPE_SIZES` | byte size | no SHM slot, no force flag, var invisible to KronServer/REST |
+| `IEC_TO_SERVER_TYPE` | KronServer type name | wrong signedness silently corrupts HMI/REST values |
+| `IEC_TO_KRON_TYPE` (in `transformExpr`) | KRON converter suffix | `X_TO_Y(...)` silently loses precision |
+| `IEC_CAST_C` (in `transformExpr`) | C cast for `INT(x)` coercions | also update the type-name regex |
 
-### ST Transpilation — Operator Mappings
-| IEC ST | C |
-|--------|---|
-| `:=` | `=` |
-| `AND` | `&&` (logical) |
-| `OR` | `\|\|` (logical) |
-| `NOT` | `!` (logical) |
-| `XOR` | `^` |
-| `BAND` | `&` (bitwise — vendor extension) |
-| `BOR` | `\|` (bitwise — vendor extension) |
-| `BXOR` | `^` (bitwise — vendor extension) |
-| `BNOT` | `~` (bitwise — vendor extension) |
-| `MOD` | `%` |
-| `ABS(x)` | macro `((x) < 0 ? -(x) : (x))` defined in plc.h prelude — works for REAL and integer; argument is evaluated twice, so don't pass side-effecting expressions |
-| `IF/THEN … ELSIF … ELSE … END_IF` | `if { } else if { } else { }` |
-| `FOR i := s TO e BY b DO … END_FOR` | `for (…)` |
-| `WHILE … DO … END_WHILE` | `while (…)` |
-| `REPEAT … UNTIL …` | `do { } while (!…)` |
-| `EXIT` | `break` |
-| `RETURN` | `return` |
+`agentTools.js` `SCALAR_IEC_TYPES` mirrors `mapType`'s typeMap keys — they are **not** shared/imported, so keep them in sync by hand.
 
-**The transpiler is NOT type-aware on `AND`/`OR`** — they always emit logical `&&`/`||`. To do bitwise masking on integer/byte values, use `BAND`/`BOR`/`BXOR`/`BNOT`. Mixing `AND` with integer operands produces silent wrong results (compiler warns `-Wconstant-logical-operand` only when an operand is a literal).
+### ST operator mappings
+| IEC ST | C | Notes |
+|---|---|---|
+| `:=` `AND` `OR` `NOT` `XOR` `MOD` | `=` `&&` `||` `!` `^` `%` | AND/OR/NOT are **always logical** |
+| `BAND` `BOR` `BXOR` `BNOT` | `&` `|` `^` `~` | bitwise (vendor extension) — use these for integer masking |
+| `ABS(x)` | `((x)<0?-(x):(x))` macro | arg evaluated twice — no side-effecting args |
+| control flow | `if/else if/else`, `for`, `while`, `do{}while(!…)`, `break`, `return` | |
 
-### Task assignment — STRICT (a program runs only if assigned to a task)
-`generateMainLoop` (CTranspilerService.js) builds task→program groups from `taskConfig.tasks` (priority order: `taskConfig` > legacy `res_config` > none). **A program is executed ONLY if it is explicitly assigned to a task.** There is NO `__unassigned` default-task fallback (it was removed — it used to auto-run any unassigned program at 10 ms whenever ≥1 task existed, which surprised users: "I never assigned it but it runs + streams data"). Now an unassigned program's POU code is still generated but never called by a task thread, so its variables stay at their initial values (no live data). The transpiler `console.warn`s the unassigned program names, and `handleToggleSimulation` (App.jsx) compares `projectStructure.programs` against `variableTable.tasks` (the authoritative run-list; `program` names normalized spaces→`_`) and `addLog`s a UI warning ("Not assigned to any task — will NOT run: …"). With ZERO tasks configured at all, nothing runs (unchanged).
+⚠️ The transpiler is **not type-aware** on AND/OR — mixing `AND` with integer operands produces silent wrong results. Use BAND/BOR/BXOR/BNOT for bit ops.
 
-### ST Transpilation — Line Handling
-- **Comment stripping order (in `transpileSTLogics`):** BOTH `(* … *)` block comments AND `// …` line comments are stripped in the initial `stripped` step, BEFORE the keyword-normalization pass (which injects newlines after `THEN`/`DO`/`OF`/`ELSE`/`END_*`). Order matters: an ST keyword appearing inside a comment (e.g. the word "**of**" in `// period of 1 second`) matches `\bOF\b` and gets a newline injected mid-comment, splitting it so the tail (`1 second`) survives and leaks into the C output as a bogus statement → `error: expected ';'`. If you add comment handling, keep it ahead of normalization.
-- Variables are referenced by BARE name in ST — there is NO `global.`/`GVL.` namespace object. The system prompt instructs the model to never write `global.led`/`global.blink.Q` (a CODESYS habit some models have); member access is only for FB output pins (`blink.Q`).
-- Raw line split: `/\r?\n|\\n/` (handles both real and escaped newlines).
-- **Continuation merge**: lines ending with `AND`/`OR`/`NOT`/`XOR`, an arithmetic operator (`+ - * /`), a comparison operator (`< > <= >= <>` or bare `=`), `,`, or `(` are merged with the next line. `:=` is excluded so trailing assignments don't accidentally swallow the next statement.
-- **CASE label + body split**: a numeric label followed by an inline body on the same line (e.g. `1:  init_wait(IN := TRUE, PT := T#30ms);`) is automatically split into two lines so the body still passes through the full statement pipeline (FB-call detection, etc.). Without this split, named-arg FB calls inside CASE labels would be mangled into invalid C.
-- **Multi-statement line split (top-level `;`)**: after continuation-merge + CASE-label split, each physical line is split on TOP-LEVEL `;` (paren depth 0, outside `'…'` strings) so every statement gets its own line. The FB-call detector regex is anchored (`^…;?\s*$`) and matches a WHOLE line as exactly one `inst(args);` call — so a single-line body like `IF init_wait.Q THEN init_wait(IN := FALSE); init_step := 3; END_IF;` (the `THEN` body survives normalization as `init_wait(IN := FALSE); init_step := 3;`) used to fall through to `transformExpr`, which mangled the named FB call `init_wait(IN := FALSE)` → `init_wait(IN = false)` (clang: `undeclared identifier 'IN'`). The split fixes this so FB calls need NOT be on their own source line. Control-flow headers (`IF/FOR/END_*`) carry no internal `;` and lone single-statement lines are preserved verbatim (keep trailing `;`).
-- **String-literal placeholder uses ASCII control chars** (`\x01<idx>\x02`) inside `transformExpr`. They will not appear in any text editor view, but they exist in the JS source and must NOT be replaced with bare digits — bare-digit placeholders silently corrupt every numeric literal in the expression into `"undefined"` because the restore regex `\d+` cannot distinguish a placeholder from a real number.
+### ST line handling (order matters)
+- **Comment stripping happens BEFORE keyword normalization.** Both `(* *)` block and `// ` line comments are stripped in the initial `stripped` step, before the pass that injects newlines after `THEN`/`DO`/`OF`/`ELSE`/`END_*`. Otherwise an ST keyword *inside* a comment (e.g. "of" in `// period of 1 second`) triggers a mid-comment newline that leaks the tail into C.
+- **String literals** are blanked length-preservingly before scanning (both here and in `validateCode`, so a variable name mentioned inside `'...'` no longer produces a bogus "undefined identifier" that aborts the build).
+- Variables are referenced by **bare name** in ST — no `global.`/`GVL.` namespace. Member access is only for FB output pins (`blink.Q`).
+- **Continuation merge:** lines ending in an operator / `,` / `(` merge with the next. `:=` is excluded.
+- **CASE label + inline body** on one line is split so the body runs through the full pipeline.
+- **Multi-statement `;` split:** each physical line is split on top-level `;` (paren depth 0, outside strings), so FB calls need not be on their own source line.
+- **String placeholders use ASCII control chars** `\x01<idx>\x02` — never replace them with bare digits (the `\d+` restore regex would corrupt real numeric literals).
 
-### LD Transpilation — Data Structures
+### CASE labels
+The label matcher accepts **numeric ranges/lists, identifier (enum) labels, and negative numbers** — e.g. `IDLE: …`, `1..5:`, `-1:`. Enum labels emit `case <ENUM_CONST>:` (enum members become C enum constants). (Previously digits-only, which silently turned enum-labeled bodies into dead C goto-labels.)
+
+### FUNCTION POUs (`category === 'function'`)
+Supported: **Input**-class vars become C parameters in declaration order (`static inline RET name(T1 a, T2 b)`); **Local/Temp** vars are declared at the top of the body; `FuncName := expr;` becomes `return (expr);`. Call sites resolve args positionally.
+
+### Task assignment — STRICT
+`generateMainLoop` builds task→program groups from `taskConfig.tasks`. **A program runs ONLY if explicitly assigned to a task** — there is no `__unassigned` default fallback. An unassigned program's code is generated but never called, so its variables stay at initial values. The transpiler `console.warn`s unassigned names; `handleToggleSimulation` (App.jsx) also surfaces a UI warning. Zero tasks configured → nothing runs.
+
+### LD data structures & rules
 ```js
-rung.blocks[i].type          // block type: 'Contact', 'TON', 'SR', etc.
-rung.blocks[i].data.subType  // Contact: 'NO'|'NC'; Coil: 'Normal'|'Set'|'Reset'
-rung.blocks[i].data.values   // { var: 'name' } Contact, { coil: 'name' } Coil, { PT: 'T#5s' } FB
-rung.connections[i].sourcePin // 'out' (Contact/Coil), 'out_0','out_1'... (FB)
-rung.connections[i].targetPin // 'in' (Contact/Coil), 'in_0','in_1'... (FB)
+rung.blocks[i].type / data.subType / data.values   // Contact NO|NC, Coil Normal|Set|Reset, {PT:'T#5s'} etc.
+rung.connections[i].sourcePin/targetPin            // 'out'/'in' or 'out_0','in_1' for FBs
 ```
+- Global vars never get `prog_` prefix (checked against `globalVarNames[]`).
+- FB trigger pin: `in_0`/`in` = power flow; `in_1`+ = separate assignments.
+- SR trigger → `.S1`; RS trigger → `.S` (different fields).
+- Topological sort deduplicates identical source→target edges.
+- Module-scope constants: `FB_TRIGGER_PIN`, `FB_Q_OUTPUT`, `FB_INPUTS`, `FB_OUTPUTS`, `FB_INPUT_TYPES`.
 
-### LD Transpilation — Key Rules
-- **Global var prefix**: Global vars never get `prog_` prefix; check against `globalVarNames[]`
-- **FB trigger pin**: `in_0` / `in` = power flow trigger; `in_1`, `in_2`… = separate pin assignments
-- **SR vs RS trigger**: SR → `.S1`; RS → `.S` (different fields!)
-- **Duplicate edges**: topological sort deduplicates same source→target pairs
-- **resolveVal**: handles IEC time literals, numeric, and identifier types correctly
-- Module-scope constants: `FB_TRIGGER_PIN`, `FB_Q_OUTPUT`, `FB_INPUTS`, `FB_OUTPUTS`, `FB_INPUT_TYPES`
-- `globalVarNames` flows: `transpileToC` → `transpilePOUSource` → `transpileLDLogics`
+### Block-specific codegen notes (learned the hard way)
+- **LIMIT / MUX are emitted by argument NAME, not position.** `LIMIT` → `KRON_LIMIT(MN, IN, MX)` (the C macro order); the 2-input `MUX` → a ternary `((K)?(IN1):(IN0))` (the `KRON_MUX` macro expects an array pointer and would not compile on scalars).
+- **Rising/Falling edge contacts and coils have real edge memory.** Each edge block gets a persistent BOOL — a `PlcState` field for program scope (`prog_<prog>_edge_<id>`) or an FB struct member (`__edge_<id>`). A Rising contact fires only on the false→true transition of its variable. ⚠️ These fields are part of `PlcState`, so they contribute to `plc_state_layout_hash` — that's expected and correct.
+- **TIME pins:** only `T#…`-literal values go through `mapIECtoTimeUs`; a variable or expression passes through `transformExpr` untouched. `mapIECtoTimeUs` supports fractional, `m`/`h`, and compound (`T#1m30s`, `T#1h2m3s500ms`) forms and **throws** on an unparseable literal (no more silent 10 ms default).
+- **`FOR … BY <negative>`** iterates downward correctly.
+- **`0b…`/`0o…`/`16#…` literals** parse correctly in `resolveVal`; malformed numeric tokens return null (surfacing the problem) rather than leaking into C.
 
-### HAL Port Resolution
-- Port IDs use underscore format: `USB_0`, `USB_2`, `UART_1`, `I2C_1`, `SPI_0_CE0`
-- System vars from hwPortVars.js: `USB2_PORT`, `UART1_PORT`, `I2C1_PORT`
-- `resolveHardwarePortSymbol(value)` → converts both system var name and numeric literal to channel index string
+### Arrays
+`transpileDataType` sizes a C array as **`[max+1]`**, NOT `[max-min+1]`, so raw IEC indices stay valid when the lower bound is > 0 (elements below `min` are simply unused). ⚠️ **Negative lower bounds and `upper < lower` are rejected with a clear transpile error.** Multi-dimensional arrays use the full index cross-product for debug/SHM expansion (`var[i][j]`), not per-dimension iteration.
 
----
+### Shared-memory layout & bounds
+Data region grows from offset 0; force flags start at `FORCE_FLAGS_BASE` (32768); total segment is 65536. ⚠️ The transpiler **throws a clear error** if the data region would cross `FORCE_FLAGS_BASE` or the flag region would exceed the segment (e.g. huge arrays) — instead of silently producing overlapping regions.
+- Struct-member debug offsets are computed with **natural C alignment** (not packed), so the local sim reads padded UDTs correctly; AXIS_REF debug fields carry real byte offsets.
+- `resolveInitialValue` parses TIME/radix literals so `variables.json` `initial_value` matches the compiled initial (KronServer's `WriteInitialValues` then seeds the right value).
 
-## AI Agent Panel (`src/components/AiAgentPanel.jsx`)
+### `resolveVarsInExpr` is single-pass
+Names are substituted in one pass via a single alternation regex with a callback, skipping matches preceded by `.`/`->`. (A naive longest-first repeated `replace` corrupted expressions when a variable was named `s`, `q`, or `instance` — it would rewrite the `S` in `S->`.)
 
-Second tab of the right "Kütüphane" sidebar — a **real tool-calling agent** that edits the project (NOT a chat stub anymore; `sampleReply` is gone). It can create/rename/delete POUs, rewrite ST, add/update/remove variables (local + global), and author ladder. The **board is read-only context** — no tool changes hardware. Config persists in `localStorage["aiAgentConfig"]` = `{provider, model, apiKey, baseUrl}`. **Display name is "PLC Agent"** (sidebar tab + panel header + the `addLog` "PLC Agent applied changes" line); the CODE symbols stay `AiAgentPanel` / `aiAgentConfig` / `aiAgentConversation` / `/api/host/ai/*` (renaming those would break persisted config + routes — only the user-visible strings were rebranded). **The system prompt now instructs a CLARIFY-FIRST policy:** on a materially ambiguous request (a named "block" that could be an FB or a plain var, unspecified ST/LD/SCL, unknown type/address/axis/IO channel) the model asks 1–3 questions and emits NO tool calls that turn — the loop already renders a no-tool-call turn as a normal assistant message the user answers (so no loop change was needed). **Model field is an editable combobox** (`ModelCombo`) — known models are suggestions but any name is typeable (Gemini ships many). **Provider list includes `gemini`** (see ai.go note).
+### exec-time is MICROseconds
+The per-program execution-time field (`__exec_us_<prog>`) stores **microseconds**. Both `TaskManager.jsx` (overrun detection) and `ProjectSidebar.jsx` (display) treat it as µs. (It previously stored ns while the name said µs, making overrun detection 1000× too eager.)
 
-### Agent architecture (3 layers)
-- **`host-agent/ai.go`** — provider-agnostic **single-turn** chat proxy at `POST /api/host/ai/chat`. STATELESS normalizer: given `{provider, model, apiKey, baseUrl, system, messages, tools, maxTokens?, temperature?}` it calls the configured provider and returns ONE normalized assistant message `{role:'assistant', content, toolCalls:[{id,name,arguments}]}`. Each provider's wire dialect is isolated in `callAnthropic` (`/v1/messages`, `x-api-key`, content-block tool_use/tool_result, merges consecutive same-role turns), `callOpenAI` (`/v1/chat/completions`, Bearer, `tool_calls` with string args; also serves `custom` — OpenAI-compatible, baseUrl required — AND `gemini`/`google`, routed to Gemini's OpenAI-compat base `https://generativelanguage.googleapis.com/v1beta/openai` with default base so no baseUrl entry is needed; tool-calling works), `callOllama` (`/api/chat`, `stream:false`, object args, synthesizes `call_<i>` ids since Ollama gives none). Normalized message shape is shared in both directions; `aiTool.parameters`/`aiToolCall.arguments` are `json.RawMessage`. **Ollama prompt-based tool fallback:** some Ollama models (e.g. `codellama`) have no native tool API and answer HTTP 400 `"<model> does not support tools"` when `tools` is sent. `callOllama` detects this (`isUnsupportedToolsErr`), then retries via `ollamaChatOnce` WITHOUT the `tools` field but with `toolPrompt(tools)` appended to the system prompt (renders each tool's name/description/JSON-schema + instructs the model to emit `{"name","arguments"}` JSON). The frontend's `extractInlineToolCalls`/`repairJsonBrackets` then recover those calls — so non-tool models still drive the agent (less reliably than a native-tools model like qwen2.5-coder).
-- **`host-agent/anthropic_oauth.go`** — "Sign in with your Claude account" (Pro/Max subscription) as an alternative to an Anthropic API key. Implements Claude Code's public **PKCE OAuth** flow (client_id `9d1c250a-…`, authorize `claude.ai/oauth/authorize`, token `console.anthropic.com/v1/oauth/token`, redirect = the hosted `…/oauth/code/callback` that shows a `code#state` to paste). Routes: `/api/host/anthropic-oauth/{start,exchange,status,logout}`. Tokens persist at `AppDataDir/anthropic_oauth.json` (0600); `accessToken(force)` auto-refreshes within 60 s of expiry (or on a forced 401 retry). The agent uses provider **`anthropic-oauth`** (no apiKey) → `handleAIChat` calls `callAnthropic(ctx, req, oauthToken)`: that param switches `callAnthropic` to **Bearer auth + `anthropic-beta: oauth-2025-04-20`** (no `x-api-key`) AND sends `system` as content blocks **led by a "You are Claude Code…" identity block** (the subscription credential is only authorized for Claude Code, else 403). Frontend: provider `anthropic-oauth` in `PROVIDERS`; the config panel shows a sign-in flow (`anthropicOAuthStart` → open URL → paste `code#state` → `anthropicOAuthExchange`); `configured` treats it as ready when `oauth.connected`. **CAVEATS (user opted in):** gray-area ToS for 3rd-party subscription use, Claude-only, and breakable if Anthropic changes the flow.
-- **`src/services/agentTools.js`** — the agent's **action surface**. `TOOL_DEFS` (JSON-Schema tool list sent to the model) + `applyToolCall(struct, name, args)`, a **pure** executor: never mutates in place, returns either `{mutation:false, ok, result}` (read tools) or `{mutation:true, ok, summary, diff, next}` (write tools, `next` = fresh projectStructure) or `{ok:false, error}`. Tools: `get_project_overview`, `read_pou`, `list_blocks`, `create_pou`, `rename_pou`, `delete_pou`, `set_st_code` (full-body replace), `add/update/remove_variable` (scope local|global, **defaults to local** — globals live in the RESOURCE_EDITOR `content.globalVars`), `set_ladder`, `create_data_type`. Purity is what enables the diff-then-approve flow.
-
-**Array/struct/enum types — never inline, always a named data type.** A variable's `type` field must be either a scalar IEC type, an existing data-type/FB-instance NAME, or — exactly once — the inline literal `ARRAY[m..n] OF TYPE` (optionally multi-dim, comma-separated bounds), which is auto-recovered (not rejected) into a real `dataTypes` entry. Anything else unrecognized (a struct/enum shape typed inline, a typo) is REJECTED with a message telling the model to call `create_data_type` first. This is enforced by a single choke point, `resolveVarType(struct, rawType)` in `agentTools.js`, that `add_variable`/`update_variable` both funnel `type` through before building the variable — fixing a real bug where the agent wrote a variable's `type` as the literal string `"ARRAY[0..31] OF BYTE"` (instead of creating a named Array data type via the Array type editor and referencing it by name), which the transpiler's `mapType` fallback (`typeMap[iecType] || iecType`) silently passed straight into the C struct field declaration as garbage, producing `no member named prog_X_rxBuffer in struct PlcState` only at COMPILE time. `create_data_type` (kind `ARRAY`/`STRUCT`/`ENUM`) builds the exact same `dataTypes` entry shape the human-facing editors (`ArrayTypeEditor`/`StructureTypeEditor`/`EnumTypeEditor`) produce (`{name, type:'Array'|'Structure'|'Enumerated', content}` — note the capitalized `type` discriminator, distinct from the lowercase IEC scalar names), so the agent and a human using the UI converge on identical data. `SCALAR_IEC_TYPES` (agentTools.js) is the validation source list — mirror `CTranspilerService.js`'s `mapType` typeMap keys if either ever changes; they are not currently shared/imported between the two files, so keep them in sync by hand. **`create_pou` accepts language `ST` | `LD` | `SCL`** (SCL = mixed, `{rungs,variables}` content like LD); **`set_ladder` works on LD *and* SCL POUs** (SCL ladder rungs are tagged `lang:'LD'`); `set_st_code` works on ST and SCL (SCL → a single `lang:'ST'` rung). `findPOU` is exported and case-insensitive, and rejects the literal strings `"undefined"`/`"null"` (weak models stringify a missing arg into them). **Program "tokenization" for the model:** `read_pou` renders LD/SCL rungs via `renderRungs` (NOT the old block-type-name `summarizeRungs`, removed) — it traces each rung's power-flow graph (`incoming` edges, memoized `exprOf` from the left rail) into readable boolean logic (`coil := (Start OR Motor) AND NOT Stop`; series=AND, converging edges=OR, NC contact=`NOT v`, coil SET/RESET/Negated tagged); ST/SCL-ST rungs surface verbatim `code`; rungs with FBs list them structurally + a note (FB internals are opaque to boolean rendering). **Live-data buffering for diagnosis:** `summarizeLiveSamples(samples)` (exported) condenses the panel's rolling snapshot buffer into a per-variable time-series — `last/first/min/max`, `changes`, a recent down-sampled series, and a `flags` classification (`constant` / `oscillating` [≤3 distinct values + ≥4 flips] / `rising` / `falling`) — built on the shared per-series helper `summarizeSeries`; `read_live_variables` returns `{ running, values:current, history }` (instant snapshot of whatever was ALREADY buffered). **Active monitoring** = the `watch_live_variables` tool + `summarizeWatch(samples, specs)` (exported): the model passes `variables:[{name, seconds}]` (+ optional `maxSeconds`) and EACH variable is summarized over its OWN trailing window, so different vars can be watched for different durations. The REAL-TIME waiting happens in `AiAgentPanel.runTurn` (the agent loop is async): for a `watch_live_variables` call it `await`s `wait*1000`ms (clamped 1–60, defaults to max per-var seconds) while the `liveBufRef` SSE effect keeps filling, then injects `args.__watch = { running, waitedSeconds, history: summarizeWatch(...) }` (mirrors the `__live` injection). The system prompt routes the model to use `watch` for time-dependent behaviour AND to **auto-verify after any change/deploy** (watch the targeted vars, compare to the asked-for behaviour, report pass/fail, re-fix if not).
-- **`list_blocks` is how the agent learns what FBs/functions exist and their PINS** (`buildBlockCatalog(struct, library, filter)`): standard library blocks come from App's `libraryData` (the parsed `public/libraries/*.xml`, shape `[{title, blocks:[{blockType, class, inputs:[{name,type}], outputs:[{name,type}]}]}]`) injected as `args.__library` by the panel; project-defined FBs/functions come from `struct.functionBlocks`/`functions`, pins derived from their variables by `class` (Input/InOut→inputs, Output→outputs — same rule the transpiler & RungContainer use). The system prompt lists only block **names** (grouped, scales as the XML grows) and instructs the model to call `list_blocks` for exact pins before using any FB/function in ST. **`set_ladder` still cannot place an FB into a rung** (contacts+coils only — FB rungs need `customData` pin metadata); the prompt routes timers/counters/motion/comm/user-FBs to ST instead.
-- **`src/components/AiAgentPanel.jsx`** — owns the **agent loop** (it lives frontend-side because that's where `projectStructure` is). Per model turn: read tools auto-run and feed results back; write tools are dry-run into a composed `next` structure and shown as a **diff card the user must Approve/Reject** before it touches state. On approve → `setProjectStructure(next)` + `onApplied(pouNames)`. Loop capped at `MAX_AGENT_TURNS=16`. Tool-call args are chained through a `workingRef` so multi-step turns (add_variable then set_st_code) compose. **POU-target inference (weak-model safety net):** in the dry-run loop, a local-scope tool (`add_variable`/`update_variable`/`remove_variable` when scope≠global, plus `set_st_code`/`set_ladder` always) whose `pou` doesn't resolve in the working struct gets its `pou` rewritten to a context-inferred POU — the POU touched last this turn → the single `create_pou` of this turn → the open POU (`activeItem`). This is what fixes the common weak-model failure where it does `create_pou("X")` then `add_variable` with a missing/garbled `pou` (so the BOOL behind a ladder coil never lands and the rung references an undefined name). It only overrides an *unresolvable* `pou`, never a valid one. **Live-sample ring buffer:** a `liveBufRef` (cap `LIVE_BUF_MAX=600`) is appended in a lightweight `useEffect([liveVariables])` (ref, NOT state — no heavy re-render) while the program runs; `read_live_variables` injects `args.__live = { current: liveVariables, history: summarizeLiveSamples(liveBufRef.current) }`; the buffer is cleared on New chat. `extractInlineToolCalls` recovers tool calls that weaker local models emit as TEXT instead of the structured field — without it, qwen2.5-coder-class models don't drive the agent. It handles BOTH shapes: a proper `{name, arguments}` JSON object, AND the **markdown form** where the tool NAME is a heading and only the ARGS are JSON (`1. **create_pou**\n{"name":"Blinker","language":"ST"}`) — `findJsonObjects` returns each object's position, and a bare args object (whose `name` isn't a known tool) is paired with `lastToolMention` (the nearest known tool name in the preceding text). `create_pou` also DEFAULTS a missing/variant `category` to `programs` (weak models omit it). Without the pairing the qwen markdown output yields ZERO calls ("agent produced no output"). **`extractKeyValToolCalls`** handles a THIRD shape some models use — non-JSON `tool_name key="value" key=value` lines (one call per block; quoted values may span newlines, e.g. `set_st_code … code="…multi-line…"`): it finds each known tool name at a line-start call position and parses its key/value args up to the next tool name. **`recoverStCodeBlock`** is the last-ditch layer: after several turns a weak model may stop calling tools entirely and just PRINT the POU body in a ```st code block — this recovers the first ST-looking fenced block (tagged st/scl/iec/pascal, or content with `:=`/IEC keywords; JSON blocks skipped) as a `set_st_code` call with no `pou` (the POU-target inference fills the open POU). These layers keep qwen2.5-coder-7b *usable* but it remains unreliable across long conversations — a native-tools cloud model (Gemini/Claude) is far steadier. Two robustness layers ride on top: (1) **`stripSpecialTokens`** removes chat-template leakage (`<|im_start|>`) AND `<tool_call>`/`<tool_response>` wrapper tags some models emit (a faked `<tool_response>APPLIED:…</tool_response>` carries no JSON so it correctly yields no call); (2) **`repairJsonBrackets`** is a parse fallback for the single most common LLM JSON malformation — an object written with `[...]` instead of `{...}` (e.g. `set_ladder`'s `rungs: [["outputs":…]]`). It rewrites a `[` whose first non-space content is a `"key":` to `{` (and its matching `]` to `}`), is idempotent on valid JSON, and only runs after `JSON.parse` throws. A dropped `set_ladder` (malformed args) is what makes weak models then hallucinate a fake `<tool_response>` confirmation on the next turn — fixing the parse fixes both.
-
-### Agent wiring & gotchas
-- App.jsx passes `projectStructure`, `setProjectStructure`, `selectedBoard`, `onApplied` to `<AiAgentPanel>`. **EditorPane seeds its local state from `initialContent` only on mount** (keyed by `activeItem.id`), so an agent edit to the OPEN POU won't show until remount — App.jsx bumps `agentReloadKey` (added to the EditorPane `key`) when `onApplied` reports the active POU was touched.
-- **`set_st_code` auto-recovers inline declarations (weak-model safety net).** The ST editor box is BODY-ONLY (variables live in the table), so `stripStWrappers` removes any `VAR…END_VAR` blocks and bare `name : TYPE;` lines a model wrongly inlines. But weaker models (qwen2.5-coder-7b class) routinely declare variables that way *instead of* calling `add_variable` — which would leave the body referencing undefined names. So `set_st_code` first runs `extractStDeclarations(rawCode)`: parses those stripped declarations (VAR_GLOBAL → global scope, VAR_INPUT/OUTPUT/IN_OUT/TEMP/EXTERNAL → matching class, else Local; multi-name `a, b : INT := 0;` supported) and **adds the missing variables to the POU (or globals) as part of the same diff**, skipping names that already exist. The system prompt still tells the model to use `add_variable`; this is the silent fallback when it doesn't. A pure body with no declarations adds nothing (FB calls like `pulse(...)` are never mistaken for decls — the `: TYPE` vs `:=` distinction guards it).
-- **Ladder generation (`set_ladder`) is contacts + coils ONLY.** Function blocks (TON, CTU, HAL, motion, user FBs) need `data.customData.inputs/outputs` pin metadata from the XML library — the agent doesn't carry it, and `RungContainer` draws FB handles from that metadata, so a generated FB wouldn't render or transpile. For timers/counters/FBs the agent must use ST. The ladder compiler in `agentTools.js` (`compileLadderRung`) models a rung as OR-of-`branches` (each an AND-series of contacts) + optional `seriesAfter` + `outputs` coils; OR = multiple power-flow edges into one merge block, AND = a series chain (matches how the transpiler ORs incoming edges / ANDs series). Contacts set BOTH `data.instanceName` and `data.values.{var|coil}` (renderer reads instanceName-or-values at RungContainer.jsx:458; transpiler reads `values.var||instanceName`). Terminals are the literal ids `terminal_left_middle` / `terminal_right_middle`; contact/coil pins are `'in'`/`'out'`.
-
-### Local model download & setup (Ollama) — REAL
-The "Download & Setup" tab in the config dropdown talks to a locally-running **Ollama daemon** (default `http://localhost:11434`, overridable via the host field which writes `draftCfg.baseUrl`). Backend in **`host-agent/ollama.go`**, no `ollama` CLI shell-out — it proxies the daemon's HTTP API:
-- `POST /api/host/ollama-status {baseUrl?}` → `{running, installed, models:[{name,size}]}` (queries `GET {base}/api/tags`; unreachable daemon = `running:false`, not an error. `installed` = an ollama binary exists user-local or on PATH).
-- `POST /api/host/ollama-setup {baseUrl?}` → returns immediately `{started}`; **one-click bootstrap** in a detached goroutine: if the daemon is reachable → done; else locate an ollama binary (user-local install first via `findExtractedOllama`, then PATH), download the official archive into `{AppDataDir}/ollama` if missing (no sudo), then spawn `ollama serve` (tracked in `OllamaState.serveCmd`, killed on agent shutdown) and poll until ready. Progress on topic **`ollama-setup-progress`** = `{phase, percent, done, error}` (phases: checking/downloading/starting/ready/failed). `OllamaState.setting` dedupes concurrent setups.
-- **Multiplatform install — asset naming is OS-specific and NOT static:** `downloadOllama` streams the archive to a temp file then extracts. **Linux** → `ollama.com/download/ollama-linux-{amd64|arm64}.tar.zst` — **zstd-compressed** (NOT gzip; Ollama renamed `.tgz`→`.tar.zst`), decoded via `github.com/klauspost/compress/zstd` (pure-Go, keeps `CGO_ENABLED=0`), layout `bin/ollama`+`lib/`. **Windows** → `ollama-windows-{amd64|arm64}.zip` (`archive/zip`), layout `ollama.exe`+`lib/` at root. `ollama.com/download/<asset>` 307-redirects to the GitHub `releases/latest/download/<asset>`, so a future asset rename there silently breaks setup — `findExtractedOllama` walks the dir as a fallback, but the URL/extension is still hardcoded per-OS. `exec.LookPath("ollama")` finds `ollama.exe` on Windows automatically. **Verified end-to-end on Linux** (download→zstd extract→`ollama serve`→GPU detect→model pull); Windows path is compile-verified only.
-- `POST /api/host/ollama-pull {model, baseUrl?}` → returns immediately `{started}`; runs `POST {base}/api/pull` (stream) in a **detached goroutine** (2 h ctx, survives the request) and rebroadcasts progress on the generic event bus under topic **`ollama-pull-progress`** = `{model, status, completed, total, percent, done, error}`. `OllamaState.inFlight` map dedupes concurrent pulls of the same model.
-- **`OllamaState` (in `ollama.go`) is a field on `Server`** (`srvState.ollama = NewOllamaState()`), all 3 routes registered in `main.go`, and `srvState.ollama.Stop()` runs on shutdown. Forgetting the struct field / init makes the host-agent fail to compile (the handlers reference `s.ollama`).
-- `POST /api/host/ollama-runtime {model, baseUrl, load?}` → reports where the model runs: `{loaded, processor:"GPU"|"CPU"|"GPU/CPU", gpuPercent, modelSize, modelVram, gpu?:{name, vramTotal}}`. Placement comes from Ollama's `GET /api/ps` (`size_vram` vs `size`). `load:true` first preloads the model (empty-prompt `POST /api/generate`, blocks up to 120s) so /api/ps can observe it. **Total VRAM** has no Ollama HTTP surface: `detectGPU` tries `nvidia-smi --query-gpu=name,memory.total` first, then **falls back to scraping the managed daemon's own stderr/stdout** (`gpuLogTap` tees both streams and parses the `inference compute … description="…" … total="N GiB"` line into `OllamaState.gpuVramTotal`). The fallback matters because a driver/NVML mismatch breaks `nvidia-smi` even when Ollama's CUDA detection still works. `gpu` is omitted on CPU-only hosts. The frontend's `RuntimeStats` shows a badge + a VRAM bar of **modelVram / vramTotal** (model footprint vs capacity — a 7B model reads ~4.6/6 GB).
-- Frontend consumes both progress topics via the existing `host.streamEvents()` SSE (NOT a dedicated stream). The Download button per model is `disabled` while the daemon is down; when `!running`, `OllamaCatalog` shows an **Install & Start Ollama** (or **Start Ollama** if `installed`) button wired to `ollamaSetup` — on setup `done && !error` it calls `refreshOllama`, flipping `running:true` and enabling the Download buttons. On pull `done && !error` it auto-writes `aiAgentConfig` to that ollama model and "connects" it. **"Use this model" keeps the config dropdown open** (doesn't close) so the active row's `RuntimeStats` is visible; while the Download tab shows the active ollama model, a 4s poll hits `ollamaRuntime` (first tick `load:true`). `OLLAMA_CATALOG` is the curated model list; installed models not in it render under "Other installed".
-- HostClient methods: `ollamaStatus(baseUrl)`, `ollamaSetup(baseUrl)`, `ollamaPull(model, baseUrl)`, `ollamaRuntime(model, baseUrl, load)`.
+### Verification harness
+- `experiments/transpiler-check/compile-gate.sh` — regenerates the representative project's C and compiles it with the bundled clang using the exact sim include/lib recipe. **This is the completeness gate; run it after transpiler changes.**
+- `experiments/hotswap-v2/demo.sh` — proves live swap with state preserved.
 
 ---
 
-## HAL Pattern
+## 6. Simulation, hot-swap & the PlcState model
 
-Every hardware block: **struct + `_Call` function**
-- Hardware struct: `HAL_UART_Send`, `HAL_I2C_Read`, `HAL_USB_Send`
-- Generic struct (in transpiled C): `UART_Send`, `USB_Receive`
-- Channel dispatch: `UART0_Send_Call(inst)` → `HAL_UART_Send_Call(inst, 0)`
-- Both `KrontekLibraries/KronHAL/kronhal.h` and `src-tauri/resources/.../kronhal.h` must stay in sync.
+### The PlcState model (foundation of both sim and hot-swap)
+The transpiler **always** emits a single `PlcState` struct holding ALL mutable state (globals, program locals, FB instances, shadow vars, edge memory, exec-time), reached through a file-scope `static PlcState *S`. Every state reference is `S->…`. FB-local vars stay `instance->…`; function/LD-transient locals stay bare. Declarations are collected into `stateFields`, emitted as the struct *after* all type defs but *before* function bodies; non-zero initials go to `plc_state_init()` (called from `PLC_Init`). The instance is `static PlcState __plc_state;` with `static PlcState *S = &__plc_state;`.
 
-### USB_Send vs USB_Receive Paradigms (different on purpose)
+⚠️ **`__plc_state` must have EXTERNAL linkage in the non-hot-swap build.** `#ifdef PLC_HOTSWAP` keeps it `static` (host owns state); otherwise it's a plain global. As `static` under `-O3`, SROA dissolves it entirely (no symbol) and the local-sim's DWARF-based live read finds nothing. The fix has three parts: (1) external linkage; (2) sim compiled with **`-g`** so DWARF carries the layout; (3) `parseELFSymbols` finds `__plc_state`'s base + each member's offset from DWARF (`plcStateMemberOffsets`). The sim build uses **`-O0 -g`** (faster compile; `-O0` also keeps the symbol as belt-and-suspenders). The target/deploy build (`compileForTarget`) stays `-O3`.
 
-| Block | Trigger pin | Done/Ready pin | Buffer pin | Length pin |
-|-------|-------------|----------------|------------|-----------|
-| `USB_Send` | `Execute` (rising edge — like a one-shot transfer) | `Done`, `Busy`, `Error` | `pTxBuffer` | `Length` |
-| `USB_Receive` | `Enable` (continuous level — drains all available bytes each call) | `NewData`, `Error` | `pRxBuffer` | `MaxSize` (capacity) + `ReceivedLength` (output, actual bytes read) |
+⚠️ **CRITICAL filename separation:** the local-sim binary is **`sim_runtime.bin`** (host x86_64, `-O0 -g`); the target/deploy + hot-swap binary is **`runtime.bin`** (cross-compiled, `-O3`, no `-g`). Same dir, different names — they used to both be `runtime.bin`, so a Build & Send clobbered the local sim with a wrong-arch, no-DWARF binary and simulation read garbage. `sim_runtime.bin` is referenced only by `compileSimulation` (writes) and `handleRunSimulation` (runs).
 
-`USB_Receive_Call` loops up to `MaxSize` byte-reads in a single PLC scan — when the OS read returns no byte the loop breaks. So one `Enable=TRUE` per scan drains the kernel tty buffer. **No edge-cycling required.**
+**Compile cache:** the bundled clang is ~242 MB; its cold load dominates perceived compile time (actual codegen ~60 ms). `compileSimulation` skips clang when `simInputsHash` (SHA-256 of `plc.c`+`plc.h`) matches `sim_runtime.bin.hash` and the binary exists — so re-toggling Simulation off→on without code changes is near-instant. The hash is captured *before* clang runs, so a concurrent input rewrite safely forces a rebuild next time.
 
-### USB DTR Handling
-`_*_usb_open()` (rpi/jetson/bb) drops DTR low after `tcsetattr` via `ioctl(fd, TIOCMBIC, &TIOCM_DTR)`. This is required for motor-controlled USB devices like RPLIDAR A1M8 (DTR-high = motor-off; without this the motor stalls a few hundred ms after `open()` and the data stream stops).
+### Hot-swap (online change) — Linux only
+State-preserving live code update: change logic while running, timers/counters/latches survive. **Hot-swap is the DEFAULT runtime for simulation** — toggling Simulation ON builds+runs the loader-host; there is no separate "Go live" button.
 
-**Side effect**: Arduino/ESP32 boards with a DTR-driven auto-reset line will be held in reset while the PLC runtime keeps the port open. If a future board needs DTR-high default behavior, refactor this into an explicit HAL block (`USB_DTR_Set` etc.) instead of a per-port flag.
+**Split binary:** a stable **loader-host** owns `PlcState` (host memory → survives swap) + the `/dev/shm` mirror + timing + scan threads; a swappable **`logic.so`** holds the POU logic. `-DPLC_HOTSWAP` turns the same `plc.c` into the `.so`, exporting a fixed ABI (`plc_state_size`, `plc_bind`, `plc_state_init`, `plc_task_body_<i>`, `plc_shm_name`, `plc_state_layout_hash`, …). Without the define it builds as the normal single binary.
 
----
+**Loader-host** (`host-agent/hotswaphost/host.c`, embedded, compiled `-rdynamic`): on `SIGUSR1` it reads `./swap_request`, parks task threads on a scan-boundary barrier, `dlclose`+`dlopen`s the new `.so`, re-binds the SAME `PlcState` (no re-init), and **rolls back** on any failure.
 
-## ST/SCL Editor Validation
+**Generation scheme + confirmed-cleanup + layout guard** (`hotswaplib/` shared module):
+- `DiscoverGeneration`/`NextGeneration` scan `logic_*.so` on disk (never an in-memory counter — that desynced after restarts). `CleanupExcept` deletes others. First upload is correctly `logic_0.so`.
+- **`swap_result` file** (atomic tmp+rename, written by `host.c`): `OK <gen>` / `FAIL <gen> <DLOPEN|SYMBOL|TASKCOUNT|LAYOUT>` / `OK <gen> COLDSTART`. Both `host-agent/hotswap.go` and `server/process.go` **poll it before reporting success and clean up only after a confirmed `OK`** — never optimistically. On `FAIL`, only the rejected candidate is deleted. On timeout, nothing is deleted; result surfaces as unknown.
+- **`plc_state_layout_hash()`** (FNV-1a over the joined `stateFields` struct-body — the *shape*, never values): `host.c` refuses+rolls back a swap whose hash differs from the one captured at the first cold-start bind (every swap checked against the ORIGINAL, so incremental drift can't slip through). This is the **hard safety net**, run unconditionally.
+- **`layoutSignature(struct, boardId, buses, busConfigs)`** (App.jsx): a fast UX pre-check over `{task, variables, udts, ioEc}`. `handleAgentHotSwap` calls `layoutSignatureDiff` and reports *which* part changed instead of pushing online. Two-layer by design: the JS guard names the problem; `plc_state_layout_hash` prevents corruption regardless.
+- **Concurrency:** both supervisors have a dedicated `swapMu` (separate from the state-protecting `mu`); a swap holds it for the whole operation (compile→request→signal→poll, ≤5s), while `Stop` only needs the short `mu` so it's never blocked behind a hung swap.
 
-Monaco's live "Undefined identifier" red squiggles for ST come from **`src/utils/stValidation.js` `findStMarkers(code, {allowedLower, conversionPattern, varTypes})`** — shared by the ST editor (`EditorPane.jsx`) and the SCL inline rung editor (`RungEditorNew.jsx` `validateSCLCode`); both pass their own allow-list + a `name→type` map and tag the returned markers with `MarkerSeverity.Error`. It does ONE forward token scan per line tracking the open-call-paren stack, so **named arguments (`IN := …` inside `TON(…)`) are validated as PINS, not variables**: a named-arg key is flagged ONLY when the call target resolves to a *known standard* FB/function and the key isn't one of its pins. Pins come from **`getStandardFBPins(type)` (exported from `CTranspilerService.js`)** = inputs ∪ outputs ∪ EN/ENO from `FB_INPUTS`/`FB_OUTPUTS` (plus `X_TO_Y` → en/eno/in/out); the call target is resolved either directly (type name like `TON`) or via the instance variable's declared type (`pulse : TON`). **Unknown targets (user-defined FBs, or an instance typed as a non-FB like `TIME`) return null ⇒ their named args are deliberately NOT flagged** (we can't know the pin list, so we never false-positive). Time/duration literals (`T#500ms`) and radix literals (`16#FF`) are blanked before scanning; member access (`x.Q`) is skipped.
+**Force-write works in hot-swap sim.** `handleWriteVariable` (runtime.go) detects a running hot-swap host and writes the value + force flag into the `/dev/shm` mirror at the variable's offset (`writeHotSwapVariable`, using `ShmSpec` with a `ForceOff` field loaded by `buildShmSpecs`). (Previously it only knew the legacy plain sim, so every force-write during a default simulation failed 400.)
 
-## LD Editor
+**Robustness (process lifecycle):**
+- The crash reaper closes `stopCh` when it's still the current process, so the SHM poller dies with the process (no frozen values, no double poller on restart).
+- `handleHotSwapRun` removes the `/dev/shm` mirror path only *after* the already-running early-return (a redundant run no longer kills the live poller).
+- On cold-start poll timeout the host is killed and state cleaned (deterministic failure, not a phantom "running" sim).
+- Reaper is the sole `cmd.Wait()` caller (done-channel pattern); `Stop` kills then waits on `done`. (Concurrent `Wait` calls are a race.)
+- NaN/Inf floats are sanitized to JSON null at decode so one bad float can't stop the whole live-variable frame.
 
-### Project-tree Undo/Redo (App.jsx)
-Separate from the LD-editor history below. Covers sidebar STRUCTURAL ops — add/delete/rename/reorder/paste of programs, function blocks, functions, data types (and paste-globals). Implementation: `undoHistoryRef = {past:[], future:[]}` (cap `UNDO_LIMIT=50`) + `projectStructureRef` (synced via effect). Each structural handler calls **`pushUndoSnapshot(prev)` INSIDE its `setProjectStructure(prev => …)` updater** (so it records ONLY when a real mutation runs — not on validation-failed early returns); `undoProject`/`redoProject` swap snapshots and update the ref synchronously (so rapid Ctrl+Z/Ctrl+Y chains). A window `keydown` handler does Ctrl+Z (undo) / Ctrl+Shift+Z|Ctrl+Y (redo), gated like the sidebar copy/paste handler: bail in INPUT/TEXTAREA/contentEditable (Monaco/LD own their undo) and when `getEditorScope()` is a non-SIDEBAR scope. NOT wired for variable-table edits or agent/taskConfig changes (only the listed sidebar ops snapshot).
+**HAL-to-host (done):** HAL functions are `static inline` with file-scope `static` fd arrays, so a naive split loses IO state. Fix (codegen-partition, no HAL edits): in hot-swap mode the transpiler emits `extern void __hs_F(void*); #define F __hs_F` after `kronhal.h`, and returns a `host_glue.c` with `__hs_*` trampolines; the host compiles `host.c`+`host_glue.c` together so HAL + its fds live in the host and survive swaps. **Verified end-to-end on the local sim.**
 
-### Undo/Redo (RungEditorNew.jsx)
-- History: `useRef` storing `{ rungs, variables }` pairs, max 50 steps
-- **Every mutation** must call `saveHistory(newRungs, newVariables)` with both
-- `insertBlock(rungId, ..., newVariables)` — caller must compute new variables and pass them
-- `deleteBlockFromRung` — deletes variable synchronously, then calls `saveHistory`
-- Ctrl+Z = undo, Ctrl+Shift+Z = redo
+**Known gaps before field use:** (1) EtherCAT/motion are NOT trampolined — a project using EC/motion can't hot-swap that IO (full redeploy). (2) A `sudo -n`-spawned runtime won't receive SIGUSR1 — the agent must run as root on target. (3) The loader-host is cached per build dir — a HAL/board change needs a clean build. (4) The field path is compile- and logic-verified only; on-hardware testing + operator-safe-state review are still required. (5) The field branch (`startHotSwapSession`'s field branch → `host.hotswapTargetDeploy`) is functionally correct but **not wired to any UI control** yet.
 
-### Block Insertion (RungEditorNew.jsx `insertBlock`)
-- `subTypeOverride = customData?.subType` for Contact/Coil
-- Spreads `subType` directly onto block `data` so RungContainer renders the correct symbol immediately
+### Re-attach after a browser reload
+The simulation is a separate host-agent process, so it survives a tab close/reload. `GET /api/host/sim-status` reports both the plain and hot-swap state (`{running, pid, mode}`, `mode` = `"hotswap"`|`"plain"`). On (re)load, an effect (guarded by `simReattachedRef`) restores the running flags; for hot-swap it also restores `hotSwapActiveRef`/`taskSigRef` so a re-attached sim stays reloadable. Live values resume over the existing `simulation-output` SSE.
 
-### Performance Rules (RungContainer.jsx)
-- **Never** put `liveVariables` in `mapBlocksToNodes` useCallback deps — causes full node rebuild every 500ms
-- Update live values via a separate lightweight `useEffect`:
-  ```js
-  React.useEffect(() => {
-    setNodes(nds => nds.map(n => {
-      if (n.id.startsWith('terminal_')) return n;
-      if (n.data.liveVariables === liveVariables) return n;
-      return { ...n, data: { ...n.data, liveVariables } };
-    }));
-  }, [liveVariables, setNodes]);
-  ```
-- **Wrap** `varsByType`/`dtMap`/`allRawVars` in `useMemo` (deps: `variables, globalVars, dataTypes`)
-- **Do not** add custom equality to `RungContainerWrapper` until all callbacks use `setRungs(prev => …)` form (stale closure risk)
+For a **remote** running PLC, the 3s `checkStatus` poll re-attaches (guarded by `!isSimulationModeRef.current`). ⚠️ The re-attach starts the SSE stream unconditionally (it no longer requires `remoteVarKeysRef` to be populated — that ref is only set by Build & Send in the same session, so after a reload it's empty and live values used to stay `---`).
 
 ---
 
-## Clipboard / Copy-Paste (`src/utils/kronClipboard.js`)
+## 7. Frontend architecture
 
-Cross-tab copy/paste rides the OS clipboard (`navigator.clipboard`) with an in-process fallback. Every payload is tagged with a `CLIP_KIND` (`POU`, `RUNG`, `BLOCK`, `VARIABLE`, `GLOBALS`). Keyboard handlers in ProjectSidebar / VariableManager / RungEditorNew are **scope-gated** via `editorScope.js` (`EDITOR_SCOPE.SIDEBAR|VARIABLES|LD`), set on the container's mousedown; a handler bails if the scope isn't its own, so the three Ctrl+C/V listeners don't race on the shared clipboard. **The LD editor (RungEditorNew root) MUST use `onMouseDownCapture`, not `onMouseDown`** — ReactFlow's node drag (d3-drag) calls `stopPropagation` on a node's mousedown, so a bubble-phase handler never fires when you click a block; the scope then stays `SIDEBAR` (from selecting the program in the tree) and Ctrl+C copies the whole PROGRAM instead of the block. Capture phase runs before ReactFlow can swallow the event. The ST editor needs no scope-set: the sidebar handler bails when `document.activeElement` is an `INPUT`/`TEXTAREA`/`isContentEditable`/inside `.monaco-editor`, so Monaco owns text copy/paste. **All global Ctrl+C/V/Z handlers (ProjectSidebar, RungEditorNew, App project-tree) MUST use this SAME focus guard** — a tagName-only `INPUT`/`TEXTAREA` check is NOT enough: the SCL inline ST editor (`SCLInlineEditor` in RungEditorNew) is a Monaco `@monaco-editor/react` whose focused surface can be a `contentEditable` div, not a textarea. With the weaker guard, the sidebar's `Ctrl+V` fired while the cursor was inside the SCL code box and pasted a previously-copied POU as a whole new program instead of pasting text. Fix added `isContentEditable` + `.closest('.monaco-editor')` to the ProjectSidebar guard (`ProjectSidebar.jsx:310`) to match App.jsx's undo guard. **Monaco keyboard paste workaround:** once the global handlers correctly defer to Monaco, Ctrl+V STILL did nothing in either Monaco editor (typing worked, paste didn't) — Monaco's default keyboard paste relies on the browser's native `paste` event reaching its hidden input, which does not fire reliably in this embedded setup. Fix: both Monaco mounts (`EditorPane.handleEditorDidMount` and `SCLInlineEditor` onMount) register explicit `editor.addCommand(CtrlCmd|Key{V,C,X}, …)` commands that use the async Clipboard API directly — **paste** reads `navigator.clipboard.readText()` and inserts via `executeEdits` (guards on `readOnly`); **copy** writes the selection (or current line if no selection) via `navigator.clipboard.writeText`; **cut** writes then deletes. The native copy event ALSO failed to reach the OS clipboard in this embedded setup, so copy/cut needed the same override as paste — not just paste. **Monaco cursor-jump:** both Monaco editors MUST use `defaultValue` (uncontrolled) + a position-preserving sync effect (`if (model.getValue() !== code) { const pos = ed.getPosition(); model.setValue(code); ed.setPosition(pos); }`), NOT a controlled `value={code}` prop. `@monaco-editor/react`'s controlled-value reconciliation calls `model.setValue()` on parent re-render, which jerks the cursor to (1,1) — the symptom is "first click jumps the caret to the top." EditorPane was controlled (bug); SCLInlineEditor was already uncontrolled (correct). The guard makes the sync effect a no-op for user typing (model already matches `code`), firing setValue only for genuinely external changes (undo/redo, programmatic).
+### Read-only mode (`isRunning === true`)
+`App.jsx` passes `isRunning` down: Monaco `readOnly`, `RungEditorNew` blocks all mutations, `VariableManager` disabled, `ProjectSidebar` add/delete/edit disabled.
 
-**Paste-naming rules differ by kind — this is intentional:**
-- **POUs / data types** (`handlePasteItem`, App.jsx): keep the original name; on collision append `_copy1`, `_copy2`, … (strip any existing `_copy\d*` first). ProjectSidebar's paste passes the source name verbatim — it does **not** pre-suffix `_copy`.
-- **Local variables** (`uniqueVarName`, VariableManager): same `_copy{n}` scheme.
-- **Global-variable SET** (sidebar "Global Variables" node → `CLIP_KIND.GLOBALS` → `handlePasteGlobals`, App.jsx): **merge by name, NOT `_copy`**. Globals are shared definitions, so a same-named global is **skipped** (destination's copy kept) rather than duplicated as `Foo_copy1`. Addresses are dropped on paste (hardware-unique; matches the variable-table paste convention). Copy/paste the whole set via Ctrl+C/V or right-click on the node; merging into another project is the point.
-- **Referenced globals bundled with a POU**: copying a POU also bundles the globals it references (`bundleReferencedGlobals`) into `meta.globalsBundle`; `handlePasteItem` merges them by name (skip-if-present) — same philosophy as the GLOBALS kind.
+### Simulation while connected
+Local sim and a remote PLC connection coexist. **Build & Send is NOT disabled during sim/run** — when connected it stays enabled; `handleBuildAndSend` instead `window.confirm`s (a full Build & Send recompiles + RESTARTS the runtime → state lost). The confirm message reflects which runtime is actually live (local sim vs remote). Build & Send deploys a self-contained runtime (`compileForTarget`) — it is **not** hot-swap.
 
----
+### ST editor live badges (`EditorPane.jsx`)
+CoDeSys-style inline decorations, TYPE-AWARE via a `varTypeMap` + `SCALAR_IEC_TYPES`:
+- A **call site** (`blink(`) gets no badge; a **member access** (`blink.Q`) shows the member's scalar value and continues; a **composite root** (whole FB/struct/array) shows a `{ }`/`▦` icon, not a raw value; **scalars** show the value badge.
+- **Comments & string literals are excluded** — block comments and `// ` line comments and `'…'` literals are blanked length-preservingly before the scan (and the hover checks against the blanked line). ⚠️ Block comments must be blanked with **same-length spaces** (not deleted) so badge columns stay aligned after an inline `(* … *)`.
+- **Live hover** shows an FB/struct/array's full contents as a Markdown table; the provider reads `window.stLiveCtx = { live, prog }`.
 
-## Library System
+**FB outputs — two representations, overlay handles both.** The local sim reads the FB struct via DWARF as an object at `prog_X_blink` (`{Q,ET}`); the target/hot-swap streams FLAT scalar keys `prog_X_<var>.<pin>` (read from `/dev/shm` by offset). The transpiler emits each FB scalar OUTPUT pin as its own SHM-slotted variable (`prog_X_<var>.<pin>`, c_symbol `prog_X_inst_<var>.<pin>`) so KronServer streams `prog_Blinker_blink.Q` as a flat bool. The ST overlay resolves both; the watch table shows flat keys as individual pin rows. Requires a re-Build&Send.
 
-### XML Format (public/libraries/*.xml)
-```xml
-<library>
-  <category name="CATEGORY_NAME">
-    <block type="BlockType">
-      <inputs>
-        <pin name="Execute" type="BOOL" trigger="true"/>
-        <pin name="Port_ID" type="USINT"/>
-      </inputs>
-      <outputs>
-        <pin name="ENO" type="BOOL"/>
-        <pin name="DONE" type="BOOL"/>
-      </outputs>
-    </block>
-  </category>
-</library>
-```
+### Watch panel (`OutputPanel.jsx`)
+`buildGroups` reads globals from `projectStructure.resources[].content.globalVars` (the RESOURCE_EDITOR resource — globals do NOT live at `projectStructure.globalVars`). `resolveExpression` maps a bare global name to the live key `prog__<name>`.
 
-### Load Order & Blocks (LibraryService.js)
-1. `bit_logic.xml` → BIT LOGIC: SR, RS, R_TRIG, F_TRIG, BAND, BOR, BXOR, BNOT, SHL, SHR, ROL, ROR
-2. `timers.xml` → TIMERS: TON, TOF, TP, TONR (retentive; ET accumulates across IN=false, only RESET clears)
-3. `counters.xml` → COUNTERS: CTU, CTD, CTUD
-4. `math.xml` → MATH: ADD, SUB, MUL, DIV, MOD, MOVE, ABS, SQRT, EXPT, SIN, COS, TAN, ASIN, ACOS, ATAN
-5. `comparison_selection.xml` → COMPARISON: GT, GE, EQ, NE, LE, LT, SEL, MUX, MAX, MIN, LIMIT
-6. `conversion.xml` → CONVERSION: INT_TO_REAL, REAL_TO_INT, DINT_TO_REAL, REAL_TO_DINT, BOOL_TO_INT, INT_TO_BOOL, NORM_X, SCALE_X
-7. `advanced_control.xml`, `motion.xml`, `communication.xml`, `system.xml` → placeholder categories
+### RungContainer performance rules ⚠️
+- **Never** put `liveVariables` in `mapBlocksToNodes` useCallback deps — it rebuilds every node every 500 ms. Update live values via a separate lightweight effect that only touches `n.data.liveVariables`.
+- **Wrap** `varsByType`/`dtMap`/`allRawVars` in `useMemo` (deps: `variables, globalVars, dataTypes`).
+- **Do not** add custom equality to `RungContainerWrapper` until all callbacks use `setRungs(prev => …)` form.
+- Pin-type validation in `isValidConnection` resolves handles **by name** (`in_PT` → strip prefix → look up `cfg.inputs/outputs`), not by index.
 
-Notes:
-- `categoryName.replace(/_/g, ' ')` — regex fix for multi-underscore names
-- Trig typedefs uppercase (`SIN`, `COS`, `TAN`, etc.) to avoid libc conflict
-- `standardfunction.c`: GT_Call uses `GT *inst` (not `GT_BLOCK *inst`)
+### Undo/redo
+- **Project-tree undo (App.jsx):** covers sidebar structural ops (add/delete/rename/reorder/paste of POUs & data types). `undoHistoryRef = {past,future}` (cap 50) + `projectStructureRef`. Each structural handler calls `pushUndoSnapshot(prev)` inside its `setProjectStructure` updater. Window keydown: Ctrl+Z / Ctrl+Shift+Z|Ctrl+Y, gated by `getEditorScope()` being SIDEBAR (or null).
+- **LD editor undo (RungEditorNew.jsx):** `useRef` of `{rungs, variables}` pairs (max 50). ⚠️ **Every mutation must call `saveHistory(newRungs, newVariables)` with both.** The Ctrl+Z/Y handler is scope-gated to `EDITOR_SCOPE.LD`. ⚠️ `saveHistory` is called *outside* setState updaters (compute new value → set → saveHistory) — calling it inside an updater double-counts under React StrictMode.
 
-### Adding or Removing Pins from a Block
+### Focus guards ⚠️
+Every global window keydown handler (undo/redo, Space-toggle of contacts, Ctrl+X Run shortcut, clipboard) MUST bail when the active element is an `INPUT`/`TEXTAREA`/`isContentEditable`/inside `.monaco-editor`. A tagName-only check is insufficient because the SCL inline ST editor is Monaco (a contentEditable div). Missing guards caused: sidebar paste firing inside the code box, Ctrl+X hijacking native cut, spacebar force-toggling a contact while typing in a modal.
 
-When adding or removing input/output pins from **any** standard FB (motion, HAL, standard library, etc.), **all five locations** must be updated together:
+### Monaco editors ⚠️
+Both Monaco mounts use **`defaultValue` (uncontrolled)** + a position-preserving sync effect (`if (model.getValue() !== code) { save pos; setValue; restore pos }`), NOT a controlled `value={code}` — the controlled path calls `setValue()` on every parent re-render and jerks the caret to (1,1). The EditorPane parent-sync effect **skips its first run** (mountedRef) so merely opening a POU doesn't mark the project unsaved. The SCL inline editor's blur/validation listeners read fresh props via **refs** (they're registered once at mount and would otherwise capture stale `rungs`/`variables`).
 
-| Location | What to change |
-|----------|---------------|
-| `KrontekLibraries/…/header.h` | Add/remove the field from the C struct (canonical source) |
-| `src-tauri/resources/*/include/header.h` | Sync — copy updated header to all 7–8 target directories |
-| `public/libraries/*.xml` | Add/remove the `<Variable>` entry under `<Inputs>` or `<Outputs>` |
-| `FB_INPUTS[type]` in `CTranspilerService.js` | Update the ordered input pin list (drives pre-call assignments) |
-| `FB_OUTPUTS[type]` in `CTranspilerService.js` | Update the output pin list (drives shadow var declaration + write-back) |
+Note: the old Monaco `addCommand(Ctrl+V/C/X)` clipboard overrides were **removed** post-Tauri — Monaco's native clipboard works in the browser setup. (Earlier docs claimed they were required.)
 
-**Rules:**
-- `FB_OUTPUTS` is the single source of truth for code generation — if a pin is NOT listed here, no shadow var is declared and no write-back code is emitted.
-- `FB_INPUTS` drives Step 1 input assignment. Any `data.values` entry whose key is not in `FB_INPUTS` is silently skipped (safe guard for stale project data).
-- Always verify pins against the PLCopen / vendor spec before adding them. Example: `MC_Stop` has **no** `Active` output per PLCopen TC2 v2.0 — only `Done, Busy, CommandAborted, Error, ErrorID`.
-- `MC_Halt`, `MC_MoveAbsolute`, etc. **do** have `Active`.
-- After removing a pin, existing projects may still have it in `data.values` — this is harmless because of the guard above.
-- The XML file controls what the LD editor UI shows to the user; the JS constants control what C code is generated. They must stay in sync.
-
-### Toolbox 3-Level Hierarchy
-**`src/utils/libraryTree.js`** — `LIBRARY_TREE` static definition:
-- 9 top-level categories, each with subcategories
-- `fromLibrary: [blockTypes]` → resolved from XML at render time
-- `items: [{blockType, subType, label, desc}]` → inline items (Contact/Coil, placeholders)
-
-**`src/components/Toolbox.jsx`**:
-- `buildBlockMap(libraryData)` → flat `{ blockType → block }` lookup
-- 3-level expand/collapse: `expandedCats`, `expandedSubs` (separate useState)
-- Contact color: `#1a6b3a`, Coil color: `#8b3a0f`, others: `#673ab7`
-- User-defined blocks appended as flat category at bottom
-- `subType` passed via `customData.subType` for Contact/Coil drag
+### ST/SCL validation (`stValidation.js`)
+`findStMarkers(code, {allowedLower, conversionPattern, varTypes})` — shared by the ST editor and the SCL inline rung editor. One forward token scan per line tracking the call-paren stack, so **named arguments (`IN := …`) are validated as PINS**, flagged only when the call target resolves to a *known standard* FB/function and the key isn't a pin. Pins come from `getStandardFBPins(type)`. Unknown targets (user FBs) return null → their named args are never flagged. Time/radix literals AND single-quoted string literals are blanked before scanning; member access (`x.Q`) is skipped.
 
 ---
 
-## EtherCAT & Motion
+## 8. The AI agent panel
 
-### Motion Control (CTranspilerService.js)
-- `MOTION_FB_AXIS_PARAM` set — all `MC_*` blocks call `MC_xxx_Call(&inst, &axisVar)` (not `MC_xxx_Call(&inst)`)
-- `Axis` input pin is **not** a struct field — skipped in step 1 (values assignment) and null-init loop
-- `MC_Power`: trigger=`Enable`, Q=`Status`; `MC_MoveAbsolute/Relative`: trigger=`Execute`, Q=`Done`
+`src/components/AiAgentPanel.jsx` — a real tool-calling agent ("PLC Agent") that edits the project: create/rename/delete POUs, rewrite ST, add/update/remove variables, author ladder. The board is read-only context. Config in `localStorage["aiAgentConfig"]`. (Code symbols stay `AiAgentPanel`/`aiAgentConfig`/`/api/host/ai/*`; only user-visible strings are "PLC Agent".) The system prompt enforces a **clarify-first policy** on ambiguous requests.
 
-### motion.xml (PLCopen standard blocks)
-MC_Power, MC_Home, MC_Stop, MC_Halt, MC_MoveAbsolute, MC_MoveRelative, MC_MoveVelocity,
-MC_Reset, MC_ReadActualPosition, MC_ReadActualVelocity, MC_ReadStatus, MC_ReadAxisError, MC_SetOverride.
-All have `Axis` (AXIS_REF) as first input pin.
+### Architecture (3 layers)
+- **`host-agent/ai.go`** — provider-agnostic single-turn chat proxy at `POST /api/host/ai/chat`. Normalizes `{provider, model, apiKey, baseUrl, system, messages, tools}` → one assistant message `{content, toolCalls}`. Dialects isolated in `callAnthropic`, `callOpenAI` (also serves `custom` + `gemini`/`google` via Gemini's OpenAI-compat base), `callOllama` (synthesizes tool-call ids; has a prompt-based tool fallback for models with no native tool API).
+- **`host-agent/anthropic_oauth.go`** — "Sign in with your Claude account" (Pro/Max) via Claude Code's PKCE OAuth flow. Provider `anthropic-oauth`: Bearer auth + `anthropic-beta: oauth-2025-04-20` + a "You are Claude Code" identity system block (the subscription credential is only authorized for Claude Code). Tokens at `AppDataDir/anthropic_oauth.json`; auto-refresh within 60s of expiry. ⚠️ The refresh does NOT hold the mutex across the network call; `state` is matched exactly (no single-pending fallback).
+- **`src/services/agentTools.js`** — the pure action surface. `TOOL_DEFS` + `applyToolCall(struct, name, args)` returns `{mutation, ok, summary, diff, next}` (never mutates in place). Tools: `get_project_overview`, `read_pou`, `list_blocks`, `create_pou`, `rename/delete_pou`, `set_st_code`, `add/update/remove_variable`, `set_ladder`, `create_data_type`.
 
-### EtherCAT Config Generation (CTranspilerService.js)
-- `generateEtherCATConfig(buses, busConfigs)` → generates `KRON_EC_Config` init C code
-- `static KRON_EC_Config __ec_cfg;` added to `plc.c` (NOT `plc.h`)
-- `kron_ec_init(&__ec_cfg)` in PLC_Init; `kron_ec_close(&__ec_cfg)` in PLC_Cleanup
-- `kron_ec_pdo_read` injected before `plc_shm_pull`; `kron_ec_pdo_write` after `plc_shm_sync` in each task
-- PDO varName: uses `entry.varName` if set; else auto-generates `ec_{slaveName}_{entryName}`
+### ⚠️ Array/struct/enum types are never inline — always a named data type
+A variable's `type` must be a scalar IEC type, an existing data-type/FB name, or (once) the literal `ARRAY[m..n] OF TYPE` (auto-recovered into a real `dataTypes` entry). Anything else is rejected with a message telling the model to call `create_data_type` first. Enforced at the single choke point `resolveVarType(struct, rawType)` (both `add_variable`/`update_variable` funnel through it). `create_data_type` builds the exact `dataTypes` shape the human editors produce (`{name, type:'Array'|'Structure'|'Enumerated', content}`).
 
-### EtherCAT Files
-- Master config: `EtherCATEditor.jsx` + `deviceCodegen.js`
-- Slave config: `SlaveConfigPage.jsx` + `EsiLibraryService.js`
-- C generation: `KRON_EC_Config` struct + `ethercat_master_config.h`
+### Agent loop & robustness
+- **`create_pou` accepts `ST`|`LD`|`SCL`** (SCL = mixed). `set_ladder` works on LD+SCL; `set_st_code` on ST+SCL.
+- `read_pou` renders LD/SCL rungs via `renderRungs` (traces power-flow into readable boolean logic).
+- **`list_blocks`** is how the agent learns FB/function pins (`buildBlockCatalog`). `set_ladder` is **contacts + coils only** — FBs need `customData` pin metadata the agent doesn't carry, so timers/counters/motion/user-FBs are routed to ST.
+- **Live diagnosis:** `read_live_variables` returns a buffered snapshot + history; `watch_live_variables` awaits a per-variable trailing window (`summarizeWatch`) then injects the summary. The prompt routes time-dependent checks to `watch` and to auto-verify after any change/deploy.
+- **POU-target inference:** a local-scope tool whose `pou` doesn't resolve gets rewritten to the last-touched / just-created / open POU (weak-model safety net; only overrides an *unresolvable* pou).
+- **Weak-model recovery layers:** `extractInlineToolCalls` (JSON + markdown-heading + bare-args forms), `extractKeyValToolCalls`, `recoverStCodeBlock`, `stripSpecialTokens`, `repairJsonBrackets`, `extractStDeclarations` (adds inlined `VAR…END_VAR` declarations to the diff). These keep qwen2.5-coder-class local models *usable* but unreliable; a native-tools cloud model (Gemini/Claude) is far steadier.
+
+### Local model setup (Ollama) — `host-agent/ollama.go`
+Talks to a local Ollama daemon (default `:11434`) over HTTP — no CLI shell-out. Routes: `ollama-status`, `ollama-setup` (one-click bootstrap: locate/download the official archive into `AppDataDir/ollama`, spawn `ollama serve`), `ollama-pull`, `ollama-runtime` (GPU/CPU placement + VRAM). Progress on SSE topics `ollama-setup-progress`/`ollama-pull-progress`. Multiplatform: Linux `.tar.zst` (pure-Go zstd, keeps `CGO_ENABLED=0`), Windows `.zip`. ⚠️ Tar extraction rejects symlink-slip (absolute or `..`-escaping Linknames). Verified end-to-end on Linux; Windows compile-verified.
 
 ---
 
-## KronServer — PLC Deployment & Debug Agent
+## 9. Board support (adding a new SBC)
 
-Source: `<repo>/server/` (in-tree; cross-compiled by `server/build.sh` into `server/dist/` **and copied into `resources/<triple>/server/`** — the host-agent's `deploy_server_to_target` (SSH/SFTP, `deploy_ssh.go`) reads from there and ships it to the target hardware)
+Boards are grouped into **display families** (`BOARD_FAMILIES` in `boardDefinitions.js`) and, separately, into **HAL families** (chosen by ID prefix). The HAL family determines the HAL header, compile triple, device paths, and server binary.
 
-### Overview
-Go-based agent that deploys compiled PLC runtime binaries to target hardware, manages runtime lifecycle, and provides live variable streaming via shared memory IPC. Serves HMI web interface with role-based access control.
+### ⚠️ INVARIANT — `getBoardFamilyDefine` exists in THREE files, keep them identical
+1. `src/utils/devicePortMapping.js`
+2. `src/services/CTranspilerService.js`
+3. `src/utils/deviceCodegen.js`
 
-### Technology
-- **Language**: Go 1.25 — fully static binaries (`CGO_ENABLED=0`)
-- **RPC**: ConnectRPC (supports Connect, gRPC, gRPC-Web protocols)
-- **Serialization**: Protocol Buffers (`proto/plc/v1/plc.proto`)
-- **IPC**: `mmap` on `/dev/shm/<name>` — zero-CGO shared memory with PLC runtime
-- **Build targets**: ARM32 (RPi 32-bit), ARM64 (RPi 64-bit, Jetson), x86_64
+All three map an ID prefix → HAL family: `rpi_pico`→`PICO`, `rpi_`→`RPI`, `bb_`→`BB`, `jetson_`→`JETSON`, plus the generic-Linux vendor prefixes below. Adding a prefix to one but not the others silently breaks codegen for that board.
 
-### ConnectRPC Service (`/plc.v1.PLCService/`)
-| RPC | Description |
-|-----|-------------|
-| `Start` | Launch PLC runtime binary, returns PID |
-| `Stop` | Graceful SIGTERM (5s) → SIGKILL |
-| `WriteVar` | Force-write variable value to shared memory |
-| `ClearAllForces` | Remove all force flags |
-| `StreamVars` | Server-stream all variables every 50ms |
+### Currently supported HAL families
+| HAL family | Boards | Arch | HAL header |
+|---|---|---|---|
+| `HAL_BOARD_FAMILY_RPI` | Raspberry Pi (rpi_*) + all generic-Linux SBCs below | aarch64 | `kronhal_rpi.h` |
+| `HAL_BOARD_FAMILY_BB` | BeagleBone (bb_*; `bb_ai64` is aarch64, rest armv7) | armv7/aarch64 | `kronhal_bb.h` |
+| `HAL_BOARD_FAMILY_JETSON` | NVIDIA Jetson (jetson_*) | aarch64 | `kronhal_jetson.h` |
+| `HAL_BOARD_FAMILY_PICO` | rpi_pico(_w) — sim only, deploy rejected | Cortex-M | `kronhal_pico.h` |
 
-### HTTP Endpoints
-- `POST /deploy/runtime` — upload PLC runtime binary (128 MB max, atomic write)
-- `POST /deploy/variable-table` — upload `variable_table.json`
-- `POST /deploy/project-file` — upload the editor project source (`project.xml`); `GET` returns it back. Editor-only — the runtime never reads it. Stored at `{deploy-dir}/project.xml` (`handleProjectFile` in `server.go`). Powers "Pull from Target".
-- `GET /status` — JSON status report
-- `GET /stream/vars` — SSE variable stream
+### Generic-Linux SBCs (reuse the RPi HAL)
+`kronhal_rpi.h` uses standard Linux userspace APIs (gpiod, `/dev/i2c-*`, `/dev/spidev*`, `/dev/tty*`) that work on essentially all aarch64 Linux SBCs. So these boards are grouped under their own **display** families for a nice UI but map (via the three `getBoardFamilyDefine`) to `HAL_BOARD_FAMILY_RPI` — no new C HAL, no new triple, no new server binary:
 
-**Project file round-trip**: `handleBuildAndSend` (App.jsx) POSTs the serialized project XML to `/deploy/project-file` right after the runtime/variable deploy — a failure here **fails the whole Build & Send** (strict). The Project dropdown's "Pull from Target" (`handlePullFromTarget`) GETs it back, loads it via `processFileContent(xml, label)` then clears `currentFilePath` so the next Save acts as Save As. Both calls are direct browser→KronServer fetches (like `/deploy/hmi-layout` and `/deploy/config`), NOT routed through the host agent. **Consequence: an already-deployed older KronServer without this endpoint will break Build & Send — rebuild + redeploy the server first.**
+Orange Pi (`opi_*`), Radxa (`radxa_*`), Odroid (`odroid_*`), Banana Pi (`bpi_*`), Libre Computer (`libre_*`), Pine64 (`pine_*`) — 12 boards, all aarch64, pinLayout `rpi40`.
 
-### Shared Memory IPC (`ipc.go`)
-- Variable table loaded from `variable_table.json` (name, offset, type, size, force_flag_offset)
-- Supported types: `bool`, `int8/16/32/64`, `uint8/16/32/64`, `float32/64`
-- Little-endian decoding, bounds checking, duplicate detection
+⚠️ **Device-path caveat:** these boards reuse the RPi `BOARD_PORT_DETAILS` (`/dev/ttyAMA0`, `/dev/i2c-1`, `/dev/spidev0.0`), which are *functional defaults* but differ per SoC — Rockchip header UART is often `/dev/ttyS2`, header I2C `/dev/i2c-2/-3/-7`; Amlogic UARTs are `/dev/ttyAML*`; Allwinner H618 UARTs are `/dev/ttyS0..5`. Users can override the device path per port. USB serial (`/dev/ttyUSB*`, `/dev/ttyACM*`) is identical everywhere.
 
-### HMI & Auth (`hmi.go`, `auth.go`)
-- 4-tier RBAC: Viewer → Operator → Maintainer → Admin
-- SHA-256 password hashing with per-user salt
-- Session tokens: 64-byte random hex, 8h TTL
-- HMI layout: XML or JSON import, per-page read/write permissions
-- Persisted at `deploy-dir/hmi_layout.json`
+### Checklist — adding a board
+**Adding an aarch64 Linux SBC to an existing (or generic-Linux) family — the common case:**
+1. `boardDefinitions.js` — add the board object to a `BOARD_FAMILIES` family (`{id, name, cpu, arch:'aarch64', ram, storage, connectivity, gpio, usb, display, pinout, pinLayout:'rpi40', interfaces, usbPorts}`). Reuse `GENERIC_40PIN_HEADER` for 40-pin boards.
+2. `boardLibraryBlocks.js` — add `BOARD_CHANNELS[id] = {PWM, SPI, I2C, UART, USB}` matching the board's real peripheral count.
+3. **Nothing else** if the prefix already maps to a HAL family. `compile.go` needs no change (non-`bb_`/non-pico → default aarch64 triple). The aarch64 server binary already exists at `resources/aarch64-linux-gnu/server/plc-agent_linux_arm64`.
+
+**Adding a NEW vendor prefix (new display family, still generic Linux):**
+4. Add the prefix → `HAL_BOARD_FAMILY_RPI` to **all three** `getBoardFamilyDefine` functions (with a comment that it reuses the generic Linux HAL).
+5. Add the prefix to `serverBinaryForBoard`'s aarch64 list in `host-agent/deploy_ssh.go` (else deploy ships the amd64 binary).
+6. Add the family to `LINUX_BOARD_FAMILIES` in `devicePortMapping.js` **only if** it's a genuinely new HAL family string (the generic boards map to `RPI`, already present).
+7. Add an icon/gradient for the new family name in `BoardConfigPage.jsx` `boardIcon()` (else it falls to the BeagleBone default).
+
+**Adding a truly new HAL family (new arch or non-generic peripherals)** additionally requires: a new `kronhal_<family>.h` (adapt an existing one), a `compile.go` triple case if not aarch64, and a cross-compiled server binary for the arch. Much more work — only when reuse is genuinely impossible.
+
+---
+
+## 10. HAL pattern
+
+Every hardware block = **struct + `_Call` function**.
+- Hardware struct: `HAL_UART_Send`, `HAL_I2C_Read`, `HAL_USB_Send`.
+- Generic struct (in transpiled C): `UART_Send`, `USB_Receive`.
+- Channel dispatch: `UART0_Send_Call(inst)` → `HAL_UART_Send_Call(inst, 0)`.
+- ⚠️ Both `KrontekLibraries/KronHAL/kronhal.h` and `resources/.../kronhal.h` must stay in sync.
+
+### USB_Send vs USB_Receive (different by design)
+| Block | Trigger | Done/Ready | Buffer | Length |
+|---|---|---|---|---|
+| `USB_Send` | `Execute` (rising edge) | `Done`, `Busy`, `Error` | `pTxBuffer` | `Length` |
+| `USB_Receive` | `Enable` (continuous level) | `NewData`, `Error` | `pRxBuffer` | `MaxSize` (in) + `ReceivedLength` (out) |
+
+`USB_Receive_Call` loops up to `MaxSize` byte-reads per scan and breaks when the OS read returns nothing — so one `Enable=TRUE` per scan drains the kernel tty buffer. No edge-cycling required.
+
+### USB DTR handling
+`_*_usb_open()` drops DTR low after `tcsetattr` via `ioctl(fd, TIOCMBIC, &TIOCM_DTR)`. Required for motor-controlled USB devices like RPLIDAR A1M8 (DTR-high = motor-off). **Side effect:** Arduino/ESP32 boards with a DTR auto-reset line are held in reset while the port is open. If a future board needs DTR-high default, refactor into an explicit HAL block instead of a per-port flag.
+
+### Adding/removing pins on a standard FB — five locations
+| Location | Change |
+|---|---|
+| `KrontekLibraries/…/header.h` | struct field (canonical) |
+| `resources/*/include/header.h` | sync to all target dirs |
+| `public/libraries/*.xml` | `<pin>` under `<inputs>`/`<outputs>` (drives the LD UI) |
+| `FB_INPUTS[type]` (CTranspilerService.js) | ordered input pin list (drives pre-call assignment) |
+| `FB_OUTPUTS[type]` (CTranspilerService.js) | output pin list (drives shadow-var decl + write-back) |
+
+Rules: `FB_OUTPUTS` is the single source of truth for codegen — a pin not listed there gets no shadow var and no write-back. A `data.values` key not in `FB_INPUTS` is silently skipped (safe guard for stale project data). Always verify pins against the PLCopen/vendor spec (e.g. `MC_Stop` has no `Active` output; `MC_Halt`/`MC_MoveAbsolute` do).
+
+---
+
+## 11. KronServer (target-device agent)
+
+Source: `server/` (in-tree; cross-compiled by `server/build.sh` into `server/dist/` **and copied into `resources/<triple>/server/`** — the SSH deploy reads from there). Go 1.25, fully static (`CGO_ENABLED=0`), ConnectRPC + protobuf, `mmap` on `/dev/shm` for IPC.
+
+### ConnectRPC service (`/plc.v1.PLCService/`)
+`Start` (launch runtime, returns PID) · `Stop` (SIGTERM 5s → SIGKILL) · `WriteVar` (force-write) · `ClearAllForces` · `StreamVars` (all vars every 50 ms).
+
+### HTTP endpoints
+- `POST /deploy/runtime` — upload PLC binary (128 MB max, atomic write).
+- `POST /deploy/variable-table` — upload `variable_table.json`.
+- `POST /deploy/project-file` / `GET` — the editor project XML (editor-only; powers "Pull from Target"). ⚠️ `handleBuildAndSend` POSTs it as a strict step, so an already-deployed **older KronServer without this endpoint breaks Build & Send** — rebuild + redeploy the server first.
+- `POST /deploy/logic` — hot-swap `.so` upload (generation-numbered; guarded against concurrent-upload collisions).
+- `GET /status` — JSON status incl. `auto_run`, `stream_interval_ms`, `last_runtime_event`.
+- `GET /stream/vars` — SSE variable stream.
+
+### Shared memory IPC (`ipc.go`)
+Variable table = name, offset, type, size, force_flag_offset. Types: `bool`, `int8/16/32/64`, `uint8/16/32/64`, `float32/64`. Little-endian, bounds-checked. ⚠️ **Offsets are validated at load** (`Offset >= 0 && Size > 0 && Offset <= shmSize - Size`, same for `ForceFlagOffset`) — a malicious/corrupt table with a negative or overflowing offset is rejected with a clear error instead of panicking (which, via `WriteInitialValues` on the startup goroutine under AutoRun, would crash-loop the agent forever).
+
+### Process lifecycle (`process.go`) ⚠️
+- `intentionalStop` is **reset in `Start()`** (after `cancelRestartLocked`) and only set by `Stop()` when something is actually running — otherwise a manual Stop would permanently suppress the next genuine crash's event + AutoRun respawn.
+- **`WriteInitialValues` runs via a `preStartHook`** invoked *after* the old process is stopped and *before* the new one spawns — so the dying runtime's shm sync can't clobber the fresh initials. Wired in `main.go` to `ipc.WriteInitialValues`.
+- `Start()` takes `swapMu` for the whole operation and releases `mu` before the ≤5s cold-start `PollSwapResult` — so `Stop()`/`Status()` (the editor's poll) never stall behind it, and an AutoRun crash-restart can't interleave with `SwapLogic`. Lock order is strictly swapMu → mu.
+- Orphan cleanup runs *before* the HTTP server starts accepting, so a Start RPC in the startup window isn't reaped as an orphan.
+
+### HMI & auth (`hmi.go`, `auth.go`)
+4-tier RBAC (Viewer → Operator → Maintainer → Admin), SHA-256 salted passwords, 64-byte session tokens (8h TTL), HttpOnly + SameSite=Lax cookies. Layout persisted at `deploy-dir/hmi_layout.json`.
+- ⚠️ **Reflected values are HTML-escaped** (login `?error=`, username/roleName) and JS-literal-encoded via `json.Marshal` — previously a raw-interpolation XSS.
+- ⚠️ `/hmi/api/write` is **restricted to addressed variables** (mirrors the read feed) and requires Operator+. (Per-page `writeRoles` enforcement is a known residual gap — component bindings are opaque editor-side JSON; documented in code.)
+- Constant-time password comparison (`crypto/subtle`).
 
 ### HMI serving — two listeners, base-path aware
-The same HMI UI is reachable two ways:
-- **Agent port** (`:7070`) under **`/hmi/`** — always registered (`RegisterHMIRoutes`).
-- **Dedicated operator port** at the **root** (`http://ip:PORT/`) — registered by `RegisterHMIRoutesAtRoot` on a second `http.Server` that only carries HMI routes (no deploy/RPC surface). Managed by `Server.applyHMIPort(port)` in `server.go`: idempotent, tears down on 0, rebinds on change, bind failures are logged not fatal. The port is `RuntimeConfig.HMIPort` (persisted in `runtime_config.json`, pushed via `/deploy/config` `hmi_port`); started in `Start()` and on every config update.
-- Handlers/templates are **base-path aware** via `hmiBase(r)` (`"/hmi"` when the path starts with `/hmi`, else `""`). It drives the login/logout redirects, the session-cookie `Path` (`hmiCookiePath`), and the `BASE` const injected into `mainHMIHTML`/`loginHTML` (all fetch/form URLs are `BASE+'/api/...'`). Add base-awareness to any new HMI route or template path, or root serving breaks.
-- **`/hmi/api/variables` returns only ADDRESSED variables** (`ReadAddressedVariables`), matching the REST API and the editor restriction below.
+Same UI reachable two ways: the agent port (`:7070`) under **`/hmi/`** (always registered), and a dedicated operator port at the **root** (`RegisterHMIRoutesAtRoot`, managed by `applyHMIPort`, port from `RuntimeConfig.HMIPort`). ⚠️ Handlers/templates are base-path aware via `hmiBase(r)` (`"/hmi"` or `""`), which drives login/logout redirects, the session-cookie `Path`, and the injected `BASE` const. Add base-awareness to any new HMI route/template or root serving breaks. `/hmi/api/variables` returns only addressed variables. The editor's Visualization picker (`HmiProperties.jsx`) lists only addressed vars.
 
-**Editor side**: the Visualization variable picker (`HmiProperties.jsx` `collectVars`) lists **only addressed variables** (global + local, with the address shown) — non-addressed vars have no value on the target's addressed feed, so binding them is pointless. The HMI port lives in **`hmiLayout.port`** (edited in the Visualization toolbar, default 8080, persisted in project XML since the whole `hmiLayout` is JSON-serialized). `handleBuildAndSend` pushes it as `/deploy/config` `hmi_port` (or `0` when there are no HMI pages → tears the listener down) and logs `http://<plc-host>:<port>/`.
+### Addressed variables & REST API
+An IEC address in the VariableManager "Address" column (`%MW0`, `%MX0.1`, …) exposes a variable via REST. `formatIECAddress` (VariableManager.jsx): BOOL→`%MX{byte}.{bit}`, BYTE/SINT/USINT→`%MB`, INT/UINT/WORD→`%MW`, DINT/UDINT/DWORD/REAL/TIME→`%MD`, LINT/ULINT/LWORD/LREAL→`%ML`. A plain number auto-formats by type. The single API password (SettingsPage → Connection) is SHA-256+salt-embedded into `variable_table.json`; empty = API disabled.
 
-### CLI Flags
+**REST endpoints** (`api.go`, Bearer token from `POST /api/v1/auth`): `GET/POST /variables[/{name}]`, `GET /stream` (SSE, addressed only, cadence tunable 5–60000 ms via `stream_interval_ms`), `POST /forces/clear`, `GET/POST /runtime[/start|/stop|/config]`. Editor streams (`/stream/vars`, RPC `StreamVars`) are fixed at 50 ms.
+
+⚠️ KronServer **auto-rehydrates `variable_table.json` on startup** (`loadStoredVariableTable`) — else the API password would be empty after every reboot. The runtime need not be running for the REST API to work.
+
+### AutoRun & restart
+- AutoRun toggle persisted in project XML → pushed via `POST /deploy/config {"auto_run":…}` → `runtime_config.json`. On startup with `auto_run=true`, the server writes initial values then starts the runtime.
+- The editor's 10s `/status` poll attaches on `running:true` / detects crash on `running:false`.
+- ⚠️ **`restart` is a transient action flag** (not persisted). `handleDeployRuntime` only overwrites `runtime.bin` on disk — the running process keeps the old binary in memory. So `handleBuildAndSend` sends `restart: autoRun || isRunning` as its LAST step (after runtime + variable_table + project-file are all uploaded) so a push to a running/AutoRun target restarts into the new code instead of running stale code. `/deploy/config` accepts a **partial** JSON body (omitted fields keep their value); POST-only + 1 MB body limit.
+
+### CLI flags
+`-addr :7070` · `-deploy-dir /opt/plc` · `-shm-name plc_runtime` · `-shm-size 65536` · `-log-level info`.
+
+---
+
+## 12. Security model
+
+The agents are "local trust" backends, but the browser makes them network-reachable, so both now **origin-gate** every request:
+
+⚠️ **CORS/origin gating (host-agent `main.go` `isAllowedOrigin`; KronServer `server.go` `isAllowedCORSOrigin`).** If a request has an `Origin` header, it is allowed only from local/private origins — localhost, `.localhost`, `.local`, loopback (127/8, ::1), RFC1918/ULA (`net.IP.IsPrivate`), link-local — any port, http/https only. Allowed origins get the origin reflected + `Vary: Origin` (not `*`); disallowed origins get **403 without processing, on all methods** (not just preflight). Requests **without** an Origin header (curl, same-origin GET, connect-web) pass unchanged. This stops a random website the user visits from driving the agent (which exposes file R/W, compile/exec, and — on KronServer — unauthenticated `/deploy/*` that runs a binary as root).
+
+Other hardening in place:
+- **host-agent `build.go`:** `Compiler` restricted to a bare-name allowlist (clang/clang++/gcc/g++/cc); `Output` rejects `..`/separators.
+- **Body limits + `ReadHeaderTimeout`** on both agents; KronServer deploy/config endpoints bounded.
+- **SSH deploy** (`deploy_ssh.go`): per-command timeout, install-step errors surfaced. (Host-key auto-retrust is a known, deliberate tradeoff — see §2.)
+- **KronServer:** offset validation (§11), XSS escaping, addressed-only writes, constant-time compares.
+
+Deploy endpoints remain unauthenticated by design (the trust model is "same machine / trusted LAN"); origin gating + the private-network restriction are what make that safe against drive-by browser attacks. A shared-secret on `/deploy/*` would be the next hardening step if the threat model widens.
+
+---
+
+## 13. EtherCAT & motion
+
+### Motion control (CTranspilerService.js)
+- `MOTION_FB_AXIS_PARAM` set — all `MC_*` blocks call `MC_xxx_Call(&inst, &axisVar)`.
+- `Axis` (AXIS_REF) is not a struct field — skipped in value assignment and null-init.
+- `MC_Power`: trigger `Enable`, Q `Status`. `MC_MoveAbsolute/Relative`: trigger `Execute`, Q `Done`.
+- `motion.xml`: MC_Power, MC_Home, MC_Stop, MC_Halt, MC_MoveAbsolute/Relative/Velocity, MC_Reset, MC_ReadActualPosition/Velocity/Status, MC_ReadAxisError, MC_SetOverride — all have `Axis` first.
+
+### EtherCAT config generation
+- `generateEtherCATConfig(buses, busConfigs)` → `KRON_EC_Config` init C. `static KRON_EC_Config __ec_cfg;` in `plc.c`. `kron_ec_init(&__ec_cfg)` in PLC_Init, `kron_ec_close` in PLC_Cleanup. `kron_ec_pdo_read` before `plc_shm_pull`, `kron_ec_pdo_write` after `plc_shm_sync` per task.
+- ⚠️ **Axis init uses `S->${axisName}`** (globals are PlcState fields post-migration): `AXIS_REF_Init(&S->Axis1,…)`, `NC_Init(…, &S->Axis1)`.
+- ⚠️ **PDO variable names are excluded from the `S->` mapping.** The transpiler generates `#define ec_X (__gpi_snap->_pi_ec_X)` per PDO entry; those names are left as bare identifiers (not `S->ec_X`) so the macro applies, and they get no `PlcState` field and no SHM slot (they're EtherCAT-owned). Mapping them to `S->` would expand to `S->(__gpi_snap->…)` — a syntax error.
+- PDO varName: `entry.varName` if set, else `ec_{slaveName}_{entryName}`.
+- Files: `EtherCATEditor.jsx` + `deviceCodegen.js` (master), `SlaveConfigPage.jsx` + `EsiLibraryService.js` (slave).
+
+### Known gap
+EtherCAT/motion are NOT hot-swap-trampolined (see §6) — a project using them needs a full redeploy + restart to change logic, not a hot-swap.
+
+---
+
+## 14. Library system & clipboard
+
+### XML library format (`public/libraries/*.xml`)
+```xml
+<library><category name="TIMERS">
+  <block type="TON">
+    <inputs><pin name="IN" type="BOOL" trigger="true"/><pin name="PT" type="TIME"/></inputs>
+    <outputs><pin name="Q" type="BOOL"/><pin name="ET" type="TIME"/></outputs>
+  </block>
+</category></library>
 ```
--addr        :7070          Listen address
--deploy-dir  /opt/plc       Working directory for binaries & logs
--shm-name    plc_runtime    Shared memory name under /dev/shm
--shm-size    65536          Shared memory size (bytes)
--log-level   info           debug|info|warn|error
-```
+Load order (LibraryService.js): `bit_logic` → `timers` → `counters` → `math` → `comparison_selection` → `conversion` → `advanced_control`/`motion`/`communication`/`system`. `categoryName.replace(/_/g,' ')`. Trig typedefs are uppercase to avoid libc conflicts. Timers include TONR (retentive; ET accumulates across IN=false, only RESET clears).
 
-### Runtime Artifacts
-- `deploy-dir/runtime.bin` — compiled PLC binary
-- `deploy-dir/variable_table.json` — variable symbol table
-- `deploy-dir/hmi_layout.json` — persisted HMI config
-- `deploy-dir/logs/runtime_*_{stdout,stderr}.log` — process logs
+### Toolbox 3-level hierarchy
+`libraryTree.js` `LIBRARY_TREE`: 9 top-level categories with subcategories; `fromLibrary:[types]` resolved from XML at render; `items:[{blockType, subType, label, desc}]` inline. `Toolbox.jsx`: `buildBlockMap`, separate `expandedCats`/`expandedSubs`. Contact `#1a6b3a`, Coil `#8b3a0f`, others `#673ab7`. `subType` passed via `customData.subType`.
 
-### Addressed Variables & REST API
+### Clipboard (`kronClipboard.js`)
+Cross-tab copy/paste rides `navigator.clipboard` with an in-process fallback. Each payload is tagged with a `CLIP_KIND` (`POU`, `RUNG`, `BLOCK`, `VARIABLE`, `GLOBALS`). Keyboard handlers are **scope-gated** via `editorScope.js` (`SIDEBAR|VARIABLES|LD`), set on the container's mousedown. ⚠️ **The LD editor root MUST use `onMouseDownCapture`** — ReactFlow's node drag `stopPropagation`s a bubble-phase mousedown, so the scope would stay SIDEBAR and Ctrl+C would copy the whole program. All global Ctrl+C/V/Z handlers use the full focus guard (§7).
 
-Variables get an IEC address in the VariableManager "Address" column (e.g. `%MW0`, `%MX0.1`, `%MD10`). Non-empty address = variable is exposed via REST API. Input: user can type a plain number (`1`) and it auto-formats to IEC based on type (BOOL→`%MX0.1`, INT→`%MW1`, DINT/REAL→`%MD1`, LREAL→`%ML1`). Or user can type full IEC address directly.
-
-**IEC address prefix logic** (`formatIECAddress` in VariableManager.jsx):
-- `BOOL` → `%MX{byte}.{bit}` (e.g. address 9 = byte 1, bit 1 → `%MX1.1`)
-- `BYTE/SINT/USINT` → `%MB{n}`
-- `INT/UINT/WORD` → `%MW{n}`
-- `DINT/UDINT/DWORD/REAL/TIME` → `%MD{n}`
-- `LINT/ULINT/LWORD/LREAL` → `%ML{n}`
-
-**Password**: Single API password set in SettingsPage → Connection tab. Hashed (SHA-256 with 16-byte salt) and embedded in `variable_table.json` as `api_password_hash` + `api_password_salt` during Build & Send. Empty = API disabled.
-
-**variable_table.json extended format**:
-```json
-{
-  "variables": [
-    { "name": "prog__motor_speed", "offset": 0, "type": "float32", "size": 4,
-      "force_flag_offset": 32768, "address": "%MD0", "initial_value": 0.0 },
-    { "name": "prog__pump_on", "offset": 4, "type": "bool", "size": 1,
-      "force_flag_offset": 32769, "address": "%MX0.4", "initial_value": true }
-  ],
-  "api_password_hash": "a1b2c3...",
-  "api_password_salt": "d4e5f6..."
-}
-```
-
-**Initial values**: `WriteInitialValues()` is called before runtime Start. Writes `initial_value` from variable_table.json to SHM so variables start at their configured defaults on every restart.
-
-**Agent restart**: KronServer auto-rehydrates `{deploy-dir}/variable_table.json` on startup (`server.go` `loadStoredVariableTable`). Without this the API password (embedded in the file) would be empty after every reboot and `/api/v1/auth` would return 503 even though Build & Send had already deployed the file. The PLC runtime does NOT need to be running for the REST API to work — the agent and the runtime are independent processes; only `LoadVariableTable` matters for `APIEnabled()`.
-
-**REST API Endpoints** (`api.go`):
-| Method | Path | Auth | Description |
-|--------|------|------|-------------|
-| POST | `/api/v1/auth` | No | `{"password":"..."}` → `{"token":"..."}` |
-| GET | `/api/v1/variables` | Bearer token | All addressed variables |
-| GET | `/api/v1/variables/{name}` | Bearer token | Single addressed variable + address field |
-| POST | `/api/v1/variables/{name}` | Bearer token | Write value |
-| GET | `/api/v1/stream` | Bearer token | SSE stream (addressed only, cadence tunable, default 50ms) |
-| POST | `/api/v1/forces/clear` | Bearer token | Clear force flags |
-| GET | `/api/v1/runtime` | Bearer token | `{running, pid, auto_run, stream_interval_ms}` |
-| POST | `/api/v1/runtime/start` | Bearer token | Start PLC runtime (mirrors ConnectRPC `Start`) |
-| POST | `/api/v1/runtime/stop` | Bearer token | Stop PLC runtime (SIGTERM → 5s → SIGKILL) |
-| POST | `/api/v1/runtime/config` | Bearer token | Partial update of `auto_run` and/or `stream_interval_ms` |
-
-**Stream cadence scope**: only `/api/v1/stream` (addressed variables, external clients) is tunable. Editor streams (`/stream/vars` SSE and ConnectRPC `StreamVars`) are deliberately fixed at the `streamInterval` constant (50 ms) — the editor relies on this stability. The `stream_interval_ms` knob is clamped to **5–60000** and changes apply on the next tick to all in-flight `/api/v1/stream` clients (no reconnect needed).
-
-**Key files**:
-- Editor: `VariableManager.jsx` (`formatIECAddress`), `CTranspilerService.js` (propagation), `App.jsx` (password hash)
-- Server: `ipc.go` (`ReadAddressedVariables`, `CheckAPIPassword`, `WriteInitialValues`), `api.go` (REST endpoints)
-
-### AutoRun
-
-**Editor**: AutoRun toggle button in toolbar (green = ON, grey = OFF). Persisted in project XML.
-
-**Deploy**: `POST /deploy/config` sends `{"auto_run": true/false}` → server saves to `deploy-dir/runtime_config.json`.
-
-**Server startup**: If `auto_run=true` in `runtime_config.json`, server calls `WriteInitialValues()` then starts the runtime automatically.
-
-**Editor on connect**: Every 10s status check parses `/status` JSON. If `running: true` and editor doesn't think it's running → attaches as if Start was pressed (creates PLCClient, starts stream, sets `isRunning=true`). If `running: false` and editor thinks it's running → detects crash, sets `isRunning=false`.
-
-**`/status` response** includes `auto_run: bool` and `stream_interval_ms: uint`.
-
-**`/deploy/config` endpoint**: `POST /deploy/config` — no auth required (same trust level as other deploy endpoints). Accepts a **partial** JSON body (`auto_run`, `stream_interval_ms`, `hmi_port`, `restart`): omitted fields keep their current value, so the editor can push `{"auto_run": ...}` without clobbering an API-tuned `stream_interval_ms`. Saves `runtime_config.json`. A present `hmi_port` triggers `applyHMIPort` (rebind/teardown of the dedicated HMI listener). Same partial-update payload is also accepted (with bearer auth) at `POST /api/v1/runtime/config`. **`restart` is a transient ACTION flag (not persisted):** `restart:true` makes the server `StartRuntime()` (which `pm.Start()`s — stopping the running process first, then launching the freshly-deployed `runtime.bin`). **This is what makes Build & Send actually swap the running code:** `handleDeployRuntime` only overwrites `runtime.bin` on disk — the already-running process keeps the OLD binary in memory, and the AutoRun side-effect no-ops when a runtime is already running. So `handleBuildAndSend` sends `restart: autoRun || isRunning` as its LAST deploy step (after runtime.bin + variable_table + project-file are all on the target), so a push to a running/AutoRun target restarts into the new code instead of silently running stale code. `restart:false`/absent keeps the old behavior (AutoRun-on starts only when idle).
+**Paste-naming rules (intentionally different by kind):**
+- **POUs / data types:** keep name; on collision append `_copy1`, `_copy2`, ….
+- **Local variables:** same `_copy{n}` scheme.
+- **Global-variable SET** (`CLIP_KIND.GLOBALS`): **merge by name** — a same-named global is skipped (destination's kept), not `_copy`-duplicated. Addresses dropped on paste (hardware-unique). Merging into another project is the point.
+- **Referenced globals bundled with a POU** (`meta.globalsBundle`): merged by name (skip-if-present).

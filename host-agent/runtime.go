@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"log"
 	"math"
 	"net/http"
 	"os"
@@ -29,20 +30,25 @@ type SimState struct {
 	pid      int
 	varSpecs []VarSpec
 	stopCh   chan struct{}
+	done     chan struct{} // closed by the reaper goroutine (the ONLY cmd.Wait caller)
 }
 
 func NewSimState() *SimState {
 	return &SimState{}
 }
 
-func (s *SimState) Stop() {
+// Stop kills a running simulation and waits for its reaper to confirm the
+// process is gone. exec.Cmd.Wait must only ever be called once, so Stop never
+// calls Wait itself — the reaper goroutine spawned in handleRunSimulation owns
+// Wait and closes `done`. Returns whether a simulation was actually running.
+func (s *SimState) Stop() bool {
 	s.mu.Lock()
-	cmd := s.cmd
-	ch := s.stopCh
+	cmd, ch, done := s.cmd, s.stopCh, s.done
 	s.cmd = nil
 	s.pid = 0
 	s.varSpecs = nil
 	s.stopCh = nil
+	s.done = nil
 	s.mu.Unlock()
 
 	if ch != nil {
@@ -52,10 +58,19 @@ func (s *SimState) Stop() {
 			close(ch)
 		}
 	}
-	if cmd != nil && cmd.Process != nil {
-		_ = cmd.Process.Kill()
-		_ = cmd.Wait()
+	if cmd == nil {
+		return false
 	}
+	if cmd.Process != nil {
+		_ = cmd.Process.Kill()
+	}
+	if done != nil {
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+		}
+	}
+	return true
 }
 
 // ── run_simulation ───────────────────────────────────────────────────────────
@@ -109,20 +124,26 @@ func (s *Server) handleRunSimulation(w http.ResponseWriter, r *http.Request) {
 	s.sim.pid = cmd.Process.Pid
 	s.sim.varSpecs = specs
 	stopCh := make(chan struct{})
+	done := make(chan struct{})
 	s.sim.stopCh = stopCh
+	s.sim.done = done
 	pid := s.sim.pid
 	s.sim.mu.Unlock()
 
 	s.events.Emit("simulation-output", map[string]any{"status": "started"})
 
 	go s.simulationPoller(pid, specs, stopCh)
+	// Reaper: the ONLY cmd.Wait caller for this process. Stop() just kills and
+	// then waits on `done` — never a second Wait (which races/panics).
 	go func() {
 		_ = cmd.Wait()
+		close(done)
 		s.sim.mu.Lock()
 		if s.sim.cmd == cmd {
 			s.sim.cmd = nil
 			s.sim.pid = 0
 			s.sim.varSpecs = nil
+			s.sim.done = nil
 			if s.sim.stopCh != nil {
 				close(s.sim.stopCh)
 				s.sim.stopCh = nil
@@ -170,27 +191,10 @@ func (s *Server) handleStopSimulation(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusMethodNotAllowed, "POST required")
 		return
 	}
-	s.sim.mu.Lock()
-	cmd := s.sim.cmd
-	ch := s.sim.stopCh
-	s.sim.cmd = nil
-	s.sim.pid = 0
-	s.sim.varSpecs = nil
-	s.sim.stopCh = nil
-	s.sim.mu.Unlock()
-	if cmd == nil {
+	if !s.sim.Stop() {
 		writeError(w, http.StatusBadRequest, "No simulation running")
 		return
 	}
-	if ch != nil {
-		select {
-		case <-ch:
-		default:
-			close(ch)
-		}
-	}
-	_ = cmd.Process.Kill()
-	_ = cmd.Wait()
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "message": "Simulation stopped"})
 }
 
@@ -222,7 +226,9 @@ func (s *Server) handleWriteVariable(w http.ResponseWriter, r *http.Request) {
 	}
 	s.sim.mu.Unlock()
 	if pid == 0 {
-		writeError(w, http.StatusBadRequest, "No simulation running")
+		// The DEFAULT simulation is the hot-swap loader-host, not the plain
+		// sim — force-write through its /dev/shm mirror instead.
+		s.writeHotSwapVariable(w, req)
 		return
 	}
 	if spec == nil {
@@ -271,12 +277,19 @@ func (s *Server) handlePlcVariables(w http.ResponseWriter, r *http.Request) {
 		case <-ctx.Done():
 			return
 		case vars := <-ch:
-			payload, _ := json.Marshal(vars)
+			payload, err := json.Marshal(vars)
+			if err != nil {
+				plcVarsMarshalLogOnce.Do(func() { log.Printf("plc-variables: marshal failed (frame dropped): %v", err) })
+				continue
+			}
 			fmt.Fprintf(w, "data: %s\n\n", payload)
 			flusher.Flush()
 		}
 	}
 }
+
+// plcVarsMarshalLogOnce keeps a persistent marshal failure from flooding the log.
+var plcVarsMarshalLogOnce sync.Once
 
 // SimState also maintains a fan-out for variable snapshots used by handlePlcVariables.
 var plcVarSubsMu sync.Mutex
@@ -592,9 +605,9 @@ func decodeValue(buf []byte, t string) interface{} {
 	case "ULINT":
 		return binary.LittleEndian.Uint64(buf[:8])
 	case "REAL":
-		return math.Float32frombits(binary.LittleEndian.Uint32(buf[:4]))
+		return sanitizeFloat(float64(math.Float32frombits(binary.LittleEndian.Uint32(buf[:4]))), true)
 	case "LREAL":
-		return math.Float64frombits(binary.LittleEndian.Uint64(buf[:8]))
+		return sanitizeFloat(math.Float64frombits(binary.LittleEndian.Uint64(buf[:8])), false)
 	case "TON", "TOF":
 		if len(buf) >= 15 {
 			return map[string]interface{}{
@@ -619,6 +632,19 @@ func decodeValue(buf []byte, t string) interface{} {
 		}
 	}
 	return nil
+}
+
+// sanitizeFloat maps NaN/±Inf to nil (JSON null): json.Marshal rejects
+// non-finite floats, and one bad REAL used to make the ENTIRE live-variable
+// frame silently fail to marshal (stream freezes).
+func sanitizeFloat(v float64, single bool) interface{} {
+	if math.IsNaN(v) || math.IsInf(v, 0) {
+		return nil
+	}
+	if single {
+		return float32(v)
+	}
+	return v
 }
 
 func encodeValue(t, value string) ([]byte, bool) {

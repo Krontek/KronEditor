@@ -575,6 +575,12 @@ const UsbPortsVisual = ({ board, interfaceConfig, onInterfaceConfigChange }) => 
 const boardIcon = (family) => {
   if (family === 'Raspberry Pi') return { icon: '🍓', bg: 'linear-gradient(135deg, #c51a4a, #8b1a3a)' };
   if (family === 'NVIDIA Jetson') return { icon: '🤖', bg: 'linear-gradient(135deg, #2e7d32, #1b5e20)' };
+  if (family === 'Orange Pi') return { icon: '🍊', bg: 'linear-gradient(135deg, #ef6c00, #b34700)' };
+  if (family === 'Radxa') return { icon: '🪨', bg: 'linear-gradient(135deg, #00838f, #005662)' };
+  if (family === 'Odroid') return { icon: '🔷', bg: 'linear-gradient(135deg, #1565c0, #0d3c78)' };
+  if (family === 'Banana Pi') return { icon: '🍌', bg: 'linear-gradient(135deg, #f9a825, #b57800)' };
+  if (family === 'Libre Computer') return { icon: '🥔', bg: 'linear-gradient(135deg, #6d4c41, #452c24)' };
+  if (family === 'Pine64') return { icon: '🌲', bg: 'linear-gradient(135deg, #33691e, #1e4212)' };
   return { icon: '🦴', bg: 'linear-gradient(135deg, #546e7a, #37474f)' };
 };
 

@@ -137,16 +137,13 @@ func (s *Server) handleAnthropicOAuthExchange(w http.ResponseWriter, r *http.Req
 		code, state = raw[:i], raw[i+1:]
 	}
 	st := s.anthropicOAuth
+	// Require an EXACT state match — using the single pending verifier for a
+	// mismatched state would defeat the CSRF protection state exists for.
 	st.mu.Lock()
 	verifier := st.verifiers[state]
-	if verifier == "" && len(st.verifiers) == 1 { // single pending login → use it
-		for _, v := range st.verifiers {
-			verifier = v
-		}
-	}
 	st.mu.Unlock()
 	if verifier == "" {
-		writeError(w, http.StatusBadRequest, "no pending login — start sign-in again")
+		writeError(w, http.StatusBadRequest, "no pending login matching this state — start sign-in again")
 		return
 	}
 	tok, err := st.tokenRequest(url.Values{
@@ -189,16 +186,12 @@ func (s *Server) handleAnthropicOAuthCallback(w http.ResponseWriter, r *http.Req
 		return
 	}
 	st := s.anthropicOAuth
+	// Exact state match only (see handleAnthropicOAuthExchange).
 	st.mu.Lock()
 	verifier := st.verifiers[state]
-	if verifier == "" && len(st.verifiers) == 1 {
-		for _, v := range st.verifiers {
-			verifier = v
-		}
-	}
 	st.mu.Unlock()
 	if verifier == "" {
-		page("Authorization failed", "No pending sign-in. Start again from KronEditor.")
+		page("Authorization failed", "No pending sign-in matching this request. Start again from KronEditor.")
 		return
 	}
 	tok, err := st.tokenRequest(url.Values{
@@ -278,23 +271,48 @@ func (st *AnthropicOAuthState) tokenRequest(form url.Values) (*anthropicTokens, 
 
 // accessToken returns a currently-valid access token, refreshing if it expires
 // within 60s. `force` refreshes unconditionally (used on a 401 retry).
+//
+// The mutex is NOT held across the (up to 30s) refresh HTTP call — holding it
+// would block every OAuth endpoint and chat for the duration. Instead the
+// refresh token is snapshotted, the lock dropped for the network round-trip,
+// and on re-lock we check whether another goroutine (or a fresh login) already
+// stored a different token in the meantime — if so, theirs wins.
 func (st *AnthropicOAuthState) accessToken(force bool) (string, error) {
+	st.mu.Lock()
+	if st.tok == nil {
+		st.mu.Unlock()
+		return "", fmt.Errorf("not signed in to a Claude account")
+	}
+	if !force && st.tok.ExpiresAt-time.Now().Unix() >= 60 {
+		tok := st.tok.AccessToken
+		st.mu.Unlock()
+		return tok, nil
+	}
+	prevAccess := st.tok.AccessToken
+	refresh := st.tok.RefreshToken
+	st.mu.Unlock()
+
+	tok, err := st.tokenRequest(url.Values{
+		"grant_type":    {"refresh_token"},
+		"refresh_token": {refresh},
+		"client_id":     {anthropicOAuthClientID},
+	})
+
 	st.mu.Lock()
 	defer st.mu.Unlock()
 	if st.tok == nil {
+		// Logged out while we were on the wire.
 		return "", fmt.Errorf("not signed in to a Claude account")
 	}
-	if force || st.tok.ExpiresAt-time.Now().Unix() < 60 {
-		tok, err := st.tokenRequest(url.Values{
-			"grant_type":    {"refresh_token"},
-			"refresh_token": {st.tok.RefreshToken},
-			"client_id":     {anthropicOAuthClientID},
-		})
-		if err != nil {
-			return "", fmt.Errorf("token refresh failed (sign in again): %w", err)
-		}
-		st.tok = tok
-		st.save()
+	if st.tok.AccessToken != prevAccess {
+		// Someone else refreshed (or re-logged-in) already — use their token
+		// and discard ours (refresh tokens may be single-use).
+		return st.tok.AccessToken, nil
 	}
+	if err != nil {
+		return "", fmt.Errorf("token refresh failed (sign in again): %w", err)
+	}
+	st.tok = tok
+	st.save()
 	return st.tok.AccessToken, nil
 }

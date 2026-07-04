@@ -61,6 +61,20 @@ const SCLInlineEditor = ({ code, readOnly, onCodeChange, onBlur, variables = [],
   const monacoRef = useRef(null);
   const liveDecsRef = useRef([]);
 
+  // The listeners registered in onMount (blur → undo snapshot, content change
+  // → validation) live for the editor's whole lifetime but would otherwise
+  // close over MOUNT-TIME props: blur pushed a STALE history snapshot and
+  // validation used stale variable lists. Route them through refs kept fresh
+  // by effects so the mount-registered callbacks always read current props.
+  const onBlurRef = useRef(onBlur);
+  const variablesRef = useRef(variables);
+  const globalVarsRef = useRef(globalVars);
+  const hwPortVarsRef = useRef(hwPortVars);
+  useEffect(() => { onBlurRef.current = onBlur; }, [onBlur]);
+  useEffect(() => { variablesRef.current = variables; }, [variables]);
+  useEffect(() => { globalVarsRef.current = globalVars; }, [globalVars]);
+  useEffect(() => { hwPortVarsRef.current = hwPortVars; }, [hwPortVars]);
+
   // Sync external code (undo/redo) into Monaco without resetting cursor
   useEffect(() => {
     const ed = editorRef.current;
@@ -202,13 +216,14 @@ const SCLInlineEditor = ({ code, readOnly, onCodeChange, onBlur, variables = [],
           };
           editor.onDidContentSizeChange(updateHeight);
           updateHeight();
-          editor.onDidBlurEditorText(onBlur);
+          // Read through refs — these listeners outlive the mount-time props.
+          editor.onDidBlurEditorText(() => { onBlurRef.current && onBlurRef.current(); });
           // Initial validation
           const model = editor.getModel();
           if (model && mc) {
-            validateSCLCode(model.getValue(), variables, globalVars, mc, model, hwPortVars);
+            validateSCLCode(model.getValue(), variablesRef.current, globalVarsRef.current, mc, model, hwPortVarsRef.current);
             editor.onDidChangeModelContent(() => {
-              validateSCLCode(model.getValue(), variables, globalVars, mc, model, hwPortVars);
+              validateSCLCode(model.getValue(), variablesRef.current, globalVarsRef.current, mc, model, hwPortVarsRef.current);
             });
           }
         }}
@@ -409,34 +424,37 @@ const RungEditorNew = ({ variables, setVariables, rungs, setRungs, availableBloc
       // FB instance variables for copied blocks. When the rung comes from
       // another editor window, `variables` will not contain the source's
       // entries, so we also look them up in clip.meta.instanceVars.
+      // Compute the new values FIRST, then call the setters with the values
+      // and saveHistory OUTSIDE any updater — StrictMode double-invokes
+      // updaters, which duplicated history entries.
       const bundledVars = clip.meta?.instanceVars || [];
       const fbBlocks = newBlocks
         .map((b, i) => ({ b, orig: src.blocks[i] }))
         .filter(({ b }) => b.data?.type !== 'Contact' && b.data?.type !== 'Coil' && b.data?.instanceName);
+      let newVariables = variables;
       if (fbBlocks.length) {
-        setVariables(prev => {
-          const names = new Set(prev.map(v => v.name));
-          const extra = [];
-          fbBlocks.forEach(({ b, orig }) => {
-            if (names.has(b.data.instanceName)) return;
-            const srcName = orig?.data?.instanceName;
-            const def = prev.find(v => v.name === srcName)
-              || bundledVars.find(v => v.name === srcName);
-            if (def) {
-              extra.push({ ...def, id: `var_${Date.now()}_${Math.random()}`, name: b.data.instanceName });
-              names.add(b.data.instanceName);
-            }
-          });
-          return extra.length ? [...prev, ...extra] : prev;
+        const names = new Set(variables.map(v => v.name));
+        const extra = [];
+        fbBlocks.forEach(({ b, orig }) => {
+          if (names.has(b.data.instanceName)) return;
+          const srcName = orig?.data?.instanceName;
+          const def = variables.find(v => v.name === srcName)
+            || bundledVars.find(v => v.name === srcName);
+          if (def) {
+            extra.push({ ...def, id: `var_${Date.now()}_${Math.random()}`, name: b.data.instanceName });
+            names.add(b.data.instanceName);
+          }
         });
+        if (extra.length) {
+          newVariables = [...variables, ...extra];
+          setVariables(newVariables);
+        }
       }
-      setRungs(prev => {
-        const idx = focusedRungId ? prev.findIndex(r => r.id === focusedRungId) : prev.length - 1;
-        const newRungs = [...prev];
-        newRungs.splice(idx + 1, 0, newRung);
-        setTimeout(() => setVariables(v => { saveHistory(newRungs, v); return v; }), 0);
-        return newRungs;
-      });
+      const idx = focusedRungId ? rungs.findIndex(r => r.id === focusedRungId) : rungs.length - 1;
+      const newRungs = [...rungs];
+      newRungs.splice(idx + 1, 0, newRung);
+      setRungs(newRungs);
+      saveHistory(newRungs, newVariables);
       setFocusedRungId(newRung.id);
       return;
     }
@@ -455,63 +473,64 @@ const RungEditorNew = ({ variables, setVariables, rungs, setRungs, availableBloc
       : (focusedRungId || rungs[rungs.length - 1]?.id);
     if (!targetRungId) return;
 
-    setRungs(prevRungs => {
-      const targetRung = prevRungs.find(r => r.id === targetRungId);
-      if (!targetRung) return prevRungs;
+    // Compute the new rungs/variables FIRST, then call the setters with the
+    // values and saveHistory OUTSIDE any updater — StrictMode double-invokes
+    // updaters, which duplicated history entries.
+    const targetRung = rungs.find(r => r.id === targetRungId);
+    if (!targetRung) return;
 
-      const newBlockId = `node_${Date.now()}_${Math.random()}`;
-      const newPosition = {
-        x: (copied.position?.x || 0) + 20,
-        y: (copied.position?.y || 0) + 20
-      };
+    const newBlockId = `node_${Date.now()}_${Math.random()}`;
+    const newPosition = {
+      x: (copied.position?.x || 0) + 20,
+      y: (copied.position?.y || 0) + 20
+    };
 
-      const newBlock = {
-        ...copied,
-        id: newBlockId,
-        position: newPosition,
-        selected: true,
-      };
+    const newBlock = {
+      ...copied,
+      id: newBlockId,
+      position: newPosition,
+      selected: true,
+    };
 
-      if (newBlock.data.type !== 'Contact' && newBlock.data.type !== 'Coil') {
-          newBlock.data.instanceName = `${newBlock.data.instanceName}_copy`;
-          setVariables(prevVars => {
-             const newVars = [...prevVars];
-             if(!newVars.some(v => v.name === newBlock.data.instanceName)) {
-                const varDef = prevVars.find(v => v.name === copied.data.instanceName)
-                  || (bundledInstanceVar && bundledInstanceVar.name === copied.data.instanceName ? bundledInstanceVar : null);
-                if(varDef) {
-                   newVars.push({ ...varDef, id: `var_${Date.now()}`, name: newBlock.data.instanceName });
-                }
-             }
-             return newVars;
-          });
-      }
-
-      const newRungs = prevRungs.map(r => {
-        if (r.id === targetRung.id) {
-          return {
-            ...r,
-            blocks: [...r.blocks.map(b => ({...b, selected: false})), newBlock]
-          };
+    let newVariables = variables;
+    if (newBlock.data.type !== 'Contact' && newBlock.data.type !== 'Coil') {
+        newBlock.data.instanceName = `${newBlock.data.instanceName}_copy`;
+        if (!variables.some(v => v.name === newBlock.data.instanceName)) {
+           const varDef = variables.find(v => v.name === copied.data.instanceName)
+             || (bundledInstanceVar && bundledInstanceVar.name === copied.data.instanceName ? bundledInstanceVar : null);
+           if (varDef) {
+              newVariables = [...variables, { ...varDef, id: `var_${Date.now()}`, name: newBlock.data.instanceName }];
+              setVariables(newVariables);
+           }
         }
-        return r;
-      });
+    }
 
-      setTimeout(() => setVariables(v => { saveHistory(newRungs, v); return v; }), 0);
-      return newRungs;
+    const newRungs = rungs.map(r => {
+      if (r.id === targetRung.id) {
+        return {
+          ...r,
+          blocks: [...r.blocks.map(b => ({...b, selected: false})), newBlock]
+        };
+      }
+      return r;
     });
+
+    setRungs(newRungs);
+    saveHistory(newRungs, newVariables);
 
     selectedNodeRef.current = { rungId: targetRungId, ...copied, selected: true };
 
-  }, [readOnly, focusedRungId, setRungs, setVariables, saveHistory, rungs]);
+  }, [readOnly, focusedRungId, setRungs, setVariables, saveHistory, rungs, variables]);
 
   useEffect(() => {
     const handleKeyDown = (e) => {
       const ae = document.activeElement;
-      // Skip if typing in an input/textarea or inside a Monaco editor
+      // Standard focus guard: skip if typing in ANY input/textarea, a
+      // contentEditable surface, or inside a Monaco editor.
       if (ae && (
-        (ae.tagName === 'INPUT' && ae.type === 'text') ||
+        ae.tagName === 'INPUT' ||
         ae.tagName === 'TEXTAREA' ||
+        ae.isContentEditable ||
         ae.closest?.('.monaco-editor')
       )) {
         return;
@@ -520,10 +539,13 @@ const RungEditorNew = ({ variables, setVariables, rungs, setRungs, availableBloc
       if (e.ctrlKey || e.metaKey) {
         const key = e.key.toLowerCase();
         const scope = getEditorScope();
-        if (key === 'z') {
+        if (key === 'z' || key === 'y') {
+          // Scope-gate undo/redo like copy/paste: without this, a single
+          // Ctrl+Z fired BOTH the App project-tree undo and this rung undo.
+          if (scope !== EDITOR_SCOPE.LD) return;
           e.preventDefault();
           e.stopPropagation();
-          if (e.shiftKey) {
+          if (key === 'y' || e.shiftKey) {
             redo();
           } else {
             undo();
@@ -545,46 +567,43 @@ const RungEditorNew = ({ variables, setVariables, rungs, setRungs, availableBloc
   }, [undo, redo, handleCopy, handlePaste]);
 
   // Update block data
+  // Compute the new rungs/variables FIRST, then call the setters with the
+  // values and saveHistory OUTSIDE any updater — StrictMode double-invokes
+  // updaters, which duplicated history entries (undo needed 2 presses in dev).
   const updateBlockData = useCallback((rungId, blockId, newData) => {
     if (readOnly) return;
 
-    setRungs(prevRungs => {
-      let oldInstanceName = null;
-      let oldBlockType = null;
-      const newRungs = prevRungs.map(rung => {
-        if (rung.id === rungId) {
-          return {
-            ...rung,
-            blocks: rung.blocks.map(b => {
-              if (b.id === blockId) {
-                oldInstanceName = b.data.instanceName;
-                oldBlockType = b.data.type || b.type;
-                return { ...b, data: { ...b.data, ...newData } };
-              }
-              return b;
-            })
-          };
-        }
-        return rung;
-      });
-
-      // Only rename the variable table entry when an FB instance is renamed.
-      // Contact/Coil just reference an existing variable — renaming their label
-      // must NOT touch the variable table.
-      const isFBBlock = oldBlockType && oldBlockType !== 'Contact' && oldBlockType !== 'Coil';
-      if (isFBBlock && newData.instanceName && oldInstanceName && newData.instanceName !== oldInstanceName) {
-         setVariables(prev => {
-            const newVars = prev.map(v => v.name === oldInstanceName ? { ...v, name: newData.instanceName } : v);
-            setTimeout(() => saveHistory(newRungs, newVars), 0);
-            return newVars;
-         });
-      } else {
-         saveHistory(newRungs, variables);
+    let oldInstanceName = null;
+    let oldBlockType = null;
+    const newRungs = rungs.map(rung => {
+      if (rung.id === rungId) {
+        return {
+          ...rung,
+          blocks: rung.blocks.map(b => {
+            if (b.id === blockId) {
+              oldInstanceName = b.data.instanceName;
+              oldBlockType = b.data.type || b.type;
+              return { ...b, data: { ...b.data, ...newData } };
+            }
+            return b;
+          })
+        };
       }
-
-      return newRungs;
+      return rung;
     });
-  }, [readOnly, variables, saveHistory, setVariables]);
+
+    // Only rename the variable table entry when an FB instance is renamed.
+    // Contact/Coil just reference an existing variable — renaming their label
+    // must NOT touch the variable table.
+    const isFBBlock = oldBlockType && oldBlockType !== 'Contact' && oldBlockType !== 'Coil';
+    let newVariables = variables;
+    if (isFBBlock && newData.instanceName && oldInstanceName && newData.instanceName !== oldInstanceName) {
+       newVariables = variables.map(v => v.name === oldInstanceName ? { ...v, name: newData.instanceName } : v);
+       setVariables(newVariables);
+    }
+    setRungs(newRungs);
+    saveHistory(newRungs, newVariables);
+  }, [readOnly, rungs, variables, saveHistory, setRungs, setVariables]);
 
   // Update block position (not saved to history for performance)
   const updateBlockPosition = useCallback((rungId, blockId, position) => {
@@ -846,17 +865,18 @@ const RungEditorNew = ({ variables, setVariables, rungs, setRungs, availableBloc
       }
     };
 
-    setRungs(prevRungs => {
-      const newRungs = prevRungs.map(rung => {
-        if (rung.id === rungId) {
-          return { ...rung, blocks: [...rung.blocks, newBlock] };
-        }
-        return rung;
-      });
-      saveHistory(newRungs, newVariables);
-      return newRungs;
+    // Compute the new rungs FIRST, then setRungs(value) + saveHistory OUTSIDE
+    // the updater — StrictMode double-invokes updaters, which duplicated
+    // history entries.
+    const newRungs = rungs.map(rung => {
+      if (rung.id === rungId) {
+        return { ...rung, blocks: [...rung.blocks, newBlock] };
+      }
+      return rung;
     });
-  }, [setRungs, saveHistory]);
+    setRungs(newRungs);
+    saveHistory(newRungs, newVariables);
+  }, [rungs, setRungs, saveHistory]);
 
   // Main Add Block Handler
   const addBlockToRung = useCallback((rungId, blockType, position, customData = null) => {

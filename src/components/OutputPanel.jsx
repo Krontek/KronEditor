@@ -23,6 +23,16 @@ const LOG_BG_HOVER = {
     error:   'rgba(241,76,76,0.09)',
 };
 
+// Global variables live on the RESOURCE_EDITOR resource
+// (projectStructure.resources[].content.globalVars), not on a top-level
+// projectStructure.globalVars field.
+const getGlobalVars = (projectStructure) => {
+    if (!projectStructure) return [];
+    const res = projectStructure.resources?.find(r => r.type === 'RESOURCE_EDITOR')
+        || projectStructure.resources?.[0];
+    return res?.content?.globalVars || [];
+};
+
 // Resolve an expression like "ProgName.varName" or "varName" to a liveKey
 const resolveExpression = (expr, projectStructure) => {
     if (!expr || !projectStructure) return { liveKey: null, varType: null };
@@ -50,6 +60,17 @@ const resolveExpression = (expr, projectStructure) => {
         };
     }
 
+    // Bare name — try GLOBALS first (the picker lists globals by bare name;
+    // POU locals always come through in "Prog.var" form). The transpiler keys
+    // global debug variables as `prog__<name>` (empty program segment).
+    const globalVar = getGlobalVars(projectStructure).find(v => v.name === trimmed);
+    if (globalVar) {
+        return {
+            liveKey: `prog__${trimmed.replace(/\s+/g, '_')}`,
+            varType: globalVar.type || null,
+        };
+    }
+
     const allPOUs = [
         ...(projectStructure.programs || []),
         ...(projectStructure.functionBlocks || []),
@@ -69,8 +90,8 @@ const buildGroups = (projectStructure, liveVariables) => {
     const groups = [];
 
     if (projectStructure) {
-        // Global variables group
-        const globals = projectStructure.globalVars || [];
+        // Global variables group (globals live on the RESOURCE_EDITOR resource)
+        const globals = getGlobalVars(projectStructure);
         if (globals.length > 0) {
             groups.push({
                 label: 'GLOBAL VARIABLES',

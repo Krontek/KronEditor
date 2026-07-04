@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net/http"
 	"path/filepath"
+	"sync"
 
 	"github.com/krontek/hotswaplib"
 )
@@ -39,11 +40,18 @@ import (
 // applying — see the editor-side guards. This path remains UNVERIFIED on
 // physical hardware (compile- and logic-verified only).
 
+// deployLogicMu serializes generation discovery + save in handleDeployLogic:
+// two concurrent uploads would otherwise both get the same NextGeneration
+// and silently overwrite each other's .so.
+var deployLogicMu sync.Mutex
+
 func (s *Server) handleDeployLogic(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "only POST is supported", http.StatusMethodNotAllowed)
 		return
 	}
+	deployLogicMu.Lock()
+	defer deployLogicMu.Unlock()
 	gen := hotswaplib.NextGeneration(s.cfg.DeployDir)
 	dest := hotswaplib.GenerationPath(s.cfg.DeployDir, gen)
 	name := filepath.Base(dest)

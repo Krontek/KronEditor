@@ -122,7 +122,18 @@ const EditorPane = ({
   }, [code]);
 
   // --- SYNC WITH PARENT ---
+  // Skip the FIRST run: on mount the assembled newContent is a fresh object
+  // whose content equals initialContent, and pushing it up marked the project
+  // unsaved merely for OPENING a POU. Only real edits after mount propagate.
+  // The unmount cleanup resets the flag so React StrictMode's dev-only
+  // mount→cleanup→mount cycle also skips its second setup pass.
+  const contentSyncReadyRef = useRef(false);
+  useEffect(() => () => { contentSyncReadyRef.current = false; }, []);
   useEffect(() => {
+    if (!contentSyncReadyRef.current) {
+      contentSyncReadyRef.current = true;
+      return;
+    }
     let newContent = {};
     if (fileType === 'ST') {
       newContent = { code, variables };
@@ -188,12 +199,22 @@ const EditorPane = ({
           }
 
           if (newData.values) {
-            Object.keys(newData.values).forEach(key => {
-              if (newData.values[key] === oldName) {
-                newData.values[key] = value;
-                changed = true;
+            // Copy `values` before writing: newData is a SHALLOW copy of
+            // block.data, so mutating newData.values in place would mutate the
+            // object shared with the old block and BlockNode's [data.values]
+            // sync effect would never see a reference change.
+            const newValues = { ...newData.values };
+            let valuesChanged = false;
+            Object.keys(newValues).forEach(key => {
+              if (newValues[key] === oldName) {
+                newValues[key] = value;
+                valuesChanged = true;
               }
             });
+            if (valuesChanged) {
+              newData.values = newValues;
+              changed = true;
+            }
           }
           return changed ? { ...block, data: newData } : block;
         })
@@ -231,8 +252,10 @@ const EditorPane = ({
     const validate = () => {
       const text = model.getValue();
       const markers = [];
-      // Strip multi-line (* block comments *) from the whole text before line-by-line scan
-      const stripped = text.replace(/\(\*[\s\S]*?\*\)/g, match => '\n'.repeat((match.match(/\n/g) || []).length));
+      // Blank (* block comments *) with SAME-LENGTH spaces (newlines kept) so
+      // both row AND column offsets stay valid for the decoration scan — an
+      // inline `(* … *)` must not shift the badge columns of the code after it.
+      const stripped = text.replace(/\(\*[\s\S]*?\*\)/g, match => match.replace(/[^\n]/g, ' '));
       const lines = stripped.split('\n');
 
       // Case-insensitive set: IEC 61131-3 identifiers are case-insensitive

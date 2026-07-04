@@ -58,20 +58,27 @@ func main() {
 	srv := NewServer(cfg, ipc, pm, hmi)
 	// Wire the crash-restart watchdog so it knows when AutoRun is on.
 	pm.SetAutoRunGetter(srv.AutoRunEnabled)
+	// Initial values are written inside pm.Start(), AFTER any previous
+	// process has fully stopped and BEFORE the new one spawns — never
+	// beforehand, where the dying runtime's shm sync would overwrite them.
+	pm.SetPreStartHook(ipc.WriteInitialValues)
+
+	// Reap any runtime left behind by a previous agent crash. Must run
+	// BEFORE the HTTP server starts accepting: a Start RPC arriving in the
+	// window between listen and cleanup would get its fresh runtime killed
+	// as an "orphan". Also must precede the AutoRun Start() below so two
+	// runtimes never contend for the same /dev/shm/plc_runtime mapping.
+	pm.CleanupOrphanRuntime()
+
 	if err := srv.Start(); err != nil {
 		slog.Error("Failed to start server", "err", err)
 		os.Exit(1)
 	}
 
-	// Reap any runtime left behind by a previous agent crash. Must run
-	// before the AutoRun Start() below to avoid two runtimes contending
-	// for the same /dev/shm/plc_runtime mapping.
-	pm.CleanupOrphanRuntime()
-
-	// AutoRun: if configured, write initial values and start the PLC runtime automatically.
+	// AutoRun: if configured, start the PLC runtime automatically
+	// (initial values are written by the pre-start hook inside Start).
 	if srv.AutoRunEnabled() {
 		slog.Info("AutoRun is enabled — starting PLC runtime automatically")
-		ipc.WriteInitialValues()
 		if err := pm.Start(); err != nil {
 			slog.Warn("AutoRun: failed to start PLC runtime", "err", err)
 		} else {

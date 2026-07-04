@@ -8,6 +8,16 @@ const getBoardFamilyDefine = (boardId) => {
     if (boardId.startsWith('rpi_')) return 'HAL_BOARD_FAMILY_RPI';
     if (boardId.startsWith('bb_')) return 'HAL_BOARD_FAMILY_BB';
     if (boardId.startsWith('jetson_')) return 'HAL_BOARD_FAMILY_JETSON';
+    // Third-party aarch64 Linux SBCs (Orange Pi, Radxa, Odroid, Banana Pi,
+    // Libre Computer, Pine64) reuse the generic Linux userspace HAL
+    // (kronhal_rpi.h) until a board-specific HAL family is written.
+    // Keep in sync with devicePortMapping.js and deviceCodegen.js.
+    if (boardId.startsWith('opi_')) return 'HAL_BOARD_FAMILY_RPI';
+    if (boardId.startsWith('radxa_')) return 'HAL_BOARD_FAMILY_RPI';
+    if (boardId.startsWith('odroid_')) return 'HAL_BOARD_FAMILY_RPI';
+    if (boardId.startsWith('bpi_')) return 'HAL_BOARD_FAMILY_RPI';
+    if (boardId.startsWith('libre_')) return 'HAL_BOARD_FAMILY_RPI';
+    if (boardId.startsWith('pine_')) return 'HAL_BOARD_FAMILY_RPI';
     return null;
 };
 
@@ -353,6 +363,10 @@ export const validateProjectST = (projectStructure, stdFunctionNames = [], hwPor
             //     DT#2026-01-01-12:00:00, TOD#13:45:00.123)
             // Replace with same-length spaces so column numbers in errors stay accurate.
             const line = rawLine
+                // Blank single-quoted string literals FIRST (length-preserving) so
+                // identifiers inside 'strings' are never flagged and a // inside a
+                // string doesn't truncate the line.
+                .replace(/'(?:[^'\\\r\n]|\\.)*'/g, m => ' '.repeat(m.length))
                 .replace(/\/\/.*$/, '')
                 .replace(/\(\*.*?\*\)/g, '')
                 .replace(/\b\d+#[0-9A-Fa-f_]+\b/g, m => ' '.repeat(m.length))
@@ -476,6 +490,7 @@ export const transpileToC = (projectStructure, standardHeaders = [], boardId = n
     // Force flags region starts at FORCE_FLAGS_BASE: one byte per variable, set by KronServer
     // to prevent plc_shm_sync from overwriting a forced value with the PLC-computed value.
     const FORCE_FLAGS_BASE = 32768;
+    const PLC_SHM_TOTAL_SIZE = 65536; // must match PLC_SHM_SIZE emitted into plc.c
     let shmOffset = 0;
     const shmEntries = []; // {c_symbol, offset, size, flagOffset} used to generate plc_shm_sync()
     const tryAssignShm = (type, c_symbol) => {
@@ -483,19 +498,46 @@ export const transpileToC = (projectStructure, standardHeaders = [], boardId = n
         if (!size) return {}; // FB, user-defined type or unknown — no SHM slot
         const offset = shmOffset;
         const flagOffset = FORCE_FLAGS_BASE + shmEntries.length;
+        // Data region must stay below the force-flag region, and the flag region
+        // must stay inside the shared-memory segment — otherwise the generated
+        // memcpy offsets silently corrupt neighbouring variables / overflow SHM.
+        if (offset + size > FORCE_FLAGS_BASE) {
+            throw new Error(`Too many/too large variables for shared memory: data region exceeds ${FORCE_FLAGS_BASE} bytes at variable "${c_symbol}". Reduce the number/size of monitored variables (e.g. large arrays).`);
+        }
+        if (flagOffset >= PLC_SHM_TOTAL_SIZE) {
+            throw new Error(`Too many variables for shared memory: force-flag region exceeds the ${PLC_SHM_TOTAL_SIZE}-byte segment at variable "${c_symbol}". Reduce the number of monitored variables.`);
+        }
         shmOffset += size;
         shmEntries.push({ c_symbol, offset, size, flagOffset });
         return { offset, size, force_flag_offset: flagOffset };
     };
 
+    // Parse a Variable Manager initial value into the JS value stored in
+    // variables.json. Must MATCH what the compiled C initialiser produces
+    // (formatVarInitial): time literals (T#300ms → 300000 µs), IEC typed-radix
+    // (16#40 → 64), hex (0x40 → 64). Otherwise KronServer's WriteInitialValues
+    // seeds 0 while the binary's cold-init uses the real value.
     const resolveInitialValue = (val, type) => {
+        const T = String(type || '').toUpperCase();
         if (val !== undefined && val !== null && val !== '') {
-            if (type === 'BOOL') return val.toString().toLowerCase() === 'true' || val === '1';
-            if (['STRING'].includes(type)) return val.toString().replace(/^"|"$/g, '');
-            return Number(val) || 0;
+            const s = String(val).trim();
+            if (T === 'BOOL') {
+                const b = s.toLowerCase();
+                return b === 'true' || b === '1';
+            }
+            if (T === 'STRING') return s.replace(/^"|"$/g, '');
+            if (T === 'TIME' && /^(?:T|TIME)#/i.test(s)) return mapIECtoTimeUs(s);
+            const radix = s.match(/^(\d+)#([0-9A-Fa-f_]+)$/);
+            if (radix) {
+                const n = parseInt(radix[2].replace(/_/g, ''), parseInt(radix[1], 10));
+                return Number.isFinite(n) ? n : 0;
+            }
+            if (/^-?0x[0-9A-Fa-f]+$/i.test(s)) return parseInt(s, 16);
+            const num = Number(s);
+            return Number.isFinite(num) ? num : 0;
         }
-        if (type === 'BOOL') return false;
-        if (['STRING'].includes(type)) return "";
+        if (T === 'BOOL') return false;
+        if (T === 'STRING') return "";
         return 0;
     };
 
@@ -518,6 +560,15 @@ export const transpileToC = (projectStructure, standardHeaders = [], boardId = n
 
     // Compute EtherCAT config early so we can inject the extern before POU function bodies
     const ecCfgEarly = generateEtherCATConfig(buses, busConfigs, simMode);
+
+    // EtherCAT PDO variable names are accessed through the GPI #define macros
+    // (ec_X → __gpi_snap->_pi_ec_X). The user workflow ALSO adds them as global
+    // variables — those must NOT become PlcState fields / S-> references / SHM
+    // slots, or the macro expansion produces `S->(__gpi_snap->…)` (syntax error)
+    // and plc_shm_sync copies EC-owned data. Registered transiently like
+    // HAL_BLOCK_TYPES; cleared in the cleanup section below.
+    EC_PDO_VAR_NAMES.clear();
+    (ecCfgEarly.gpiVarNames || []).forEach(n => EC_PDO_VAR_NAMES.add(n));
 
     let header = `// Autogenerated by KronEditor CTranspiler
 #ifndef PLC_H
@@ -618,26 +669,74 @@ ${boardDefines}${runtimePortHelpers}${customIncludes}${ecCfgEarly.motionIncludes
 
     // 2. Global Variables
 
-    // AXIS_REF fields exposed for SHM debugging (subset useful for diagnosing motion issues)
+    // AXIS_REF fields exposed for SHM debugging (subset useful for diagnosing motion issues).
+    // `offset` = byte offset inside the real AXIS_REF C struct (kronmotion.h) on the
+    // LOCAL-SIM target (x86_64: 8-byte pointers, 4-byte enums, natural alignment) —
+    // used by the sim's /proc/<pid>/mem reader (base_symbol + byte_offset).
+    // Verified against offsetof() with the bundled clang; keep in sync with kronmotion.h.
     const AXIS_REF_DEBUG_FIELDS = [
-        { name: 'AxisNo',           type: 'UINT' },
-        { name: 'Simulation',       type: 'BOOL' },
-        { name: 'ActualPosition',   type: 'REAL' },
-        { name: 'ActualVelocity',   type: 'REAL' },
-        { name: 'ActualTorque',     type: 'REAL' },
-        { name: 'IsHomed',          type: 'BOOL' },
-        { name: 'AxisWarning',      type: 'BOOL' },
-        { name: 'AxisErrorID',      type: 'UINT' },
-        { name: 'cmd_Seq',          type: 'UINT' },
-        { name: 'sts_AckSeq',       type: 'UINT' },
-        { name: 'sts_State',        type: 'UINT' },
-        { name: 'sts_Busy',         type: 'BOOL' },
-        { name: 'sts_Done',         type: 'BOOL' },
-        { name: 'sts_Error',        type: 'BOOL' },
-        { name: 'sts_ErrorID',      type: 'UINT' },
-        { name: 'drv_StatusWord',   type: 'UINT' },
-        { name: 'drv_ControlWord',  type: 'UINT' },
+        { name: 'AxisNo',           type: 'UINT', offset: 0 },
+        { name: 'Simulation',       type: 'BOOL', offset: 16 },
+        { name: 'ActualPosition',   type: 'REAL', offset: 32 },
+        { name: 'ActualVelocity',   type: 'REAL', offset: 36 },
+        { name: 'ActualTorque',     type: 'REAL', offset: 40 },
+        { name: 'IsHomed',          type: 'BOOL', offset: 61 },
+        { name: 'AxisWarning',      type: 'BOOL', offset: 62 },
+        { name: 'AxisErrorID',      type: 'UINT', offset: 64 },
+        { name: 'cmd_Seq',          type: 'UINT', offset: 66 },
+        { name: 'sts_AckSeq',       type: 'UINT', offset: 96 },
+        { name: 'sts_State',        type: 'UINT', offset: 100 },
+        { name: 'sts_Busy',         type: 'BOOL', offset: 104 },
+        { name: 'sts_Done',         type: 'BOOL', offset: 105 },
+        { name: 'sts_Error',        type: 'BOOL', offset: 106 },
+        { name: 'sts_ErrorID',      type: 'UINT', offset: 108 },
+        { name: 'drv_StatusWord',   type: 'UINT', offset: 110 },
+        { name: 'drv_ControlWord',  type: 'UINT', offset: 112 },
     ];
+
+    // Expand an ARRAY data type into the FULL index cross-product with row-major
+    // byte offsets that match the C declaration `base name[d0max+1][d1max+1]…`
+    // (see transpileDataType — dimensions are sized [max+1] so raw IEC indices
+    // stay valid; lower bounds must be >= 0). Iterating dimensions independently
+    // (the old behaviour) emitted var[0], var[1] per dimension — duplicates with
+    // wrong offsets for multi-dim arrays.
+    const expandArrayElements = (dtDef) => {
+        const baseType = dtDef.content.baseType;
+        const elemSize = IEC_TYPE_SIZES[baseType.toUpperCase()] || 0;
+        const dims = (dtDef.content.dimensions || []).map(d => ({
+            min: parseInt(d.min, 10), max: parseInt(d.max, 10),
+        }));
+        const elements = [];
+        if (dims.length === 0 || dims.some(d => !Number.isFinite(d.min) || !Number.isFinite(d.max))) {
+            return { baseType, elements };
+        }
+        const strides = dims.map((_, i) =>
+            dims.slice(i + 1).reduce((acc, d) => acc * (d.max + 1), 1) * elemSize);
+        const rec = (dimIdx, suffix, offset) => {
+            if (dimIdx === dims.length) { elements.push({ suffix, offset }); return; }
+            for (let i = dims[dimIdx].min; i <= dims[dimIdx].max; i++) {
+                rec(dimIdx + 1, `${suffix}[${i}]`, offset + i * strides[dimIdx]);
+            }
+        };
+        rec(0, '', 0);
+        return { baseType, elements };
+    };
+
+    // Walk a Structure data type's members computing NATURALLY ALIGNED offsets
+    // (alignment = scalar size, up to 8) — matches the C compiler's struct
+    // layout. A packed walk (just summing sizes) disagreed with real padding,
+    // so the local sim read garbage for padded UDTs.
+    const structMemberOffsets = (members) => {
+        let off = 0;
+        return (members || []).map(member => {
+            const size = IEC_TYPE_SIZES[member.type?.toUpperCase()] || 0;
+            const align = Math.min(Math.max(size, 1), 8);
+            off = Math.ceil(off / align) * align;
+            const entry = { member, offset: off };
+            off += size;
+            return entry;
+        });
+    };
 
     // Build lookup: typeName → data type definition (for array/struct/enum expansion)
     const dataTypeDefs = (projectStructure.dataTypes || []).reduce((acc, dt) => {
@@ -647,11 +746,17 @@ ${boardDefines}${runtimePortHelpers}${customIncludes}${ecCfgEarly.motionIncludes
     if (config && config.content.globalVars && config.content.globalVars.length > 0) {
         header += `// --- GLOBAL VARIABLES ---\n`;
         config.content.globalVars.forEach(v => {
+            const gInitVal = resolveInitialValue(v.initialValue, v.type);
+            // EC-owned PDO variable: lives in the GPI struct behind an access
+            // macro — no PlcState field, no SHM slot, no S-> mapping.
+            if (EC_PDO_VAR_NAMES.has((v.name || '').trim())) {
+                variableTable.globalVars[v.name] = { type: v.type, initialValue: gInitVal };
+                return;
+            }
             const isUserType = !!dataTypeDefs[v.type];
             const initVal = isUserType ? '' : formatVarInitial(v.initialValue, v.type);
             stateFields.push(`${mapType(v.type)} ${v.name};`);
             if (initVal) stateInits.push(`S->${v.name}${initVal};`);
-            const gInitVal = resolveInitialValue(v.initialValue, v.type);
             variableTable.globalVars[v.name] = { type: v.type, initialValue: gInitVal };
             // Debug: top-level entry (scalar types get a SHM slot)
             const gShmSlot = !isUserType ? tryAssignShm(v.type, v.name) : {};
@@ -661,30 +766,25 @@ ${boardDefines}${runtimePortHelpers}${customIncludes}${ecCfgEarly.motionIncludes
             // Debug: expand array elements and struct members for monitoring
             const dtDef = dataTypeDefs[v.type];
             if (dtDef?.type === 'Array') {
-                const baseType = dtDef.content.baseType;
-                const elemSize = IEC_TYPE_SIZES[baseType.toUpperCase()] || 0;
-                dtDef.content.dimensions.forEach(dim => {
-                    for (let i = parseInt(dim.min); i <= parseInt(dim.max); i++) {
-                        const elemCSym = `${v.name}[${i}]`;
-                        const elemShmSlot = tryAssignShm(baseType, elemCSym);
-                        variableTable.debugDefaults[`prog__${v.name}[${i}]`] = {
-                            type: baseType, c_symbol: elemCSym,
-                            base_symbol: v.name, byte_offset: i * elemSize,
-                            defaultValue: 0, address: v.address || '', ...elemShmSlot
-                        };
-                    }
+                const { baseType, elements } = expandArrayElements(dtDef);
+                elements.forEach(({ suffix, offset }) => {
+                    const elemCSym = `${v.name}${suffix}`;
+                    const elemShmSlot = tryAssignShm(baseType, elemCSym);
+                    variableTable.debugDefaults[`prog__${v.name}${suffix}`] = {
+                        type: baseType, c_symbol: elemCSym,
+                        base_symbol: v.name, byte_offset: offset,
+                        defaultValue: 0, address: v.address || '', ...elemShmSlot
+                    };
                 });
             } else if (dtDef?.type === 'Structure') {
-                let memberOffset = 0;
-                (dtDef.content.members || []).forEach(member => {
+                structMemberOffsets(dtDef.content.members).forEach(({ member, offset }) => {
                     const memCSym = `${v.name}.${member.name}`;
                     const memShmSlot = tryAssignShm(member.type, memCSym);
                     variableTable.debugDefaults[`prog__${v.name}.${member.name}`] = {
                         type: member.type, c_symbol: memCSym,
-                        base_symbol: v.name, byte_offset: memberOffset,
+                        base_symbol: v.name, byte_offset: offset,
                         defaultValue: 0, address: v.address || '', ...memShmSlot
                     };
-                    memberOffset += IEC_TYPE_SIZES[member.type.toUpperCase()] || 0;
                 });
             } else if (v.type === 'AXIS_REF') {
                 AXIS_REF_DEBUG_FIELDS.forEach(field => {
@@ -692,7 +792,8 @@ ${boardDefines}${runtimePortHelpers}${customIncludes}${ecCfgEarly.motionIncludes
                     const memShmSlot = tryAssignShm(field.type, memCSym);
                     variableTable.debugDefaults[`prog__${v.name}.${field.name}`] = {
                         type: field.type, c_symbol: memCSym,
-                        base_symbol: v.name, defaultValue: 0, address: v.address || '', ...memShmSlot
+                        base_symbol: v.name, byte_offset: field.offset,
+                        defaultValue: 0, address: v.address || '', ...memShmSlot
                     };
                 });
             }
@@ -710,6 +811,13 @@ ${boardDefines}${runtimePortHelpers}${customIncludes}${ecCfgEarly.motionIncludes
                 if (isInlineMathType(v.type)) return; // Inline math — no struct member needed
                 header += `    ${mapType(v.type)} ${v.name};\n`;
             });
+            // Edge-memory members for Rising/Falling LD contacts/coils inside
+            // this FB's ladder (per-instance previous-scan state).
+            if (fb.type === 'LD' || fb.type === 'SCL') {
+                collectEdgeVars(fb.content?.rungs).forEach(ev => {
+                    header += `    bool __edge_${ev.id};\n`;
+                });
+            }
             header += `} ${fbNameSafe};\n\n`;
         });
     }
@@ -728,7 +836,7 @@ ${boardDefines}${runtimePortHelpers}${customIncludes}${ecCfgEarly.motionIncludes
         projectStructure.functions.forEach(fn => {
             const retType = mapType(fn.returnType || 'VOID');
             let fnName = (fn.name || '').trim().replace(/\s+/g, '_');
-            header += `static inline ${retType} ${fnName}();\n`;
+            header += `static inline ${retType} ${fnName}(${buildFunctionParams(fn)});\n`;
         });
     }
 
@@ -807,7 +915,10 @@ ${boardDefines}${runtimePortHelpers}${customIncludes}${ecCfgEarly.motionIncludes
                 const isFB = isFBType(vType, projectStructure) || !!stdFunctions[vType] || HAL_BLOCK_TYPES.has(vType) || (vType in FB_TRIGGER_PIN && !isInlineMathType(vType));
                 if (HAL_BLOCK_TYPES.has(vType)) usedHalBlocks.add(vType);
                 if (isFB) {
-                    stateFields.push(`${vType} prog_${progName}_inst_${vName};`);
+                    // Sanitize the type the same way the FB typedef does
+                    // ("My FB" → typedef My_FB), or the field declaration
+                    // references a nonexistent type name.
+                    stateFields.push(`${vType.replace(/\s+/g, '_')} prog_${progName}_inst_${vName};`);
                 } else {
                     // Program-local variables — emit initial value when the user
                     // provided one in the Variable Manager. Without this, scalar
@@ -851,34 +962,39 @@ ${boardDefines}${runtimePortHelpers}${customIncludes}${ecCfgEarly.motionIncludes
                 if (!isFB) {
                     const dtDef = dataTypeDefs[vType];
                     if (dtDef?.type === 'Array') {
-                        const baseType = dtDef.content.baseType;
-                        const elemSize = IEC_TYPE_SIZES[baseType.toUpperCase()] || 0;
-                        dtDef.content.dimensions.forEach(dim => {
-                            for (let i = parseInt(dim.min); i <= parseInt(dim.max); i++) {
-                                const elemCSym = `${cSym}[${i}]`;
-                                const elemShmSlot = tryAssignShm(baseType, elemCSym);
-                                variableTable.debugDefaults[`prog_${progName}_${vName}[${i}]`] = {
-                                    type: baseType, c_symbol: elemCSym,
-                                    base_symbol: cSym, byte_offset: i * elemSize,
-                                    defaultValue: 0, address: v.address || '', ...elemShmSlot
-                                };
-                            }
+                        const { baseType, elements } = expandArrayElements(dtDef);
+                        elements.forEach(({ suffix, offset }) => {
+                            const elemCSym = `${cSym}${suffix}`;
+                            const elemShmSlot = tryAssignShm(baseType, elemCSym);
+                            variableTable.debugDefaults[`prog_${progName}_${vName}${suffix}`] = {
+                                type: baseType, c_symbol: elemCSym,
+                                base_symbol: cSym, byte_offset: offset,
+                                defaultValue: 0, address: v.address || '', ...elemShmSlot
+                            };
                         });
                     } else if (dtDef?.type === 'Structure') {
-                        let memberOffset = 0;
-                        (dtDef.content.members || []).forEach(member => {
+                        structMemberOffsets(dtDef.content.members).forEach(({ member, offset }) => {
                             const memCSym = `${cSym}.${member.name}`;
                             const memShmSlot = tryAssignShm(member.type, memCSym);
                             variableTable.debugDefaults[`prog_${progName}_${vName}.${member.name}`] = {
                                 type: member.type, c_symbol: memCSym,
-                                base_symbol: cSym, byte_offset: memberOffset,
+                                base_symbol: cSym, byte_offset: offset,
                                 defaultValue: 0, address: v.address || '', ...memShmSlot
                             };
-                            memberOffset += IEC_TYPE_SIZES[member.type.toUpperCase()] || 0;
                         });
                     }
                 }
             });
+            // Edge-memory state for Rising/Falling LD contacts/coils — one BOOL
+            // per edge block holding the previous-scan value. Lives in PlcState
+            // so it survives hot-swaps; pushed BEFORE plcStateLayoutHash is
+            // computed (all program-loop pushes are).
+            if (prog.type === 'LD' || prog.type === 'SCL') {
+                collectEdgeVars(prog.content?.rungs).forEach(ev => {
+                    stateFields.push(`bool prog_${progName}_edge_${ev.id};`);
+                });
+            }
+
             // Collect shadow vars BEFORE transpiling so they can be declared before the function body
             const shadowVars = (prog.type === 'LD' || prog.type === 'SCL')
                 ? collectShadowVars(prog.content?.rungs, progName)
@@ -1079,6 +1195,7 @@ ${boardDefines}${runtimePortHelpers}${customIncludes}${ecCfgEarly.motionIncludes
     _deviceSavedKeys.outputs.forEach(k => delete FB_OUTPUTS[k]);
     _deviceSavedKeys.inputTypes.forEach(k => delete FB_INPUT_TYPES[k]);
     _deviceSavedKeys.outputTypes.forEach(k => delete GENERATED_FB_OUTPUT_TYPES[k]);
+    EC_PDO_VAR_NAMES.clear();
 
     // ── Phase 2 (hot-swap): emit the PlcState struct collected above, the
     // file-scope pointer S, plc_bind() (re-point S at the live state arena after
@@ -1154,13 +1271,38 @@ const isFBType = (type, structure) => {
     return structure.functionBlocks?.some(fb => (fb.name || '').trim() === t);
 };
 
+// Parse an IEC time-duration literal into integer MICROseconds.
+// Supports the full compound form with fractional values and d/h/m/s/ms/us/ns
+// units: T#500ms, T#1.5s, T#1m30s, T#1h2m3s500ms, TIME#2d, 10ms (prefix optional).
+// Underscore digit separators (T#1_500ms) are allowed. Empty/undefined input
+// keeps the historical 10 ms default (unconfigured task interval); anything
+// non-empty that does not fully parse THROWS a transpile error instead of
+// silently becoming 10000 µs.
+const TIME_UNIT_US = {
+    'D': 86400000000, 'H': 3600000000, 'M': 60000000,
+    'S': 1000000, 'MS': 1000, 'US': 1, 'NS': 0.001,
+};
 const mapIECtoTimeUs = (iecTimeStr) => {
-    if (!iecTimeStr) return 10000;
-    const str = iecTimeStr.toUpperCase().replace('T#', '').replace('TIME#', '');
-    if (str.endsWith('MS')) return parseInt(str.replace('MS', '')) * 1000;
-    if (str.endsWith('US')) return parseInt(str.replace('US', ''));
-    if (str.endsWith('S')) return parseInt(str.replace('S', '')) * 1000000;
-    return 10000; // Default 10000us (10ms)
+    if (iecTimeStr === undefined || iecTimeStr === null || String(iecTimeStr).trim() === '') return 10000;
+    const raw = String(iecTimeStr).trim();
+    const str = raw.toUpperCase().replace(/^(?:LTIME|TIME|LT|T)#/, '').replace(/_/g, '');
+    if (!str) return 10000;
+    // Bare number (no unit) — historically accepted in pin fields as µs.
+    if (/^\d+(?:\.\d+)?$/.test(str)) return Math.round(parseFloat(str));
+    // Unit order matters: MS before M, US/NS before S.
+    const re = /(\d+(?:\.\d+)?)(MS|US|NS|D|H|M|S)/y;
+    let total = 0;
+    let idx = 0;
+    while (idx < str.length) {
+        re.lastIndex = idx;
+        const m = re.exec(str);
+        if (!m) {
+            throw new Error(`Invalid TIME literal "${raw}" — expected forms like T#500ms, T#1.5s, T#1h2m3s500ms.`);
+        }
+        total += parseFloat(m[1]) * TIME_UNIT_US[m[2]];
+        idx = re.lastIndex;
+    }
+    return Math.round(total);
 };
 
 // formatVarInitial — turn a Variable Manager `initialValue` field into a C
@@ -1230,7 +1372,7 @@ const generateEtherCATConfig = (buses, busConfigs, globalSimMode = false) => {
         headerDecl: '', headerExtern: '', gpiMacros: '', motionIncludes: '', initCode: '', cleanupCode: '',
         pdoReadCode: '', pdoWriteCode: '',
         ecThreadCode: '', ecThreadStartCode: '', ecThreadJoinCode: '',
-        halContent: ''
+        halContent: '', gpiVarNames: []
     };
 
     // Only the first EtherCAT bus is used for now
@@ -1534,13 +1676,16 @@ extern KRON_Process_Image __gpi;
             // vel_raw_per_unit: drive reports velocity in counts/s — same ratio applies
             const vpu = cpu;
             const sim = (globalSimMode || slave.axisRef.simMode) ? 'true' : 'false';
-            // AXIS_REF_Init zeroes the struct and sets AxisNo, slot, VelFactor=1, AccFactor=1
-            axisInitCode += `    AXIS_REF_Init(&${axisName}, ${axisNo}, &Kron_PI.servo[${axisNo}]);\n`;
+            // AXIS_REF_Init zeroes the struct and sets AxisNo, slot, VelFactor=1, AccFactor=1.
+            // The AXIS_REF global is a PlcState field (hot-swap refactor), so it is
+            // reached via S-> — this init code lands in PLC_Init (plc.c), where the
+            // file-scope S from plc.h is in scope.
+            axisInitCode += `    AXIS_REF_Init(&S->${axisName}, ${axisNo}, &Kron_PI.servo[${axisNo}]);\n`;
             const encTypeMap = { incremental: 'KRON_ENC_INCREMENTAL', absolute_st: 'KRON_ENC_ABSOLUTE_ST', absolute_mt: 'KRON_ENC_ABSOLUTE_MT' };
             const encType = encTypeMap[slave.axisRef.encoderType] || 'KRON_ENC_INCREMENTAL';
-            axisInitCode += `    ${axisName}.Simulation        = ${sim};\n`;
-            axisInitCode += `    ${axisName}.GearRatio         = ${floatLit(gRatio)};\n`;
-            axisInitCode += `    ${axisName}.EncoderType       = ${encType};\n`;
+            axisInitCode += `    S->${axisName}.Simulation        = ${sim};\n`;
+            axisInitCode += `    S->${axisName}.GearRatio         = ${floatLit(gRatio)};\n`;
+            axisInitCode += `    S->${axisName}.EncoderType       = ${encType};\n`;
             // Scaling factors on the servo slot (set after AXIS_REF_Init so slot is valid)
             axisInitCode += `    Kron_PI.servo[${axisNo}].counts_per_unit   = ${floatLit(cpu)};\n`;
             axisInitCode += `    Kron_PI.servo[${axisNo}].vel_raw_per_unit  = ${floatLit(vpu)};\n`;
@@ -1551,7 +1696,7 @@ extern KRON_Process_Image __gpi;
             }
             axisInitCode += `    Kron_PI.servo[${axisNo}].present           = !${sim};\n`;
             // NC engine private state
-            axisInitCode += `    NC_Init(&g_NC_Axes[${i}], &${axisName});\n`;
+            axisInitCode += `    NC_Init(&g_NC_Axes[${i}], &S->${axisName});\n`;
         });
     }
     initCode += axisInitCode;
@@ -1691,7 +1836,14 @@ ${ncWriteBridge}` : ''}        /* Step 4: Propagate HW-updated staging to the ba
 `    pthread_join(__ec_wd_tid,  NULL);\n` +
 `    pthread_join(__ec_io_tid,  NULL);\n`;
 
-    return { headerDecl, headerExtern, gpiMacros, motionIncludes, initCode, cleanupCode, pdoReadCode, pdoWriteCode, ecThreadCode, ecThreadStartCode, ecThreadJoinCode, halContent };
+    return {
+        headerDecl, headerExtern, gpiMacros, motionIncludes, initCode, cleanupCode,
+        pdoReadCode, pdoWriteCode, ecThreadCode, ecThreadStartCode, ecThreadJoinCode,
+        halContent,
+        // Names of all GPI-macro-backed PDO variables — transpileToC excludes
+        // same-named user globals from PlcState/SHM so the macro applies.
+        gpiVarNames: uniqueGpiVars.map(v => v.varName),
+    };
 };
 
 const generateMainLoop = (projectStructure, config, boardId = null, shmEnabled = false, execTimeVars = [], initCode = '', cleanupCode = '', ecPdoReadCode = '', ecPdoWriteCode = '', ecThreadCode = '', ecThreadStartCode = '', ecThreadJoinCode = '', gpiMutexEnabled = false, shmEntries = [], plcStateLayoutHash = '0') => {
@@ -1842,7 +1994,7 @@ const generateMainLoop = (projectStructure, config, boardId = null, shmEnabled =
                 mainSrc += `      clock_gettime(CLOCK_MONOTONIC, &__t0);\n`;
                 mainSrc += `      ${pName}();\n`;
                 mainSrc += `      clock_gettime(CLOCK_MONOTONIC, &__t1);\n`;
-                mainSrc += `      S->${etv.cSym} = (uint32_t)((__t1.tv_sec - __t0.tv_sec) * 1000000000UL + (__t1.tv_nsec - __t0.tv_nsec)); }\n`;
+                mainSrc += `      S->${etv.cSym} = (uint32_t)(((int64_t)(__t1.tv_sec - __t0.tv_sec) * 1000000LL) + ((__t1.tv_nsec - __t0.tv_nsec) / 1000)); }\n`;
             } else {
                 mainSrc += `    ${pName}();\n`;
             }
@@ -1973,6 +2125,19 @@ const generateMainLoop = (projectStructure, config, boardId = null, shmEnabled =
     return { src: mainSrc, programTasks, baseTickUs };
 };
 
+// FUNCTION POU helpers — Input-class variables become C parameters in
+// declaration order; everything else is a body-local.
+const functionInputVars = (pou) =>
+    (pou?.content?.variables || []).filter(v => String(v.class || '').toLowerCase() === 'input');
+
+const buildFunctionParams = (pou) => {
+    const ins = functionInputVars(pou);
+    if (ins.length === 0) return 'void';
+    return ins
+        .map(v => `${mapType((v.type || '').trim())} ${(v.name || '').trim().replace(/\s+/g, '_')}`)
+        .join(', ');
+};
+
 const transpilePOUSource = (pou, category, stdFunctions = {}, parentName = '', globalVarNames = [], inputShadowMap = null, globalVarsList = [], projectStructure = null) => {
     // User-defined FB type names (normalized) — so ST can recognize a user-FB
     // instance call and name the instance consistently with its declaration.
@@ -1981,15 +2146,75 @@ const transpilePOUSource = (pou, category, stdFunctions = {}, parentName = '', g
     let src = ``;
     let safeName = (pou.name || '').trim().replace(/\s+/g, '_');
     let sig = `static inline void ${safeName}()`;
+    const fnRetType = category === 'function' ? mapType(pou.returnType || 'VOID') : 'void';
 
     if (category === 'function') {
-        const retType = mapType(pou.returnType || 'VOID');
-        sig = `static inline ${retType} ${safeName}()`;
+        sig = `static inline ${fnRetType} ${safeName}(${buildFunctionParams(pou)})`;
     } else if (category === 'function_block') {
         sig = `static inline void ${safeName}_Execute(${safeName} *instance)`;
     }
 
     src += `${sig} {\n`;
+
+    // FUNCTION POU: declare non-input variables as body locals (with initials)
+    // and, for non-void functions, the implicit result variable. Assignments to
+    // the function's own name (`FuncName := expr;`) target __ret via varMap, so
+    // mid-body result assignments keep executing the rest of the body (IEC
+    // semantics) and the single `return __ret;` epilogue returns the final value.
+    let fnEpilogue = '';
+    const fnInputNames = new Set();
+    if (category === 'function') {
+        functionInputVars(pou).forEach(v => {
+            const vName = (v.name || '').trim().replace(/\s+/g, '_');
+            if (vName) fnInputNames.add(vName);
+        });
+        (pou.content?.variables || []).forEach(v => {
+            const vName = (v.name || '').trim().replace(/\s+/g, '_');
+            if (!vName || fnInputNames.has(vName)) return;
+            if (isInlineMathType(v.type)) return;
+            const init = formatVarInitial(v.initialValue, v.type) || ' = {0}';
+            src += `    ${mapType((v.type || '').trim())} ${vName}${init};\n`;
+        });
+        if (fnRetType !== 'void') {
+            src += `    ${fnRetType} __ret = {0};\n`;
+            fnEpilogue = `    return __ret;\n`;
+        }
+    }
+
+    // User-defined FUNCTION input order — lets ST rewrite named-argument calls
+    // (`MyFunc(A := x)`) into positional C calls.
+    const userFunctionInputs = {};
+    (projectStructure?.functions || []).forEach(fn => {
+        const n = (fn.name || '').trim().replace(/\s+/g, '_');
+        if (!n) return;
+        userFunctionInputs[n] = functionInputVars(fn)
+            .map(v => (v.name || '').trim().replace(/\s+/g, '_'))
+            .filter(Boolean);
+    });
+
+    // User-defined FB input pin order — lets ST map POSITIONAL FB instance
+    // calls (`inst(a, b)`) onto the FB's declared input pins.
+    const userFBInputs = {};
+    (projectStructure?.functionBlocks || []).forEach(fb => {
+        const n = (fb.name || '').trim().replace(/\s+/g, '_');
+        if (!n) return;
+        userFBInputs[n] = (fb.content?.variables || [])
+            .filter(v => ['input', 'inout'].includes(String(v.class || '').toLowerCase()))
+            .map(v => (v.name || '').trim().replace(/\s+/g, '_'))
+            .filter(Boolean);
+    });
+
+    // Local variable names + which of them are FB instances (for LD member
+    // access like `blink.Q` → inst_ field, and local-vs-global precedence).
+    const localVarNames = new Set();
+    const fbInstanceNames = new Set();
+    (pou.content?.variables || []).forEach(v => {
+        const vName = (v.name || '').trim().replace(/\s+/g, '_');
+        if (!vName) return;
+        localVarNames.add(vName);
+        const isFB = stdFunctions[v.type] !== undefined || HAL_BLOCK_TYPES.has(v.type) || isUserFB(v.type) || (v.type in FB_TRIGGER_PIN && !isInlineMathType(v.type));
+        if (isFB) fbInstanceNames.add(vName);
+    });
 
     // Build C-symbol → IEC-type map for LD type inference (REAL detection)
     const buildCSymTypeMap = () => {
@@ -2018,10 +2243,17 @@ const transpilePOUSource = (pou, category, stdFunctions = {}, parentName = '', g
         return map;
     };
 
-    if (pou.type === 'ST') {
-        // Build variable name map: IEC identifier → C symbol
+    // Build IEC identifier → C symbol + IEC identifier → type maps for ST.
+    // Shared by the ST and SCL branches (they were duplicated before).
+    const buildStMaps = () => {
         const varMap = {};
         const varTypeMap = {};
+        // Globals first — so their TYPES are known (a global FB instance must get
+        // FB-call treatment) — locals overwrite (shadowing).
+        (globalVarsList || []).forEach(gv => {
+            const gName = (gv.name || '').trim().replace(/\s+/g, '_');
+            if (gName) varTypeMap[gName] = gv.type;
+        });
         (pou.content.variables || []).forEach(v => {
             const vName = (v.name || '').trim().replace(/\s+/g, '_');
             if (!vName) return;
@@ -2029,8 +2261,7 @@ const transpilePOUSource = (pou, category, stdFunctions = {}, parentName = '', g
             if (globalVarNames.includes(vName)) {
                 varMap[vName] = `S->${vName}`; // global: PlcState field (hot-swap)
             } else if (category === 'program') {
-                const isFB = stdFunctions[v.type] !== undefined || HAL_BLOCK_TYPES.has(v.type) || isUserFB(v.type) || (v.type in FB_TRIGGER_PIN && !isInlineMathType(v.type));
-                varMap[vName] = isFB
+                varMap[vName] = fbInstanceNames.has(vName)
                     ? `S->prog_${parentName}_inst_${vName}`
                     : `S->prog_${parentName}_${vName}`;
             } else if (category === 'function_block') {
@@ -2041,39 +2272,45 @@ const transpilePOUSource = (pou, category, stdFunctions = {}, parentName = '', g
         });
         // Globals referenced but not declared locally are PlcState fields too.
         globalVarNames.forEach(g => { const gn = (g || '').trim().replace(/\s+/g, '_'); if (gn && !(gn in varMap)) varMap[gn] = `S->${gn}`; });
-        src += transpileSTLogics(pou.content.code, stdFunctions, parentName, category, varMap, varTypeMap, userFBTypes);
+        // EtherCAT PDO variables must stay BARE so the GPI access macro applies
+        // (they have no PlcState field — mapping them to S->name breaks compile).
+        EC_PDO_VAR_NAMES.forEach(n => { if (varMap[n] === `S->${n}`) delete varMap[n]; });
+        // Function result variable: FuncName := expr → __ret = expr.
+        if (category === 'function' && fnRetType !== 'void') {
+            varMap[safeName] = '__ret';
+        }
+        return { varMap, varTypeMap };
+    };
+
+    const stOpts = {
+        fnReturnVar: (category === 'function' && fnRetType !== 'void') ? '__ret' : null,
+        userFunctionInputs,
+        userFBInputs,
+    };
+
+    if (pou.type === 'ST') {
+        const { varMap, varTypeMap } = buildStMaps();
+        src += transpileSTLogics(pou.content.code, stdFunctions, parentName, category, varMap, varTypeMap, userFBTypes, stOpts);
     } else if (pou.type === 'LD') {
-        src += transpileLDLogics(pou.content.rungs, stdFunctions, safeName, category, globalVarNames, inputShadowMap, 0, buildCSymTypeMap());
+        src += transpileLDLogics(pou.content.rungs, stdFunctions, safeName, category, globalVarNames, inputShadowMap, 0, buildCSymTypeMap(), localVarNames, fbInstanceNames);
     } else if (pou.type === 'SCL') {
         // SCL: mixed LD/ST per rung. Each rung carries a `lang` field ('LD' or 'ST').
         let sclLdRungIdx = 0;
         (pou.content.rungs || []).forEach(rung => {
             if (rung.lang === 'ST') {
-                const varMap = {};
-                const varTypeMap = {};
-                (pou.content.variables || []).forEach(v => {
-                    const vName = (v.name || '').trim().replace(/\s+/g, '_');
-                    if (!vName) return;
-                    varTypeMap[vName] = v.type;
-                    if (globalVarNames.includes(vName)) { varMap[vName] = `S->${vName}`; }
-                    else if (category === 'program') {
-                        const isFB = stdFunctions[v.type] !== undefined || HAL_BLOCK_TYPES.has(v.type) || isUserFB(v.type) || (v.type in FB_TRIGGER_PIN && !isInlineMathType(v.type));
-                        varMap[vName] = isFB ? `S->prog_${parentName}_inst_${vName}` : `S->prog_${parentName}_${vName}`;
-                    } else if (category === 'function_block') { varMap[vName] = `instance->${vName}`; }
-                    else { varMap[vName] = vName; }
-                });
-                globalVarNames.forEach(g => { const gn = (g || '').trim().replace(/\s+/g, '_'); if (gn && !(gn in varMap)) varMap[gn] = `S->${gn}`; });
+                const { varMap, varTypeMap } = buildStMaps();
                 src += `    // SCL rung [ST]\n`;
-                src += transpileSTLogics(rung.code || '', stdFunctions, parentName, category, varMap, varTypeMap, userFBTypes);
+                src += transpileSTLogics(rung.code || '', stdFunctions, parentName, category, varMap, varTypeMap, userFBTypes, stOpts);
             } else {
                 // Default: treat as LD rung
                 src += `    // SCL rung [LD]\n`;
-                src += transpileLDLogics([rung], stdFunctions, safeName, category, globalVarNames, inputShadowMap, sclLdRungIdx, buildCSymTypeMap());
+                src += transpileLDLogics([rung], stdFunctions, safeName, category, globalVarNames, inputShadowMap, sclLdRungIdx, buildCSymTypeMap(), localVarNames, fbInstanceNames);
                 sclLdRungIdx++;
             }
         });
     }
 
+    src += fnEpilogue;
     src += `}\n\n`;
     return src;
 };
@@ -2192,6 +2429,27 @@ const getOutputPinType = (blockType, pinName, customData) => {
         if (outDef) return outDef.type || 'BOOL';
     }
     return 'BOOL';
+};
+
+// Sanitize a block id into a C identifier fragment (edge-memory field names).
+const sanitizeBlockId = (id) => String(id).replace(/[^A-Za-z0-9_]/g, '_');
+
+// Pre-scan rungs for Rising/Falling edge contacts & coils. Each needs one
+// persistent BOOL holding the previous-scan value: programs get a PlcState
+// field `prog_<prog>_edge_<id>`, FBs get a struct member `__edge_<id>`.
+// Block ids are unique per project (ReactFlow), so names are collision-free.
+const collectEdgeVars = (rungs) => {
+    const list = [];
+    (rungs || []).forEach(rung => {
+        (rung.blocks || []).forEach(b => {
+            const type = (b.type || '').trim();
+            const sub = b.data?.subType;
+            if ((type === 'Contact' || type === 'Coil') && (sub === 'Rising' || sub === 'Falling')) {
+                list.push({ id: sanitizeBlockId(b.id), subType: sub, blockType: type });
+            }
+        });
+    });
+    return list;
 };
 
 // Pre-scan rungs and collect shadow variables for unassigned FB output pins.
@@ -2431,6 +2689,12 @@ const BITWISE_OP = {
 // _Call functions — they must NOT be treated as stateless inline blocks.
 const HAL_BLOCK_TYPES = new Set();
 
+// Tracks EtherCAT PDO variable names registered transiently during transpileToC.
+// These are backed by GPI access macros (#define ec_X (__gpi_snap->_pi_ec_X)) —
+// they must stay BARE names in generated code (no S-> prefix, no PlcState field,
+// no SHM slot) or the macro expansion produces invalid C.
+const EC_PDO_VAR_NAMES = new Set();
+
 // Returns true for EN-trigger stateless blocks that should be inlined.
 // HAL blocks (GPIO_Read, PWM0, etc.) are excluded even though their trigger is EN.
 const isInlineMathType = (type) => FB_TRIGGER_PIN[type] === 'EN' && !HAL_BLOCK_TYPES.has(type);
@@ -2629,8 +2893,9 @@ _CONV_TYPES.forEach(src => _CONV_TYPES.forEach(dst => {
     if (src !== dst) FB_INPUTS[`${src}_TO_${dst}`] = ['EN', 'IN'];
 }));
 
-const transpileSTLogics = (code, stdFunctions = {}, parentName = '', category = 'program', varMap = {}, varTypeMap = {}, userFBTypes = new Set()) => {
+const transpileSTLogics = (code, stdFunctions = {}, parentName = '', category = 'program', varMap = {}, varTypeMap = {}, userFBTypes = new Set(), opts = {}) => {
     if (!code) return `    // ST Implementation Empty\n`;
+    const { fnReturnVar = null, userFunctionInputs = {}, userFBInputs = {} } = opts;
 
     // Strip IEC 61131-3 comments and VAR…END_VAR blocks before splitting:
     //   (* block comments — single or multi-line *)
@@ -2662,7 +2927,9 @@ const transpileSTLogics = (code, stdFunctions = {}, parentName = '', category = 
         // line so the IF / CASE / WHILE / FOR / REPEAT line-matcher sees it.
         // Without this, "1: IF foo THEN ..." is taken as a single expression by
         // the case-label handler and IF/THEN leak into the C output.
-        .replace(/^([\d ,\.\t]+:)[ \t]+(?=(?:IF|CASE|WHILE|FOR|REPEAT)\b)/gim, '$1\n')
+        // Labels may be numbers (incl. negative), identifiers (enum members) or
+        // TypeName#EnumValue; `:(?!=)` keeps `x := IF…`-style text unmatched.
+        .replace(/^((?:[A-Za-z_][A-Za-z0-9_#]*|-?\d+)(?:[ \t]*(?:\.\.|,)[ \t]*(?:[A-Za-z_][A-Za-z0-9_#]*|-?\d+))*[ \t]*:)(?!=)[ \t]+(?=(?:IF|CASE|WHILE|FOR|REPEAT)\b)/gim, '$1\n')
         // After THEN/DO/OF — insert newline when something follows on the same line
         .replace(/\bTHEN\b[ \t]*(?=[^\r\n])/gi, 'THEN\n')
         .replace(/\bDO\b[ \t]*(?=[^\r\n])/gi, 'DO\n')
@@ -2720,9 +2987,14 @@ const transpileSTLogics = (code, stdFunctions = {}, parentName = '', category = 
     // transformExpr (which would mangle `:=` into `=` inside named args).
     {
         const expanded = [];
+        // Label atoms: numbers (incl. negative), identifiers (enum members),
+        // TypeName#EnumValue — same shapes the case-label handler accepts.
+        // `:(?!=)` keeps assignments (`x := 1`) from being split as labels.
+        const SPLIT_ATOM = '(?:[A-Za-z_][A-Za-z0-9_]*(?:#[A-Za-z_][A-Za-z0-9_]*)?|-?\\d+)';
+        const SPLIT_LABEL_RE = new RegExp(`^(${SPLIT_ATOM}(?:\\s*(?:\\.\\.|,)\\s*${SPLIT_ATOM})*)\\s*:(?!=)\\s*(.+)$`);
         for (const ln of lines) {
             const t = ln.trim();
-            const m = t.match(/^(\d[\d\s,\.]*)\s*:\s*(.+)$/);
+            const m = t.match(SPLIT_LABEL_RE);
             const body = m && m[2].trim();
             if (m && body && body !== ';') {
                 expanded.push(m[1].trim() + ':');
@@ -2787,14 +3059,27 @@ const transpileSTLogics = (code, stdFunctions = {}, parentName = '', category = 
 
     const indent = () => '    '.repeat(indentLevel);
 
-    // Substitute known variable names with their C equivalents
+    // Substitute known variable names with their C equivalents.
+    // SINGLE-PASS: one alternation regex (longest name first) with a callback —
+    // never rescans already-substituted output, so a variable named `s`, `q`
+    // or `instance` can no longer corrupt an earlier `S->…` / `instance->…`
+    // substitution. Matches preceded by `.` or `->` (member access) are skipped.
+    const escapeRegExp = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const varMapLower = {};
+    Object.keys(varMap).forEach(name => { varMapLower[name.toLowerCase()] = varMap[name]; });
+    const varNamesSorted = Object.keys(varMap).sort((a, b) => b.length - a.length);
+    const varNameRegex = varNamesSorted.length > 0
+        ? new RegExp(`\\b(?:${varNamesSorted.map(escapeRegExp).join('|')})\\b`, 'gi')
+        : null;
     const resolveVarsInExpr = (expr) => {
-        const sortedNames = Object.keys(varMap).sort((a, b) => b.length - a.length);
-        let result = expr;
-        sortedNames.forEach(name => {
-            result = result.replace(new RegExp(`\\b${name}\\b`, 'gi'), varMap[name]);
+        if (!varNameRegex) return expr;
+        return String(expr).replace(varNameRegex, (m, offset, whole) => {
+            const prev = offset > 0 ? whole[offset - 1] : '';
+            if (prev === '.') return m; // member access (x.Q) — leave member name alone
+            if (prev === '>' && offset > 1 && whole[offset - 2] === '-') return m; // already C `->`
+            const mapped = varMapLower[m.toLowerCase()];
+            return mapped !== undefined ? mapped : m;
         });
-        return result;
     };
 
     const transformExpr = (expr) => {
@@ -2806,6 +3091,25 @@ const transpileSTLogics = (code, stdFunctions = {}, parentName = '', category = 
         let work = String(expr).replace(/'(?:[^'\\]|\\.)*'|"(?:[^"\\]|\\.)*"/g, m => {
             stringTokens.push(m);
             return `${stringTokens.length - 1}`;
+        });
+
+        // Named-argument USER FUNCTION calls (`MyFunc(A := x, B := y)`) → map the
+        // args positionally by the function's Input declaration order, BEFORE the
+        // `:=` protection below would mangle them into `A = x`. Only non-nested
+        // argument lists are handled (regex limit) — the common form.
+        Object.entries(userFunctionInputs).forEach(([fnName, inputs]) => {
+            if (!inputs || inputs.length === 0) return;
+            const re = new RegExp(`\\b${fnName}\\s*\\(([^()]*)\\)`, 'gi');
+            work = work.replace(re, (m, argStr) => {
+                if (!/:=/.test(argStr)) return m;
+                const byName = {};
+                argStr.split(',').forEach(a => {
+                    const mm = a.match(/^\s*([A-Za-z_][A-Za-z0-9_]*)\s*:=\s*([\s\S]+?)\s*$/);
+                    if (mm) byName[mm[1].toLowerCase()] = mm[2];
+                });
+                const positional = inputs.map(p => byName[p.toLowerCase()] !== undefined ? byName[p.toLowerCase()] : '0');
+                return `${fnName}(${positional.join(', ')})`;
+            });
         });
 
         let result = work
@@ -2829,10 +3133,10 @@ const transpileSTLogics = (code, stdFunctions = {}, parentName = '', category = 
             .replace(/\^\^\^/g, '^')        // restore BXOR placeholder
             .replace(/\bTRUE\b/gi, 'true')
             .replace(/\bFALSE\b/gi, 'false');
-        // IEC time-duration literal → microsecond integer.
-        // Only the simple forms (T#5ms / TIME#1s / T#250us) are converted —
-        // compound forms (T#1h30m) fall through unchanged.
-        result = result.replace(/\b(?:T|TIME)#\d+(?:US|MS|S)\b/gi, m => String(mapIECtoTimeUs(m)));
+        // IEC time-duration literal → microsecond integer. Handles simple,
+        // fractional and compound forms (T#5ms, T#1.5s, T#1m30s, T#1h2m3s500ms);
+        // a malformed literal throws a transpile error in mapIECtoTimeUs.
+        result = result.replace(/\b(?:T|TIME)#(?:[\d._]+(?:MS|US|NS|D|H|M|S))+\b/gi, m => String(mapIECtoTimeUs(m)));
         result = result.replace(/\bADR\s*\(\s*([^)]+?)\s*\)/gi, (_, inner) => `(&(${resolveVarsInExpr(inner.trim())}))`);
         result = result.replace(/\bNULL\b/gi, 'NULL');
         // IEC 61131-3 type-conversion functions → KRON_ library names
@@ -2898,41 +3202,16 @@ const transpileSTLogics = (code, stdFunctions = {}, parentName = '', category = 
             return;
         }
 
-        // ── Case label(s): n: or n1,n2: or n1..n2: ───────────────────────
+        // ── Case label(s): n:, IDLE:, -1:, n1,n2:, n1..n2: ────────────────
         // Only valid when the innermost open block is the CASE itself — a
         // case label inside a nested IF/FOR/WHILE is a syntax error in IEC
         // and we should not treat it as one here.
         if (topKind() === 'CASE') {
             const frame = topFrame();
-            const caseLabelMatch = trimmed.match(/^([\d\s,\.]+)\s*:\s*(.*)/);
-            if (caseLabelMatch) {
-                const labelPart = caseLabelMatch[1].trim();
-                const bodyPart  = caseLabelMatch[2].trim();
-                if (frame.caseBodyOpen) {
-                    out += `${indent()}break;\n`;
-                    indentLevel = Math.max(1, indentLevel - 1);
-                }
-                // Multiple values: "1, 2" or ranges "1..3"
-                const parts = labelPart.split(',').map(p => p.trim());
-                parts.forEach(p => {
-                    if (p.includes('..')) {
-                        const [from, to] = p.split('..').map(n => parseInt(n.trim(), 10));
-                        for (let v = from; v <= to; v++) out += `${indent()}case ${v}:\n`;
-                    } else {
-                        out += `${indent()}case ${p}:\n`;
-                    }
-                });
-                indentLevel++;
-                frame.caseBodyOpen = true;
-                if (bodyPart && bodyPart !== ';') {
-                    let cl = transformExpr(bodyPart);
-                    if (!cl.endsWith(';')) cl += ';';
-                    out += `${indent()}${cl}\n`;
-                }
-                return;
-            }
             // ELSE inside CASE (at the case's direct level) → default:
-            if (/^ELSE\s*:?\s*/i.test(trimmed)) {
+            // Checked BEFORE label matching — `ELSE` would otherwise parse as
+            // an identifier label now that identifier labels are supported.
+            if (/^ELSE\b\s*:?/i.test(trimmed)) {
                 if (frame.caseBodyOpen) {
                     out += `${indent()}break;\n`;
                     indentLevel = Math.max(1, indentLevel - 1);
@@ -2941,9 +3220,50 @@ const transpileSTLogics = (code, stdFunctions = {}, parentName = '', category = 
                 indentLevel++;
                 frame.caseBodyOpen = true;
                 frame.hasDefault = true;
-                const elseBody = trimmed.replace(/^ELSE\s*:?\s*/i, '').trim();
+                const elseBody = trimmed.replace(/^ELSE\b\s*:?\s*/i, '').trim();
                 if (elseBody && elseBody !== ';') {
                     let cl = transformExpr(elseBody);
+                    if (!cl.endsWith(';')) cl += ';';
+                    out += `${indent()}${cl}\n`;
+                }
+                return;
+            }
+            // Label atoms: integers (incl. negative), identifiers (enum members —
+            // transpiled enums are plain C enum constants, so a bare identifier
+            // label works), or TypeName#EnumValue. `:(?!=)` keeps assignments
+            // (`x := 1`) from matching as a label `x`.
+            const CASE_ATOM = '(?:[A-Za-z_][A-Za-z0-9_]*(?:#[A-Za-z_][A-Za-z0-9_]*)?|-?\\d+)';
+            const caseLabelMatch = trimmed.match(new RegExp(`^(${CASE_ATOM}(?:\\s*(?:\\.\\.|,)\\s*${CASE_ATOM})*)\\s*:(?!=)\\s*(.*)$`));
+            if (caseLabelMatch) {
+                const labelPart = caseLabelMatch[1].trim();
+                const bodyPart  = caseLabelMatch[2].trim();
+                if (frame.caseBodyOpen) {
+                    out += `${indent()}break;\n`;
+                    indentLevel = Math.max(1, indentLevel - 1);
+                }
+                // TypeName#EnumValue → EnumValue (enum members are bare C constants)
+                const stripEnumPrefix = (p) => p.replace(/^[A-Za-z_][A-Za-z0-9_]*#/, '');
+                // Multiple values: "1, 2" or ranges "1..3"
+                const parts = labelPart.split(',').map(p => p.trim());
+                parts.forEach(p => {
+                    if (p.includes('..')) {
+                        const [fromS, toS] = p.split('..').map(n => n.trim());
+                        const from = parseInt(fromS, 10);
+                        const to = parseInt(toS, 10);
+                        if (Number.isFinite(from) && Number.isFinite(to)) {
+                            for (let v = from; v <= to; v++) out += `${indent()}case ${v}:\n`;
+                        } else {
+                            // Non-numeric range bounds: GCC/Clang case-range extension
+                            out += `${indent()}case ${stripEnumPrefix(fromS)} ... ${stripEnumPrefix(toS)}:\n`;
+                        }
+                    } else {
+                        out += `${indent()}case ${stripEnumPrefix(p)}:\n`;
+                    }
+                });
+                indentLevel++;
+                frame.caseBodyOpen = true;
+                if (bodyPart && bodyPart !== ';') {
+                    let cl = transformExpr(bodyPart);
                     if (!cl.endsWith(';')) cl += ';';
                     out += `${indent()}${cl}\n`;
                 }
@@ -3002,7 +3322,20 @@ const transpileSTLogics = (code, stdFunctions = {}, parentName = '', category = 
         if (forByMatch) {
             const [, vn, start, end, step] = forByMatch;
             const cv = varMap[vn] || vn;
-            out += `${indent()}for (${cv} = ${transformExpr(start)}; ${cv} <= ${transformExpr(end)}; ${cv} += ${transformExpr(step)}) {\n`;
+            const stepExpr = transformExpr(step).trim();
+            const endExpr = transformExpr(end);
+            // Loop condition depends on the step SIGN: a negative BY counts down
+            // (cv >= end). Literal steps get the right operator directly; a
+            // variable step gets a runtime sign check.
+            let cond;
+            if (/^-\s*\d+(?:\.\d+)?$/.test(stepExpr)) {
+                cond = `${cv} >= ${endExpr}`;
+            } else if (/^\+?\s*\d+(?:\.\d+)?$/.test(stepExpr)) {
+                cond = `${cv} <= ${endExpr}`;
+            } else {
+                cond = `((${stepExpr}) >= 0 ? (${cv} <= ${endExpr}) : (${cv} >= ${endExpr}))`;
+            }
+            out += `${indent()}for (${cv} = ${transformExpr(start)}; ${cond}; ${cv} += ${stepExpr}) {\n`;
             indentLevel++;
             blockStack.push({ kind: 'FOR' });
             return;
@@ -3054,7 +3387,15 @@ const transpileSTLogics = (code, stdFunctions = {}, parentName = '', category = 
         // ── RETURN ────────────────────────────────────────────────────────
         if (/^RETURN\b/i.test(trimmed)) {
             const retVal = trimmed.replace(/^RETURN\s*/i, '').replace(/;$/, '').trim();
-            out += `${indent()}return${retVal ? ` ${transformExpr(retVal)}` : ''};\n`;
+            if (retVal) {
+                out += `${indent()}return ${transformExpr(retVal)};\n`;
+            } else if (fnReturnVar) {
+                // IEC RETURN carries no value — a non-void FUNCTION returns the
+                // current result variable (FuncName := … assignments target it).
+                out += `${indent()}return ${fnReturnVar};\n`;
+            } else {
+                out += `${indent()}return;\n`;
+            }
             return;
         }
 
@@ -3074,13 +3415,10 @@ const transpileSTLogics = (code, stdFunctions = {}, parentName = '', category = 
                 userFBTypes.has(fbType) ||
                 (fbType in FB_TRIGGER_PIN && !isInlineMathType(fbType))
             );
-            // Accept named arg form (`:=`/`=>`) or empty arg list. Positional
-            // args (`inst(a, b)`) without `:=` for an FB instance also fall
-            // through here; we generate just the Call so the FB still ticks.
-            const looksLikeFBCall = isFB && (
-                /:=/.test(argStr) || /=>/.test(argStr) || !argStr.trim()
-            );
-            if (looksLikeFBCall) {
+            // Any call statement on an FB-typed variable is an FB call: named
+            // args (`:=`/`=>`), an empty arg list, or POSITIONAL args
+            // (`inst(a, b)` — mapped onto the FB's input pins in order).
+            if (isFB) {
                 const cInst = varMap[instName];
                 // Top-level comma split — depth- and string-aware so nested
                 // calls/casts and string literals stay intact.
@@ -3112,7 +3450,20 @@ const transpileSTLogics = (code, stdFunctions = {}, parentName = '', category = 
                 // so the user reads post-call values.
                 const outputCaptures = [];
 
-                args.forEach(a => {
+                // POSITIONAL call (`inst(a, b)`, no `:=`/`=>`): synthesize named
+                // args by the FB's input pin declaration order (EN skipped — it
+                // is not a struct field on standard FBs).
+                let effArgs = args;
+                if (args.length > 0 && !args.some(a => /:=|=>/.test(a))) {
+                    const fbTypeNorm = (fbType || '').trim().replace(/\s+/g, '_');
+                    const pinOrder = (FB_INPUTS[fbType] || stdFunctions[fbType]?.inputs || userFBInputs[fbTypeNorm] || [])
+                        .filter(p => p !== 'EN');
+                    effArgs = args
+                        .map((a, i) => (pinOrder[i] ? `${pinOrder[i]} := ${a}` : null))
+                        .filter(Boolean);
+                }
+
+                effArgs.forEach(a => {
                     // Try output-capture form first (`Pin => varname`); then
                     // input form (`Pin := value`). Anything else is ignored.
                     const outM = a.match(/^([A-Za-z_][A-Za-z0-9_]*)\s*=>\s*([\s\S]+)$/);
@@ -3148,8 +3499,13 @@ const transpileSTLogics = (code, stdFunctions = {}, parentName = '', category = 
                         else if (IDENTIFIER_REF_REGEX.test(rawValue)) value = `&(${resolveVarsInExpr(rawValue)})`;
                         else value = transformExpr(rawValue);
                     } else if (inputType === 'TIME') {
-                        const us = mapIECtoTimeUs(rawValue);
-                        value = (us !== null && us !== undefined) ? us.toString() : transformExpr(rawValue);
+                        // Only convert actual T#/TIME# LITERALS. A variable (or
+                        // expression) passed to PT must go through transformExpr —
+                        // mapIECtoTimeUs never returns null, so it used to turn
+                        // `PT := myDelay` into the literal 10000.
+                        value = /^(?:T|TIME|LTIME|LT)#/i.test(rawValue)
+                            ? String(mapIECtoTimeUs(rawValue))
+                            : transformExpr(rawValue);
                     } else {
                         value = transformExpr(rawValue);
                     }
@@ -3185,7 +3541,7 @@ const transpileSTLogics = (code, stdFunctions = {}, parentName = '', category = 
     return out || `    // ST parsing placeholder\n`;
 };
 
-const transpileLDLogics = (rungs, stdFunctions = {}, parentName = '', category = 'program', globalVarNames = [], inputShadowMap = null, rungIdxOffset = 0, cSymTypeMap = {}) => {
+const transpileLDLogics = (rungs, stdFunctions = {}, parentName = '', category = 'program', globalVarNames = [], inputShadowMap = null, rungIdxOffset = 0, cSymTypeMap = {}, localVarNames = new Set(), fbInstanceNames = new Set()) => {
     if (!rungs || rungs.length === 0) return `    // LD Implementation Empty\n`;
 
     let out = '';
@@ -3200,7 +3556,8 @@ const transpileLDLogics = (rungs, stdFunctions = {}, parentName = '', category =
     };
 
     // Resolve a variable/signal name to its C symbol, respecting scope.
-    // Handles simple names, array elements (var[idx]), struct members (var.member).
+    // Handles simple names, array elements (var[idx]), struct members (var.member),
+    // FB-instance output access (blink.Q → …_inst_blink.Q).
     const resolveVar = (varName) => {
         if (!varName) return null;
         const s = varName.trim();
@@ -3208,13 +3565,30 @@ const transpileLDLogics = (rungs, stdFunctions = {}, parentName = '', category =
         const sepIdx = s.search(/[[.]/);
         const baseName = (sepIdx >= 0 ? s.slice(0, sepIdx) : s).replace(/\s+/g, '_');
         const suffix = sepIdx >= 0 ? s.slice(sepIdx) : '';
+        // EtherCAT PDO variables have no PlcState field — leave the name BARE
+        // so the GPI access macro (#define ec_X (__gpi_snap->…)) applies.
+        if (EC_PDO_VAR_NAMES.has(baseName) && !localVarNames.has(baseName)) {
+            return baseName + suffix;
+        }
         if (category === 'program') {
             // All state lives in PlcState (hot-swap): globals and local program
             // vars are both fields reached via S->.
-            const resolved = globalVarNames.includes(baseName) ? `S->${baseName}` : `S->prog_${parentName}_${baseName}`;
-            return resolved + suffix;
+            if (globalVarNames.includes(baseName)) return `S->${baseName}${suffix}`;
+            // FB instance member access (blink.Q): the state field is
+            // prog_<prog>_inst_<name>, mirroring the ST varMap logic.
+            if (suffix.startsWith('.') && fbInstanceNames.has(baseName)) {
+                return `S->prog_${parentName}_inst_${baseName}${suffix}`;
+            }
+            return `S->prog_${parentName}_${baseName}${suffix}`;
         }
-        if (category === 'function_block') return `instance->${baseName}${suffix}`;
+        if (category === 'function_block') {
+            // Locals (incl. FB-local FB instances) live in the instance struct;
+            // GLOBALS referenced inside an FB's ladder are PlcState fields.
+            if (!localVarNames.has(baseName) && globalVarNames.includes(baseName)) {
+                return `S->${baseName}${suffix}`;
+            }
+            return `instance->${baseName}${suffix}`;
+        }
         return s;
     };
 
@@ -3239,12 +3613,18 @@ const transpileLDLogics = (rungs, stdFunctions = {}, parentName = '', category =
         }
         // IEC hex literal 16#FF → 0xFF
         if (/^16#[0-9A-Fa-f]+$/i.test(s)) return '0x' + s.slice(3).toUpperCase();
-        // Binary literal 0b... → decimal (C99 doesn't support 0b)
-        if (/^0[bB][01]+$/.test(s)) return parseInt(s, 2).toString();
+        // Binary literal 0b... → decimal (C99 doesn't support 0b).
+        // NOTE: parse the DIGITS only — parseInt('0b101', 2) is 0.
+        if (/^0[bB][01]+$/.test(s)) return parseInt(s.slice(2), 2).toString();
         // Octal literal 0o... → C octal 0... (C uses leading-zero octal)
-        if (/^0[oO][0-7]+$/.test(s)) return '0' + parseInt(s, 8).toString(8);
-        // Numeric literal (int, float, hex 0x...)
-        if (/^-?[0-9][0-9a-fA-FxX.]*$/.test(s)) return s;
+        if (/^0[oO][0-7]+$/.test(s)) return '0' + parseInt(s.slice(2), 8).toString(8);
+        // Numeric literal — STRICT: plain int, float (with optional exponent),
+        // or hex 0x…. Malformed tokens (`5F`, `1.2.3`, `0x`) return null so the
+        // problem surfaces instead of leaking garbage into the C output.
+        if (/^-?\d+$/.test(s)) return s;
+        if (/^-?(?:\d+\.\d*|\.\d+)(?:[eE][+-]?\d+)?$/.test(s)) return s;
+        if (/^-?\d+[eE][+-]?\d+$/.test(s)) return s;
+        if (/^-?0[xX][0-9A-Fa-f]+$/.test(s)) return s;
         // Boolean literals
         if (isBooleanLiteral(s)) return normalizeBooleanLiteral(s);
         // Variable reference: simple, arr[idx], or struct.member
@@ -3314,9 +3694,12 @@ const transpileLDLogics = (rungs, stdFunctions = {}, parentName = '', category =
         return expr;
     };
 
-    // Get the C call-target for an FB instance
+    // Get the C call-target for an FB instance. GLOBAL FB instances are plain
+    // PlcState fields (`S-><name>`, no prog_/inst_ prefix — matching how the
+    // global-variable loop emits them); locals get the per-POU field.
     const getCallTarget = (instName) => {
         const i = (instName || '').trim().replace(/\s+/g, '_');
+        if (!localVarNames.has(i) && globalVarNames.includes(i)) return `S->${i}`;
         if (category === 'program') return `S->prog_${parentName}_inst_${i}`;
         if (category === 'function_block') return `instance->${i}`;
         return i;
@@ -3424,11 +3807,34 @@ const transpileLDLogics = (rungs, stdFunctions = {}, parentName = '', category =
 
             out += `    bool ${bOut} = false;\n`;
 
+            // Persistent edge memory for Rising/Falling contacts & coils —
+            // matches the fields pushed by collectEdgeVars (PlcState for
+            // programs, instance struct member for FBs). Functions have no
+            // persistent state, so edges there degrade to level semantics.
+            const edgeMemRef = () => {
+                const id = sanitizeBlockId(blockId);
+                if (category === 'program') return `S->prog_${parentName}_edge_${id}`;
+                if (category === 'function_block') return `instance->__edge_${id}`;
+                return null;
+            };
+
             if (type === 'Contact') {
                 const varName = ((data.values?.var || data.instanceName) + '').replace(/[🌍🏠⊞⊡⊟]/g, '').trim() || null;
                 if (varName) {
                     const v = resolveVar(varName);
-                    if (subType === 'NC' || subType === 'Falling') {
+                    if (subType === 'Rising' || subType === 'Falling') {
+                        const mem = edgeMemRef();
+                        if (mem) {
+                            // One-scan pulse on the variable's transition
+                            const edgeLocal = `__e_r${rungIdx}_b${idx}`;
+                            out += `    bool ${edgeLocal} = ${subType === 'Rising' ? `(${v} && !${mem})` : `(!${v} && ${mem})`};\n`;
+                            out += `    ${mem} = ${v};\n`;
+                            out += `    ${bOut} = ${inExpr} && ${edgeLocal};\n`;
+                        } else {
+                            // No persistent state (function): level semantics fallback
+                            out += `    ${bOut} = ${inExpr} && ${subType === 'Falling' ? `!${v}` : v}; /* edge contact: no state in FUNCTION, level fallback */\n`;
+                        }
+                    } else if (subType === 'NC') {
                         out += `    ${bOut} = ${inExpr} && !${v};\n`;
                     } else {
                         out += `    ${bOut} = ${inExpr} && ${v};\n`;
@@ -3448,6 +3854,16 @@ const transpileLDLogics = (rungs, stdFunctions = {}, parentName = '', category =
                         out += `    if (${bOut}) { ${v} = true; }\n`;
                     } else if (subType === 'Reset') {
                         out += `    if (${bOut}) { ${v} = false; }\n`;
+                    } else if (subType === 'Rising' || subType === 'Falling') {
+                        // Edge coil: target is TRUE for exactly one scan on the
+                        // rung input's rising/falling transition.
+                        const mem = edgeMemRef();
+                        if (mem) {
+                            out += `    ${v} = ${subType === 'Rising' ? `(${bOut} && !${mem})` : `(!${bOut} && ${mem})`};\n`;
+                            out += `    ${mem} = ${bOut};\n`;
+                        } else {
+                            out += `    ${v} = ${bOut}; /* edge coil: no state in FUNCTION, level fallback */\n`;
+                        }
                     } else {
                         out += `    ${v} = ${bOut};\n`;
                     }
@@ -3584,7 +4000,17 @@ const transpileLDLogics = (rungs, stdFunctions = {}, parentName = '', category =
                 } else {
                     // ── Inline comparison/selection/range/bitwise/conversion ──
                     let resultExpr;
-                    if (KRON_FN[type]) {
+                    if (type === 'MUX') {
+                        // KRON_MUX expects (k, ARRAY-pointer, n) — dereferencing a
+                        // scalar is a compile error. The 2-input XML block is a
+                        // simple select: K != 0 picks IN1.
+                        resultExpr = `((${argValues['K'] || '0'}) ? (${argValues['IN1'] || '0'}) : (${argValues['IN0'] || '0'}))`;
+                    } else if (type === 'LIMIT') {
+                        // IEC LIMIT(MN, IN, MX); the KRON_LIMIT macro takes
+                        // (mn, in, mx) — FB_INPUTS order is (IN, MN, MX), so map
+                        // by NAME instead of position.
+                        resultExpr = `KRON_LIMIT(${argValues['MN'] || '0'}, ${argValues['IN'] || '0'}, ${argValues['MX'] || '0'})`;
+                    } else if (KRON_FN[type]) {
                         resultExpr = `${KRON_FN[type]}(${args.join(', ')})`;
                     } else if (BITWISE_OP[type]) {
                         if (args.length === 1) {
@@ -3867,7 +4293,9 @@ const mapType = (iecType) => {
         'POINTER': 'void*',
         'VOID': 'void'
     };
-    return typeMap[iecType] || iecType; // Fallback to custom name
+    // Fallback to custom name — sanitized like the typedef emission ("My FB" →
+    // typedef My_FB), so field declarations reference the real C type name.
+    return typeMap[iecType] || String(iecType || '').trim().replace(/\s+/g, '_');
 };
 
 const transpileDataType = (dt) => {
@@ -3885,7 +4313,25 @@ const transpileDataType = (dt) => {
         });
         code += `} ${dt.name};\n\n`;
     } else if (dt.type === 'Array') {
-        const sizes = dt.content.dimensions.map(d => `[${parseInt(d.max) - parseInt(d.min) + 1}]`).join('');
+        // Dimensions are sized [max+1] (NOT [max-min+1]) so raw IEC indices stay
+        // valid when the lower bound is > 0 — every element access in generated
+        // code (ST/LD passthrough, SHM/debug expansion) uses raw IEC indices.
+        // Elements below `min` are simply unused. Negative lower bounds cannot
+        // be represented this way and are rejected.
+        const sizes = dt.content.dimensions.map(d => {
+            const min = parseInt(d.min, 10);
+            const max = parseInt(d.max, 10);
+            if (!Number.isFinite(min) || !Number.isFinite(max)) {
+                throw new Error(`ARRAY data type "${dt.name}": invalid dimension bounds [${d.min}..${d.max}].`);
+            }
+            if (min < 0) {
+                throw new Error(`ARRAY lower bound must be >= 0 (data type "${dt.name}" has [${d.min}..${d.max}]).`);
+            }
+            if (max < min) {
+                throw new Error(`ARRAY upper bound must be >= lower bound (data type "${dt.name}" has [${d.min}..${d.max}]).`);
+            }
+            return `[${max + 1}]`;
+        }).join('');
         code += `typedef ${mapType(dt.content.baseType)} ${dt.name}${sizes};\n\n`;
     }
     return code;

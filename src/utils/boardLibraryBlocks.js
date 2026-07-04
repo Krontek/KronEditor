@@ -42,6 +42,25 @@ const BOARD_CHANNELS = {
   jetson_orin_nano:  { PWM: 3, SPI: 1, I2C: 2, UART: 4, CAN: 1, USB: 5 },
   jetson_orin_nx:    { PWM: 3, SPI: 1, I2C: 2, UART: 4, CAN: 1, USB: 5 },
   jetson_agx_orin:   { PWM: 3, SPI: 1, I2C: 2, UART: 4, CAN: 2, USB: 5 },
+  // Orange Pi — RK3588S/RK3588 expose many UART/I2C/SPI controllers; counts
+  // reflect what is practically reachable on the 40-pin header.
+  opi_5:             { PWM: 4, SPI: 2, I2C: 3, UART: 4, USB: 4 },
+  opi_5_plus:        { PWM: 4, SPI: 2, I2C: 3, UART: 4, USB: 5 },
+  opi_zero_2w:       { PWM: 2, SPI: 1, I2C: 2, UART: 3, USB: 1 },
+  // Radxa
+  radxa_rock_5b:     { PWM: 4, SPI: 2, I2C: 4, UART: 4, USB: 5 },
+  radxa_rock_3a:     { PWM: 3, SPI: 2, I2C: 3, UART: 4, USB: 4 },
+  radxa_zero_3w:     { PWM: 2, SPI: 1, I2C: 2, UART: 3, USB: 2 },
+  // Odroid (Amlogic)
+  odroid_c4:         { PWM: 2, SPI: 1, I2C: 2, UART: 2, USB: 4 },
+  odroid_n2_plus:    { PWM: 2, SPI: 1, I2C: 2, UART: 2, USB: 4 },
+  // Banana Pi (Amlogic)
+  bpi_m5:            { PWM: 2, SPI: 1, I2C: 2, UART: 2, USB: 4 },
+  // Libre Computer (Amlogic)
+  libre_le_potato:   { PWM: 2, SPI: 1, I2C: 2, UART: 2, USB: 4 },
+  // Pine64 (Rockchip)
+  pine_rock64:       { PWM: 2, SPI: 1, I2C: 2, UART: 2, USB: 3 },
+  pine_rockpro64:    { PWM: 2, SPI: 2, I2C: 4, UART: 4, USB: 4 },
 };
 
 // ─── Block templates per interface ──────────────────────────────────────────

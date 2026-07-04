@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"encoding/xml"
 	"fmt"
+	"html"
 	"io"
 	"log/slog"
 	"net/http"
@@ -420,27 +421,36 @@ func (hm *HMIManager) handleDeployHMILayout(w http.ResponseWriter, r *http.Reque
 	jsonOK(w, map[string]any{"ok": true, "pages": pages, "loaded": loaded})
 }
 
+// deployedPageCount returns the current page count under the manager lock,
+// tolerating a nil config (a concurrent LoadJSON may have cleared it).
+func (hm *HMIManager) deployedPageCount() int {
+	hm.mu.RLock()
+	defer hm.mu.RUnlock()
+	if hm.config == nil {
+		return 0
+	}
+	return len(hm.config.Pages)
+}
+
 // handleDeploy receives the HMI XML from KronEditor.
+// Reads are bounded (8 MB, same order as the layout endpoint) — an HMI
+// config is small; an unbounded read is a trivial memory-exhaustion DoS.
 func (hm *HMIManager) handleDeploy(w http.ResponseWriter, r *http.Request) {
-	if err := r.ParseMultipartForm(4 << 20); err != nil {
-		// Try reading as raw body
+	const maxHMIUpload = 8 << 20 // 8 MB
+	r.Body = http.MaxBytesReader(w, r.Body, maxHMIUpload)
+	if err := r.ParseMultipartForm(maxHMIUpload); err != nil {
+		// Not multipart — try reading as raw body.
 		defer r.Body.Close()
-		data := make([]byte, 0, 64*1024)
-		buf := make([]byte, 4096)
-		for {
-			n, err := r.Body.Read(buf)
-			if n > 0 {
-				data = append(data, buf[:n]...)
-			}
-			if err != nil {
-				break
-			}
+		data, rerr := io.ReadAll(r.Body)
+		if rerr != nil {
+			jsonError(w, http.StatusBadRequest, "failed to read body: "+rerr.Error())
+			return
 		}
 		if err2 := hm.Load(data); err2 != nil {
 			jsonError(w, http.StatusBadRequest, err2.Error())
 			return
 		}
-		jsonOK(w, map[string]any{"ok": true, "pages": len(hm.config.Pages)})
+		jsonOK(w, map[string]any{"ok": true, "pages": hm.deployedPageCount()})
 		return
 	}
 	f, _, err := r.FormFile("hmi")
@@ -449,25 +459,16 @@ func (hm *HMIManager) handleDeploy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer f.Close()
-	data := make([]byte, 0, 64*1024)
-	buf := make([]byte, 4096)
-	for {
-		n, err2 := f.Read(buf)
-		if n > 0 {
-			data = append(data, buf[:n]...)
-		}
-		if err2 != nil {
-			break
-		}
+	data, err := io.ReadAll(io.LimitReader(f, maxHMIUpload))
+	if err != nil {
+		jsonError(w, http.StatusBadRequest, "failed to read file: "+err.Error())
+		return
 	}
 	if err := hm.Load(data); err != nil {
 		jsonError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	hm.mu.RLock()
-	pages := len(hm.config.Pages)
-	hm.mu.RUnlock()
-	jsonOK(w, map[string]any{"ok": true, "pages": pages})
+	jsonOK(w, map[string]any{"ok": true, "pages": hm.deployedPageCount()})
 }
 
 // handleLoginPage serves the login HTML.
@@ -683,6 +684,19 @@ func (hm *HMIManager) handleAPIWrite(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, http.StatusServiceUnavailable, "IPC not available")
 		return
 	}
+	// HMI writes are restricted to ADDRESSED variables — mirroring the read
+	// feed (handleAPIVariables) and the REST API. Without this, any internal
+	// variable could be force-written by name from a crafted request.
+	//
+	// KNOWN GAP: per-page writeRoles are only enforced in the UI (canWrite in
+	// the layout response); a server-side variable→page mapping is not
+	// maintained (component props are opaque JSON blobs whose variable
+	// bindings use editor-side name resolution), so an operator+ session can
+	// still write any ADDRESSED variable regardless of which page binds it.
+	if !hm.ipc.IsAddressed(body.Key) {
+		jsonError(w, http.StatusForbidden, "variable is not addressed (not writable via HMI)")
+		return
+	}
 	if err := hm.ipc.WriteVariable(body.Key, body.Value); err != nil {
 		jsonError(w, http.StatusBadRequest, err.Error())
 		return
@@ -702,7 +716,9 @@ func (hm *HMIManager) handleAPIUsersGet(w http.ResponseWriter, r *http.Request) 
 func loginHTML(errMsg, base string) string {
 	errBlock := ""
 	if errMsg != "" {
-		errBlock = `<div class="err">` + errMsg + `</div>`
+		// errMsg comes straight from the ?error= query parameter on BOTH
+		// listeners — escape it or it is reflected XSS on the login page.
+		errBlock = `<div class="err">` + html.EscapeString(errMsg) + `</div>`
 	}
 	return `<!DOCTYPE html>
 <html lang="en">
@@ -764,6 +780,14 @@ func mainHMIHTML(sess *Session, base string) string {
 		username = sess.Username
 		roleName = sess.Role.String()
 	}
+	// username is attacker-influenced (chosen at HMI-config deploy time) and
+	// is interpolated into HTML — escape it. roleName/base are server-derived
+	// but escaped/marshalled anyway (defense in depth). For the JS string
+	// literals use json.Marshal, which yields a safely quoted JS string.
+	usernameHTML := html.EscapeString(username)
+	roleHTML := html.EscapeString(roleName)
+	roleJS, _ := json.Marshal(roleName)
+	baseJS, _ := json.Marshal(base)
 	return `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -808,8 +832,8 @@ body{background:#0d0d0d;color:#d4d4d4;font-family:Consolas,monospace;overflow:hi
   <span id="topbar-title">KronHMI</span>
   <div id="page-tabs"></div>
   <div id="user-info">
-    <span>` + username + `</span>
-    <span class="role-badge">` + roleName + `</span>
+    <span>` + usernameHTML + `</span>
+    <span class="role-badge">` + roleHTML + `</span>
     <form method="POST" action="` + base + `/logout" style="display:inline">
       <button id="logout-btn" type="submit">Sign out</button>
     </form>
@@ -820,9 +844,9 @@ body{background:#0d0d0d;color:#d4d4d4;font-family:Consolas,monospace;overflow:hi
 </div>
 <script>
 const USER_ROLE_LEVEL = {viewer:1,operator:2,maintainer:3,admin:4};
-const MY_ROLE = '` + roleName + `';
+const MY_ROLE = ` + string(roleJS) + `;
 const MY_LEVEL = USER_ROLE_LEVEL[MY_ROLE] || 1;
-const BASE = '` + base + `';
+const BASE = ` + string(baseJS) + `;
 
 let pages = [];
 let currentPage = 0;

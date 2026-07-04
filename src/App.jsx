@@ -399,7 +399,12 @@ function App() {
               }
               setIsRunning(true);
               addLog('info', 'Runtime already running (AutoRun). Attaching stream...');
-              if (remoteVarKeysRef.current.length > 0 && !plcClientRef.current.isStreaming) {
+              // Always (re)attach the stream here — the server streams its own
+              // deployed variable table, so we must NOT gate on
+              // remoteVarKeysRef (it is only populated by Build & Send in the
+              // same browser session; after a reload it is empty and live
+              // values would stay '---' forever).
+              if (!plcClientRef.current.isStreaming) {
                 stopStreamRef.current = plcClientRef.current.streamVars(
                   (vars) => { Object.assign(liveVarsRef.current, vars); liveVarsDirtyRef.current = true; },
                   (err) => addLog('error', `Stream error: ${err.message}`),
@@ -1473,7 +1478,10 @@ function App() {
     // confirm before disrupting a live system. (For a state-preserving update use
     // the PLC Agent's online change / "Go live" instead.)
     if (isRunning || isSimulationMode) {
-      const where = isPlcConnected ? `the PLC at ${plcAddress}` : 'the local simulation';
+      // isPlcConnected is always true here (guarded above), so base the message
+      // on WHICH runtime is actually live: in simulation mode isRunning tracks
+      // the local sim; otherwise it tracks the remote PLC runtime.
+      const where = isSimulationMode ? 'the local simulation' : `the PLC at ${plcAddress}`;
       if (!window.confirm(`The runtime on ${where} is RUNNING.\n\nBuild & Send will recompile and RESTART it with the new program — outputs reset and current state (timers, counters, latches) is lost.\n\nProceed?`)) {
         addLog('info', 'Build & Send cancelled.');
         return;
@@ -1614,14 +1622,25 @@ function App() {
           handleSave();
         }
 
+        // Focus guard for shortcuts that collide with native editing keys
+        // (Ctrl+X = cut, Ctrl+B in Monaco): never hijack them while the user
+        // is typing in an input/textarea/contentEditable/Monaco editor.
+        const ae = document.activeElement;
+        const isTextEditingTarget = !!(ae && (
+          ae.tagName === 'INPUT' ||
+          ae.tagName === 'TEXTAREA' ||
+          ae.isContentEditable ||
+          ae.closest?.('.monaco-editor')
+        ));
+
         // Compile: Ctrl + B
-        if (e.key.toLowerCase() === 'b') {
+        if (e.key.toLowerCase() === 'b' && !isTextEditingTarget) {
           e.preventDefault();
           handleBuildRef.current();
         }
 
         // Run/Start: Ctrl + X
-        if (e.key.toLowerCase() === 'x') {
+        if (e.key.toLowerCase() === 'x' && !isTextEditingTarget) {
           e.preventDefault();
           handleStartRef.current();
         }

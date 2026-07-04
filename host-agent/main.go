@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"flag"
 	"log"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"strings"
@@ -135,9 +137,12 @@ func main() {
 	// production the host-agent is the single origin for both UI and API.
 	mux.Handle("/", frontendHandler())
 
+	sweepStaleBuildDirs()
+
 	srv := &http.Server{
-		Addr:    *flagAddr,
-		Handler: withCORS(mux),
+		Addr:              *flagAddr,
+		Handler:           withCORS(withBodyLimit(mux)),
+		ReadHeaderTimeout: 10 * time.Second,
 	}
 
 	stop := make(chan os.Signal, 1)
@@ -208,14 +213,80 @@ func writeError(w http.ResponseWriter, status int, msg string) {
 	writeJSON(w, status, map[string]any{"ok": false, "error": msg})
 }
 
+// withCORS gates every request by Origin: the agent is unauthenticated and
+// exposes file I/O + exec endpoints, so a public website driving a visitor's
+// browser must never be able to reach it. Requests WITHOUT an Origin header
+// (curl, same-origin navigations/GETs) pass unchanged; requests WITH one are
+// allowed only from local/private-network origins, and the allowed origin is
+// reflected back (never `*`).
 func withCORS(h http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+		origin := r.Header.Get("Origin")
+		if origin != "" {
+			if !isAllowedOrigin(origin) {
+				http.Error(w, "forbidden origin", http.StatusForbidden)
+				return
+			}
+			w.Header().Set("Access-Control-Allow-Origin", origin)
+			w.Header().Add("Vary", "Origin")
+			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+			w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+		}
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)
 			return
+		}
+		h.ServeHTTP(w, r)
+	})
+}
+
+// isAllowedOrigin accepts http/https origins whose host is local or private:
+// localhost (and *.localhost), loopback (127.0.0.0/8, [::1]), RFC1918 ranges
+// (10/8, 172.16/12, 192.168/16 — plus IPv6 ULA via IsPrivate), and mDNS
+// `.local` hostnames. Any port is fine.
+func isAllowedOrigin(origin string) bool {
+	u, err := url.Parse(origin)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") {
+		return false
+	}
+	host := strings.ToLower(u.Hostname())
+	if host == "" {
+		return false
+	}
+	if host == "localhost" || strings.HasSuffix(host, ".localhost") || strings.HasSuffix(host, ".local") {
+		return true
+	}
+	ip := net.ParseIP(strings.Trim(host, "[]"))
+	if ip == nil {
+		return false
+	}
+	return ip.IsLoopback() || ip.IsPrivate()
+}
+
+// largeBodyPaths are endpoints that legitimately carry big payloads
+// (transpiled sources, whole project files) — capped generously; everything
+// else is a small JSON config/command body.
+var largeBodyPaths = map[string]bool{
+	"/api/host/build":                true,
+	"/api/host/write-plc-files":      true,
+	"/api/host/write-file":           true,
+	"/api/host/compile-for-target":   true,
+	"/api/host/hotswap/build":        true,
+	"/api/host/hotswap/swap":         true,
+	"/api/host/hotswap/target-build": true,
+	"/api/host/hotswap/target-logic": true,
+}
+
+// withBodyLimit bounds request bodies (DoS hardening): ~256 MB for the
+// file/compile endpoints above, ~10 MB for everything else.
+func withBodyLimit(h http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Body != nil {
+			limit := int64(10 << 20)
+			if largeBodyPaths[r.URL.Path] {
+				limit = 256 << 20
+			}
+			r.Body = http.MaxBytesReader(w, r.Body, limit)
 		}
 		h.ServeHTTP(w, r)
 	})
