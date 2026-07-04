@@ -178,7 +178,12 @@ func (s *Server) handleHotSwapTargetDeploy(w http.ResponseWriter, r *http.Reques
 		writeError(w, http.StatusBadGateway, "variable table deploy: "+err.Error())
 		return
 	}
-	if err := postBinary("http://"+req.ServerAddr+"/deploy/logic", "application/octet-stream", logicBytes); err != nil {
+	// cold=1: this is the INITIAL loader-host deploy, so the device wipes any
+	// stale logic_*.so from a previous session and installs this as logic_0.so
+	// — the next runtime start then runs a single, unambiguous generation 0.
+	// Subsequent online changes go through handleHotSwapDeploySwap (no cold
+	// flag), which ping-pongs into the other slot off the confirmed-running gen.
+	if err := postBinary("http://"+req.ServerAddr+"/deploy/logic?cold=1", "application/octet-stream", logicBytes); err != nil {
 		writeError(w, http.StatusBadGateway, "logic deploy: "+err.Error())
 		return
 	}

@@ -573,8 +573,17 @@ const RungEditorNew = ({ variables, setVariables, rungs, setRungs, availableBloc
   const updateBlockData = useCallback((rungId, blockId, newData) => {
     if (readOnly) return;
 
+    // __declare is a transient commit marker (set by the settings modal's Save
+    // and by the canvas input's blur/Enter), NOT block data — strip it before
+    // merging so it never persists into the project. Inline declaration below
+    // runs only on these commits; the canvas input calls updateBlockData on
+    // EVERY keystroke, so declaring unconditionally would create a variable
+    // for each prefix typed ("m", "mo", "mot", …).
+    const { __declare, ...blockUpdates } = newData;
+
     let oldInstanceName = null;
     let oldBlockType = null;
+    let oldCustomData = null;
     const newRungs = rungs.map(rung => {
       if (rung.id === rungId) {
         return {
@@ -583,7 +592,8 @@ const RungEditorNew = ({ variables, setVariables, rungs, setRungs, availableBloc
             if (b.id === blockId) {
               oldInstanceName = b.data.instanceName;
               oldBlockType = b.data.type || b.type;
-              return { ...b, data: { ...b.data, ...newData } };
+              oldCustomData = b.data.customData || null;
+              return { ...b, data: { ...b.data, ...blockUpdates } };
             }
             return b;
           })
@@ -597,13 +607,48 @@ const RungEditorNew = ({ variables, setVariables, rungs, setRungs, availableBloc
     // must NOT touch the variable table.
     const isFBBlock = oldBlockType && oldBlockType !== 'Contact' && oldBlockType !== 'Coil';
     let newVariables = variables;
-    if (isFBBlock && newData.instanceName && oldInstanceName && newData.instanceName !== oldInstanceName) {
-       newVariables = variables.map(v => v.name === oldInstanceName ? { ...v, name: newData.instanceName } : v);
+    if (isFBBlock && blockUpdates.instanceName && oldInstanceName && blockUpdates.instanceName !== oldInstanceName) {
+       newVariables = variables.map(v => v.name === oldInstanceName ? { ...v, name: blockUpdates.instanceName } : v);
        setVariables(newVariables);
     }
+
+    // ── Inline variable declaration (on commit only, see __declare above) ──
+    // If the committed block references a variable name that isn't declared
+    // anywhere (local or global), create it on the spot with an INFERRED type —
+    // so you never have to leave the rung and open the variable table just to
+    // add the BOOL behind a contact or the timer instance behind a TON. It
+    // appears in the table (editable, undoable). Type inference mirrors the
+    // drop path (addBlockToRung): contacts/coils → BOOL; standard/HAL FBs → an
+    // instance typed by the block; user-defined FBs → typed by customData.name;
+    // user-defined FUNCTIONS get no instance variable at all (same as drop).
+    const refName = __declare ? (blockUpdates.instanceName || '').trim().replace(/\s+/g, '_') : '';
+    const isValidName = /^[A-Za-z_][A-Za-z0-9_]*$/.test(refName);
+    if (refName && isValidName) {
+      const declared = newVariables.some(v => v.name === refName) || (globalVars || []).some(v => v.name === refName);
+      if (!declared) {
+        let inferredType = null;
+        let isInstance = false;
+        if (oldBlockType === 'Contact' || oldBlockType === 'Coil') {
+          inferredType = 'BOOL';
+        } else if (isFBBlock && oldCustomData?.type !== 'functions') {
+          inferredType = (oldBlockType === 'UserDefined' ? oldCustomData?.name : oldBlockType) || null;
+          isInstance = !!inferredType;
+        }
+        if (inferredType) {
+          newVariables = [...newVariables, {
+            id: `var_${Date.now()}_${Math.floor(Math.random() * 1e6)}`,
+            name: refName, class: 'Local', type: inferredType,
+            initialValue: '', description: '', address: '',
+            ...(isInstance ? { _isInstance: true } : {}),
+          }];
+          setVariables(newVariables);
+        }
+      }
+    }
+
     setRungs(newRungs);
     saveHistory(newRungs, newVariables);
-  }, [readOnly, rungs, variables, saveHistory, setRungs, setVariables]);
+  }, [readOnly, rungs, variables, globalVars, saveHistory, setRungs, setVariables]);
 
   // Update block position (not saved to history for performance)
   const updateBlockPosition = useCallback((rungId, blockId, position) => {
@@ -655,7 +700,8 @@ const RungEditorNew = ({ variables, setVariables, rungs, setRungs, availableBloc
   // Save block settings
   const handleSaveSettings = useCallback((blockId, newSettings) => {
     if (!editingBlock) return;
-    updateBlockData(editingBlock.rungId, blockId, newSettings);
+    // Modal Save is a commit → allow inline variable declaration.
+    updateBlockData(editingBlock.rungId, blockId, { ...newSettings, __declare: true });
     setEditingBlock(null);
   }, [editingBlock, updateBlockData]);
 
@@ -776,6 +822,30 @@ const RungEditorNew = ({ variables, setVariables, rungs, setRungs, availableBloc
     if (readOnly) return;
     const newRungs = rungs.filter(r => r.id !== rungId);
     setRungs(newRungs);
+    saveHistory(newRungs, variables);
+  }, [readOnly, rungs, variables, saveHistory]);
+
+  // Switch a rung between Ladder and Structured Text. Common case: you added a
+  // rung in the wrong language — an EMPTY rung switches silently. If the rung
+  // already has content (ladder blocks or code) that the other language can't
+  // carry over, we confirm first, since it will be cleared (variables are kept).
+  const convertRungLang = useCallback((rungId) => {
+    if (readOnly) return;
+    const rung = rungs.find(r => r.id === rungId);
+    if (!rung) return;
+    const cur = rung.lang || 'LD';
+    const next = cur === 'ST' ? 'LD' : 'ST';
+    const losesContent = cur === 'ST'
+      ? !!(rung.code && rung.code.trim())
+      : !!(rung.blocks && rung.blocks.length);
+    if (losesContent && !window.confirm(
+      `Convert this rung from ${cur} to ${next}?\n\nThe existing ${cur === 'ST' ? 'code' : 'ladder blocks'} in this rung will be cleared — variables in the table are kept.`
+    )) return;
+    const newRungs = rungs.map(r => r.id === rungId
+      ? { ...r, lang: next, blocks: [], connections: [], code: next === 'ST' ? (r.code || '') : '' }
+      : r);
+    setRungs(newRungs);
+    setFocusedRungId(rungId);
     saveHistory(newRungs, variables);
   }, [readOnly, rungs, variables, saveHistory]);
 
@@ -1224,6 +1294,39 @@ const RungEditorNew = ({ variables, setVariables, rungs, setRungs, availableBloc
       <div style={{ flex: 1, overflowY: 'auto', padding: '12px', background: '#1e1e1e', minHeight: 0 }}>
         <div style={{ display: 'flex', flexDirection: 'column' }}>
           <InsertZone onInsert={() => addRung(rungs[0]?.id, true)} onPaste={() => pasteRungAt(rungs[0]?.id, true)} canPaste={canPasteRung} disabled={readOnly || draggedRungIndex !== null} />
+          {/* Empty-state onboarding: a fresh POU has no rungs. Guide the user
+              straight to adding the first Ladder or Structured Text rung
+              instead of leaving them on a blank canvas. */}
+          {rungs.length === 0 && !readOnly && (
+            <div style={{ margin: '24px auto', maxWidth: 460, textAlign: 'center', color: '#bbb', background: '#252526', border: '1px dashed #3a3a3a', borderRadius: 8, padding: '28px 24px' }}>
+              <div style={{ fontSize: 15, fontWeight: 600, color: '#e8e8e8', marginBottom: 6 }}>This POU is empty</div>
+              <div style={{ fontSize: 12.5, lineHeight: 1.6, marginBottom: 18 }}>
+                {programType === 'SCL' ? (
+                  <>A POU is a list of <strong>rungs</strong>. Add a <strong>Ladder</strong> rung
+                  to draw contacts &amp; coils, or a <strong>Structured Text</strong> rung to write
+                  code — you can mix both in the same POU.</>
+                ) : (
+                  <>A POU is a list of <strong>rungs</strong>. Add a <strong>Ladder</strong> rung
+                  to draw contacts &amp; coils.</>
+                )}
+              </div>
+              <div style={{ display: 'flex', gap: 12, justifyContent: 'center', flexWrap: 'wrap' }}>
+                <button
+                  onClick={() => addRung(null, false, 'LD')}
+                  style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '10px 18px', border: 'none', borderRadius: 6, cursor: 'pointer', background: '#1a6b3a', color: '#fff', fontSize: 13, fontWeight: 600 }}
+                >🪜 Add Ladder rung</button>
+                {/* addRung honors the ST language only for the unified (SCL)
+                    model — on a legacy pure-LD POU the button would silently
+                    create an LD rung, so it is hidden there. */}
+                {programType === 'SCL' && (
+                  <button
+                    onClick={() => addRung(null, false, 'ST')}
+                    style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '10px 18px', border: 'none', borderRadius: 6, cursor: 'pointer', background: '#0d47a1', color: '#fff', fontSize: 13, fontWeight: 600 }}
+                  >📝 Add Structured Text rung</button>
+                )}
+              </div>
+            </div>
+          )}
           {rungs.map((rung, index) => (
             <div key={rung.id}>
               {/* Drag drop indicator above */}
@@ -1244,15 +1347,19 @@ const RungEditorNew = ({ variables, setVariables, rungs, setRungs, availableBloc
                       style={{ cursor: 'grab', color: '#555', fontSize: 14, padding: '0 2px', lineHeight: 1, userSelect: 'none' }}
                     >⠿</div>
                     <span style={{ fontSize: 10, color: '#888' }}>Rung {index}:</span>
-                    {/* Read-only language indicator — the language is chosen when the
-                        rung is created and is NOT switchable afterwards. */}
-                    <span
-                      title={(rung.lang || 'LD') === 'ST' ? 'Structured Text' : 'Ladder Diagram'}
+                    {/* Language pill — click to convert this rung to the other
+                        language (Ladder <-> Structured Text). */}
+                    <button
+                      onClick={() => convertRungLang(rung.id)}
+                      disabled={readOnly}
+                      title={readOnly ? ((rung.lang || 'LD') === 'ST' ? 'Structured Text' : 'Ladder Diagram')
+                        : `${(rung.lang || 'LD') === 'ST' ? 'Structured Text' : 'Ladder'} — click to convert to ${(rung.lang || 'LD') === 'ST' ? 'Ladder' : 'Structured Text'}`}
                       style={{
-                        padding: '1px 8px', fontSize: 11, borderRadius: 3,
-                        background: '#007acc', color: '#fff', fontWeight: 'bold',
+                        padding: '1px 8px', fontSize: 11, borderRadius: 3, border: 'none',
+                        background: (rung.lang || 'LD') === 'ST' ? '#0d47a1' : '#1a6b3a', color: '#fff', fontWeight: 'bold',
+                        cursor: readOnly ? 'default' : 'pointer', display: 'inline-flex', alignItems: 'center', gap: 4,
                       }}
-                    >{rung.lang || 'LD'}</span>
+                    >{rung.lang || 'LD'}{!readOnly && <span style={{ opacity: 0.7, fontSize: 10 }}>⇄</span>}</button>
                     {!readOnly && (
                       <div style={{ marginLeft: 'auto', display: 'flex', gap: 4 }}>
                         <button

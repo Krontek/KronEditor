@@ -5,12 +5,29 @@
 // bookkeeping around it (which generation is current, when it's safe to
 // delete an old one) must behave identically in both places.
 //
-// Generation files are named logic_<N>.so (N >= 0). The generation number is
-// NEVER trusted from an in-memory counter across a process restart — it is
-// always re-derived by scanning the directory, which is what makes this
-// package the single fix for the "in-memory counter desynced from what's
-// actually on disk" class of bug (the root cause of the field-path's
-// logic_0.so vs logic_1.so mismatch this package replaces).
+// Generation files are named logic_<N>.so. The generation number is NEVER
+// trusted from an in-memory counter across a process restart — it is always
+// re-derived by scanning the directory, which is what makes this package the
+// single fix for the "in-memory counter desynced from what's actually on disk"
+// class of bug (the root cause of the field-path's logic_0.so vs logic_1.so
+// mismatch this package replaces).
+//
+// SUSTAINABLE NAMING — 2-slot ping-pong. Hot reload uses exactly TWO on-disk
+// slots that alternate: logic_0.so <-> logic_1.so. Each swap compiles/uploads
+// into the slot that is NOT the currently-running one (PingPongGeneration),
+// dlopen's it, and — only after the loader-host CONFIRMS it is running — deletes
+// the other slot (CleanupExcept). This means the generation number never grows
+// unboundedly (the old "highest+1" scheme produced logic_0, logic_1, ...,
+// logic_57 forever, and on a long-lived field device it never reset), while
+// PlcState is still preserved (the loader-host re-binds the same arena
+// regardless of the filename). At most two files ever exist.
+//
+// ⚠️ Because a slot filename is REUSED, whoever writes a slot MUST do so
+// atomically (write a temp file, then rename over the slot) so a currently
+// mmap'd .so is never truncated in place — rename swaps the directory entry to
+// a fresh inode while the old inode stays mapped by the running loader-host.
+// TempGenerationPath gives the conventional temp name for that pattern; the
+// server's saveUpload already renames atomically.
 package hotswaplib
 
 import (
@@ -36,6 +53,35 @@ var logicNameRe = regexp.MustCompile(`^logic_(\d+)\.so$`)
 // joined under dir.
 func GenerationPath(dir string, gen int) string {
 	return filepath.Join(dir, fmt.Sprintf("logic_%d.so", gen))
+}
+
+// TempGenerationPath returns the conventional temp filename to compile/write a
+// slot into before renaming it over GenerationPath(dir, gen). Because slot
+// names are REUSED in the ping-pong scheme, writing a slot in place could
+// truncate a .so the running loader-host still has mmap'd; writing here first
+// and then os.Rename onto the real path gives the slot a fresh inode while the
+// old inode stays mapped. It matches logicNameRe's "logic_<N>.so" prefix but
+// with a .tmp suffix so DiscoverGeneration never mistakes it for a real slot.
+func TempGenerationPath(dir string, gen int) string {
+	return filepath.Join(dir, fmt.Sprintf("logic_%d.so.tmp", gen))
+}
+
+// PingPongGeneration returns the slot to use for the NEXT logic build/upload
+// given the CONFIRMED currently-running generation `cur`: the OTHER of the two
+// fixed slots {0, 1}. Callers MUST pass the generation they are CERTAIN is
+// running (the one they launched at cold start, or the one a swap was last
+// CONFIRMED "OK" for) — never a value guessed from a directory listing, which
+// is ambiguous while two slots briefly coexist. This is what guarantees we are
+// always sure which slot is running and which slot we are about to send.
+//
+// Any even `cur` maps to slot 1 and any odd `cur` to slot 0, so a legacy value
+// left over from the old monotonic scheme still resolves to a valid {0,1} slot
+// on the first swap after upgrade.
+func PingPongGeneration(cur int) int {
+	if cur%2 == 0 {
+		return 1
+	}
+	return 0
 }
 
 // ParseGenFromName extracts N from a "logic_<N>.so" basename (a full path
@@ -84,8 +130,13 @@ func DiscoverGeneration(dir string) (gen int, path string, ok bool) {
 	return best, GenerationPath(dir, best), true
 }
 
-// NextGeneration returns the generation number to use for a fresh compile:
-// one past whatever is currently on disk, or 0 if dir has no logic_*.so yet.
+// NextGeneration returns one past whatever is currently on disk.
+//
+// Deprecated: this "highest + 1" scheme makes the generation number grow
+// without bound (logic_0, logic_1, ..., logic_57) and, on a long-lived field
+// device, it never resets. Hot reload now uses the bounded 2-slot ping-pong
+// (PingPongGeneration off the CONFIRMED-running generation). Kept only so an
+// older build/deploy dir can still be read; do not use it for new swaps.
 func NextGeneration(dir string) int {
 	if gen, _, ok := DiscoverGeneration(dir); ok {
 		return gen + 1

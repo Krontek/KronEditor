@@ -52,9 +52,33 @@ func (s *Server) handleDeployLogic(w http.ResponseWriter, r *http.Request) {
 	}
 	deployLogicMu.Lock()
 	defer deployLogicMu.Unlock()
-	gen := hotswaplib.NextGeneration(s.cfg.DeployDir)
+
+	// Two modes, both bounded to the fixed ping-pong slots {0,1} — the number
+	// never grows the way the old NextGeneration ("highest+1") scheme did.
+	//   ?cold=1  → initial hot-swap deploy: wipe any stale logic_*.so from a
+	//              previous session and install exactly logic_0.so, so the next
+	//              Start() finds a single unambiguous file and runs generation 0.
+	//   default  → online change: place into the slot that is NOT the one the
+	//              loader-host is CONFIRMED running (ConfirmedGen), so we are
+	//              always certain which generation is live and which is being
+	//              sent. When the runtime isn't running yet we fall back to the
+	//              cold behavior (fresh slot 0) rather than guessing.
+	var gen int
+	if r.URL.Query().Get("cold") == "1" {
+		_ = hotswaplib.CleanupExcept(s.cfg.DeployDir, -1) // remove every stale slot
+		_ = hotswaplib.ClearResultFile(filepath.Join(s.cfg.DeployDir, "swap_result"))
+		gen = 0
+	} else if cur := s.pm.ConfirmedGen(); cur >= 0 {
+		gen = hotswaplib.PingPongGeneration(cur)
+	} else {
+		_ = hotswaplib.CleanupExcept(s.cfg.DeployDir, -1)
+		gen = 0
+	}
+
 	dest := hotswaplib.GenerationPath(s.cfg.DeployDir, gen)
 	name := filepath.Base(dest)
+	// saveUpload writes a temp file then renames atomically, so reusing a slot
+	// name can never truncate a .so the running loader-host still has mmap'd.
 	if err := s.saveUpload(r, dest, false); err != nil {
 		slog.Error("failed to save logic.so", "err", err)
 		http.Error(w, "failed to save file: "+err.Error(), http.StatusInternalServerError)

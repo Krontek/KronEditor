@@ -165,13 +165,13 @@ const EditorPane = ({
     const newVariables = variables.filter((v) => v.id !== id);
     setVariables(newVariables);
 
-    if (fileType === 'LD') {
+    if (fileType === 'LD' || fileType === 'SCL') {
       setRungs(prevRungs => prevRungs.map(rung => ({
         ...rung,
-        blocks: rung.blocks.filter(b => b.data.instanceName !== variableToDelete.name),
-        connections: rung.connections.filter(c => {
-          const sourceExists = rung.blocks.some(b => b.id === c.source);
-          const targetExists = rung.blocks.some(b => b.id === c.target);
+        blocks: (rung.blocks || []).filter(b => b.data.instanceName !== variableToDelete.name),
+        connections: (rung.connections || []).filter(c => {
+          const sourceExists = (rung.blocks || []).some(b => b.id === c.source);
+          const targetExists = (rung.blocks || []).some(b => b.id === c.target);
           return sourceExists && targetExists;
         })
       })));
@@ -186,10 +186,10 @@ const EditorPane = ({
       prev.map((v) => (v.id === id ? { ...v, [field]: value } : v))
     );
 
-    if (field === 'name' && fileType === 'LD' && oldName && oldName !== value) {
+    if (field === 'name' && (fileType === 'LD' || fileType === 'SCL') && oldName && oldName !== value) {
       setRungs(prevRungs => prevRungs.map(rung => ({
         ...rung,
-        blocks: rung.blocks.map(block => {
+        blocks: (rung.blocks || []).map(block => {
           const newData = { ...block.data };
           let changed = false;
 
@@ -219,11 +219,11 @@ const EditorPane = ({
           return changed ? { ...block, data: newData } : block;
         })
       })));
-    } else if (field === 'type' && fileType === 'LD' && oldName) {
+    } else if (field === 'type' && (fileType === 'LD' || fileType === 'SCL') && oldName) {
       // Cascade variable type change to the matching Block instances in Rungs
       setRungs(prevRungs => prevRungs.map(rung => ({
         ...rung,
-        blocks: rung.blocks.map(block => {
+        blocks: (rung.blocks || []).map(block => {
           if (block.data.instanceName === oldName) {
             return {
               ...block,

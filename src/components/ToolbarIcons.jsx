@@ -63,6 +63,13 @@ export const FlaskIcon = (p) => (
   </svg>
 );
 
+export const BoltIcon = (p) => (
+  // Go Live / online change = lightning bolt
+  <svg {...base} {...p}>
+    <path d="M13 2 4 14h7l-1 8 9-12h-7l1-8Z" />
+  </svg>
+);
+
 export const PlayIcon = (p) => (
   <svg {...base} {...p}>
     <path d="M7 4v16l13-8L7 4Z" fill="currentColor" stroke="none" />

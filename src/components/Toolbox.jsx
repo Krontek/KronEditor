@@ -210,6 +210,10 @@ const Toolbox = ({ userDefinedBlocks = [], libraryData = [], activeFileType, sel
   // expand state: category-level and subcategory-level
   const [expandedCats, setExpandedCats] = useState({});
   const [expandedSubs, setExpandedSubs] = useState({});
+  // Block search: when non-empty, the nested tree is replaced by a flat,
+  // grouped, filtered list so a block can be found by name without knowing
+  // which category it lives under.
+  const [search, setSearch] = useState('');
 
   const blockMap = useMemo(() => buildBlockMap(libraryData), [libraryData]);
 
@@ -278,6 +282,50 @@ const Toolbox = ({ userDefinedBlocks = [], libraryData = [], activeFileType, sel
     return [];
   };
 
+  // Flat index of every draggable block (with its source group + color) for
+  // the search view. Reuses resolveItems so the props match exactly what the
+  // tree renders. Rebuilt only when a source input changes.
+  const allSearchItems = useMemo(() => {
+    const out = [];
+    const push = (group, item) => { if (item) out.push({ group, ...item }); };
+    boardTree.forEach(sub => (sub.items || []).forEach(item => push(
+      `${getBoardFamily(selectedBoard) || 'Board'} › ${sub.title}`,
+      { blockType: item.blockType, subType: item.subType, label: item.label, desc: item.desc, customData: item.customData, color: BOARD_COLOR }
+    )));
+    if (hasEtherCAT) {
+      ETHERCAT_LIBRARY_TREE.forEach(sub => resolveItems(sub).forEach(item => push(`EtherCAT › ${sub.title}`, { ...item, color: EC_COLOR })));
+    }
+    LIBRARY_TREE.forEach(cat => (cat.subcategories || []).forEach(sub =>
+      resolveItems(sub).forEach(item => push(`${cat.title} › ${sub.title}`, item))
+    ));
+    (userDefinedBlocks || []).forEach(b => push('User Defined', {
+      blockType: b.name, label: b.name, desc: b.type === 'functionBlocks' ? 'Block' : 'Function', customData: { ...b }, color: UD_COLOR,
+    }));
+    return out;
+  }, [boardTree, hasEtherCAT, blockMap, userDefinedBlocks, selectedBoard]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const query = search.trim().toLowerCase();
+  const searchResults = useMemo(() => {
+    if (!query) return [];
+    const terms = query.split(/\s+/).filter(Boolean);
+    return allSearchItems.filter(it => {
+      const hay = `${it.label || ''} ${it.blockType || ''} ${it.desc || ''} ${it.group || ''}`.toLowerCase();
+      return terms.every(t => hay.includes(t));
+    });
+  }, [query, allSearchItems]);
+
+  // Group search results by their source group, preserving first-seen order.
+  const groupedResults = useMemo(() => {
+    const groups = [];
+    const byName = new Map();
+    searchResults.forEach(it => {
+      let g = byName.get(it.group);
+      if (!g) { g = { title: it.group, items: [] }; byName.set(it.group, g); groups.push(g); }
+      g.items.push(it);
+    });
+    return groups;
+  }, [searchResults]);
+
   if (libraryData.length === 0) {
     return (
       <div style={{ padding: '15px', color: '#888', fontSize: '12px' }}>
@@ -286,8 +334,56 @@ const Toolbox = ({ userDefinedBlocks = [], libraryData = [], activeFileType, sel
     );
   }
 
+  const searchBox = (
+    <div style={{ position: 'sticky', top: 0, zIndex: 2, background: '#252526', padding: '8px 0 8px 0' }}>
+      <div style={{ position: 'relative' }}>
+        <span style={{ position: 'absolute', left: 8, top: '50%', transform: 'translateY(-50%)', color: '#777', fontSize: 12, pointerEvents: 'none' }}>🔍</span>
+        <input
+          type="text"
+          value={search}
+          onChange={e => setSearch(e.target.value)}
+          placeholder="Search blocks…"
+          style={{ width: '100%', boxSizing: 'border-box', padding: '6px 26px 6px 26px', background: '#1e1e1e', border: '1px solid #3e3e42', borderRadius: 4, color: '#eee', fontSize: 12, outline: 'none' }}
+        />
+        {search && (
+          <span
+            onClick={() => setSearch('')}
+            title="Clear"
+            style={{ position: 'absolute', right: 6, top: '50%', transform: 'translateY(-50%)', color: '#999', fontSize: 14, cursor: 'pointer', lineHeight: 1 }}
+          >×</span>
+        )}
+      </div>
+    </div>
+  );
+
   return (
     <div style={{ padding: '0 10px', height: '100%', overflowY: 'auto' }}>
+
+      {searchBox}
+
+      {query ? (
+        /* ── Flat, grouped search results ── */
+        groupedResults.length === 0 ? (
+          <div style={{ padding: '16px 4px', color: '#888', fontSize: 12 }}>
+            No blocks match “{search.trim()}”.
+          </div>
+        ) : (
+          groupedResults.map(g => (
+            <div key={g.title} style={{ marginBottom: 8 }}>
+              <div style={{ padding: '5px 4px', color: '#999', fontSize: 10, fontWeight: 600, textTransform: 'uppercase', letterSpacing: '0.3px', borderBottom: '1px solid #3e3e42', marginBottom: 3 }}>
+                {g.title}
+                <span style={{ marginLeft: 'auto', float: 'right', opacity: 0.5 }}>{g.items.length}</span>
+              </div>
+              <div style={{ paddingLeft: 6 }}>
+                {g.items.map((item, idx) => (
+                  <ToolboxItem key={`${item.blockType}_${item.subType || ''}_${idx}`} {...item} />
+                ))}
+              </div>
+            </div>
+          ))
+        )
+      ) : (
+      <>
 
       {/* ── Board-specific blocks ── */}
       {boardTree.length > 0 && (
@@ -546,6 +642,8 @@ const Toolbox = ({ userDefinedBlocks = [], libraryData = [], activeFileType, sel
             </div>
           )}
         </div>
+      )}
+      </>
       )}
     </div>
   );

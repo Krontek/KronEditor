@@ -27,11 +27,10 @@ import (
 // (rolls back on a bad .so). The editor keeps reading live variables from the
 // host-owned /dev/shm mirror by variables.json offset throughout.
 //
-// Generation numbers (logic_<n>.so) are NEVER trusted from an in-memory
-// counter — they are always re-derived by scanning the build dir via
-// hotswaplib.DiscoverGeneration/NextGeneration, which is what the field-path's
-// sibling (server/hotswap.go) does too, so the two can never desync the way
-// the old in-memory-counter scheme did. Cleanup of an old .so happens ONLY
+// Naming uses the bounded 2-slot ping-pong (logic_0.so <-> logic_1.so): each
+// swap targets the slot that is NOT the one we are CERTAIN is running (curGen,
+// advanced only on a confirmed OK — never inferred from a directory listing),
+// so the generation number never grows. Cleanup of the old slot happens ONLY
 // after the loader-host has CONFIRMED (via the swap_result file protocol,
 // hotswaplib.PollSwapResult) that the new generation is actually running —
 // never optimistically right after a compile.
@@ -75,6 +74,15 @@ type HotSwapState struct {
 	specs  []ShmSpec
 	stopCh chan struct{}
 	done   chan struct{} // closed by the reaper goroutine (the ONLY cmd.Wait caller)
+
+	// curGen is the generation we are CERTAIN the loader-host is running: the
+	// gen launched at cold start (always 0) and advanced ONLY when a swap is
+	// CONFIRMED "OK". It is never inferred from a directory listing (ambiguous
+	// while two ping-pong slots briefly coexist), so we always know exactly
+	// which slot is running and which slot the next swap targets
+	// (PingPongGeneration(curGen)). Guarded by swapMu (the whole swap holds it)
+	// and set under mu at run.
+	curGen int
 }
 
 func NewHotSwapState() *HotSwapState { return &HotSwapState{} }
@@ -186,8 +194,9 @@ func swapResultPath(buildDir string) string { return filepath.Join(buildDir, "sw
 func swapRequestPath(buildDir string) string { return filepath.Join(buildDir, "swap_request") }
 
 // compileLogic builds logic_<ver>.so from the plc.c already in buildDir. The
-// caller decides ver (via hotswaplib.NextGeneration) and is responsible for
-// cleanup — this function only compiles, it never deletes anything.
+// caller decides ver (the ping-pong slot, via hotswaplib.PingPongGeneration off
+// the confirmed-running generation) and is responsible for cleanup — this
+// function only compiles (atomically: temp file then rename), never deletes.
 func (s *Server) compileLogic(buildDir string, ver int) (string, string, error) {
 	resInclude, err := s.paths.ResourceTargetIncludeDir("x86_64/linux")
 	if err != nil {
@@ -205,17 +214,27 @@ func (s *Server) compileLogic(buildDir string, ver int) (string, string, error) 
 	plcC := filepath.Join(buildDir, "plc.c")
 	logicSO := hotswaplib.GenerationPath(buildDir, ver)
 
+	// Compile to a temp path then atomically rename onto the real slot: ping-pong
+	// REUSES slot names, so writing logic_<ver>.so in place could truncate a .so
+	// the running loader-host still has mmap'd. rename swaps the dir entry to a
+	// fresh inode while the old inode stays mapped.
+	tmpSO := hotswaplib.TempGenerationPath(buildDir, ver)
 	args := append([]string{}, baseArgs...)
 	args = append(args,
 		"-shared", "-fPIC", "-DPLC_HOTSWAP", "-DKRON_EC_SIM",
 		"-I", buildDir, "-I", resInclude,
 		"-I", simInc, "-I", filepath.Join(resInclude, "soem/include"),
-		"-fuse-ld=lld", "-O2", "-o", logicSO, plcC,
+		"-fuse-ld=lld", "-O2", "-o", tmpSO, plcC,
 	)
 	args = append(args, CollectStaticArchives(libDir)...)
 	args = append(args, "-lm")
 	if out, err := exec.Command(compiler, args...).CombinedOutput(); err != nil {
+		_ = os.Remove(tmpSO)
 		return "", "", fmt.Errorf("logic.so build failed: %v\n%s", err, out)
+	}
+	if err := os.Rename(tmpSO, logicSO); err != nil {
+		_ = os.Remove(tmpSO)
+		return "", "", fmt.Errorf("logic.so install failed: %w", err)
 	}
 	return logicSO, "", nil
 }
@@ -310,6 +329,7 @@ func (s *Server) compileLogicForTarget(buildDir, boardID string, ver int) (strin
 		return "", err
 	}
 	logicSO := hotswaplib.GenerationPath(buildDir, ver)
+	tmpSO := hotswaplib.TempGenerationPath(buildDir, ver) // atomic install — see compileLogic
 	args := append([]string{}, baseArgs...)
 	args = append(args, "-shared", "-fPIC", "-DPLC_HOTSWAP", "-O2", "-ffunction-sections", "-fdata-sections", "-fuse-ld=lld")
 	for _, inc := range sysIncs {
@@ -317,14 +337,19 @@ func (s *Server) compileLogicForTarget(buildDir, boardID string, ver int) (strin
 	}
 	args = append(args, "-I", buildDir, "-I", resInclude)
 	args = append(args, soemIncludeArgs(resInclude)...)
-	args = append(args, "-o", logicSO, filepath.Join(buildDir, "plc.c"))
+	args = append(args, "-o", tmpSO, filepath.Join(buildDir, "plc.c"))
 	for _, l := range s.paths.LLVMTargetLibraryDirs(llvmTarget) {
 		args = append(args, "-L", l)
 	}
 	args = append(args, CollectStaticArchives(libDir)...)
 	args = append(args, "-lm")
 	if out, err := exec.Command(compiler, args...).CombinedOutput(); err != nil {
+		_ = os.Remove(tmpSO)
 		return "", fmt.Errorf("target logic.so build failed: %v\n%s", err, out)
+	}
+	if err := os.Rename(tmpSO, logicSO); err != nil {
+		_ = os.Remove(tmpSO)
+		return "", fmt.Errorf("target logic.so install failed: %w", err)
 	}
 	return logicSO, nil
 }
@@ -459,12 +484,23 @@ func (s *Server) handleHotSwapTargetLogic(w http.ResponseWriter, r *http.Request
 	if req.Header != "" {
 		_ = os.WriteFile(filepath.Join(buildDir, "plc.h"), []byte(req.Header), 0o644)
 	}
-	ver := hotswaplib.NextGeneration(buildDir)
+	// This only STAGES the .so for upload; the target device runs its own
+	// ping-pong when it receives it (server handleDeployLogic decides the real
+	// slot off ITS confirmed-running generation). So here we just keep the local
+	// build dir bounded to a single fresh staging file that deploy-swap's
+	// DiscoverGeneration will pick up. Ping-pong off whatever is currently
+	// staged so we never grow the number locally either.
+	stagedCur, _, ok := hotswaplib.DiscoverGeneration(buildDir)
+	if !ok {
+		stagedCur = 0
+	}
+	ver := hotswaplib.PingPongGeneration(stagedCur)
 	logicSO, err := s.compileLogicForTarget(buildDir, req.BoardID, ver)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	_ = hotswaplib.CleanupExcept(buildDir, ver) // keep only the freshly staged .so
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "version": ver, "logic": logicSO})
 }
 
@@ -625,6 +661,7 @@ func (s *Server) handleHotSwapRun(w http.ResponseWriter, r *http.Request) {
 	s.hotswap.pid = cmd.Process.Pid
 	s.hotswap.stopCh = stopCh
 	s.hotswap.done = done
+	s.hotswap.curGen = 0 // cold start always launches logic_0.so (see logicSO above)
 	specs := s.hotswap.specs
 	pid := s.hotswap.pid
 	s.hotswap.mu.Unlock()
@@ -727,7 +764,15 @@ func (s *Server) handleHotSwapSwap(w http.ResponseWriter, r *http.Request) {
 		_ = os.WriteFile(filepath.Join(buildDir, "plc.h"), []byte(req.Header), 0o644)
 	}
 
-	ver := hotswaplib.NextGeneration(buildDir)
+	// Ping-pong: target the slot that is NOT the one we are CERTAIN is running
+	// (curGen), so the generation number never grows and we always know exactly
+	// which slot is live and which we are about to send. curGen is read under mu
+	// but only mutated here under swapMu (held for the whole swap), so no other
+	// swap can move it mid-operation.
+	s.hotswap.mu.Lock()
+	cur := s.hotswap.curGen
+	s.hotswap.mu.Unlock()
+	ver := hotswaplib.PingPongGeneration(cur)
 	logicSO, _, err := s.compileLogic(buildDir, ver)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
@@ -750,15 +795,21 @@ func (s *Server) handleHotSwapSwap(w http.ResponseWriter, r *http.Request) {
 	status, detail, perr := hotswaplib.PollSwapResult(resultPath, ver, swapResultTimeout)
 	switch {
 	case perr != nil:
-		// Outcome unknown — never assume success, never delete anything. Non-2xx
-		// so HostClient's _wrap throws instead of silently resolving "ok".
+		// Outcome unknown — never assume success, never delete anything, and
+		// leave curGen unchanged (we stay CERTAIN only of the last confirmed
+		// generation). Non-2xx so HostClient's _wrap throws instead of silently
+		// resolving "ok".
 		s.events.Emit("simulation-output", map[string]any{"status": "hotswap-unknown", "version": ver})
 		writeJSON(w, http.StatusGatewayTimeout, map[string]any{"ok": false, "error": "hot-swap outcome unknown (timeout)", "version": ver, "confirmed": false, "reason": "timeout"})
 	case status == "OK":
+		// CONFIRMED running ver now — advance curGen and delete the OTHER slot.
+		s.hotswap.mu.Lock()
+		s.hotswap.curGen = ver
+		s.hotswap.mu.Unlock()
 		_ = hotswaplib.CleanupExcept(buildDir, ver)
 		s.events.Emit("simulation-output", map[string]any{"status": "hotswapped", "version": ver})
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "version": ver, "logic": logicSO})
-	default: // FAIL — the PREVIOUS generation is still running (loader-host already rolled back itself).
+	default: // FAIL — the PREVIOUS generation (curGen) is still running (loader-host already rolled back itself).
 		_ = os.Remove(logicSO) // only the rejected candidate; never touch the still-running old one
 		s.events.Emit("simulation-output", map[string]any{"status": "hotswap-failed", "version": ver, "reason": detail})
 		writeJSON(w, http.StatusConflict, map[string]any{"ok": false, "error": "hot-swap rejected: " + detail, "version": ver, "confirmed": true, "reason": detail})

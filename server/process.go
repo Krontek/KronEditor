@@ -73,6 +73,15 @@ type ProcessManager struct {
 	stderrFile *os.File
 	lastEvent  *RuntimeEvent // guarded by mu; last swap/coldstart/crash outcome
 
+	// curGen is the logic generation we are CERTAIN the loader-host is running:
+	// the gen actually passed to runtime.bin at (re)start, advanced ONLY when a
+	// swap is CONFIRMED "OK". handleDeployLogic reads it (ConfirmedGen) to place
+	// each online change into the OTHER ping-pong slot, so we always know
+	// exactly which numbered logic is live and which one is being sent — never
+	// inferred from an ambiguous directory listing. Guarded by mu; -1 = the
+	// runtime is not running in hot-swap mode.
+	curGen int
+
 	// preStartHook runs inside Start() AFTER any previous process has been
 	// fully stopped and BEFORE the new one is spawned. Wired to
 	// ipc.WriteInitialValues so initial values can never be overwritten by
@@ -107,7 +116,17 @@ func (pm *ProcessManager) recordEvent(kind, status, detail string) {
 }
 
 func NewProcessManager(deployDir string) *ProcessManager {
-	return &ProcessManager{deployDir: deployDir}
+	return &ProcessManager{deployDir: deployDir, curGen: -1}
+}
+
+// ConfirmedGen returns the logic generation currently running in hot-swap mode
+// (the one launched at cold start or last CONFIRMED by a swap), or -1 if the
+// runtime is not running as a hot-swap loader-host. handleDeployLogic uses it
+// to pick the alternate ping-pong slot for an online change.
+func (pm *ProcessManager) ConfirmedGen() int {
+	pm.mu.Lock()
+	defer pm.mu.Unlock()
+	return pm.curGen
 }
 
 // SetAutoRunGetter wires up the callback used by the crash-restart watchdog
@@ -355,6 +374,15 @@ func (pm *ProcessManager) spawnRuntime() (hotSwapGen int, hotSwap bool, err erro
 	// agent restart or when generation 0 has since been cleaned up.
 	var logicPath string
 	hotSwapGen, logicPath, hotSwap = hotswaplib.DiscoverGeneration(pm.deployDir)
+	// Record the generation we are about to launch as the CONFIRMED-running one
+	// (or -1 for a plain self-contained binary). A cold hot-swap deploy wipes
+	// stale logic_*.so and ships exactly logic_0, so on a freshly deployed
+	// device this is deterministically 0 — no ambiguity about what is running.
+	if hotSwap {
+		pm.curGen = hotSwapGen
+	} else {
+		pm.curGen = -1
+	}
 
 	// SOEM requires CAP_NET_RAW (raw socket access for EtherCAT).
 	// If this process is already root (uid=0), spawn directly.
@@ -472,6 +500,11 @@ func (pm *ProcessManager) SwapLogic(logicFile string) (status, detail string, er
 	}
 	pm.recordEvent("swap", st, det)
 	if st == "OK" {
+		// CONFIRMED running `gen` now — advance the certain-running generation
+		// and delete the OTHER ping-pong slot. Never inferred from disk.
+		pm.mu.Lock()
+		pm.curGen = gen
+		pm.mu.Unlock()
 		_ = hotswaplib.CleanupExcept(pm.deployDir, gen)
 		slog.Info("Hot-swap confirmed", "generation", gen)
 	} else {

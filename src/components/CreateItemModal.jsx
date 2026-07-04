@@ -3,13 +3,17 @@ import { DataTypeSelector } from './common/Selectors';
 
 const CreateItemModal = ({ isOpen, onClose, onConfirm, category, defaultName, isEdit, initialData }) => {
     const [name, setName] = useState('');
-    const [language, setLanguage] = useState('LD');
+    // POUs are the unified rung model — the language is chosen PER RUNG in the
+    // editor (Ladder or Structured Text), not up front. So programs/FBs/
+    // functions are always created as 'SCL' (the internal tag for that model)
+    // and there is no language picker for them anymore. Data types use 'UDT'.
+    const [language, setLanguage] = useState('SCL');
     const [returnType, setReturnType] = useState('BOOL');
 
     useEffect(() => {
         if (isOpen) {
             setName(isEdit ? initialData?.name || '' : defaultName || '');
-            setLanguage(isEdit ? initialData?.language || 'LD' : category === 'dataTypes' ? 'UDT' : 'LD');
+            setLanguage(category === 'dataTypes' ? 'UDT' : 'SCL');
             setReturnType(isEdit ? initialData?.returnType || 'BOOL' : 'BOOL');
         }
     }, [isOpen, defaultName, category, isEdit, initialData]);
@@ -38,12 +42,6 @@ const CreateItemModal = ({ isOpen, onClose, onConfirm, category, defaultName, is
             onClose();
         }
     };
-
-    const LANGUAGES = [
-        { value: 'LD', label: 'Ladder Logic (LD)' },
-        { value: 'ST', label: 'Structured Text (ST)' },
-        { value: 'SCL', label: 'SCL – Mixed LD/ST per rung' },
-    ];
 
     return (
         <div style={{
@@ -121,28 +119,12 @@ const CreateItemModal = ({ isOpen, onClose, onConfirm, category, defaultName, is
                     </div>
                 )}
 
-                {/* Language Selection */}
-                {!isDataType && (
-                    <div style={{ marginBottom: '25px' }}>
-                        <label style={{ display: 'block', marginBottom: '8px', fontSize: '12px', color: '#ccc' }}>
-                            Language
-                        </label>
-                        <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
-                            {LANGUAGES.map(({ value, label }) => (
-                                <label key={value} style={{ display: 'flex', alignItems: 'center', gap: '8px', cursor: isEdit ? 'not-allowed' : 'pointer' }}>
-                                    <input
-                                        type="radio"
-                                        name="language"
-                                        value={value}
-                                        checked={language === value}
-                                        onChange={(e) => setLanguage(e.target.value)}
-                                        disabled={isEdit}
-                                        style={{ accentColor: '#007acc', cursor: isEdit ? 'not-allowed' : 'pointer' }}
-                                    />
-                                    <span style={{ opacity: isEdit ? 0.6 : 1 }}>{label}</span>
-                                </label>
-                            ))}
-                        </div>
+                {/* No language picker: a POU is a list of rungs, and each rung's
+                    language (Ladder or Structured Text) is chosen inside the
+                    editor with the "+ Rung" button. */}
+                {!isDataType && !isEdit && (
+                    <div style={{ marginBottom: '25px', fontSize: '12px', color: '#9aa', lineHeight: 1.5, background: '#1e1e1e', border: '1px solid #333', borderRadius: 4, padding: '10px 12px' }}>
+                        Add <strong>Ladder</strong> or <strong>Structured Text</strong> rungs inside the editor — you can mix both in the same POU.
                     </div>
                 )}
 

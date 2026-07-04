@@ -165,6 +165,9 @@ const TreeNode = ({ level = 0, icon, label, isOpen, onToggle, active, onClick, o
 /* ─── Item type icon ───────────────────────────────────────────────────────── */
 
 const itemIcon = (item) => {
+    // Unified rung-based POU (the only POU kind now). Legacy LD/ST icons kept
+    // for projects not yet re-saved (they normalize to SCL on load anyway).
+    if (item.type === 'SCL') return '🪜';
     if (item.type === 'ST') return '📄';
     if (item.type === 'LD') return '🪜';
     if (item.type === 'Array') return <span style={{ fontFamily: 'monospace', fontWeight: 'bold', fontSize: 10, background: '#0e639c', color: '#fff', padding: '1px 3px', borderRadius: 3 }}>[ ]</span>;

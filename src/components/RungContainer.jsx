@@ -476,7 +476,10 @@ const BlockNode = ({ id, data, selected }) => {
   const handleUpdate = useCallback((updates) => {
     setNodes((nds) => nds.map((n) => {
       if (n.id === id) {
-        const newData = { ...n.data, ...updates };
+        // __declare is a transient commit marker for the editor's inline
+        // variable declaration — forward it upstream but keep it out of node data.
+        const { __declare, ...dataUpdates } = updates;
+        const newData = { ...n.data, ...dataUpdates };
         // Sync values if instanceName changes
         if (updates.instanceName) {
           newData.values = {
@@ -605,6 +608,18 @@ const BlockNode = ({ id, data, selected }) => {
               if (typedVarDef && typedVarDef.type !== 'BOOL') return;
               handleUpdate({ instanceName: val });
             }}
+            // Blur / Enter = COMMIT: this is when an undeclared name is
+            // auto-declared as a BOOL (inline declaration). Never on keystroke
+            // — that would declare every typed prefix ("m", "mo", "mot", …).
+            onBlur={() => {
+              if (data.readOnly) return;
+              const val = (localInstanceName || '').replace(/[🌍🏠⊞⊡⊟]/g, '').trim();
+              if (!val) return;
+              const typedVarDef = allVars.find(v => v.name === val.split(/[\[.]/)[0]);
+              if (typedVarDef && typedVarDef.type !== 'BOOL') return;
+              handleUpdate({ instanceName: val, __declare: true });
+            }}
+            onKeyDown={(e) => { if (e.key === 'Enter') e.currentTarget.blur(); }}
             list={data.readOnly ? undefined : "ladder-vars-BOOL"}
             placeholder="??"
             style={{

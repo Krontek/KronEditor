@@ -531,13 +531,16 @@ export function applyToolCall(struct, name, args = {}) {
         if (!isValidIecName(args.name)) return { ok: false, error: `invalid name "${args.name}" — POU names must be IEC identifiers (letters, digits, underscore; no spaces; can't start with a digit)` };
         if (isReservedTranspilerName(args.name)) return { ok: false, error: `"${args.name}" is reserved by the transpiler/runtime — pick a different POU name` };
         if (findPOU(struct, args.name)) return { ok: false, error: `a POU named "${args.name}" already exists` };
-        const language = (args.language === 'LD' || args.language === 'SCL') ? args.language : 'ST';
-        // LD + SCL store logic as rungs; ST stores a single code body.
-        const content = (language === 'LD' || language === 'SCL') ? { rungs: [], variables: [] } : { code: '', variables: [] };
+        // Unified rung model: every POU is 'SCL' (a list of rungs, each LD or
+        // ST). The requested language is honored PER RUNG — set_ladder adds LD
+        // rungs, set_st_code adds an ST rung — so we no longer create distinct
+        // LD/ST POU types. (args.language is accepted but only steers which tool
+        // the model should call next; it never changes the POU type.)
+        const content = { rungs: [], variables: [] };
         const item = {
           id: `${category}_${Date.now()}`,
           name: args.name.trim(),
-          type: language,
+          type: 'SCL',
           returnType: category === 'functions' ? (args.returnType || 'BOOL') : undefined,
           content,
         };

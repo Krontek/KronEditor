@@ -20,6 +20,7 @@ import EditorTabs from './components/EditorTabs';
 import {
   FolderIcon, ChevronDownIcon, InfoIcon, SettingsIcon, BuildIcon, UploadIcon,
   FlaskIcon, PlayIcon, StopIcon, RepeatIcon, OpenIcon, SaveIcon, SaveAsIcon, CloseIcon,
+  BoltIcon,
 } from './components/ToolbarIcons';
 import SaveConfirmDialog from './components/SaveConfirmDialog';
 import VisualizationEditor from './components/visualization/VisualizationEditor';
@@ -46,6 +47,52 @@ import PlcIcon from './assets/icons/plc-icon.png';
 import EtherCATIconSrc from './assets/icons/ethercat.png';
 const EtherCATTabIcon = <img src={EtherCATIconSrc} height="13" style={{ objectFit: 'contain', verticalAlign: 'middle' }} alt="EtherCAT" />;
 import './App.css';
+
+// ── Unified rung-based POU model ─────────────────────────────────────────────
+// Every program / function block / function is ONE kind of thing: a list of
+// RUNGS, where each rung is authored in either Ladder (LD) or Structured Text
+// (ST). There is no separate "ST POU" vs "LD POU" vs "SCL POU" anymore — the
+// old `SCL` type IS this unified model, and it is now the only one the UI
+// creates. Older projects (and any agent output) may still carry the legacy
+// types `LD` (all-ladder rungs) or `ST` (a single code body); we fold them into
+// the unified shape on load and on create so the editor, transpiler and I/O
+// only ever deal with one type. This keeps the mental model simple: "everything
+// is rungs; pick the language per rung."
+const RUNG_POU_CATEGORIES = ['programs', 'functionBlocks', 'functions'];
+const normalizePouToRungs = (item) => {
+  if (!item || !item.content) return item;
+  if (item.type === 'ST') {
+    const code = item.content.code || '';
+    return {
+      ...item,
+      type: 'SCL',
+      content: {
+        variables: item.content.variables || [],
+        rungs: code.trim()
+          ? [{ id: `${item.id}_r0`, lang: 'ST', code, blocks: [], connections: [] }]
+          : [],
+      },
+    };
+  }
+  if (item.type === 'LD') {
+    // LD rungs are already the right shape; a rung with no `lang` renders/
+    // transpiles as LD, so no per-rung migration is needed.
+    return {
+      ...item,
+      type: 'SCL',
+      content: { variables: item.content.variables || [], rungs: item.content.rungs || [] },
+    };
+  }
+  return item; // already SCL, or a non-POU (UDT / GVL / resource)
+};
+const normalizeProjectToRungs = (struct) => {
+  if (!struct) return struct;
+  const next = { ...struct };
+  RUNG_POU_CATEGORIES.forEach((cat) => {
+    if (Array.isArray(next[cat])) next[cat] = next[cat].map(normalizePouToRungs);
+  });
+  return next;
+};
 
 // Pre-flight layout signature gating hot-swap — a FAST, FRIENDLY UX layer
 // only, not the safety boundary. If any of these sub-signatures change since
@@ -315,6 +362,14 @@ function App() {
   const [agentReloadKey, setAgentReloadKey] = useState(0);
   // Hot-swap (online change) session active — agent-approved edits go live.
   const [isHotSwap, setIsHotSwap] = useState(false);
+  // Field online-change mode: a hot-swap loader-host has been deployed to the
+  // connected target, so edits apply as online changes (no restart) instead of
+  // via a full Build & Send. Distinct from isHotSwap (which is also true for the
+  // local-sim hot-swap). Cleared by Stop Live, a plain Build & Send (which
+  // deploys a self-contained binary and thus ends online-change mode), or
+  // losing the connection. Drives the "Go Live" toolbar toggle.
+  const [fieldHotSwap, setFieldHotSwap] = useState(false);
+  const [hotSwapBusy, setHotSwapBusy] = useState(false); // Go Live deploy in flight
 
   // Save-confirm dialog state
   const [saveConfirmOpen, setSaveConfirmOpen] = useState(false);
@@ -1100,7 +1155,9 @@ function App() {
     try {
       const result = importProjectFromXml(content);
       if (result) {
-        const { projectStructure: newStructure, boardId, plcAddress: savedAddr, sshUser: savedSshUser, sshPort: savedSshPort, apiPassword: savedApiPassword, autoRun: savedAutoRun } = result;
+        // Fold any legacy LD/ST POUs into the unified rung model on load.
+        const newStructure = normalizeProjectToRungs(result.projectStructure);
+        const { boardId, plcAddress: savedAddr, sshUser: savedSshUser, sshPort: savedSshPort, apiPassword: savedApiPassword, autoRun: savedAutoRun } = result;
         // Ensure Configuration Resource Exists
         if (!newStructure.resources || newStructure.resources.length === 0) {
           newStructure.resources = [
@@ -1583,6 +1640,10 @@ function App() {
 
       setIsDeployed(true);
       setIsDirty(false);
+      // A plain Build & Send deploys a SELF-CONTAINED runtime (compileForTarget),
+      // replacing any loader-host on the target — so field online-change mode is
+      // no longer in effect. Re-enable it later with "Go Live" if desired.
+      if (fieldHotSwap) { setFieldHotSwap(false); setIsHotSwap(false); }
 
       // Store debug defaults for live variable display
       if (cCode.variableTable && cCode.variableTable.debugDefaults) {
@@ -1780,15 +1841,21 @@ function App() {
       return true;
     }
 
+    // Programs / function blocks / functions are always the unified rung model
+    // (internally still tagged 'SCL'); the create modal no longer asks for a
+    // language — you add LD or ST rungs inside the editor. Data types / globals
+    // keep their own shapes.
+    const isRungPou = RUNG_POU_CATEGORIES.includes(category);
+    const pouType = isRungPou ? 'SCL' : type;
     const newItem = {
       id: `${category}_${Date.now()}`,
       name: name,
-      type,
+      type: pouType,
       returnType: category === 'functions' ? returnType : undefined,
       content:
-        (type === 'LD' || type === 'SCL') ? { rungs: [], variables: [] } :
-          type === 'UDT' ? { members: [] } :
-            type === 'GVL' ? { variables: [] } :
+        isRungPou ? { rungs: [], variables: [] } :
+          pouType === 'UDT' ? { members: [] } :
+            pouType === 'GVL' ? { variables: [] } :
               { code: '', variables: [] }
     };
 
@@ -2172,10 +2239,17 @@ function App() {
   // only — see layoutSignature's own comment for the real safety boundary.
   const layoutSigRef = React.useRef(null);
 
+  // Losing the target connection ends field online-change mode (the loader-host
+  // may still be running on the device, but the editor can no longer push swaps).
+  useEffect(() => {
+    if (!isPlcConnected && fieldHotSwap) { setFieldHotSwap(false); setIsHotSwap(false); }
+  }, [isPlcConnected, fieldHotSwap]);
+
   // "Go live": if connected to a remote PLC, deploy a hot-swap-capable runtime
   // (loader-host + logic_0.so) to the field; otherwise start a LOCAL sim
   // hot-swap session. Either way, agent-approved edits then apply online.
   const startHotSwapSession = useCallback(async () => {
+    setHotSwapBusy(true);
     const standardHeaders = await host.getStandardHeaders().catch(() => []);
     try {
       if (isPlcConnected && plcAddress) {
@@ -2189,11 +2263,13 @@ function App() {
         // Dedicated hot-swap deploy path (NOT plain deployToServer, which is
         // Build & Send's self-contained-binary path and deliberately never
         // uploads a logic.so) — uploads runtime.bin(loader-host) + variables +
-        // logic_0.so as one atomic sequence.
+        // logic_0.so (cold, generation 0) as one atomic sequence.
         await host.hotswapTargetDeploy(plcAddress);
         hotSwapActiveRef.current = false;       // field mode (not local sim)
         setIsHotSwap(true);
-        addLog('success', 'Field hot-swap runtime deployed — online change enabled on the target.');
+        setFieldHotSwap(true);
+        setIsRunning(true);                     // the loader-host is now running the logic
+        addLog('success', 'Field hot-swap runtime deployed — online change enabled on the target (state preserved across edits).');
       } else {
         const cCode = transpileToC(projectStructure, standardHeaders, selectedBoard, true, buses, busConfigs);
         await host.hotswapBuild({
@@ -2212,6 +2288,8 @@ function App() {
       layoutSigRef.current = layoutSignature(projectStructure, selectedBoard, buses, busConfigs);
     } catch (err) {
       addLog('error', `Failed to start hot-swap session: ${err.message || err}`);
+    } finally {
+      setHotSwapBusy(false);
     }
   }, [projectStructure, selectedBoard, buses, busConfigs, isPlcConnected, plcAddress, addLog]);
 
@@ -2219,8 +2297,13 @@ function App() {
     if (hotSwapActiveRef.current) { try { await host.hotswapStop(); } catch { /* ignore */ } setIsRunning(false); }
     hotSwapActiveRef.current = false;
     setIsHotSwap(false);
-    addLog('info', 'Hot-swap session stopped.');
-  }, [addLog]);
+    // Field online-change mode ends too. NOTE: the loader-host keeps running on
+    // the target (it is an independent process, like any deployed runtime) —
+    // this only stops the editor pushing further online changes. Use Build &
+    // Send to replace it with a fresh runtime, or Stop from the runtime controls.
+    if (fieldHotSwap) { setFieldHotSwap(false); addLog('info', 'Online-change mode ended — the target keeps running the last logic.'); }
+    else { addLog('info', 'Hot-swap session stopped.'); }
+  }, [fieldHotSwap, addLog]);
 
   // Agent approved a code change while a hot-swap session is active → push it as
   // an online change (no restart, state preserved). Sim → local swap; field →
@@ -2254,11 +2337,15 @@ function App() {
         const cCode = transpileToC(projectStructure, standardHeaders, selectedBoard, true, buses, busConfigs);
         await host.hotswapSwap({ header: cCode.header, source: cCode.source });
         addLog('success', `Hot reload applied (sim): ${what}`);
-      } else if (isHotSwap && isPlcConnected && plcAddress) {
+      } else if (fieldHotSwap && isPlcConnected && plcAddress) {
         if (!window.confirm(`The PLC at ${plcAddress} is RUNNING.\n\nThis applies your change LIVE as an online change — the logic is swapped without stopping the runtime, so outputs may change immediately on real hardware (timers/counters/latches are preserved).\n\nChanged: ${what}\n\nApply to the live PLC now?`)) {
           addLog('info', 'Online change to target cancelled.');
           return;
         }
+        // Stage the new logic (host-agent picks the local staging slot) then push
+        // it to the target, which ping-pongs it into the slot NOT currently
+        // running and swaps only after confirming — surfacing a rejected swap
+        // (e.g. a layout mismatch caught by the loader-host) as an error.
         const cCode = transpileToC(projectStructure, standardHeaders, selectedBoard, false, buses, busConfigs);
         await host.hotswapTargetLogic({ header: cCode.header, source: cCode.source, boardId: selectedBoard });
         await host.hotswapDeploySwap(plcAddress);
@@ -2267,7 +2354,7 @@ function App() {
     } catch (e) {
       addLog('error', `Hot-swap apply failed (a layout change needs a full redeploy): ${e.message || e}`);
     }
-  }, [projectStructure, selectedBoard, buses, busConfigs, isHotSwap, isPlcConnected, plcAddress, addLog]);
+  }, [projectStructure, selectedBoard, buses, busConfigs, isHotSwap, fieldHotSwap, isPlcConnected, plcAddress, addLog]);
 
   // --- Resize Effects ---
   useEffect(() => {
@@ -2465,6 +2552,26 @@ function App() {
               {isPlcConnected ? <UploadIcon /> : <BuildIcon />}
               <span>{isPlcConnected ? 'Build & Send' : (t('actions.build') || 'Build')}</span>
             </button>
+
+            {/* Go Live: deploy a hot-swap loader-host to the connected target so
+                agent-approved edits apply as ONLINE changes (state preserved, no
+                restart) instead of a full Build & Send. Field path only. */}
+            {isPlcConnected && (
+              <button
+                className={`tb-btn tb-text ${fieldHotSwap ? 'tb-toggle-on' : 'tb-toggle-off'}`}
+                onClick={fieldHotSwap ? stopHotSwapSession : startHotSwapSession}
+                disabled={hotSwapBusy}
+                title={
+                  hotSwapBusy ? 'Deploying hot-swap runtime…'
+                    : fieldHotSwap ? 'Online-change mode is ON — agent edits apply live (state preserved). Click to stop pushing online changes.'
+                      : 'Go Live: deploy a hot-swap runtime so edits apply online without a restart (state preserved). Alternative to Build & Send.'
+                }
+              >
+                <BoltIcon />
+                <span>{hotSwapBusy ? 'Deploying…' : 'Go Live'}</span>
+                <span className={`tb-pill ${fieldHotSwap ? 'on' : ''}`}>{fieldHotSwap ? 'ON' : 'OFF'}</span>
+              </button>
+            )}
 
             <div className="tb-divider" />
 
