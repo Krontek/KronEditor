@@ -2401,6 +2401,12 @@ const FB_Q_OUTPUT = {
     'MC_ReadMotionState': 'Valid', 'MC_ReadAxisInfo': 'Valid', 'MC_ReadAxisError': 'Valid',
 };
 
+// Exported for agentTools.js (the PLC Agent's set_ladder): the agent authors
+// FB-in-ladder rungs and must wire the power flow into the SAME trigger pin and
+// out of the SAME Q pin this transpiler uses — importing the tables keeps one
+// source of truth instead of a hand-copied map that would silently drift.
+export { FB_TRIGGER_PIN, FB_Q_OUTPUT };
+
 const GENERATED_FB_OUTPUT_TYPES = {};
 
 // Returns the IEC type of an output pin for a given block type

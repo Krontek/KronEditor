@@ -19,6 +19,11 @@
  */
 
 import { isReservedTranspilerName } from '../utils/reservedNames';
+// Single source of truth for FB power-flow wiring: the transpiler reads the
+// trigger pin (power in) and Q pin (power out) from these tables, so the
+// ladder the agent authors must use exactly the same pins.
+import { FB_TRIGGER_PIN, FB_Q_OUTPUT } from './CTranspilerService';
+import { GENERIC_FB_DEFS } from '../utils/libraryTree';
 
 const POU_CATEGORIES = ['programs', 'functionBlocks', 'functions'];
 const RESOURCE_TYPE = 'RESOURCE_EDITOR';
@@ -337,14 +342,16 @@ export const TOOL_DEFS = [
   {
     name: 'set_ladder',
     description:
-      'Replace the ENTIRE ladder (all rungs) of an LD or SCL POU. Express each rung as a boolean network of CONTACTS driving one or more output COILS. ' +
-      'A rung = OR of `branches` (each branch is an AND-series of contacts), optionally followed by `seriesAfter` contacts (in series after the OR-merge — e.g. a normally-closed Stop for a seal-in), then `outputs` coils. ' +
-      'Contact subType: "NO" (normally open) or "NC" (normally closed). Coil subType: "Normal", "Set", "Reset" or "Negated". ' +
-      'Every contact/coil variable must be a BOOL that already exists (add it with add_variable first). ' +
-      'Each rung is an OBJECT (use {…}, never [...]). Example — Start/Stop seal-in driving Motor: ' +
-      'rungs: [{ "branches": [[{"contact":"Start"}], [{"contact":"Motor"}]], "seriesAfter": [{"contact":"Stop","subType":"NC"}], "outputs": [{"coil":"Motor"}] }]. ' +
-      'Simplest rung — coil driven directly from power (no contacts): rungs: [{ "outputs": [{"coil":"mc_power"}] }]. ' +
-      'Note: this tool supports contacts and coils only — for timers, counters or other function blocks in ladder, use ST instead.',
+      'Replace the ENTIRE ladder (all rungs) of an LD or SCL POU. Express each rung as a boolean network of CONTACTS, optionally through ONE function block (timer/counter/edge/comm/user FB), driving output COILS. ' +
+      'A rung = OR of `branches` (each branch is an AND-series of contacts), optionally followed by `seriesAfter` contacts (in series after the OR-merge — e.g. a normally-closed Stop for a seal-in), then an optional `fb`, then `outputs` coils. ' +
+      'Power flow: contact network → fb trigger input → fb Q output → coils. ' +
+      'Contact subType: "NO" (normally open), "NC" (normally closed), "Rising"/"Falling" (edge). Coil subType: "Normal", "Set", "Reset" or "Negated". ' +
+      'Referenced variables that do not exist yet are AUTO-DECLARED (contacts/coils as BOOL, fb.instance as the FB type) and listed in the approval diff — no separate add_variable needed for them. ' +
+      'Each rung is an OBJECT (use {…}, never [...]). Examples — ' +
+      'Start/Stop seal-in: rungs: [{ "branches": [[{"contact":"Start"}], [{"contact":"Motor"}]], "seriesAfter": [{"contact":"Stop","subType":"NC"}], "outputs": [{"coil":"Motor"}] }]. ' +
+      '5s on-delay: rungs: [{ "branches": [[{"contact":"Sensor"}]], "fb": { "type":"TON", "instance":"delayTimer", "inputs": {"PT":"T#5s"}, "outputs": {"ET":"elapsed"} }, "outputs": [{"coil":"Lamp"}] }]. ' +
+      'Counter with reset: rungs: [{ "branches": [[{"contact":"PartSensor"}]], "fb": { "type":"CTU", "instance":"partCounter", "inputs": {"PV":"100","R":"ResetBtn"} }, "outputs": [{"coil":"BatchDone"}] }]. ' +
+      'Note: inline math/move/compare (ADD, MOVE, GT, …) and motion (MC_*) do NOT go in ladder — write those in an ST rung (set_st_code).',
     parameters: S({
       pou: str('Target LD POU name'),
       rungs: {
@@ -355,19 +362,25 @@ export const TOOL_DEFS = [
           branches: {
             type: 'array',
             description: 'Parallel branches (OR). Each branch is a list of contacts in series (AND). A single branch = a simple series. An empty branch = always-true (direct power).',
-            items: { type: 'array', items: S({ contact: str('BOOL variable name'), subType: { type: 'string', enum: ['NO', 'NC'] } }, ['contact']) },
+            items: { type: 'array', items: S({ contact: str('BOOL variable name'), subType: { type: 'string', enum: ['NO', 'NC', 'Rising', 'Falling'] } }, ['contact']) },
           },
           seriesAfter: {
             type: 'array',
             description: 'Contacts placed in series AFTER the branches merge (shared by all branches). Use for the Stop contact in a start/stop seal-in.',
-            items: S({ contact: str('BOOL variable name'), subType: { type: 'string', enum: ['NO', 'NC'] } }, ['contact']),
+            items: S({ contact: str('BOOL variable name'), subType: { type: 'string', enum: ['NO', 'NC', 'Rising', 'Falling'] } }, ['contact']),
           },
+          fb: S({
+            type: str('Block type, e.g. TON, TOF, TP, CTU, CTD, R_TRIG, SR, RS, or a project function block name (see list_blocks)'),
+            instance: str('Instance variable name (auto-declared with the FB type if missing), e.g. "delayTimer"'),
+            inputs: { type: 'object', description: 'Non-trigger input pins by NAME: literal ("T#5s", "100") or a variable name ("ResetBtn"). The trigger pin (IN/CU/…) comes from the rung power flow — do not set it here.', additionalProperties: { type: 'string' } },
+            outputs: { type: 'object', description: 'Optional captures: output pin name → variable name to store it into (e.g. {"ET":"elapsed","CV":"count"}).', additionalProperties: { type: 'string' } },
+          }, ['type', 'instance']),
           outputs: {
             type: 'array',
-            description: 'Output coils driven by the rung (usually one).',
+            description: 'Output coils driven by the rung (usually one; may be empty if the rung only runs an fb).',
             items: S({ coil: str('BOOL variable name'), subType: { type: 'string', enum: ['Normal', 'Set', 'Reset', 'Negated'] } }, ['coil']),
           },
-        }, ['outputs']),
+        }, []),
       },
     }, ['pou', 'rungs']),
   },
@@ -547,8 +560,8 @@ export function applyToolCall(struct, name, args = {}) {
         const next = { ...struct, [category]: [...struct[category], item] };
         return {
           mutation: true, ok: true,
-          summary: `Create ${language} ${singular(category)} "${item.name}"`,
-          diff: { kind: 'pou-add', target: item.name, lines: [{ type: 'add', text: `${language} ${singular(category)}  ${item.name}${item.returnType ? ' : ' + item.returnType : ''}` }] },
+          summary: `Create ${singular(category)} "${item.name}"`,
+          diff: { kind: 'pou-add', target: item.name, lines: [{ type: 'add', text: `${singular(category)}  ${item.name}${item.returnType ? ' : ' + item.returnType : ''}  (rung-based: add LD rungs with set_ladder, ST rungs with set_st_code)` }] },
           next,
         };
       }
@@ -665,19 +678,59 @@ export function applyToolCall(struct, name, args = {}) {
         if (hit.item.type !== 'LD' && hit.item.type !== 'SCL') return { ok: false, error: `"${args.pou}" is not a Ladder/SCL POU — use set_st_code for ST` };
         const dsl = Array.isArray(args.rungs) ? args.rungs : [];
         if (dsl.length === 0) return { ok: false, error: 'rungs must be a non-empty array' };
+        const fbVarHints = []; // pin-typed declare candidates from fb.inputs/fb.outputs
         let compiled;
-        try { compiled = dsl.map((r, i) => compileLadderRung(r, i)); }
+        try { compiled = dsl.map((r, i) => compileLadderRung(r, i, { struct, library: args.__library, collect: (h) => fbVarHints.push(h) })); }
         catch (e) { return { ok: false, error: `ladder: ${e.message}` }; }
         // SCL rungs carry a per-rung language tag; ladder rungs are 'LD'.
         if (hit.item.type === 'SCL') compiled = compiled.map((r) => ({ ...r, lang: 'LD' }));
+
+        // ── Auto-declare referenced-but-undeclared variables ──
+        // Mirrors the editor's inline declaration: contact/coil names → BOOL,
+        // fb instances → the FB type. Every auto-declared variable is surfaced
+        // in the approval diff, so a typo'd name is visible to the human
+        // instead of silently splitting the logic across two variables.
+        const declared = new Set([
+          ...(hit.item.content?.variables || []).map((v) => v.name),
+          ...getGlobals(struct).map((v) => v.name),
+        ]);
+        const newVars = [];
+        const declare = (name, type, isInstance) => {
+          if (!isValidIecName(name) || declared.has(name)) return;
+          if (isReservedTranspilerName(name)) return; // compileLadderRung already ran; let the transpiler surface this loudly
+          declared.add(name);
+          newVars.push({
+            id: `var_${Date.now()}_${newVars.length}`, name, class: 'Local', type,
+            initialValue: '', description: '', address: '', ...(isInstance ? { _isInstance: true } : {}),
+          });
+        };
+        for (const r of dsl) {
+          const contacts = [
+            ...(Array.isArray(r.branches) ? r.branches.flat() : []),
+            ...(Array.isArray(r.seriesAfter) ? r.seriesAfter : []),
+          ];
+          for (const c of contacts) if (c && c.contact) declare(String(c.contact), 'BOOL', false);
+          for (const o of (Array.isArray(r.outputs) ? r.outputs : [])) if (o && o.coil) declare(String(o.coil), 'BOOL', false);
+          if (r.fb && r.fb.instance) declare(String(r.fb.instance), String(r.fb.type), true);
+        }
+        // Variables referenced inside fb pins (inputs like R:="ResetBtn",
+        // captures like ET⇒elapsed) — typed by the PIN, collected during compile.
+        for (const h of fbVarHints) declare(h.name, h.type, h.isInstance);
+
         const oldRungs = hit.item.content?.rungs || [];
-        const next = withPOUContent(struct, hit.category, hit.index, { ...hit.item.content, rungs: compiled });
+        const next = withPOUContent(struct, hit.category, hit.index, {
+          ...hit.item.content,
+          rungs: compiled,
+          ...(newVars.length ? { variables: [...(hit.item.content?.variables || []), ...newVars] } : {}),
+        });
         const lines = [
           ...oldRungs.map((rg, i) => ({ type: 'del', text: `Rung ${i + 1}: ${(rg.blocks || []).map((b) => b.type).join(' ') || '(empty)'}` })),
           ...dsl.map((r, i) => ({ type: 'add', text: `Rung ${i + 1}: ${ladderRungText(r)}` })),
+          ...newVars.map((v) => ({ type: 'add', text: `auto-declared  ${v.name} : ${v.type}` })),
         ];
         return {
-          mutation: true, ok: true, summary: `Set ladder in "${hit.item.name}" (${compiled.length} rung${compiled.length === 1 ? '' : 's'})`,
+          mutation: true, ok: true,
+          summary: `Set ladder in "${hit.item.name}" (${compiled.length} rung${compiled.length === 1 ? '' : 's'}${newVars.length ? `, declared ${newVars.length} var${newVars.length === 1 ? '' : 's'}` : ''})`,
           diff: { kind: 'ld-edit', target: hit.item.name, lines }, next,
         };
       }
@@ -1025,8 +1078,11 @@ function renderRungs(rungs) {
 
     const contactLit = (b) => {
       const v = b.data?.values?.var || b.data?.instanceName || '?';
-      const nc = (b.data?.subType || b.data?.customData?.subType) === 'NC';
-      return nc ? `NOT ${v}` : v;
+      const sub = b.data?.subType || b.data?.customData?.subType;
+      if (sub === 'NC') return `NOT ${v}`;
+      if (sub === 'Rising') return `RISING(${v})`;
+      if (sub === 'Falling') return `FALLING(${v})`;
+      return v;
     };
 
     const memo = {};
@@ -1040,7 +1096,11 @@ function renderRungs(rungs) {
       const b = byId[id];
       let res = power;
       if (b && b.type === 'Contact') res = andJoin([power, contactLit(b)]);
-      else if (b && b.type !== 'Coil') res = `${b.data?.instanceName || b.type}.<out>`; // FB output — opaque
+      else if (b && b.type !== 'Coil') {
+        // FB: downstream power continues from its boolean output pin.
+        const q = FB_Q_OUTPUT[b.type] || 'Q';
+        res = `${b.data?.instanceName || b.type}.${q}`;
+      }
       memo[id] = res;
       return res;
     };
@@ -1058,8 +1118,24 @@ function renderRungs(rungs) {
     const out = { index: i, comment: r.comment || '', logic };
     const fbs = blocks.filter((b) => b.type !== 'Contact' && b.type !== 'Coil' && !String(b.id).startsWith('terminal'));
     if (fbs.length) {
-      out.functionBlocks = fbs.map((b) => ({ type: b.type, instance: b.data?.instanceName || null }));
-      out.note = 'This rung contains function block(s); the boolean logic above omits FB internals.';
+      // Faithful FB rendering: the trigger condition (power into the trigger
+      // pin), the pin values, and the Q pin downstream logic reads from — so
+      // the model can reconstruct the rung, not just know "there's a timer".
+      out.functionBlocks = fbs.map((b) => {
+        const trig = FB_TRIGGER_PIN[b.type] || null;
+        // Power into the FB = OR of its incoming power-flow wires. exprOf(fb)
+        // returns the fb's OWN output, so compute the input side directly.
+        const powerSrcs = conns
+          .filter((c) => c.target === b.id && (!c.targetPin || c.targetPin === 'in' || c.targetPin === 'in_0' || (trig && c.targetPin === `in_${trig}`)))
+          .map((c) => exprOf(c.source, new Set()));
+        return {
+          type: b.type,
+          instance: b.data?.instanceName || null,
+          triggeredBy: powerSrcs.length ? orJoin(powerSrcs) : 'TRUE',
+          pins: b.data?.values && Object.keys(b.data.values).length ? { ...b.data.values } : undefined,
+          qOutput: FB_Q_OUTPUT[b.type] || undefined,
+        };
+      });
     }
     if (logic.length === 0 && fbs.length === 0) out.note = '(empty rung)';
     return out;
@@ -1172,16 +1248,53 @@ const LD_ROW = 80;   // vertical spacing between parallel branches
 const LD_X0 = 60;    // first column x (just right of the left rail)
 
 function normContactSub(s) {
-  return s === 'NC' ? 'NC' : 'NO';
+  // Rising/Falling get real one-scan edge semantics (transpiler edge memory).
+  return ['NC', 'Rising', 'Falling'].includes(s) ? s : 'NO';
 }
 function normCoilSub(s) {
-  return ['Normal', 'Set', 'Reset', 'Negated'].includes(s) ? s : 'Normal';
+  return ['Normal', 'Set', 'Reset', 'Negated', 'Rising', 'Falling'].includes(s) ? s : 'Normal';
 }
 
-function compileLadderRung(r, idx) {
+// Resolve a function-block type into its pin metadata, searching (in order):
+// the standard XML library, the generic comm-FB defs, and the project's own
+// function blocks. Returns { inputs, outputs, isUser, customData } or null.
+// customData is EXACTLY what the Toolbox drag attaches for the same block, so
+// an agent-authored FB block is indistinguishable from a human-dropped one
+// (the editor renders pins from customData; the transpiler reads user-FB pins
+// from customData.content.variables).
+function resolveFbBlockDef(struct, library, type) {
+  for (const cat of (Array.isArray(library) ? library : [])) {
+    for (const b of (cat.blocks || [])) {
+      if (b.blockType === type) {
+        return {
+          inputs: b.inputs || [], outputs: b.outputs || [], isUser: false,
+          customData: { inputs: b.inputs || [], outputs: b.outputs || [], class: b.class || 'FunctionBlock' },
+        };
+      }
+    }
+  }
+  if (GENERIC_FB_DEFS[type]) {
+    const d = GENERIC_FB_DEFS[type];
+    return {
+      inputs: d.inputs || [], outputs: d.outputs || [], isUser: false,
+      customData: { inputs: d.inputs || [], outputs: d.outputs || [], class: d.class || 'FunctionBlock' },
+    };
+  }
+  const userFb = (struct.functionBlocks || []).find((p) => p.name === type);
+  if (userFb) {
+    const { inputs, outputs } = pouPins(userFb);
+    // Mirror the editor's drop path: user-FB blocks carry the whole POU-ish
+    // object so the transpiler can read content.variables.
+    return { inputs, outputs, isUser: true, customData: { name: userFb.name, type: 'functionBlocks', content: userFb.content } };
+  }
+  return null;
+}
+
+function compileLadderRung(r, idx, ctx = {}) {
   if (!r || typeof r !== 'object') throw new Error(`rung ${idx + 1} is not an object`);
   const outputs = Array.isArray(r.outputs) ? r.outputs : [];
-  if (outputs.length === 0) throw new Error(`rung ${idx + 1} has no output coil`);
+  const fb = r.fb && typeof r.fb === 'object' ? r.fb : null;
+  if (outputs.length === 0 && !fb) throw new Error(`rung ${idx + 1} has no output coil (and no fb)`);
 
   const blocks = [];
   const connections = [];
@@ -1189,7 +1302,8 @@ function compileLadderRung(r, idx) {
   const stamp = Date.now();
   const bid = () => `block_${stamp}_${idx}_${seq++}`;
   const cid = () => `conn_${stamp}_${idx}_${seq++}`;
-  const connect = (source, target) => connections.push({ id: cid(), source, target, sourcePin: 'out', targetPin: 'in' });
+  const connect = (source, target, sourcePin = 'out', targetPin = 'in') =>
+    connections.push({ id: cid(), source, target, sourcePin, targetPin });
 
   const mkContact = (c, x, y) => {
     if (!c || !c.contact) throw new Error(`rung ${idx + 1}: a contact is missing its variable name`);
@@ -1206,16 +1320,73 @@ function compileLadderRung(r, idx) {
     return id;
   };
 
+  // ── Optional function block (timer/counter/edge/comm/user FB) in the rung ──
+  // Power flows: contact network → FB trigger pin → FB Q output → coils.
+  // Non-trigger inputs (PT, PV, R, …) and output captures (ET, CV, …) ride in
+  // data.values keyed by PIN NAME — exactly how the editor stores them.
+  let fbDef = null, fbTrigger = null, fbQ = null, fbValues = {};
+  if (fb) {
+    if (!fb.type) throw new Error(`rung ${idx + 1}: fb.type is required`);
+    if (!fb.instance || !isValidIecName(fb.instance)) throw new Error(`rung ${idx + 1}: fb.instance must be a valid IEC identifier (the instance variable name, e.g. "timer0")`);
+    // Inline math/move/compare check FIRST — it is type-table-based and must
+    // fire even when the block library isn't loaded/passed.
+    if (FB_TRIGGER_PIN[fb.type] === 'EN') throw new Error(`rung ${idx + 1}: "${fb.type}" is an inline math/move/compare operation — express it in an ST rung (set_st_code) instead of ladder`);
+    fbDef = resolveFbBlockDef(ctx.struct, ctx.library, fb.type);
+    if (!fbDef) throw new Error(`rung ${idx + 1}: unknown block type "${fb.type}" — call list_blocks to see available types`);
+    if ((fbDef.inputs || []).some((p) => p.type === 'AXIS_REF')) throw new Error(`rung ${idx + 1}: "${fb.type}" is a motion FB (needs an Axis) — author motion in an ST rung (set_st_code)`);
+    const inputNames = (fbDef.inputs || []).map((p) => p.name);
+    const outputNames = (fbDef.outputs || []).map((p) => p.name);
+    fbTrigger = FB_TRIGGER_PIN[fb.type]
+      || (fbDef.inputs.find((p) => p.type === 'BOOL') || fbDef.inputs[0] || {}).name || null;
+    fbQ = FB_Q_OUTPUT[fb.type]
+      || (fbDef.outputs.find((p) => p.type === 'BOOL') || {}).name || null;
+    if (outputs.length > 0 && !fbQ) throw new Error(`rung ${idx + 1}: "${fb.type}" has no boolean output to drive coils — remove the outputs or use ST`);
+    // ctx.collect gathers auto-declare candidates WITH pin-accurate types:
+    // an identifier fed to a TIME pin declares as TIME, a CTU.R reference as
+    // BOOL, an ET capture as TIME — not a blanket BOOL guess.
+    const pinType = (arr, pin) => (arr.find((p) => p.name === pin) || {}).type || 'BOOL';
+    const isIdentRef = (v) => isValidIecName(String(v)) && !/^(true|false)$/i.test(String(v));
+    for (const [pin, val] of Object.entries(fb.inputs || {})) {
+      if (!inputNames.includes(pin)) throw new Error(`rung ${idx + 1}: "${fb.type}" has no input pin "${pin}" (inputs: ${inputNames.join(', ') || 'none'})`);
+      fbValues[pin] = String(val);
+      if (isIdentRef(val)) ctx.collect?.({ name: String(val), type: pinType(fbDef.inputs, pin), isInstance: false });
+    }
+    for (const [pin, val] of Object.entries(fb.outputs || {})) {
+      if (!outputNames.includes(pin)) throw new Error(`rung ${idx + 1}: "${fb.type}" has no output pin "${pin}" (outputs: ${outputNames.join(', ') || 'none'})`);
+      if (!isValidIecName(String(val))) throw new Error(`rung ${idx + 1}: fb.outputs.${pin} must be a variable NAME to store the pin into (got "${val}")`);
+      fbValues[pin] = String(val);
+      ctx.collect?.({ name: String(val), type: pinType(fbDef.outputs, pin), isInstance: false });
+    }
+  }
+
   const branches = (Array.isArray(r.branches) && r.branches.length) ? r.branches : [[]];
   const after = Array.isArray(r.seriesAfter) ? r.seriesAfter : [];
   const maxLen = Math.max(0, ...branches.map((b) => (Array.isArray(b) ? b.length : 0)));
 
-  // Post-merge series chain: seriesAfter contacts, then output coils, left→right.
+  // Post-merge series chain: seriesAfter contacts → optional FB → output coils.
   let colX = LD_X0 + (maxLen + 1) * LD_COL;
   const chainIds = [];
-  for (const c of after) { chainIds.push(mkContact(c, colX, 0)); colX += LD_COL; }
-  for (const o of outputs) { chainIds.push(mkCoil(o, colX, 0)); colX += LD_COL; }
+  const chainInPins = [];  // target pin name for the wire INTO each chain element
+  const chainOutPins = []; // source pin name for the wire OUT of each chain element
+  for (const c of after) { chainIds.push(mkContact(c, colX, 0)); chainInPins.push('in'); chainOutPins.push('out'); colX += LD_COL; }
+  if (fb) {
+    const id = bid();
+    blocks.push({
+      id, type: fb.type, position: { x: colX, y: 0 },
+      data: { label: fb.type, instanceName: fb.instance, customData: fbDef.customData, values: fbValues },
+    });
+    chainIds.push(id);
+    // Editor handles are name-based (`in_IN`, `out_Q`); the transpiler reads
+    // the same names for power flow. User FBs without a boolean output pass
+    // power through unconditionally (the transpiler handles sourcePin loosely,
+    // but the editor needs a REAL handle to draw the wire).
+    chainInPins.push(fbTrigger ? `in_${fbTrigger}` : 'in');
+    chainOutPins.push(fbQ ? `out_${fbQ}` : 'out');
+    colX += LD_COL * 2; // FB nodes are wider than contacts
+  }
+  for (const o of outputs) { chainIds.push(mkCoil(o, colX, 0)); chainInPins.push('in'); chainOutPins.push('out'); colX += LD_COL; }
   const mergeTarget = chainIds[0];
+  const mergePin = chainInPins[0];
 
   // Branches (OR): each is an AND-series of contacts from the left rail to the merge point.
   branches.forEach((b, bi) => {
@@ -1226,12 +1397,12 @@ function compileLadderRung(r, idx) {
       connect(prev, id);
       prev = id;
     });
-    connect(prev, mergeTarget); // empty branch → direct power from the left rail
+    connect(prev, mergeTarget, 'out', mergePin); // empty branch → direct power from the left rail
   });
 
   // Series-chain the merge target through to the right rail.
-  for (let i = 0; i < chainIds.length - 1; i++) connect(chainIds[i], chainIds[i + 1]);
-  connect(chainIds[chainIds.length - 1], RIGHT_RAIL);
+  for (let i = 0; i < chainIds.length - 1; i++) connect(chainIds[i], chainIds[i + 1], chainOutPins[i], chainInPins[i + 1]);
+  connect(chainIds[chainIds.length - 1], RIGHT_RAIL, chainOutPins[chainIds.length - 1], 'in');
 
   return {
     id: `rung_${stamp}_${idx}_${Math.floor(Math.random() * 1e6)}`,
@@ -1245,7 +1416,11 @@ function compileLadderRung(r, idx) {
 
 // Human-readable boolean form of a rung DSL, for the approval diff.
 function ladderRungText(r) {
-  const contactStr = (c) => (normContactSub(c?.subType) === 'NC' ? '!' : '') + (c?.contact || '?');
+  const contactStr = (c) => {
+    const sub = normContactSub(c?.subType);
+    const prefix = sub === 'NC' ? '!' : sub === 'Rising' ? '↑' : sub === 'Falling' ? '↓' : '';
+    return prefix + (c?.contact || '?');
+  };
   const coilStr = (o) => {
     const tag = { Set: ' (S)', Reset: ' (R)', Negated: ' (/)' }[normCoilSub(o?.subType)] || '';
     return (o?.coil || '?') + tag;
@@ -1255,6 +1430,12 @@ function ladderRungText(r) {
   let cond = brTexts.length > 1 ? `(${brTexts.join(' | ')})` : brTexts[0];
   const after = Array.isArray(r?.seriesAfter) ? r.seriesAfter : [];
   if (after.length) cond += ' & ' + after.map(contactStr).join(' & ');
+  if (r?.fb && r.fb.type) {
+    const ins = Object.entries(r.fb.inputs || {}).map(([k, v]) => `${k}:=${v}`);
+    const outsMap = Object.entries(r.fb.outputs || {}).map(([k, v]) => `${k}⇒${v}`);
+    const params = [...ins, ...outsMap].join(', ');
+    cond += `  →  [${r.fb.type} ${r.fb.instance || '?'}${params ? ` (${params})` : ''}]`;
+  }
   const outs = (Array.isArray(r?.outputs) ? r.outputs : []).map(coilStr).join(', ');
-  return `${cond}  →  ${outs}`;
+  return outs ? `${cond}  →  ${outs}` : cond;
 }

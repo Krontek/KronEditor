@@ -379,6 +379,8 @@ Note: the old Monaco `addCommand(Ctrl+V/C/X)` clipboard overrides were **removed
 
 ## 8. The AI agent panel
 
+**Full internal reference: [`docs/PLC_AGENT.md`](docs/PLC_AGENT.md)** — architecture, the complete tool reference, the ladder DSL spec (fb-in-rung, auto-declare), provider matrix, prompt policies, and the agent gate. Keep it updated together with this section.
+
 `src/components/AiAgentPanel.jsx` — a real tool-calling agent ("PLC Agent") that edits the project: create/rename/delete POUs, rewrite ST, add/update/remove variables, author ladder. The board is read-only context. Config in `localStorage["aiAgentConfig"]`. (Code symbols stay `AiAgentPanel`/`aiAgentConfig`/`/api/host/ai/*`; only user-visible strings are "PLC Agent".) The system prompt enforces a **clarify-first policy** on ambiguous requests.
 
 ### Architecture (3 layers)
@@ -390,9 +392,12 @@ Note: the old Monaco `addCommand(Ctrl+V/C/X)` clipboard overrides were **removed
 A variable's `type` must be a scalar IEC type, an existing data-type/FB name, or (once) the literal `ARRAY[m..n] OF TYPE` (auto-recovered into a real `dataTypes` entry). Anything else is rejected with a message telling the model to call `create_data_type` first. Enforced at the single choke point `resolveVarType(struct, rawType)` (both `add_variable`/`update_variable` funnel through it). `create_data_type` builds the exact `dataTypes` shape the human editors produce (`{name, type:'Array'|'Structure'|'Enumerated', content}`).
 
 ### Agent loop & robustness
-- **`create_pou` accepts `ST`|`LD`|`SCL`** (SCL = mixed). `set_ladder` works on LD+SCL; `set_st_code` on ST+SCL.
+- **`create_pou` always creates the unified rung-based POU** (`SCL`; the `language` arg is accepted but only steers which authoring tool the model uses next). `set_ladder` works on LD+SCL; `set_st_code` on ST+SCL.
 - `read_pou` renders LD/SCL rungs via `renderRungs` (traces power-flow into readable boolean logic).
-- **`list_blocks`** is how the agent learns FB/function pins (`buildBlockCatalog`). `set_ladder` is **contacts + coils only** — FBs need `customData` pin metadata the agent doesn't carry, so timers/counters/motion/user-FBs are routed to ST.
+- **`list_blocks`** is how the agent learns FB/function pins (`buildBlockCatalog`).
+- **`set_ladder` supports contacts (NO/NC/Rising/Falling), coils (Normal/Set/Reset/Negated/edge) AND one stateful FB per rung** via `fb: {type, instance, inputs, outputs}` — power flows contact network → trigger pin → Q → coils. Wiring uses the transpiler's own `FB_TRIGGER_PIN`/`FB_Q_OUTPUT` tables (**exported from CTranspilerService for exactly this** — never hand-copy them) so handles are `in_IN`/`out_Q` etc., identical to a human-dropped block; pin metadata (`customData`) comes from the XML library (`args.__library`, injected by the panel for `list_blocks` + `set_ladder`), `GENERIC_FB_DEFS`, or the project's own FBs (`resolveFbBlockDef`). Non-trigger pins ride in `data.values` by pin NAME (literals or variable refs); `fb.outputs` captures output pins into variables (`{"ET":"elapsed"}`). Inline math/compare/move (`FB_TRIGGER_PIN[type]==='EN'`) and motion (any `AXIS_REF` pin) are **rejected with a routing error** → ST.
+- **`set_ladder` auto-declares** referenced-but-undeclared variables (contacts/coils → BOOL, `fb.instance` → the FB type, fb pin refs → the PIN's type, e.g. `ET⇒elapsed` declares `elapsed : TIME`) and lists each one in the approval diff — typos surface to the human instead of silently splitting logic.
+- ⚠️ **`experiments/agent-check/gate.sh`** drives the REAL tool surface (create_pou → set_ladder with seal-in + TON + CTU + R_TRIG), asserts the produced block/wire/variable shapes AND `read_pou`'s rendering, then transpiles + compiles with the bundled clang. Run it after touching agentTools' ladder DSL or the transpiler's LD path.
 - **Live diagnosis:** `read_live_variables` returns a buffered snapshot + history; `watch_live_variables` awaits a per-variable trailing window (`summarizeWatch`) then injects the summary. The prompt routes time-dependent checks to `watch` and to auto-verify after any change/deploy.
 - **POU-target inference:** a local-scope tool whose `pou` doesn't resolve gets rewritten to the last-touched / just-created / open POU (weak-model safety net; only overrides an *unresolvable* pou).
 - **Weak-model recovery layers:** `extractInlineToolCalls` (JSON + markdown-heading + bare-args forms), `extractKeyValToolCalls`, `recoverStCodeBlock`, `stripSpecialTokens`, `repairJsonBrackets`, `extractStDeclarations` (adds inlined `VAR…END_VAR` declarations to the diff). These keep qwen2.5-coder-class local models *usable* but unreliable; a native-tools cloud model (Gemini/Claude) is far steadier.
