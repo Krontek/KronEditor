@@ -1,0 +1,272 @@
+<mxfile host="65bd71144e">
+    <diagram name="1 · System Overview" id="overview">
+        <mxGraphModel dx="1202" dy="741" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1600" pageHeight="900" math="0" shadow="0">
+            <root>
+                <mxCell id="0"/>
+                <mxCell id="1" parent="0"/>
+                <mxCell id="ov_title" value="KronEditor — Browser-based IEC 61131-3 PLC editor · three cooperating processes" style="text;html=1;fontSize=16;fontStyle=1;align=left;verticalAlign=middle;" parent="1" vertex="1">
+                    <mxGeometry x="40" y="20" width="1100" height="30" as="geometry"/>
+                </mxCell>
+                <mxCell id="fe" value="FRONTEND — React (Vite) · runs in a browser tab" style="swimlane;rounded=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontStyle=1;fontSize=13;startSize=32;verticalAlign=top;" parent="1" vertex="1">
+                    <mxGeometry x="40" y="70" width="420" height="500" as="geometry"/>
+                </mxCell>
+                <mxCell id="fe_app" value="App.jsx — root state&#10;isRunning · isSimulationMode · liveVariables&#10;project tree · normalizeProjectToRungs" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#eaf2ff;strokeColor=#6c8ebf;align=left;spacingLeft=8;fontSize=11;" parent="fe" vertex="1">
+                    <mxGeometry x="20" y="44" width="380" height="56" as="geometry"/>
+                </mxCell>
+                <mxCell id="fe_ui" value="UI Components&#10;EditorPane · RungEditorNew · RungContainer (ReactFlow)&#10;Monaco (ST) · VariableManager · ProjectSidebar&#10;Toolbox · OutputPanel · TaskManager&#10;BoardConfigPage · EtherCATEditor / SlaveConfigPage · HMI props" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#eaf2ff;strokeColor=#6c8ebf;align=left;spacingLeft=8;fontSize=11;" parent="fe" vertex="1">
+                    <mxGeometry x="20" y="112" width="380" height="92" as="geometry"/>
+                </mxCell>
+                <mxCell id="fe_agent" value="AiAgentPanel — &quot;PLC Agent&quot; (tool-calling)&#10;edits POUs/vars/ladder via agentTools · clarify-first" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#eaf2ff;strokeColor=#6c8ebf;align=left;spacingLeft=8;fontSize=11;" parent="fe" vertex="1">
+                    <mxGeometry x="20" y="216" width="380" height="48" as="geometry"/>
+                </mxCell>
+                <mxCell id="fe_svc" value="Services (src/services)&#10;CTranspilerService — ST/LD → C (main compile path)&#10;HostClient — HTTP → host-agent :7171&#10;PLCClient — HTTP/SSE → remote KronServer&#10;LibraryService · agentTools · browserFs · kronClipboard" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dff0ff;strokeColor=#6c8ebf;align=left;spacingLeft=8;fontSize=11;" parent="fe" vertex="1">
+                    <mxGeometry x="20" y="276" width="380" height="96" as="geometry"/>
+                </mxCell>
+                <mxCell id="fe_utils" value="utils — boardDefinitions · devicePortMapping · deviceCodegen&#10;libraryTree · plcStandards · stValidation · hwPortVars" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dff0ff;strokeColor=#6c8ebf;align=left;spacingLeft=8;fontSize=11;" parent="fe" vertex="1">
+                    <mxGeometry x="20" y="384" width="380" height="48" as="geometry"/>
+                </mxCell>
+                <mxCell id="ha" value="HOST AGENT — Go (host-agent/) · local backend :7171" style="swimlane;rounded=1;fillColor=#d5e8d4;strokeColor=#82b366;fontStyle=1;fontSize=13;startSize=32;verticalAlign=top;" parent="1" vertex="1">
+                    <mxGeometry x="590" y="70" width="420" height="500" as="geometry"/>
+                </mxCell>
+                <mxCell id="ha_main" value="main.go — HTTP server · CORS / origin gate&#10;private-network only · body limits · embed.FS (Vite build → /)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e8f6e6;strokeColor=#82b366;align=left;spacingLeft=8;fontSize=11;" parent="ha" vertex="1">
+                    <mxGeometry x="20" y="44" width="380" height="52" as="geometry"/>
+                </mxCell>
+                <mxCell id="ha_files" value="files.go · paths.go — write_plc_files · get_standard_headers&#10;resolves resources/ + toolchains/ + app-data dir" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e8f6e6;strokeColor=#82b366;align=left;spacingLeft=8;fontSize=11;" parent="ha" vertex="1">
+                    <mxGeometry x="20" y="104" width="380" height="48" as="geometry"/>
+                </mxCell>
+                <mxCell id="ha_compile" value="compile.go — compile_simulation (sim_runtime.bin -O0 -g)&#10;compile_for_target (runtime.bin -O3 cross) · bundled clang" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e8f6e6;strokeColor=#82b366;align=left;spacingLeft=8;fontSize=11;" parent="ha" vertex="1">
+                    <mxGeometry x="20" y="160" width="380" height="48" as="geometry"/>
+                </mxCell>
+                <mxCell id="ha_runtime" value="runtime.go — run/stop sim · write_variable&#10;ELF/DWARF parse · /proc + /dev/shm reads" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e8f6e6;strokeColor=#82b366;align=left;spacingLeft=8;fontSize=11;" parent="ha" vertex="1">
+                    <mxGeometry x="20" y="216" width="380" height="48" as="geometry"/>
+                </mxCell>
+                <mxCell id="ha_hotswap" value="hotswap.go + hotswaphost/host.c — loader-host&#10;build/run/swap/stop · /dev/shm poller · ping-pong slots" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e8f6e6;strokeColor=#82b366;align=left;spacingLeft=8;fontSize=11;" parent="ha" vertex="1">
+                    <mxGeometry x="20" y="272" width="380" height="48" as="geometry"/>
+                </mxCell>
+                <mxCell id="ha_deploy" value="deploy.go — HTTP to KronServer (Build &amp; Send)&#10;deploy_ssh.go — SSH/SFTP server deploy · serverBinaryForBoard" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e8f6e6;strokeColor=#82b366;align=left;spacingLeft=8;fontSize=11;" parent="ha" vertex="1">
+                    <mxGeometry x="20" y="328" width="380" height="48" as="geometry"/>
+                </mxCell>
+                <mxCell id="ha_ai" value="ai.go · anthropic_oauth.go · ollama.go — AI provider proxy&#10;events.go — SSE broadcaster" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e8f6e6;strokeColor=#82b366;align=left;spacingLeft=8;fontSize=11;" parent="ha" vertex="1">
+                    <mxGeometry x="20" y="384" width="380" height="48" as="geometry"/>
+                </mxCell>
+                <mxCell id="ks" value="KRONSERVER — Go (server/) · runs ON the target SBC :7070" style="swimlane;rounded=1;fillColor=#ffe6cc;strokeColor=#d79b00;fontStyle=1;fontSize=13;startSize=32;verticalAlign=top;" parent="1" vertex="1">
+                    <mxGeometry x="1140" y="70" width="420" height="500" as="geometry"/>
+                </mxCell>
+                <mxCell id="ks_rpc" value="ConnectRPC /plc.v1.PLCService/&#10;Start · Stop · WriteVar · ClearAllForces · StreamVars (50ms)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffedd8;strokeColor=#d79b00;align=left;spacingLeft=8;fontSize=11;" parent="ks" vertex="1">
+                    <mxGeometry x="20" y="44" width="380" height="48" as="geometry"/>
+                </mxCell>
+                <mxCell id="ks_http" value="HTTP endpoints&#10;/deploy/{runtime,logic,variable-table,project-file,config}&#10;/status · /stream/vars (SSE)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffedd8;strokeColor=#d79b00;align=left;spacingLeft=8;fontSize=11;" parent="ks" vertex="1">
+                    <mxGeometry x="20" y="100" width="380" height="60" as="geometry"/>
+                </mxCell>
+                <mxCell id="ks_ipc" value="ipc.go — /dev/shm mmap variable table&#10;name · offset · type · size · force_flag · offset-validated" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffedd8;strokeColor=#d79b00;align=left;spacingLeft=8;fontSize=11;" parent="ks" vertex="1">
+                    <mxGeometry x="20" y="168" width="380" height="48" as="geometry"/>
+                </mxCell>
+                <mxCell id="ks_proc" value="process.go — runtime lifecycle · AutoRun · restart&#10;swapMu / preStartHook · WriteInitialValues" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffedd8;strokeColor=#d79b00;align=left;spacingLeft=8;fontSize=11;" parent="ks" vertex="1">
+                    <mxGeometry x="20" y="224" width="380" height="48" as="geometry"/>
+                </mxCell>
+                <mxCell id="ks_hotswap" value="hotswap.go — logic_N.so ping-pong swap&#10;PollSwapResult · confirmed-gen tracking · layout-hash gate" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffedd8;strokeColor=#d79b00;align=left;spacingLeft=8;fontSize=11;" parent="ks" vertex="1">
+                    <mxGeometry x="20" y="280" width="380" height="48" as="geometry"/>
+                </mxCell>
+                <mxCell id="ks_hmi" value="hmi.go · auth.go — HMI + 4-tier RBAC&#10;SHA-256 salted pw · session tokens · base-path aware · XSS-safe" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffedd8;strokeColor=#d79b00;align=left;spacingLeft=8;fontSize=11;" parent="ks" vertex="1">
+                    <mxGeometry x="20" y="336" width="380" height="48" as="geometry"/>
+                </mxCell>
+                <mxCell id="ks_api" value="api.go — REST API (addressed vars, Bearer token)&#10;/api/v1/... · /stream/buffered (binary high-rate feed)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffedd8;strokeColor=#d79b00;align=left;spacingLeft=8;fontSize=11;" parent="ks" vertex="1">
+                    <mxGeometry x="20" y="392" width="380" height="48" as="geometry"/>
+                </mxCell>
+                <mxCell id="hw" value="Target SBC hardware — GPIO / I2C / SPI / UART / USB / EtherCAT&#10;HAL: kronhal_rpi/bb/jetson/pico.h · runtime.bin ↔ /dev/shm" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#666666;fontSize=11;align=center;" parent="1" vertex="1">
+                    <mxGeometry x="1140" y="600" width="420" height="60" as="geometry"/>
+                </mxCell>
+                <mxCell id="sim" value="Local simulation (Linux only)&#10;sim_runtime.bin spawned by host-agent&#10;vars via /dev/shm (hot-swap) or /proc/&lt;pid&gt;/mem (plain)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#666666;fontSize=11;align=center;" parent="1" vertex="1">
+                    <mxGeometry x="590" y="600" width="420" height="60" as="geometry"/>
+                </mxCell>
+                <mxCell id="e_host" style="endArrow=classic;html=1;strokeColor=#3366cc;strokeWidth=2;fontSize=10;" parent="1" source="fe_svc" target="ha_main" edge="1">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="e_host_lbl" value="HostClient&#10;HTTP /api/host + SSE" style="text;html=1;fontSize=10;fontColor=#3366cc;labelBackgroundColor=#ffffff;" parent="1" vertex="1">
+                    <mxGeometry x="470" y="330" width="120" height="30" as="geometry"/>
+                </mxCell>
+                <mxCell id="e_plc" style="endArrow=classic;html=1;strokeColor=#cc6600;strokeWidth=2;exitX=1;exitY=0.2;entryX=0;entryY=0.2;" parent="1" source="fe" target="ks" edge="1">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="e_plc_lbl" value="PLCClient — HTTP/SSE to remote runtime&#10;(live vars · force · start/stop · REST)" style="text;html=1;fontSize=10;fontColor=#cc6600;labelBackgroundColor=#ffffff;align=center;" parent="1" vertex="1">
+                    <mxGeometry x="470" y="95" width="660" height="30" as="geometry"/>
+                </mxCell>
+                <mxCell id="e_deploy" style="endArrow=classic;html=1;strokeColor=#009900;strokeWidth=2;" parent="1" source="ha_deploy" target="ks_http" edge="1">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="e_deploy_lbl" value="Build &amp; Send&#10;/deploy/* · SSH/SFTP" style="text;html=1;fontSize=10;fontColor=#009900;labelBackgroundColor=#ffffff;" parent="1" vertex="1">
+                    <mxGeometry x="1015" y="330" width="120" height="30" as="geometry"/>
+                </mxCell>
+                <mxCell id="e_sim" style="endArrow=classic;html=1;strokeColor=#82b366;strokeWidth=2;" parent="1" source="ha_runtime" target="sim" edge="1">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="e_hw" style="endArrow=classic;html=1;strokeColor=#d79b00;strokeWidth=2;" parent="1" source="ks_ipc" target="hw" edge="1">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="ov_legend" value="Legend:  blue = frontend (browser)   green = host-agent (local :7171)   orange = KronServer (target :7070)   grey = execution substrate" style="text;html=1;fontSize=11;fontStyle=2;align=left;" parent="1" vertex="1">
+                    <mxGeometry x="40" y="690" width="1200" height="20" as="geometry"/>
+                </mxCell>
+            </root>
+        </mxGraphModel>
+    </diagram>
+    <diagram name="2 · Build &amp; Run Pipeline" id="pipeline">
+        <mxGraphModel dx="1202" dy="741" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1600" pageHeight="900" math="0" shadow="0">
+            <root>
+                <mxCell id="0"/>
+                <mxCell id="1" parent="0"/>
+                <mxCell id="pl_title" value="Compile path — ST/LD → C → clang → simulate OR deploy" style="text;html=1;fontSize=16;fontStyle=1;align=left;" parent="1" vertex="1">
+                    <mxGeometry x="40" y="20" width="900" height="30" as="geometry"/>
+                </mxCell>
+                <mxCell id="pl_proj" value="Project structure&#10;Unified POUs = list of rungs (LD or ST) + variables&#10;globals in RESOURCE_EDITOR · UDTs · tasks · boardId · buses" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=11;" parent="1" vertex="1">
+                    <mxGeometry x="40" y="80" width="320" height="80" as="geometry"/>
+                </mxCell>
+                <mxCell id="pl_transpile" value="CTranspilerService.transpileToC(struct, headers, boardId, simMode, buses, busConfigs)&#10;per-POU → transpilePOUSource → transpileSTLogics / transpileLDLogics&#10;emits single PlcState struct (all mutable state, reached via static PlcState *S)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=11;" parent="1" vertex="1">
+                    <mxGeometry x="40" y="200" width="520" height="90" as="geometry"/>
+                </mxCell>
+                <mxCell id="pl_artifacts" value="Generated artifacts (~/.local/share/com.plceditor.app/build/)&#10;plc.c / plc.h — transpiled C&#10;kron_hal.h — HAL glue&#10;variables.json — symbol table (SHM offsets, addresses, pw hashes)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=11;" parent="1" vertex="1">
+                    <mxGeometry x="40" y="330" width="520" height="90" as="geometry"/>
+                </mxCell>
+                <mxCell id="pl_sim_c" value="compile.go · compileSimulation&#10;bundled clang -O0 -g → sim_runtime.bin (host x86_64)&#10;skips clang when simInputsHash unchanged (compile cache)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=11;" parent="1" vertex="1">
+                    <mxGeometry x="40" y="480" width="360" height="80" as="geometry"/>
+                </mxCell>
+                <mxCell id="pl_sim_run" value="runtime.go — spawn sim · DWARF-based live read&#10;__plc_state external linkage (belt: -O0 keeps symbol)&#10;values via /dev/shm (hot-swap) or /proc/&lt;pid&gt;/mem (plain)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=11;" parent="1" vertex="1">
+                    <mxGeometry x="40" y="600" width="360" height="80" as="geometry"/>
+                </mxCell>
+                <mxCell id="pl_sim_sse" value="events.go SSE → App.jsx liveVariables&#10;OutputPanel watch · ST inline badges · RungContainer overlays" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=11;" parent="1" vertex="1">
+                    <mxGeometry x="40" y="720" width="360" height="60" as="geometry"/>
+                </mxCell>
+                <mxCell id="pl_tgt_c" value="compile.go · compileForTarget&#10;bundled clang -O3 cross → runtime.bin (target triple)&#10;⚠ distinct name from sim_runtime.bin" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=11;" parent="1" vertex="1">
+                    <mxGeometry x="620" y="480" width="360" height="80" as="geometry"/>
+                </mxCell>
+                <mxCell id="pl_send" value="deploy.go — Build &amp; Send (HTTP to KronServer)&#10;/deploy/runtime + variable-table + project-file&#10;then restart = autoRun || isRunning (LAST step)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=11;" parent="1" vertex="1">
+                    <mxGeometry x="620" y="600" width="360" height="80" as="geometry"/>
+                </mxCell>
+                <mxCell id="pl_ks_run" value="KronServer process.go — runs runtime.bin&#10;ipc.go /dev/shm variable table · REST + HMI expose addressed vars" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;fontSize=11;" parent="1" vertex="1">
+                    <mxGeometry x="620" y="720" width="360" height="60" as="geometry"/>
+                </mxCell>
+                <mxCell id="pl_hs" value="Hot-swap build (DEFAULT for simulation)&#10;-DPLC_HOTSWAP → logic_0.so / logic_1.so (2-slot ping-pong)&#10;host.c loader-host (-rdynamic) owns PlcState + /dev/shm mirror&#10;see page 3" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;fontSize=11;" parent="1" vertex="1">
+                    <mxGeometry x="1060" y="480" width="360" height="100" as="geometry"/>
+                </mxCell>
+                <mxCell id="pl_gate" value="Verification gates&#10;experiments/transpiler-check/compile-gate.sh (completeness)&#10;experiments/hotswap-v2/demo.sh · experiments/agent-check/gate.sh" style="rounded=1;whiteSpace=wrap;html=1;dashed=1;fillColor=#f5f5f5;strokeColor=#666666;fontSize=11;" parent="1" vertex="1">
+                    <mxGeometry x="1060" y="200" width="360" height="90" as="geometry"/>
+                </mxCell>
+                <mxCell id="ple1" style="endArrow=classic;html=1;strokeWidth=2;" parent="1" source="pl_proj" target="pl_transpile" edge="1">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="ple2" style="endArrow=classic;html=1;strokeWidth=2;" parent="1" source="pl_transpile" target="pl_artifacts" edge="1">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="ple3" value="Simulation ON" style="endArrow=classic;html=1;strokeWidth=2;strokeColor=#82b366;fontSize=10;" parent="1" source="pl_artifacts" target="pl_sim_c" edge="1">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="ple4" style="endArrow=classic;html=1;strokeWidth=2;strokeColor=#82b366;" parent="1" source="pl_sim_c" target="pl_sim_run" edge="1">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="ple5" style="endArrow=classic;html=1;strokeWidth=2;strokeColor=#82b366;" parent="1" source="pl_sim_run" target="pl_sim_sse" edge="1">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="ple6" value="Build &amp; Send" style="endArrow=classic;html=1;strokeWidth=2;strokeColor=#d79b00;fontSize=10;exitX=0.85;exitY=1;entryX=0.5;entryY=0;" parent="1" source="pl_artifacts" target="pl_tgt_c" edge="1">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="ple7" style="endArrow=classic;html=1;strokeWidth=2;strokeColor=#d79b00;" parent="1" source="pl_tgt_c" target="pl_send" edge="1">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="ple8" style="endArrow=classic;html=1;strokeWidth=2;strokeColor=#d79b00;" parent="1" source="pl_send" target="pl_ks_run" edge="1">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="ple9" value="online change" style="endArrow=classic;html=1;strokeWidth=2;strokeColor=#b85450;dashed=1;fontSize=10;exitX=1;exitY=0.5;entryX=0.5;entryY=0;" parent="1" source="pl_artifacts" target="pl_hs" edge="1">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+            </root>
+        </mxGraphModel>
+    </diagram>
+    <diagram name="3 · Hot-swap (online change)" id="hotswap">
+        <mxGraphModel dx="1202" dy="741" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1600" pageHeight="900" math="0" shadow="0">
+            <root>
+                <mxCell id="0"/>
+                <mxCell id="1" parent="0"/>
+                <mxCell id="hs_title" value="Hot-swap — state-preserving live code update (Linux) · same plc.c, -DPLC_HOTSWAP" style="text;html=1;fontSize=16;fontStyle=1;align=left;" parent="1" vertex="1">
+                    <mxGeometry x="40" y="20" width="1000" height="30" as="geometry"/>
+                </mxCell>
+                <mxCell id="hs_host" value="Loader-host (STABLE process)  host.c · compiled -rdynamic&#10;• owns PlcState in HOST memory → survives swap&#10;• /dev/shm mirror · timing · scan threads&#10;• host_glue.c __hs_* trampolines keep HAL fds host-side" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=12;align=left;spacingLeft=10;verticalAlign=top;" parent="1" vertex="1">
+                    <mxGeometry x="60" y="90" width="440" height="150" as="geometry"/>
+                </mxCell>
+                <mxCell id="hs_slot0" value="logic_0.so" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;fontSize=13;fontStyle=1;" parent="1" vertex="1">
+                    <mxGeometry x="640" y="100" width="160" height="60" as="geometry"/>
+                </mxCell>
+                <mxCell id="hs_slot1" value="logic_1.so" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;fontSize=13;fontStyle=1;dashed=1;" parent="1" vertex="1">
+                    <mxGeometry x="640" y="190" width="160" height="60" as="geometry"/>
+                </mxCell>
+                <mxCell id="hs_slotnote" value="2-slot ping-pong · swap targets the slot NOT running&#10;PingPongGeneration(confirmedGen) — gen never grows&#10;atomic tmp+rename → fresh inode · CleanupExcept after OK" style="text;html=1;fontSize=11;align=left;fontColor=#b85450;" parent="1" vertex="1">
+                    <mxGeometry x="640" y="260" width="360" height="60" as="geometry"/>
+                </mxCell>
+                <mxCell id="hs_abi" value="Fixed .so ABI (swappable POU logic)&#10;plc_state_size · plc_bind · plc_state_init&#10;plc_task_body_&lt;i&gt; · plc_shm_name · plc_state_layout_hash" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=11;align=left;spacingLeft=8;" parent="1" vertex="1">
+                    <mxGeometry x="1060" y="120" width="380" height="90" as="geometry"/>
+                </mxCell>
+                <mxCell id="hs_seq" value="Swap sequence (SIGUSR1)" style="text;html=1;fontSize=13;fontStyle=1;align=left;" parent="1" vertex="1">
+                    <mxGeometry x="60" y="360" width="400" height="24" as="geometry"/>
+                </mxCell>
+                <mxCell id="hs_s1" value="1 · write logic_&lt;alt&gt;.so.tmp → rename over alt slot" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=11;" parent="1" vertex="1">
+                    <mxGeometry x="60" y="400" width="360" height="40" as="geometry"/>
+                </mxCell>
+                <mxCell id="hs_s2" value="2 · write swap_request → send SIGUSR1 to loader-host" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=11;" parent="1" vertex="1">
+                    <mxGeometry x="60" y="450" width="360" height="40" as="geometry"/>
+                </mxCell>
+                <mxCell id="hs_s3" value="3 · park task threads on scan-boundary barrier" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=11;" parent="1" vertex="1">
+                    <mxGeometry x="60" y="500" width="360" height="40" as="geometry"/>
+                </mxCell>
+                <mxCell id="hs_s4" value="4 · dlclose old → dlopen new .so (by inode)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=11;" parent="1" vertex="1">
+                    <mxGeometry x="60" y="550" width="360" height="40" as="geometry"/>
+                </mxCell>
+                <mxCell id="hs_s5" value="5 · layout-hash gate vs ORIGINAL cold-start bind&#10;mismatch → refuse + rollback (hard safety net)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;fontSize=11;" parent="1" vertex="1">
+                    <mxGeometry x="60" y="600" width="360" height="50" as="geometry"/>
+                </mxCell>
+                <mxCell id="hs_s6" value="6 · re-bind SAME PlcState (no re-init) → resume threads" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=11;" parent="1" vertex="1">
+                    <mxGeometry x="60" y="660" width="360" height="40" as="geometry"/>
+                </mxCell>
+                <mxCell id="hs_s7" value="7 · host.c writes swap_result (atomic)&#10;OK &lt;gen&gt; | FAIL &lt;gen&gt; &lt;DLOPEN|SYMBOL|TASKCOUNT|LAYOUT&gt; | OK &lt;gen&gt; COLDSTART" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=11;" parent="1" vertex="1">
+                    <mxGeometry x="60" y="710" width="360" height="50" as="geometry"/>
+                </mxCell>
+                <mxCell id="hs_poll" value="Supervisor polls swap_result before reporting success&#10;host-agent/hotswap.go (local sim) · server/process.go (target)&#10;• OK → advance curGen, CleanupExcept&#10;• FAIL → delete only rejected candidate&#10;• TIMEOUT → delete nothing, curGen unchanged (outcome unknown,&#10;   loader already rolled back — machine keeps old logic, user retries)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;fontSize=11;align=left;spacingLeft=10;verticalAlign=top;" parent="1" vertex="1">
+                    <mxGeometry x="520" y="400" width="480" height="150" as="geometry"/>
+                </mxCell>
+                <mxCell id="hs_js" value="JS pre-check (UX)  App.jsx layoutSignature / layoutSignatureDiff&#10;{task, variables, udts, ioEc} — names WHICH part changed&#10;handleAgentHotSwap routes online change vs Build &amp; Send" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=11;align=left;spacingLeft=8;" parent="1" vertex="1">
+                    <mxGeometry x="520" y="580" width="480" height="80" as="geometry"/>
+                </mxCell>
+                <mxCell id="hs_field" value="Field path — &quot;Go Live&quot; toolbar toggle (when connected to PLC)&#10;startHotSwapSession → deploy loader-host + logic_0.so (cold=1)&#10;then agent edits apply as /deploy/logic online changes.&#10;Cleared by Stop Live · plain Build &amp; Send · disconnect.&#10;⚠ EtherCAT/motion NOT trampolined · physical-HW swap unverified" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;fontSize=11;align=left;spacingLeft=8;verticalAlign=top;" parent="1" vertex="1">
+                    <mxGeometry x="520" y="690" width="480" height="110" as="geometry"/>
+                </mxCell>
+                <mxCell id="hse1" value="dlopen active" style="endArrow=classic;html=1;strokeWidth=2;strokeColor=#b85450;fontSize=10;" parent="1" source="hs_host" target="hs_slot0" edge="1">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="hse2" value="swap target" style="endArrow=classic;html=1;strokeWidth=2;strokeColor=#b85450;dashed=1;fontSize=10;" parent="1" source="hs_host" target="hs_slot1" edge="1">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="hse3" style="endArrow=classic;html=1;strokeWidth=1;strokeColor=#d6b656;" parent="1" source="hs_slot0" target="hs_abi" edge="1">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="hsq1" style="endArrow=classic;html=1;" parent="1" source="hs_s1" target="hs_s2" edge="1">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="hsq2" style="endArrow=classic;html=1;" parent="1" source="hs_s2" target="hs_s3" edge="1">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="hsq3" style="endArrow=classic;html=1;" parent="1" source="hs_s3" target="hs_s4" edge="1">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="hsq4" style="endArrow=classic;html=1;" parent="1" source="hs_s4" target="hs_s5" edge="1">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="hsq5" style="endArrow=classic;html=1;" parent="1" source="hs_s5" target="hs_s6" edge="1">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="hsq6" style="endArrow=classic;html=1;" parent="1" source="hs_s6" target="hs_s7" edge="1">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="hsq7" style="endArrow=classic;html=1;strokeColor=#d79b00;" parent="1" source="hs_s7" target="hs_poll" edge="1">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+            </root>
+        </mxGraphModel>
+    </diagram>
+</mxfile>

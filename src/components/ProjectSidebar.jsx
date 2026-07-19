@@ -510,23 +510,33 @@ const ProjectSidebar = ({
                                 <span style={{ flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
                                     {item.name}
                                 </span>
-                                {key === 'programs' && liveVariables && (() => {
+                                {key === 'programs' && (() => {
+                                    // Badge shows the program's TASK CYCLE (interval) — the same
+                                    // value for every program assigned to the same task, not the
+                                    // per-program execution time (which legitimately differs).
                                     const pName = (item.name || '').trim().replace(/\s+/g, '_');
-                                    // __exec_us_<prog> is MICROseconds (matches its name; the
-                                    // transpiler divides the timespec delta by 1000).
-                                    const us = liveVariables[`prog____exec_us_${pName}`];
-                                    if (us == null) return null;
-                                    const label = us >= 1000000 ? `${(us/1000000).toFixed(2)}s` : us >= 1000 ? `${(us/1000).toFixed(2)}ms` : `${us}µs`;
-                                    // Look up task interval for this program from taskConfig
                                     const taskForProg = (projectStructure.taskConfig?.tasks || [])
                                         .find(t => (t.programs || []).some(p => (p.program || '').replace(/\s+/g, '_') === pName));
-                                    const rawInterval = taskForProg?.interval || '';
-                                    const ivStr = rawInterval.toUpperCase().replace('T#','').replace('TIME#','');
+                                    if (!taskForProg) return null;
+                                    const ivStr = (taskForProg.interval || '').toUpperCase().replace('T#','').replace('TIME#','');
                                     const cycleUs = ivStr.endsWith('MS') ? parseFloat(ivStr)*1000
                                         : ivStr.endsWith('US') ? parseFloat(ivStr)
-                                        : ivStr.endsWith('S') ? parseFloat(ivStr)*1000000 : 10000;
-                                    const overrun = us > cycleUs;
-                                    return <span style={{ fontSize: 10, color: overrun ? '#f44747' : '#4ec9b0', marginLeft: 2 }}>{label}</span>;
+                                        : ivStr.endsWith('S') ? parseFloat(ivStr)*1000000 : NaN;
+                                    if (!Number.isFinite(cycleUs)) return null;
+                                    const label = cycleUs >= 1000000 ? `${(cycleUs/1000000).toFixed(2)}s`
+                                        : cycleUs >= 1000 ? `${(cycleUs/1000).toFixed(cycleUs % 1000 ? 2 : 0)}ms`
+                                        : `${cycleUs}µs`;
+                                    // Overrun = task's TOTAL exec exceeds its cycle (shared across the
+                                    // task's programs). Only meaningful while live.
+                                    let overrun = false;
+                                    if (liveVariables) {
+                                        const total = (taskForProg.programs || []).reduce((s, p) => {
+                                            const u = liveVariables[`prog____exec_us_${(p.program || '').replace(/\s+/g, '_')}`];
+                                            return s + (u != null ? u : 0);
+                                        }, 0);
+                                        overrun = total > cycleUs;
+                                    }
+                                    return <span style={{ fontSize: 10, color: overrun ? '#f44747' : '#4ec9b0', marginLeft: 2 }} title={overrun ? 'Task overrun: toplam exec > cycle' : 'Task cycle (interval)'}>{label}</span>;
                                 })()}
                                 {item.type && (
                                     <span style={{ fontSize: 9, color: '#666', border: '1px solid #444', padding: '0 2px', borderRadius: 2 }}>

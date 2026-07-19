@@ -20,10 +20,12 @@
 package main
 
 import (
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"log/slog"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -61,6 +63,7 @@ func RegisterAPIRoutes(mux *http.ServeMux, am *APIManager) {
 	mux.HandleFunc("GET /api/v1/variables/{name...}", am.requireToken(am.handleReadOne))
 	mux.HandleFunc("POST /api/v1/variables/{name...}", am.requireToken(am.handleWriteOne))
 	mux.HandleFunc("GET /api/v1/stream", am.requireToken(am.handleStream))
+	mux.HandleFunc("GET /api/v1/stream/buffered", am.requireToken(am.handleBufferedStream))
 	mux.HandleFunc("POST /api/v1/forces/clear", am.requireToken(am.handleClearForces))
 
 	mux.HandleFunc("GET /api/v1/runtime", am.requireToken(am.handleRuntimeStatus))
@@ -271,6 +274,128 @@ func (am *APIManager) handleRuntimeConfig(w http.ResponseWriter, r *http.Request
 		return
 	}
 	jsonOK(w, am.rt.UpdateRuntimeConfig(u))
+}
+
+// typeCode maps a VarType to a 1-byte wire code so a binary client knows how to
+// parse each field in a buffered-stream frame.
+var typeCode = map[VarType]byte{
+	VarBool: 0, VarInt8: 1, VarUint8: 2, VarInt16: 3, VarUint16: 4,
+	VarInt32: 5, VarUint32: 6, VarInt64: 7, VarUint64: 8,
+	VarFloat32: 9, VarFloat64: 10,
+}
+
+// handleBufferedStream streams a high-rate, server-buffered BINARY feed of
+// addressed variables. Delivery cadence is fixed at 5 ms; the client picks a
+// sample interval (interval_us) which may be shorter, in which case the server
+// samples that fast and packs every sample accumulated per 5 ms into one frame.
+// This decouples a fast sample rate from an HTTP-friendly 5 ms push rate.
+//
+//	GET /api/v1/stream/buffered?vars=a,b,c&interval_us=1000
+//
+// Frame (little-endian, one per 5 ms that has >=1 sample):
+//	u32 frame_len       bytes after this field
+//	u16 sample_count    number of samples in this frame (~ 5000/interval_us)
+//	u8  var_count
+//	u8  types[var_count]
+//	sample_count × ( each var's native value, in request order )
+//
+// Loss policy: if the PLC writes faster than interval_us the intermediate
+// values are aliased away (accepted); samples are assumed evenly spaced by
+// interval_us (no per-sample timestamp). Delivery of what WAS sampled is
+// lossless. Addressed variables only; max ~5 concurrent clients expected.
+func (am *APIManager) handleBufferedStream(w http.ResponseWriter, r *http.Request) {
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "streaming not supported", http.StatusInternalServerError)
+		return
+	}
+
+	var vars []Variable
+	var types []byte
+	bytesPerSample := 0
+	for _, n := range strings.Split(r.URL.Query().Get("vars"), ",") {
+		n = strings.TrimSpace(n)
+		if n == "" {
+			continue
+		}
+		v, ok := am.ipc.AddressedVarInfo(n)
+		if !ok {
+			jsonError(w, http.StatusNotFound, "variable not found or not addressed: "+n)
+			return
+		}
+		tc, ok := typeCode[v.Type]
+		if !ok {
+			jsonError(w, http.StatusBadRequest, "unsupported type for "+n)
+			return
+		}
+		vars = append(vars, v)
+		types = append(types, tc)
+		bytesPerSample += v.Size
+	}
+	if len(vars) == 0 {
+		jsonError(w, http.StatusBadRequest, "no valid addressed variables in 'vars'")
+		return
+	}
+
+	intervalUs := 1000
+	if n, err := strconv.Atoi(r.URL.Query().Get("interval_us")); err == nil && n > 0 {
+		intervalUs = n
+	}
+	const minSampleUs = 100 // ticker floor — below this, scheduler jitter dominates
+	if intervalUs < minSampleUs {
+		intervalUs = minSampleUs
+	}
+	const deliverUs = 5000
+	// Cap buffered samples so a stalled/slow client can't grow the frame without
+	// bound (drops newest while full — accepted loss).
+	maxSamples := (deliverUs/intervalUs)*4 + 4
+
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("X-Accel-Buffering", "no")
+	w.WriteHeader(http.StatusOK)
+	flusher.Flush()
+
+	sampleTick := time.NewTicker(time.Duration(intervalUs) * time.Microsecond)
+	defer sampleTick.Stop()
+	deliverTick := time.NewTicker(deliverUs * time.Microsecond)
+	defer deliverTick.Stop()
+
+	buf := make([]byte, 0, maxSamples*bytesPerSample)
+	count := 0
+	ctx := r.Context()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-sampleTick.C:
+			if count < maxSamples {
+				buf = am.ipc.AppendRawSample(vars, buf)
+				count++
+			}
+		case <-deliverTick.C:
+			if count == 0 {
+				continue
+			}
+			var hdr [7]byte
+			binary.LittleEndian.PutUint32(hdr[0:4], uint32(2+1+len(types)+len(buf)))
+			binary.LittleEndian.PutUint16(hdr[4:6], uint16(count))
+			hdr[6] = byte(len(vars))
+			if _, err := w.Write(hdr[:]); err != nil {
+				return
+			}
+			if _, err := w.Write(types); err != nil {
+				return
+			}
+			if _, err := w.Write(buf); err != nil {
+				return
+			}
+			flusher.Flush()
+			buf = buf[:0]
+			count = 0
+		}
+	}
 }
 
 // handleClearForces clears force flags on all addressed variables.

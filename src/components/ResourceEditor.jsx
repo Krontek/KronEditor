@@ -1,6 +1,7 @@
 import React, { useMemo, useState } from 'react';
 import VariableManager from './VariableManager';
 import { useTranslation } from 'react-i18next';
+import { downloadFile } from '../services/browserFs';
 
 // POU buckets in projectStructure, with a human label for the overview's Scope column.
 const POU_CATS = [
@@ -61,14 +62,33 @@ const ResourceEditor = ({ content, onContentChange, availablePrograms = [], deri
         return rows;
     }, [content.globalVars, content.projectStructure]);
 
-    const SectionHeader = ({ title }) => (
+    const SectionHeader = ({ title, right = null }) => (
         <div style={{
             padding: '5px 10px', background: '#2d2d2d', color: '#ccc', fontSize: '11px',
-            fontWeight: 'bold', textTransform: 'uppercase', borderBottom: '1px solid #333'
+            fontWeight: 'bold', textTransform: 'uppercase', borderBottom: '1px solid #333',
+            display: 'flex', alignItems: 'center', justifyContent: 'space-between'
         }}>
-            {title}
+            <span>{title}</span>
+            {right}
         </div>
     );
+
+    // Export the addressed-variable overview (the REST/HMI-exposed set) as CSV.
+    // LiveKey matches the runtime/stream naming so integrators can use it
+    // directly (globals: prog__<name>, POU locals: prog_<pou>_<name>).
+    const handleExportCsv = () => {
+        const esc = (s) => {
+            const str = String(s ?? '');
+            return /[",;\n]/.test(str) ? `"${str.replace(/"/g, '""')}"` : str;
+        };
+        const header = ['Address', 'Variable', 'Type', 'Scope', 'Kind', 'LiveKey'];
+        const lines = [header, ...addressed.map(r => [
+            r.address, r.name, r.type, r.scope, r.kind,
+            r.scope === 'Global' ? `prog__${r.name}` : `prog_${r.scope.replace(/\s+/g, '_')}_${r.name}`,
+        ])].map(row => row.map(esc).join(','));
+        // BOM so Excel detects UTF-8
+        downloadFile('addressed_variables.csv', '\ufeff' + lines.join('\r\n'), 'text/csv');
+    };
 
     const TabBtn = ({ id, children }) => (
         <button
@@ -117,7 +137,24 @@ const ResourceEditor = ({ content, onContentChange, availablePrograms = [], deri
                 </div>
             ) : (
                 <div style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
-                    <SectionHeader title={`Addressed Variables — all programs (${addressed.length})`} />
+                    <SectionHeader
+                        title={`Addressed Variables — all programs (${addressed.length})`}
+                        right={addressed.length > 0 && (
+                            <button
+                                onClick={handleExportCsv}
+                                title="Download this list as addressed_variables.csv"
+                                style={{
+                                    padding: '2px 10px', fontSize: 11, cursor: 'pointer',
+                                    background: '#0e639c', color: '#fff', border: 'none',
+                                    borderRadius: 3, fontWeight: 600, textTransform: 'none',
+                                }}
+                                onMouseEnter={e => e.currentTarget.style.background = '#1177bb'}
+                                onMouseLeave={e => e.currentTarget.style.background = '#0e639c'}
+                            >
+                                ⤓ Export CSV
+                            </button>
+                        )}
+                    />
                     <div style={{ flex: 1, overflow: 'auto' }}>
                         {addressed.length === 0 ? (
                             <div style={{ padding: 20, color: '#888', fontSize: 12, textAlign: 'center' }}>

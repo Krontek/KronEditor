@@ -560,6 +560,28 @@ func (m *IPCManager) AddressedVarInfo(name string) (Variable, bool) {
 	return v, ok
 }
 
+// AppendRawSample appends the current raw little-endian bytes of each variable
+// (in the given order) to dst and returns the extended slice. Values are the
+// native SHM representation, ready to ship over the binary buffered stream. One
+// RLock covers the whole sample so all variables come from the same instant.
+// Out-of-range variables are zero-padded to keep the frame layout fixed.
+func (m *IPCManager) AppendRawSample(vars []Variable, dst []byte) []byte {
+	m.mu.RLock()
+	mem := m.mem
+	for i := range vars {
+		v := &vars[i]
+		if v.Size > 0 && v.Offset >= 0 && v.Offset+v.Size <= len(mem) {
+			dst = append(dst, mem[v.Offset:v.Offset+v.Size]...)
+		} else {
+			for n := 0; n < v.Size; n++ {
+				dst = append(dst, 0)
+			}
+		}
+	}
+	m.mu.RUnlock()
+	return dst
+}
+
 // typeSizeMap defines the byte size of each type.
 var typeSizeMap = map[VarType]int{
 	VarBool:    1,
