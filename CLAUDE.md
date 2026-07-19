@@ -26,12 +26,10 @@ This file is the durable knowledge base for anyone (human or AI) working on the 
 
 **Language.** All code, comments, identifiers, and string literals are English only.
 
-**Library C sources.**
-- Edit the canonical C sources under `/home/fehim/Documents/KrontekLibraries/` **first**.
-- If the same file exists under `src-tauri/resources/.../include/`, apply the identical change there too (keep in sync).
-- Never edit only `resources/include/` and skip KrontekLibraries.
-- Never generate `.a` static archives — only `.c`/`.h`. Rebuilding/deploying `.a` is the user's job.
-- `src-tauri/target/release/resources/include/kronec.c` is a stale stub — never touch it.
+**Library C / HAL headers.**
+- Header sources (`.h`, incl. `HAL/kronhal*.h`) now live in **ONE** place: `resources/krontek-include/`. Edit there — a single copy is served to every target, so there is no longer a per-triple sync step (the old `resources/<triple>/include/` copies were consolidated; drift between them was a recurring bug).
+- If `KrontekLibraries/` is present on the machine, edit the canonical `.c` there first and mirror any `.h` change into `resources/krontek-include/`.
+- Never generate `.a` static archives — only `.c`/`.h`. Rebuilding/deploying `.a` (per-triple under `resources/<triple>/lib/`) is the user's job.
 
 **Ask before large or ambiguous changes.** When uncertain about requirements or direction, ask *before* implementing, not after.
 
@@ -119,7 +117,8 @@ server/                       KronServer (cross-compiled to target binaries)
 hotswaplib/                   Shared Go module (local-replaced into host-agent + server go.mod)
                               Generation discovery + swap_result protocol
 
-resources/<triple>/           Krontek libraries + HAL headers + prebuilt .a + server binary
+resources/krontek-include/    SINGLE shared header tree (HAL/*.h + kron*.h + soem/) — arch-independent, served to EVERY target via one -I (host-agent paths.go ResourceTargetIncludeDir). Replaces the old per-triple include/ copies.
+resources/<triple>/           Per-arch build artifacts ONLY: prebuilt .a (lib/) + server binary (server/). No headers.
 toolchains/                   Bundled LLVM (clang, llvm-ar) + per-target sysroots (~5 GB)
 public/libraries/*.xml        Block library definitions loaded by LibraryService.js
 KrontekLibraries/             SOURCE OF TRUTH for all .c/.h HAL & library sources
@@ -457,7 +456,7 @@ Every hardware block = **struct + `_Call` function**.
 - Hardware struct: `HAL_UART_Send`, `HAL_I2C_Read`, `HAL_USB_Send`.
 - Generic struct (in transpiled C): `UART_Send`, `USB_Receive`.
 - Channel dispatch: `UART0_Send_Call(inst)` → `HAL_UART_Send_Call(inst, 0)`.
-- ⚠️ Both `KrontekLibraries/KronHAL/kronhal.h` and `resources/.../kronhal.h` must stay in sync.
+- ⚠️ The runtime HAL header is `resources/krontek-include/HAL/kronhal.h` (single shared copy). If `KrontekLibraries/KronHAL/kronhal.h` is present, keep it in sync with that one.
 
 ### USB_Send vs USB_Receive (different by design)
 | Block | Trigger | Done/Ready | Buffer | Length |
@@ -474,23 +473,21 @@ Every hardware block = **struct + `_Call` function**.
 `_*_usb_open()` drops DTR low after `tcsetattr` via `ioctl(fd, TIOCMBIC, &TIOCM_DTR)`. Required for motor-controlled USB devices like RPLIDAR A1M8 (DTR-high = motor-off). **Side effect:** Arduino/ESP32 boards with a DTR auto-reset line are held in reset while the port is open. If a future board needs DTR-high default, refactor into an explicit HAL block instead of a per-port flag.
 
 ### Servo / ESC software-PWM outputs (KRON_SERVO_* board service, NOT a block)
-Software bit-bangs a 50 Hz servo/ESC pulse on a GPIO pin with sub-µs HIGH-width accuracy. **Why it exists:** you cannot generate a 1000–2000 µs servo pulse by counting PLC scans — the edge quantizes to (and jitters by) a full scan, and a fast task can't hold its period once the scan body + full-SHM memcpy exceed the tick. First choice is **hardware PWM** (`PWMn`); on Jetson Orin (and many chips) the HW PWM min period is too small for 50 Hz (`period=20000000` → `EINVAL`), and the cleanest offload is a **PCA9685 over I2C** (timing in silicon, no custom code). This service is the no-extra-hardware fallback.
+Software bit-bangs a 50 Hz servo/ESC pulse on a GPIO pin with sub-µs HIGH-width accuracy. **Why it exists:** you cannot generate a 1000–2000 µs servo pulse by counting PLC scans — the edge quantizes to (and jitters by) a full scan, and even a fast dedicated task can't place a sub-µs edge (a tick-quantized scan only drops the line at a tick boundary; sub-µs needs an in-thread busy-wait, which the scan can't do without stalling logic) nor read the setpoint without the per-scan full-SHM memcpy. First choice is **hardware PWM** (`PWMn`); on Jetson Orin (and many chips) the HW PWM min period is too small for 50 Hz (`period=20000000` → `EINVAL`), and the cleanest offload is a **PCA9685 over I2C** (timing in silicon, no custom code). This service is the no-extra-hardware fallback.
 
 **Why a board service and not a ladder block:** hard-RT waveform timing is the wrong job for the PLC scan and an app-specific ESC FB is the wrong altitude for core HAL. So it mirrors the EtherCAT/UART-runtime pattern: configured in board IO config, the scan exchanges data via a variable (IO-image), a background thread owns the waveform. There is intentionally **no `ESC_Drive` block** (an earlier draft added one; it was removed).
 
 - **Config:** `deviceInterfaceConfig.SERVO = [{ id, enabled, pin, freqHz, variable }]` (res_config), edited in `BoardConfigPage.jsx` `ServoOutputsCard`. `variable` must be a declared **REAL global** — the pulse-width setpoint in µs. Set its initial value to 1500 (neutral) so the ESC arms.
 - **Codegen** (`buildServoRuntime` in CTranspilerService.js): per channel emits `KRON_SERVO_Register(idx, pin, period_ns, (volatile float*)&S->${var})` + `KRON_SERVO_RuntimeInit()` into PLC_Init (appended to the mainLoop initCode), and `KRON_SERVO_RuntimeCleanup()` into PLC_Cleanup. Only for linux HAL families (`SERVO_HAL_FAMILIES`); invalid pin / non-REAL / undeclared var → `console.warn` + skip. Every global is already a `S->${name}` PlcState field, so the bind is valid even if the var is only written from ST.
-- **Runtime** (shared `kronhal.h`, after the board include so it reuses `GPIO_Write_Call` → board-agnostic, one copy serves every HAL): one `SCHED_FIFO` thread schedules each frame with `clock_nanosleep(TIMER_ABSTIME)` and **busy-waits** the exact HIGH µs per channel. It reads the setpoint *by pointer* each frame (`*ch->us`), so the scan writing the REAL variable and the thread are fully decoupled — scan jitter never reaches the waveform. **Setpoint < 1000 µs (e.g. 0) or NaN → the channel is CUT** (no pulse, line held low) — the scan writes 0 to stop the signal entirely at neutral/zero rather than holding a 1500 µs neutral pulse; > 2000 clamps to 2000. (⚠️ cutting at neutral means an ESC that needs continuous signal will disarm — the ST must still write ~1500 during the arming phase.) Frame period = min of registered channel periods.
+- **Runtime** (`resources/krontek-include/HAL/kronhal.h`, at the end of the file so it sits *after* the board include and reuses `GPIO_Write_Call` → board-agnostic, one shared copy serves every HAL): one `SCHED_FIFO` thread schedules each frame with `clock_nanosleep(TIMER_ABSTIME)` and **busy-waits** the exact HIGH µs per channel. It reads the setpoint *by pointer* each frame (`*ch->us`), so the scan writing the REAL variable and the thread are fully decoupled — scan jitter never reaches the waveform. **Setpoint < 1000 µs (e.g. 0) or NaN → the channel is CUT** (no pulse, line held low) — the scan writes 0 to stop the signal entirely at neutral/zero rather than holding a 1500 µs neutral pulse; > 2000 clamps to 2000. (⚠️ cutting at neutral means an ESC that needs continuous signal will disarm — the ST must still write ~1500 during the arming phase.) Frame period = min of registered channel periods.
 - **CPU affinity** only under `#ifdef CPU_SET` (needs `_GNU_SOURCE`, which the build does NOT define) — FIFO priority + `mlockall` still apply. Add `-D_GNU_SOURCE` to `compile.go` for last-core pinning.
-- **Not hot-swap trampolined** (own thread + static GPIO fds), like EtherCAT — deploy with **Build & Send**, not "Go Live". Sim build (`HAL_SIM_MODE`) stubs `KRON_SERVO_*` to no-ops (setpoint variable still updates in the sim), so no RT thread spawns locally.
-- **Verified:** HAL compiles (jetson `-O3`, sim `-O0`, `_GNU_SOURCE`); the full transpiler→C output compiles for jetson + sim; no-hang/error-path smoke-tested. ⚠️ **Physical-hardware waveform still unverified** (no GPIO/scope) — a real-device scope check + safe-state-on-stop review remain (SIGKILL releases the lines → most ESCs failsafe to neutral, but there is no explicit neutral-on-SIGTERM handler yet).
-- ⚠️ `KrontekLibraries/` was **absent on this machine** — only `resources/*/include/HAL/kronhal.h` (all 7 triples, kept identical) was updated. Mirror the `KRON_SERVO_*` runtime into `KrontekLibraries/KronHAL/kronhal.h` when available.
+- **Not hot-swap trampolined** (own thread + static GPIO fds), like EtherCAT — deploy with **Build & Send**, not "Go Live". Sim build (`HAL_SIM_MODE` / non-Linux) stubs `KRON_SERVO_*` to no-ops (setpoint variable still updates in the sim), so no RT thread spawns locally — see the `#else` branch in kronhal.h.
+- **Verified:** the full transpiler→C output compiles for the sim (`-O0`, stub path) and for a real target (`-O3`, real RT-thread path). ⚠️ **Physical-hardware waveform still unverified** (no GPIO/scope) — a real-device scope check + safe-state-on-stop review remain (SIGKILL releases the lines → most ESCs failsafe to neutral, but there is no explicit neutral-on-SIGTERM handler yet).
 
-### Adding/removing pins on a standard FB — five locations
+### Adding/removing pins on a standard FB — four locations
 | Location | Change |
 |---|---|
-| `KrontekLibraries/…/header.h` | struct field (canonical) |
-| `resources/*/include/header.h` | sync to all target dirs |
+| `resources/krontek-include/…/header.h` | struct field (single shared copy; if `KrontekLibraries/…/header.h` exists, sync it too) |
 | `public/libraries/*.xml` | `<pin>` under `<inputs>`/`<outputs>` (drives the LD UI) |
 | `FB_INPUTS[type]` (CTranspilerService.js) | ordered input pin list (drives pre-call assignment) |
 | `FB_OUTPUTS[type]` (CTranspilerService.js) | output pin list (drives shadow-var decl + write-back) |

@@ -26,7 +26,14 @@ dist-ssr
 
 Releases/
 
-/resources
+# Large per-arch build artifacts (lib/*.a, server binaries, headers pulled from
+# the separate Krontek libraries repo) stay out of git.
+/resources/*
+# EXCEPTION: the HAL headers are source-of-truth for this repo and ARE tracked —
+# they are maintained here, not pulled from the separate repo.
+!/resources/krontek-include/
+/resources/krontek-include/*
+!/resources/krontek-include/HAL/
 
 # Backend Artifacts
 bin/
