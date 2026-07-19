@@ -90,12 +90,16 @@ func (p *Paths) ResourceTargetDir(target string) (string, error) {
 	return filepath.Join(p.ResourcesRoot, key), nil
 }
 
+// ResourceTargetIncludeDir returns the Krontek library + HAL header include
+// dir. These headers are architecture-independent (POSIX/Linux APIs gated by
+// board #defines), so a single shared tree at resources/krontek-include serves
+// every target instead of one duplicated copy per triple. The target is still
+// validated so an unknown target key surfaces the same error as before.
 func (p *Paths) ResourceTargetIncludeDir(target string) (string, error) {
-	dir, err := p.ResourceTargetDir(target)
-	if err != nil {
+	if _, err := targetResourceKey(target); err != nil {
 		return "", err
 	}
-	return filepath.Join(dir, "include"), nil
+	return filepath.Join(p.ResourcesRoot, "krontek-include"), nil
 }
 
 func (p *Paths) ResourceTargetLibDir(target string) (string, error) {
