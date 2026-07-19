@@ -224,6 +224,22 @@ body {
   color: #fff;
 }
 
+/* Compile-in-progress spinner (Build / Simulation toolbar buttons) */
+.tb-spinner {
+  display: inline-block;
+  width: 11px;
+  height: 11px;
+  border: 2px solid rgba(255, 255, 255, 0.25);
+  border-top-color: #4fc3f7;
+  border-radius: 50%;
+  animation: tb-spin 0.8s linear infinite;
+  flex-shrink: 0;
+}
+
+@keyframes tb-spin {
+  to { transform: rotate(360deg); }
+}
+
 .tb-divider {
   width: 1px;
   height: 20px;

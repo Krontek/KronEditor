@@ -21,6 +21,40 @@ export const formatTimeUs = (us) => {
     return result;
 };
 
+// True for the IEC duration types the T#-prefix normalisation applies to.
+export const isTimeType = (type) => {
+    const t = String(type || '').trim().toUpperCase();
+    return t === 'TIME' || t === 'LTIME';
+};
+
+/**
+ * Normalise a user-typed TIME value into an IEC literal so the user need not
+ * type the `T#` prefix. Rules (for a TIME-typed field):
+ *   "500ms"   → "T#500ms"        (prefix added)
+ *   "1m30s"   → "T#1m30s"
+ *   "500"     → "T#500ms"        (NO unit ⇒ milliseconds, not µs)
+ *   "T#5s"    → "T#5s"           (already prefixed → left untouched, prefix
+ *                                 uppercased so it stays a valid literal)
+ *   ""        → ""               (empty stays empty)
+ * A value that isn't a recognisable duration is returned unchanged so real
+ * errors still surface at transpile time rather than being silently mangled.
+ */
+export const normalizeTimeLiteral = (raw) => {
+    const s = String(raw ?? '').trim();
+    if (!s) return s;
+    // Already prefixed (T#/TIME#/LT#/LTIME#) — keep as the user wrote it, only
+    // normalising the prefix case so `t#5s` stays valid.
+    const pfx = s.match(/^(LTIME|TIME|LT|T)#/i);
+    if (pfx) return s.replace(/^(LTIME|TIME|LT|T)#/i, (m) => m.toUpperCase());
+    // Bare number, no unit → milliseconds.
+    if (/^\d+(?:\.\d+)?$/.test(s)) return `T#${s}ms`;
+    // Number(s) followed by d/h/m/s/ms/us/ns units (compound allowed) → add T#.
+    if (/^(?:\d+(?:\.\d+)?(?:d|h|m|s|ms|us|ns))+$/i.test(s.replace(/_/g, ''))) {
+        return `T#${s}`;
+    }
+    return s; // unrecognised — leave it for the transpiler to flag
+};
+
 export const PLC_BLOCKS = {
   // --- ZAMANLAYICILAR ---
   TON: {

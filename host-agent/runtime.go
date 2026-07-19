@@ -203,6 +203,10 @@ func (s *Server) handleStopSimulation(w http.ResponseWriter, r *http.Request) {
 type writeVariableReq struct {
 	Name  string `json:"name"`
 	Value string `json:"value"`
+	// Mode selects the force-flag semantics in the hot-swap sim: "force" (default)
+	// holds the value every scan; "pulse" injects it for a single scan then the
+	// logic resumes (the generated plc_shm_pull auto-clears a pulse flag).
+	Mode string `json:"mode"`
 }
 
 func (s *Server) handleWriteVariable(w http.ResponseWriter, r *http.Request) {
@@ -567,13 +571,13 @@ func buildVarSpecs(varTable map[string]interface{}, symbols map[string]uint64) [
 
 func typeSize(t string) int {
 	switch strings.ToUpper(t) {
-	case "BOOL", "SINT", "USINT":
+	case "BOOL", "SINT", "USINT", "BYTE":
 		return 1
-	case "INT", "UINT":
+	case "INT", "UINT", "WORD":
 		return 2
-	case "DINT", "UDINT", "TIME", "REAL":
+	case "DINT", "UDINT", "TIME", "REAL", "DWORD":
 		return 4
-	case "LINT", "ULINT", "LREAL":
+	case "LINT", "ULINT", "LREAL", "LWORD":
 		return 8
 	case "TON", "TOF":
 		return 16
@@ -590,19 +594,19 @@ func decodeValue(buf []byte, t string) interface{} {
 		return buf[0] != 0
 	case "SINT":
 		return int8(buf[0])
-	case "USINT":
+	case "USINT", "BYTE":
 		return buf[0]
 	case "INT":
 		return int16(binary.LittleEndian.Uint16(buf[:2]))
-	case "UINT":
+	case "UINT", "WORD":
 		return binary.LittleEndian.Uint16(buf[:2])
 	case "DINT":
 		return int32(binary.LittleEndian.Uint32(buf[:4]))
-	case "UDINT", "TIME":
+	case "UDINT", "TIME", "DWORD":
 		return binary.LittleEndian.Uint32(buf[:4])
 	case "LINT":
 		return int64(binary.LittleEndian.Uint64(buf[:8]))
-	case "ULINT":
+	case "ULINT", "LWORD":
 		return binary.LittleEndian.Uint64(buf[:8])
 	case "REAL":
 		return sanitizeFloat(float64(math.Float32frombits(binary.LittleEndian.Uint32(buf[:4]))), true)
@@ -663,7 +667,7 @@ func encodeValue(t, value string) ([]byte, bool) {
 			return nil, false
 		}
 		return []byte{byte(int8(v))}, true
-	case "USINT":
+	case "USINT", "BYTE":
 		v, err := strconv.ParseUint(s, 10, 8)
 		if err != nil {
 			return nil, false
@@ -677,7 +681,7 @@ func encodeValue(t, value string) ([]byte, bool) {
 		out := make([]byte, 2)
 		binary.LittleEndian.PutUint16(out, uint16(int16(v)))
 		return out, true
-	case "UINT":
+	case "UINT", "WORD":
 		v, err := strconv.ParseUint(s, 10, 16)
 		if err != nil {
 			return nil, false
@@ -693,7 +697,7 @@ func encodeValue(t, value string) ([]byte, bool) {
 		out := make([]byte, 4)
 		binary.LittleEndian.PutUint32(out, uint32(int32(v)))
 		return out, true
-	case "UDINT", "TIME":
+	case "UDINT", "TIME", "DWORD":
 		v, err := strconv.ParseUint(s, 10, 32)
 		if err != nil {
 			return nil, false
@@ -709,7 +713,7 @@ func encodeValue(t, value string) ([]byte, bool) {
 		out := make([]byte, 8)
 		binary.LittleEndian.PutUint64(out, uint64(v))
 		return out, true
-	case "ULINT":
+	case "ULINT", "LWORD":
 		v, err := strconv.ParseUint(s, 10, 64)
 		if err != nil {
 			return nil, false

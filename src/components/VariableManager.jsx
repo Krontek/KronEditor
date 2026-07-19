@@ -2,11 +2,11 @@ import React, { useState, useEffect, useRef } from 'react';
 import { DataTypeSelector, ModernSelect } from './common/Selectors';
 import ForceWriteModal from './common/ForceWriteModal';
 import { useTranslation } from 'react-i18next';
-import { formatTimeUs } from '../utils/plcStandards';
+import { formatTimeUs, isTimeType, normalizeTimeLiteral } from '../utils/plcStandards';
 import { blockConfig } from './RungContainer';
 import { writeClipboard, readClipboard, useKronClipboard, CLIP_KIND } from '../utils/kronClipboard';
 import { setEditorScope, getEditorScope, EDITOR_SCOPE } from '../utils/editorScope';
-import { isReservedTranspilerName } from '../utils/reservedNames';
+import { isReservedTranspilerName, isValidIecIdentifier } from '../utils/reservedNames';
 
 const ALL_CLASSES = ['Local', 'Global', 'Input', 'Output', 'InOut', 'Temp'];
 
@@ -382,6 +382,12 @@ const VariableManager = ({
     if (!trimmed) return;
     const currentVar = variables.find(v => v.id === id);
     if (!currentVar || currentVar.name === trimmed) return;
+    // Must be a valid IEC identifier — no spaces (incl. internal), no
+    // punctuation, no leading digit — else the generated C symbol is broken.
+    if (!isValidIecIdentifier(trimmed)) {
+      alert(t('errors.invalidVarName', { name: trimmed }));
+      return;
+    }
     // Block names the transpiler/runtime reserve at C file scope (e.g. "S" is
     // the internal PlcState pointer) — using one produces broken generated C
     // that only fails at compile time (see reservedNames.js for the full list
@@ -594,28 +600,15 @@ const VariableManager = ({
                       onChange={(newType) => {
                         if (isSimulationMode || disabled) return;
 
-                        // User request: if the selected type is the same type and same name as another variable, including global, don't allow the change.
+                        // Block only same-SCOPE collisions: another var in THIS
+                        // POU with the same name+type, or a global of the same
+                        // name+type. Local variables in DIFFERENT programs are
+                        // independently scoped and MAY share a name+type — do not
+                        // check across programs (that wrongly rejected e.g. a
+                        // second program declaring its own `var1 : INT`).
                         const isDuplicate = variables.some(other => other.id !== v.id && other.name === v.name && other.type === newType) ||
                           globalVars.some(other => other.name === v.name && other.type === newType);
-
-                        if (projectStructure) {
-                          let isLocalDuplicate = false;
-                          ['programs'].forEach(category => {
-                            if (projectStructure[category]) {
-                              projectStructure[category].forEach(item => {
-                                if (item.content && item.content.variables) {
-                                  if (item.content.variables.some(other => other.name === v.name && other.type === newType)) {
-                                    isLocalDuplicate = true;
-                                  }
-                                }
-                              });
-                            }
-                          });
-                          if (isDuplicate || isLocalDuplicate) {
-                            alert(t('errors.varExistsWithType', { name: v.name, type: newType }));
-                            return;
-                          }
-                        } else if (isDuplicate) {
+                        if (isDuplicate) {
                           alert(t('errors.varExistsWithType', { name: v.name, type: newType }));
                           return;
                         }
@@ -627,7 +620,7 @@ const VariableManager = ({
                     />
                   </td>
                   <td style={bCell}>
-                    <EditableCell value={v.initialValue} onCommit={(val) => !disabled && onUpdate && onUpdate(v.id, 'initialValue', val)} />
+                    <EditableCell value={v.initialValue} onCommit={(val) => !disabled && onUpdate && onUpdate(v.id, 'initialValue', isTimeType(v.type) ? normalizeTimeLiteral(val) : val)} />
                   </td>
                   {liveVariables && (
                     <td
@@ -729,7 +722,8 @@ const VariableManager = ({
           varType={forceModal.varType}
           currentValue={forceModal.liveVal}
           liveKey={forceModal.liveKey}
-          onConfirm={(key, val) => { onForceWrite && onForceWrite(key, val); }}
+          allowPulse={isSimulationMode}
+          onConfirm={(key, val, mode) => { onForceWrite && onForceWrite(key, val, mode); }}
         />
       )}
 

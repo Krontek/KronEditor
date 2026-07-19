@@ -24,3 +24,22 @@ export function isReservedTranspilerName(name) {
   if (!n) return false;
   return RESERVED_EXACT.has(n) || TASK_BODY_RE.test(n);
 }
+
+// A valid IEC 61131-3 identifier: a letter or underscore, then letters, digits
+// or underscores — no spaces (leading, trailing OR internal), no punctuation,
+// no leading digit. Every user-entered name (variable, POU/program, data type)
+// must satisfy this so the generated C symbol is always well-formed.
+export const IEC_IDENTIFIER_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
+
+export function isValidIecIdentifier(name) {
+  return IEC_IDENTIFIER_RE.test(String(name || '').trim());
+}
+
+// Normalize a raw name for a PLC identifier: trim surrounding whitespace and
+// drop every character that isn't a letter, digit or underscore (spaces and
+// punctuation are removed rather than turned into underscores). Useful as an
+// as-you-type sanitizer; callers should still validate with
+// isValidIecIdentifier (this does not fix a leading digit).
+export function sanitizeIecIdentifier(name) {
+  return String(name || '').trim().replace(/[^A-Za-z0-9_]/g, '');
+}

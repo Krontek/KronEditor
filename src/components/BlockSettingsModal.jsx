@@ -1,5 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { useTranslation } from 'react-i18next';
+import { getBlockNotes } from '../utils/blockNotes';
 const BlockSettingsModal = ({ isOpen, onClose, blockData, onSave, blockConfig, variables = [], globalVars = [] }) => {
     const { t } = useTranslation();
     const [instanceName, setInstanceName] = useState('');
@@ -209,6 +210,35 @@ const BlockSettingsModal = ({ isOpen, onClose, blockData, onSave, blockConfig, v
                         </div>
                     </div>
                 )}
+
+                {/* How it works — behaviour notes for the block (subType- and
+                    EN-aware; library blocks fall back to their XML description) */}
+                {(() => {
+                    const notes = getBlockNotes({ ...blockData, subType, executionControl }, t);
+                    if (!notes) return null;
+                    return (
+                        <div style={{ marginBottom: '20px' }}>
+                            <h4 style={{ fontSize: '12px', color: '#888', textTransform: 'uppercase', marginBottom: '10px' }}>
+                                {t('common.howItWorks')}
+                            </h4>
+                            <div style={{
+                                background: '#1e1e1e',
+                                border: '1px solid #333',
+                                borderLeft: '3px solid #0d47a1',
+                                padding: '10px',
+                                borderRadius: '4px',
+                                fontSize: '12px',
+                                color: '#bbb',
+                                lineHeight: 1.55,
+                                whiteSpace: 'pre-wrap',
+                                maxHeight: '140px',
+                                overflowY: 'auto'
+                            }}>
+                                {notes}
+                            </div>
+                        </div>
+                    );
+                })()}
 
                 {/* Buttons */}
                 <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '10px' }}>

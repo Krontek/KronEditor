@@ -131,8 +131,10 @@ export class HostClient {
   async simStatus() {
     return _get(this._p('/api/host/sim-status'));
   }
-  async writeVariable(name, value) {
-    return _post(this._p('/api/host/write-variable'), { name, value: String(value) });
+  // mode: 'force' (hold every scan, default) or 'pulse' (apply for one scan,
+  // then the logic resumes) — only meaningful for the hot-swap simulation.
+  async writeVariable(name, value, mode = 'force') {
+    return _post(this._p('/api/host/write-variable'), { name, value: String(value), mode });
   }
 
   /**

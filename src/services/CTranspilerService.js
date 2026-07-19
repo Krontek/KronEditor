@@ -1156,10 +1156,17 @@ ${boardDefines}${runtimePortHelpers}${customIncludes}${ecCfgEarly.motionIncludes
         source += `}\n`;
         source += `#endif\n`;
         source += `#define PLC_FORCE_FLAGS_BASE ${FORCE_FLAGS_BASE}\n`;
+        // Force-flag byte values: 0 = normal (logic owns the value), 1 = FORCE
+        // (value is re-injected every scan → held constant), 2 = PULSE (inject
+        // once then auto-release: pull applies it and immediately clears the flag
+        // to 0, so the logic resumes from the injected value on the SAME scan —
+        // e.g. seeding a counter to 0 which then counts up again). sync writes
+        // PlcState→shm only for flag==0, so a released pulse is written back the
+        // same scan.
         source += `static void plc_shm_pull(void) {\n`;
         source += `    if (!__plc_shm) return;\n`;
         shmEntries.forEach(({ c_symbol, offset, size, flagOffset }) => {
-            source += `    if (__plc_shm[${flagOffset}] != 0) { memcpy((void*)&(S->${c_symbol}), __plc_shm + ${offset}, ${size}); }\n`;
+            source += `    if (__plc_shm[${flagOffset}]) { memcpy((void*)&(S->${c_symbol}), __plc_shm + ${offset}, ${size}); if (__plc_shm[${flagOffset}] == 2) __plc_shm[${flagOffset}] = 0; }\n`;
         });
         source += `}\n`;
         source += `static void plc_shm_sync(void) {\n`;
@@ -1982,10 +1989,12 @@ const generateMainLoop = (projectStructure, config, boardId = null, shmEnabled =
     // All currently include the full variable set; partition per-task in future if needed.
     if (shmEnabled && shmEntries.length > 0) {
         taskGroups.forEach(tg => {
+            // See plc_shm_pull above for the flag semantics: 1 = FORCE (hold),
+            // 2 = PULSE (apply once, auto-clear, logic resumes same scan).
             mainSrc += `static void plc_shm_pull_${tg.taskName}(void) {\n`;
             mainSrc += `    if (!__plc_shm) return;\n`;
             shmEntries.forEach(({ c_symbol, offset, size, flagOffset }) => {
-                mainSrc += `    if (__plc_shm[${flagOffset}] != 0) { memcpy((void*)&(S->${c_symbol}), __plc_shm + ${offset}, ${size}); }\n`;
+                mainSrc += `    if (__plc_shm[${flagOffset}]) { memcpy((void*)&(S->${c_symbol}), __plc_shm + ${offset}, ${size}); if (__plc_shm[${flagOffset}] == 2) __plc_shm[${flagOffset}] = 0; }\n`;
             });
             mainSrc += `}\n`;
             mainSrc += `static void plc_shm_sync_${tg.taskName}(void) {\n`;

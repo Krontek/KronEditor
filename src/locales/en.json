@@ -70,7 +70,8 @@
         "paste": "Paste",
         "library": "Library",
         "dragDrop": "Drag & Drop",
-        "blockCount": "{{count}} blocks"
+        "blockCount": "{{count}} blocks",
+        "howItWorks": "How it works"
     },
     "actions": {
         "add": "Add",
@@ -147,7 +148,8 @@
         "invalidIdentifier": "Invalid Identifier: \"{name}\". Must start with a letter/underscore and contain only alphanumeric characters.",
         "varExistsScope": "Variable name '{{name}}' already exists in this scope!",
         "varExistsOtherScope": "Variable name '{{name}}' already exists as a local variable in another program/block!",
-        "varExistsWithType": "Variable with name '{{name}}' and type '{{type}}' already exists!"
+        "varExistsWithType": "Variable with name '{{name}}' and type '{{type}}' already exists!",
+        "invalidVarName": "Invalid name '{{name}}'. Use letters, digits and underscore only (no spaces) and don't start with a digit."
     },
     "settingsPage": {
         "general": "General",
@@ -319,5 +321,59 @@
         "startSimulation": "Start Simulation",
         "undo": "Undo",
         "redo": "Redo"
+    },
+    "blockNotes": {
+        "Contact": {
+            "NO": "Normally Open contact — passes rung power while the variable is TRUE.",
+            "NC": "Normally Closed contact — passes rung power while the variable is FALSE.",
+            "Rising": "Rising-edge contact — passes power for exactly ONE scan when the variable goes FALSE→TRUE. Has internal edge memory; it will not fire again until the variable drops and rises again.",
+            "Falling": "Falling-edge contact — passes power for exactly ONE scan when the variable goes TRUE→FALSE."
+        },
+        "Coil": {
+            "Normal": "Writes the rung power to the variable EVERY scan: TRUE while the rung conducts, FALSE while it does not. Do not write the same variable from two rungs — the last one wins.",
+            "Negated": "Writes the INVERSE of the rung power to the variable every scan.",
+            "Set": "Latches the variable TRUE when the rung conducts. It STAYS TRUE after power is lost — pair it with a Reset coil elsewhere.",
+            "Reset": "Latches the variable FALSE when the rung conducts. Pair with a Set coil.",
+            "Rising": "Sets the variable TRUE for one scan when rung power goes FALSE→TRUE.",
+            "Falling": "Sets the variable TRUE for one scan when rung power goes TRUE→FALSE."
+        },
+        "TON": "On-delay timer. While IN is TRUE, ET counts up; when ET reaches PT, Q turns TRUE. IN going FALSE resets ET and Q immediately. Typical use: delay an action after a condition appears.",
+        "TOF": "Off-delay timer. Q turns TRUE immediately when IN is TRUE; when IN drops, Q STAYS TRUE for PT (ET counts during the off-phase), then turns FALSE. Typical use: keep a fan running after stop.",
+        "TP": "Pulse timer. A rising edge on IN fires Q for EXACTLY PT, regardless of how long IN stays TRUE (retriggers are ignored while the pulse runs).",
+        "TONR": "Retentive on-delay timer. ET ACCUMULATES across IN=FALSE gaps — losing IN pauses but does not clear the elapsed time. Only the RESET input clears ET/Q.",
+        "CTU": "Up-counter. Each FALSE→TRUE edge on CU increments CV by 1. Q turns TRUE while CV >= PV. R=TRUE forces CV back to 0. CU held TRUE does NOT keep counting — only edges count.",
+        "CTD": "Down-counter. LD=TRUE loads CV with PV; each rising edge on CD decrements CV. Q turns TRUE when CV <= 0.",
+        "CTUD": "Up/down counter. Rising edges on CU increment, on CD decrement. R clears CV to 0, LD loads PV. QU = (CV >= PV), QD = (CV <= 0).",
+        "SR": "Set-dominant latch. S1=TRUE sets Q1; R=TRUE resets it — but if BOTH are TRUE, SET wins (Q1 stays TRUE).",
+        "RS": "Reset-dominant latch. S=TRUE sets Q1; R1=TRUE resets it — if BOTH are TRUE, RESET wins (Q1 goes FALSE).",
+        "R_TRIG": "Rising-edge detector. Q is TRUE for exactly one scan after CLK goes FALSE→TRUE.",
+        "F_TRIG": "Falling-edge detector. Q is TRUE for exactly one scan after CLK goes TRUE→FALSE.",
+        "ADD": "OUT = IN1 + IN2, recomputed every scan while the rung conducts. Works on any numeric type; the output type follows the inputs.",
+        "SUB": "OUT = IN1 − IN2, recomputed every scan while the rung conducts.",
+        "MUL": "OUT = IN1 × IN2, recomputed every scan while the rung conducts. Watch for overflow on small integer types.",
+        "DIV": "OUT = IN1 ÷ IN2, recomputed every scan. INTEGER inputs divide with truncation (7/2 = 3). IN2 = 0 is not guarded — avoid division by zero in your logic.",
+        "MOD": "OUT = IN1 modulo IN2 (remainder). Integer types only make sense here.",
+        "MOVE": "Copies IN to OUT every scan while the rung conducts. When the rung is off, OUT keeps its last value (it is NOT cleared).",
+        "ABS": "OUT = absolute value of IN, every scan while powered.",
+        "SQRT": "OUT = square root of IN (REAL math). Negative input is undefined — clamp it first.",
+        "EXPT": "OUT = IN raised to the power EXP (REAL math).",
+        "SIN": "OUT = sine of IN. IN is in RADIANS, not degrees.",
+        "COS": "OUT = cosine of IN (radians).",
+        "TAN": "OUT = tangent of IN (radians).",
+        "ASIN": "OUT = arcsine of IN, result in radians. IN must be within [-1, 1].",
+        "ACOS": "OUT = arccosine of IN, result in radians. IN must be within [-1, 1].",
+        "ATAN": "OUT = arctangent of IN, result in radians.",
+        "MAX": "OUT = the larger of IN1 and IN2, every scan while powered.",
+        "MIN": "OUT = the smaller of IN1 and IN2, every scan while powered.",
+        "LIMIT": "Clamps IN into the range [MN, MX]: OUT = MN if IN < MN, MX if IN > MX, else IN.",
+        "SEL": "Binary selector: OUT = IN0 when G is FALSE, IN1 when G is TRUE.",
+        "MUX": "Multiplexer: K selects which input is copied to OUT (K=0 → IN0, K=1 → IN1).",
+        "GT": "Q = TRUE while IN1 > IN2. Recomputed every scan — Q is a level, not a pulse.",
+        "GE": "Q = TRUE while IN1 >= IN2.",
+        "EQ": "Q = TRUE while IN1 = IN2. Avoid EQ on REAL values — use a tolerance comparison instead.",
+        "NE": "Q = TRUE while IN1 ≠ IN2.",
+        "LE": "Q = TRUE while IN1 <= IN2.",
+        "LT": "Q = TRUE while IN1 < IN2.",
+        "enNote": "Execution Control is ON: the block body runs only while EN is TRUE; ENO mirrors EN so following blocks can chain on it."
     }
 }

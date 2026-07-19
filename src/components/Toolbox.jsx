@@ -272,7 +272,9 @@ const Toolbox = ({ userDefinedBlocks = [], libraryData = [], activeFileType, sel
             blockType: lib.blockType,
             label: lib.label,
             desc: lib.desc,
-            customData: { inputs: lib.inputs, outputs: lib.outputs, class: lib.class },
+            // description rides along so the block settings modal can show it
+            // in its "How it works" section for non-standard blocks
+            customData: { inputs: lib.inputs, outputs: lib.outputs, class: lib.class, description: lib.desc },
             color: CAT_COLOR
           };
         })

@@ -43,13 +43,26 @@ const displayValue = (val) => {
  *  varType       string  — PLC type ('BOOL', 'INT', 'REAL', …)
  *  currentValue  any     — current live value (null if unknown)
  *  liveKey       string  — key passed to onConfirm
- *  onConfirm     (key, value) => void
+ *  allowPulse    boolean — offer the Pulse/Force choice (local hot-swap sim only)
+ *  onConfirm     (key, value, mode) => void  — mode: 'pulse' | 'force'
  */
-const ForceWriteModal = ({ isOpen, onClose, varName, varType, currentValue, liveKey, onConfirm }) => {
+const ForceWriteModal = ({ isOpen, onClose, varName, varType, currentValue, liveKey, allowPulse, onConfirm }) => {
+  // Pulse (one-scan) is only meaningful in the local hot-swap sim. Callers that
+  // know their context pass `allowPulse`; the rest fall back to the flag App
+  // publishes on window (mirrors the existing window.stLiveCtx live-context
+  // pattern) so every force entry point behaves consistently without threading
+  // isSimulationMode through ReactFlow node data.
+  const pulseOK = allowPulse !== undefined
+    ? allowPulse
+    : (typeof window !== 'undefined' && !!window.__kronSimActive);
   const [inputValue, setInputValue] = useState('');
   const [boolSelect, setBoolSelect] = useState('TRUE');
   const [format, setFormat] = useState('dec'); // dec | hex | oct | bin
   const [error, setError] = useState('');
+  // 'pulse' = apply for one scan then release (default when offered); 'force' =
+  // hold the value every scan. When pulse isn't available (remote PLC), always
+  // force.
+  const [mode, setMode] = useState('pulse');
 
   const type = (varType || '').toUpperCase();
   const isBool  = type === 'BOOL';
@@ -61,6 +74,7 @@ const ForceWriteModal = ({ isOpen, onClose, varName, varType, currentValue, live
     if (!isOpen) return;
     setError('');
     setFormat('dec');
+    setMode(pulseOK ? 'pulse' : 'force');
     if (isBool) {
       setBoolSelect(currentValue === true ? 'TRUE' : 'FALSE');
     } else if (currentValue !== null && currentValue !== undefined) {
@@ -79,7 +93,7 @@ const ForceWriteModal = ({ isOpen, onClose, varName, varType, currentValue, live
   };
 
   const confirm = (value) => {
-    if (onConfirm) onConfirm(liveKey, value);
+    if (onConfirm) onConfirm(liveKey, value, pulseOK ? mode : 'force');
     onClose();
   };
 
@@ -241,6 +255,37 @@ const ForceWriteModal = ({ isOpen, onClose, varName, varType, currentValue, live
         {/* Error message */}
         {error && (
           <div style={{ color: '#f44336', fontSize: 11, marginTop: 6 }}>{error}</div>
+        )}
+
+        {/* Write mode: Pulse (one scan) vs Force (hold) — sim only */}
+        {pulseOK && (
+          <div style={{ marginTop: 12 }}>
+            <div style={{ display: 'flex', gap: 4 }}>
+              {[
+                ['pulse', 'Pulse', 'Apply for one scan, then the logic resumes'],
+                ['force', 'Force', 'Hold the value every scan (pinned)'],
+              ].map(([m, label, tip]) => (
+                <button
+                  key={m}
+                  onClick={() => setMode(m)}
+                  title={tip}
+                  style={{
+                    flex: 1, padding: '5px 0', fontSize: 11, cursor: 'pointer',
+                    fontWeight: mode === m ? 'bold' : 'normal',
+                    background: mode === m ? (m === 'force' ? '#7a4a12' : '#0e639c') : '#2d2d2d',
+                    border: `1px solid ${mode === m ? (m === 'force' ? '#a5641a' : '#007acc') : '#444'}`,
+                    color: mode === m ? 'white' : '#999',
+                    borderRadius: 3,
+                  }}
+                >{label}</button>
+              ))}
+            </div>
+            <div style={{ color: '#777', fontSize: 10, marginTop: 5, lineHeight: 1.4 }}>
+              {mode === 'pulse'
+                ? 'Writes the value for a single scan; the program keeps running from it.'
+                : 'Holds the value until you Stop the run (the program can’t change it).'}
+            </div>
+          </div>
         )}
 
         {/* OK / Cancel — for all types */}

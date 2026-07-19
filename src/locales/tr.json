@@ -70,7 +70,8 @@
         "paste": "Yapıştır",
         "library": "Kütüphane",
         "dragDrop": "Sürükleyip Bırak",
-        "blockCount": "{{count}} blok"
+        "blockCount": "{{count}} blok",
+        "howItWorks": "Nasıl çalışır"
     },
     "actions": {
         "add": "Ekle",
@@ -147,7 +148,8 @@
         "invalidIdentifier": "Geçersiz Tanımlayıcı: \"{name}\". Bir harf veya alt çizgi ile başlamalı ve yalnızca alfasayısal karakterler içermelidir.",
         "varExistsScope": "Değişken adı '{{name}}' bu kapsamda zaten mevcut!",
         "varExistsOtherScope": "Değişken adı '{{name}}' başka bir programda/blokta yerel değişken olarak zaten mevcut!",
-        "varExistsWithType": "'{{name}}' adında ve '{{type}}' tipinde değişken zaten mevcut!"
+        "varExistsWithType": "'{{name}}' adında ve '{{type}}' tipinde değişken zaten mevcut!",
+        "invalidVarName": "Geçersiz ad '{{name}}'. Yalnızca harf, rakam ve alt çizgi kullanın (boşluk olmaz) ve rakamla başlamayın."
     },
     "settingsPage": {
         "general": "Genel",
@@ -319,5 +321,59 @@
         "startSimulation": "Simülasyonu Başlat",
         "undo": "Geri Al",
         "redo": "İleri Al"
+    },
+    "blockNotes": {
+        "Contact": {
+            "NO": "Normalde Açık kontak — değişken TRUE iken basamak gücünü geçirir.",
+            "NC": "Normalde Kapalı kontak — değişken FALSE iken basamak gücünü geçirir.",
+            "Rising": "Yükselen kenar kontağı — değişken FALSE→TRUE olduğunda tam BİR tarama boyunca güç geçirir. İç kenar hafızası vardır; değişken düşüp yeniden yükselmeden tekrar tetiklenmez.",
+            "Falling": "Düşen kenar kontağı — değişken TRUE→FALSE olduğunda tam BİR tarama boyunca güç geçirir."
+        },
+        "Coil": {
+            "Normal": "Basamak gücünü HER tarama değişkene yazar: basamak iletiyorken TRUE, iletmiyorken FALSE. Aynı değişkene iki basamaktan yazmayın — sonuncusu kazanır.",
+            "Negated": "Basamak gücünün TERSİNİ her tarama değişkene yazar.",
+            "Set": "Basamak ilettiğinde değişkeni TRUE'ya kilitler. Güç kesildikten sonra da TRUE KALIR — başka bir yerde Reset bobiniyle eşleştirin.",
+            "Reset": "Basamak ilettiğinde değişkeni FALSE'a kilitler. Set bobiniyle eşleştirin.",
+            "Rising": "Basamak gücü FALSE→TRUE olduğunda değişkeni bir tarama boyunca TRUE yapar.",
+            "Falling": "Basamak gücü TRUE→FALSE olduğunda değişkeni bir tarama boyunca TRUE yapar."
+        },
+        "TON": "Çekmede gecikmeli zamanlayıcı. IN TRUE iken ET sayar; ET PT'ye ulaşınca Q TRUE olur. IN FALSE olunca ET ve Q anında sıfırlanır. Tipik kullanım: bir koşul oluştuktan sonra eylemi geciktirmek.",
+        "TOF": "Bırakmada gecikmeli zamanlayıcı. IN TRUE olunca Q anında TRUE olur; IN düşünce Q, PT süresince TRUE KALIR (ET kapanma fazında sayar), sonra FALSE olur. Tipik kullanım: durdurmadan sonra fanı çalışır tutmak.",
+        "TP": "Darbe zamanlayıcı. IN'deki yükselen kenar, IN ne kadar TRUE kalırsa kalsın Q'yu tam PT süresince tetikler (darbe sürerken yeniden tetiklemeler yok sayılır).",
+        "TONR": "Kalıcı (retentive) çekme gecikmesi. ET, IN=FALSE aralıklarında BİRİKİR — IN kaybı süreyi duraklatır ama silmez. ET/Q'yu yalnız RESET girişi temizler.",
+        "CTU": "Yukarı sayıcı. CU'daki her FALSE→TRUE kenarı CV'yi 1 artırır. CV >= PV iken Q TRUE olur. R=TRUE, CV'yi 0'a döndürür. CU'yu TRUE tutmak saymayı sürdürmez — yalnız kenarlar sayılır.",
+        "CTD": "Aşağı sayıcı. LD=TRUE, CV'ye PV yükler; CD'deki her yükselen kenar CV'yi azaltır. CV <= 0 olunca Q TRUE olur.",
+        "CTUD": "Yukarı/aşağı sayıcı. CU kenarları artırır, CD kenarları azaltır. R CV'yi sıfırlar, LD PV yükler. QU = (CV >= PV), QD = (CV <= 0).",
+        "SR": "Set baskın kilit. S1=TRUE Q1'i kurar; R=TRUE sıfırlar — İKİSİ de TRUE ise SET kazanır (Q1 TRUE kalır).",
+        "RS": "Reset baskın kilit. S=TRUE Q1'i kurar; R1=TRUE sıfırlar — ikisi de TRUE ise RESET kazanır (Q1 FALSE olur).",
+        "R_TRIG": "Yükselen kenar dedektörü. CLK FALSE→TRUE olduktan sonra Q tam bir tarama TRUE olur.",
+        "F_TRIG": "Düşen kenar dedektörü. CLK TRUE→FALSE olduktan sonra Q tam bir tarama TRUE olur.",
+        "ADD": "OUT = IN1 + IN2; basamak ilettiği sürece her tarama yeniden hesaplanır. Tüm sayısal tiplerle çalışır; çıkış tipi girişleri izler.",
+        "SUB": "OUT = IN1 − IN2; basamak ilettiği sürece her tarama yeniden hesaplanır.",
+        "MUL": "OUT = IN1 × IN2; her tarama yeniden hesaplanır. Küçük tamsayı tiplerinde taşmaya dikkat.",
+        "DIV": "OUT = IN1 ÷ IN2; her tarama. TAMSAYI girişler kesirli kısmı atarak böler (7/2 = 3). IN2 = 0 korunmaz — sıfıra bölmeyi mantığınızda engelleyin.",
+        "MOD": "OUT = IN1 mod IN2 (kalan). Yalnız tamsayı tiplerde anlamlıdır.",
+        "MOVE": "Basamak ilettiği sürece IN'i her tarama OUT'a kopyalar. Basamak kapalıyken OUT son değerini korur (SİLİNMEZ).",
+        "ABS": "OUT = IN'in mutlak değeri; güç varken her tarama.",
+        "SQRT": "OUT = IN'in karekökü (REAL matematik). Negatif giriş tanımsızdır — önce sınırlayın.",
+        "EXPT": "OUT = IN üzeri EXP (REAL matematik).",
+        "SIN": "OUT = IN'in sinüsü. IN RADYAN cinsindendir, derece değil.",
+        "COS": "OUT = IN'in kosinüsü (radyan).",
+        "TAN": "OUT = IN'in tanjantı (radyan).",
+        "ASIN": "OUT = IN'in ark sinüsü, sonuç radyan. IN [-1, 1] aralığında olmalı.",
+        "ACOS": "OUT = IN'in ark kosinüsü, sonuç radyan. IN [-1, 1] aralığında olmalı.",
+        "ATAN": "OUT = IN'in ark tanjantı, sonuç radyan.",
+        "MAX": "OUT = IN1 ile IN2'nin büyüğü; güç varken her tarama.",
+        "MIN": "OUT = IN1 ile IN2'nin küçüğü; güç varken her tarama.",
+        "LIMIT": "IN'i [MN, MX] aralığına sıkıştırır: IN < MN ise OUT = MN, IN > MX ise MX, değilse IN.",
+        "SEL": "İkili seçici: G FALSE iken OUT = IN0, TRUE iken OUT = IN1.",
+        "MUX": "Çoklayıcı: K hangi girişin OUT'a kopyalanacağını seçer (K=0 → IN0, K=1 → IN1).",
+        "GT": "IN1 > IN2 olduğu sürece Q = TRUE. Her tarama yeniden hesaplanır — Q bir seviyedir, darbe değil.",
+        "GE": "IN1 >= IN2 olduğu sürece Q = TRUE.",
+        "EQ": "IN1 = IN2 olduğu sürece Q = TRUE. REAL değerlerde EQ kullanmaktan kaçının — tolerans karşılaştırması kullanın.",
+        "NE": "IN1 ≠ IN2 olduğu sürece Q = TRUE.",
+        "LE": "IN1 <= IN2 olduğu sürece Q = TRUE.",
+        "LT": "IN1 < IN2 olduğu sürece Q = TRUE.",
+        "enNote": "Yürütme Kontrolü AÇIK: blok gövdesi yalnız EN TRUE iken çalışır; ENO EN'i aynalar, sonraki bloklar ona zincirlenebilir."
     }
 }

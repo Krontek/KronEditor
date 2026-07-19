@@ -2,10 +2,10 @@ import React, { useState, useRef, useEffect } from 'react';
 import ReactDOM from 'react-dom';
 
 export const ELEMENTARY_TYPES = [
-    'BOOL', 'SINT', 'INT', 'DINT',
-    'USINT', 'UINT', 'UDINT',
-    'REAL', 'TIME', 'DATE', 'TOD', 'DT',
-    'STRING', 'WSTRING', 'BYTE', 'WORD', 'DWORD'
+    'BOOL', 'SINT', 'INT', 'DINT', 'LINT',
+    'USINT', 'UINT', 'UDINT', 'ULINT',
+    'REAL', 'LREAL', 'TIME', 'DATE', 'TOD', 'DT',
+    'STRING', 'WSTRING', 'BYTE', 'WORD', 'DWORD', 'LWORD'
 ];
 
 export const STD_BLOCK_TYPES = [

@@ -1,7 +1,7 @@
 import React, { useState, useCallback, useRef, useEffect } from 'react';
 import { useTranslation } from 'react-i18next';
 import ForceWriteModal from './common/ForceWriteModal';
-import { formatTimeUs } from '../utils/plcStandards';
+import { formatTimeUs, normalizeTimeLiteral } from '../utils/plcStandards';
 import { ErrorCodeService } from '../services/ErrorCodeService';
 import ReactFlow, {
   ReactFlowProvider,
@@ -713,7 +713,7 @@ const BlockNode = ({ id, data, selected }) => {
             varType={forceModal.varType}
             currentValue={forceModal.currentValue}
             liveKey={forceModal.liveKey}
-            onConfirm={(key, val) => { data.onForceWrite && data.onForceWrite(key, val); }}
+            onConfirm={(key, val, mode) => { data.onForceWrite && data.onForceWrite(key, val, mode); }}
           />
         )}
       </div>
@@ -805,10 +805,15 @@ const BlockNode = ({ id, data, selected }) => {
         if (inferredType === 'ANY_NUM') inferredType = varDef.type;
       }
     }
+    // Keep `suggestType` at the broad ANY_NUM family: the inferred concrete
+    // type is for display/wiring only. Without it, typing a literal into IN1
+    // (→ inferred DINT) narrowed EVERY pin's suggestion datalist to
+    // `ladder-vars-DINT`, which doesn't exist unless a DINT variable happens to
+    // be declared — so the other pins silently lost ALL autocomplete.
     cfg = {
       ...cfg,
-      inputs: cfg.inputs.map(p => p.type === 'ANY_NUM' ? { ...p, type: inferredType } : p),
-      outputs: cfg.outputs.map(p => p.type === 'ANY_NUM' ? { ...p, type: inferredType } : p),
+      inputs: cfg.inputs.map(p => p.type === 'ANY_NUM' ? { ...p, type: inferredType, suggestType: 'ANY_NUM' } : p),
+      outputs: cfg.outputs.map(p => p.type === 'ANY_NUM' ? { ...p, type: inferredType, suggestType: 'ANY_NUM' } : p),
     };
   }
 
@@ -823,7 +828,10 @@ const BlockNode = ({ id, data, selected }) => {
     : cfg.outputs;
 
   const getPinSuggestionList = (pin) => {
-    const normalizedType = normalizeEditorPinType(pin.type);
+    // suggestType (set by the ANY_NUM polymorphic inference above) keeps the
+    // autocomplete at the whole numeric family even after the pin's display
+    // type was narrowed to a concrete one.
+    const normalizedType = normalizeEditorPinType(pin.suggestType || pin.type);
     return normalizedType === 'ANY' ? 'ladder-vars-ANY' : `ladder-vars-${normalizedType}`;
   };
 
@@ -943,8 +951,11 @@ const BlockNode = ({ id, data, selected }) => {
                     transform: (liveVariables && val && valVarDef) ? 'translateY(8px)' : 'none',
                     transition: 'transform 0.2s ease'
                   }}>
-                    {/* Live value badge (simulation mode) - Positioned above the input if a variable is assigned, or in place of it if not */}
-                    {(liveVariables && (!val || valVarDef || hasShadow)) && (() => {
+                    {/* Live value badge (simulation mode) - Positioned above the input if a variable is assigned, or in place of it if not.
+                        In EDITABLE live mode (hot-swap online change) the badge never REPLACES an
+                        empty pin's input — it would cover the field and swallow clicks, making a
+                        freshly dropped block impossible to wire while the sim runs. */}
+                    {(liveVariables && (data.readOnly ? (!val || valVarDef || hasShadow) : !!(val && (valVarDef || hasShadow)))) && (() => {
                       const varLiveVal = liveVariables[`prog_${safeProgName}_${baseValName}`] !== undefined
                         ? liveVariables[`prog_${safeProgName}_${baseValName}`]
                         : liveVariables[`prog__${baseValName}`] !== undefined
@@ -1033,6 +1044,19 @@ const BlockNode = ({ id, data, selected }) => {
                         if (isTime && !TIME_CHAR_REGEX.test(newValue)) return;
                         handleInputChange(pin.name, newValue);
                       }}
+                      onBlur={() => {
+                        // TIME pins: let the user type "500ms" or "500" (no T#
+                        // prefix); on commit, normalise to a valid IEC literal
+                        // ("T#500ms"; a bare number is milliseconds). Variable
+                        // refs and unrecognised text are left untouched.
+                        if (data.readOnly || !isTime) return;
+                        const cur = localPinValues[pin.name] !== undefined ? localPinValues[pin.name] : (val || '');
+                        const norm = normalizeTimeLiteral((cur || '').replace(/[🌍🏠⊞⊡⊟]/g, '').trim());
+                        if (norm !== cur) {
+                          setLocalPinValues(prev => ({ ...prev, [pin.name]: norm }));
+                          handleInputChange(pin.name, norm);
+                        }
+                      }}
                       style={{
                         minWidth: 40,
                         width: `${Math.max(40, (localPinValues[pin.name] !== undefined ? localPinValues[pin.name].length : (val || '').length) * 6 + 8)}px`,
@@ -1045,7 +1069,9 @@ const BlockNode = ({ id, data, selected }) => {
                         borderRadius: 2,
                         outline: 'none',
                         textAlign: 'right',
-                        opacity: (liveVariables && (!val || (hasShadow && !isLiteralVal))) ? 0 : 1
+                        // Hide the input under the live badge only in READ-ONLY live view —
+                        // while live-EDITING the field must stay visible and typeable.
+                        opacity: (data.readOnly && liveVariables && (!val || (hasShadow && !isLiteralVal))) ? 0 : 1
                       }}
                       placeholder={isTime ? 'T#...' : '...'}
                     />
@@ -1149,8 +1175,10 @@ const BlockNode = ({ id, data, selected }) => {
                     transform: (lv && val && outVarDef) ? 'translateY(8px)' : 'none',
                     transition: 'transform 0.2s ease'
                   }}>
-                    {/* Live value badge (simulation mode) - Positioned above the input if a variable is assigned, or in place of it if not */}
-                    {(lv && (!val || outVarDef)) && (() => {
+                    {/* Live value badge (simulation mode) - Positioned above the input if a variable is assigned, or in place of it if not.
+                        Same editable-live rule as the input pins: never replace an empty
+                        field's input while the canvas is editable (hot-swap online change). */}
+                    {(lv && (data.readOnly ? (!val || outVarDef) : !!(val && outVarDef))) && (() => {
                       const isErrorPin = ErrorCodeService.getErrorFieldName(pin.name) !== null;
                       const numericVal = hasLive ? Number(outLiveVal) : 0;
                       const errInfo = (isErrorPin && errorCodeService && numericVal !== 0)
@@ -1210,7 +1238,9 @@ const BlockNode = ({ id, data, selected }) => {
                         borderRadius: 2,
                         outline: 'none',
                         textAlign: 'left',
-                        opacity: (lv && !val) ? 0 : 1 // Hide input visually if in sim mode and it's empty, so the '---' badge shows perfectly
+                        // Hide the empty input under the '---' badge only in READ-ONLY live
+                        // view — while live-editing the field must stay visible and typeable.
+                        opacity: (data.readOnly && lv && !val) ? 0 : 1
                       }}
                       placeholder="..."
                     />
@@ -1229,7 +1259,7 @@ const BlockNode = ({ id, data, selected }) => {
           varType={forceModal.varType}
           currentValue={forceModal.currentValue}
           liveKey={forceModal.liveKey}
-          onConfirm={(key, val) => { data.onForceWrite && data.onForceWrite(key, val); }}
+          onConfirm={(key, val, mode) => { data.onForceWrite && data.onForceWrite(key, val, mode); }}
         />
       )}
     </div >
@@ -1355,7 +1385,40 @@ const RungContainer = ({
     return Math.max(MIN_RUNG_HEIGHT, maxBottomEdge + 20);
   }, [rung.blocks, getBlockHeight]);
 
-  const MIDDLE_Y = RUNG_HEIGHT / 2;
+  // Power-line Y: FIXED at the middle of the MINIMUM rung height — deliberately
+  // NOT RUNG_HEIGHT/2. RUNG_HEIGHT grows with the lowest block, and a
+  // height-proportional middle MOVED the rail connection points every time the
+  // rung grew, putting a step ("kayma") into every previously straight wire.
+  // The rung only ever grows downward, so a fixed line keeps old alignments.
+  const MIDDLE_Y = MIN_RUNG_HEIGHT / 2;
+
+  // ── Power-line magnet ──────────────────────────────────────────────────────
+  // The wire only draws perfectly straight when a block's power-flow handle
+  // center sits EXACTLY on MIDDLE_Y — but the [10,10] snap grid can't guarantee
+  // that (e.g. a contact's handle is at y+9, forever 1px off any grid line).
+  // So on drag-stop/drop we measure the node's real handle offset from the DOM
+  // (exact for every block kind — contact, coil, FB header+rows, board blocks —
+  // with zero duplicated layout math) and, when the handle lands near the power
+  // line, snap the node so the handle is dead on it.
+  const POWER_SNAP_DRAG = 16; // px (flow units) — magnet range on drag stop
+  const POWER_SNAP_DROP = 30; // px — more generous on initial drop from palette
+
+  const powerHandleOffsetY = useCallback((nodeId) => {
+    try {
+      const root = containerRef.current || document;
+      const nodeEl = root.querySelector(`.react-flow__node[data-id="${CSS.escape(nodeId)}"]`);
+      if (!nodeEl) return null;
+      // First target (left-side) handle in DOM order = the power-flow input:
+      // contact/coil 'in', FB trigger row (or EN when execution control is on).
+      const hEl = nodeEl.querySelector('.react-flow__handle.target');
+      if (!hEl) return null;
+      const nRect = nodeEl.getBoundingClientRect();
+      const hRect = hEl.getBoundingClientRect();
+      return (hRect.top + hRect.height / 2 - nRect.top) / (scaleFactor || 1);
+    } catch {
+      return null;
+    }
+  }, [scaleFactor]);
 
   const createTerminalNodes = useCallback(() => {
     // Terminal positions in virtual coordinate system (REFERENCE_WIDTH)
@@ -1953,9 +2016,24 @@ const RungContainer = ({
       y: constrainedY
     };
 
-    onAddBlock(blockType, clampedPosition, customData);
+    const newBlockId = onAddBlock(blockType, clampedPosition, customData);
     DragDropManager.clear();
-  }, [screenToFlowPosition, onAddBlock, RUNG_BOUNDS, getBlockHeight]);
+
+    // Power-line magnet on drop: once the new node has mounted, measure its
+    // real power-handle offset and, if the drop landed near the power line,
+    // snap the block so the handle sits EXACTLY on it (straight wire, no jog).
+    // Double rAF: first frame React commits the node, second frame it is laid out.
+    if (newBlockId) {
+      requestAnimationFrame(() => requestAnimationFrame(() => {
+        const off = powerHandleOffsetY(newBlockId);
+        if (off == null) return;
+        const target = MIDDLE_Y - off;
+        if (Math.abs(clampedPosition.y - target) <= POWER_SNAP_DROP) {
+          onUpdateBlockPosition(newBlockId, { x: clampedPosition.x, y: Math.max(0, target) });
+        }
+      }));
+    }
+  }, [screenToFlowPosition, onAddBlock, RUNG_BOUNDS, getBlockHeight, powerHandleOffsetY, MIDDLE_Y, onUpdateBlockPosition]);
 
 
   const isValidConnection = useCallback((connection) => {
@@ -2036,12 +2114,15 @@ const RungContainer = ({
     const blockType = node.data?.type || node.data?.label || 'Contact';
     const bw = getBlockWidth(blockType);
     const bh = getBlockHeight(blockType, node.data?.customData);
-    const clampedPos = {
-      x: Math.max(RUNG_BOUNDS.minX, Math.min(RUNG_BOUNDS.maxX - bw, node.position.x)),
-      y: Math.max(0, Math.min(Math.max(0, RUNG_HEIGHT - bh), node.position.y))
-    };
-    onUpdateBlockPosition(node.id, clampedPos);
-  }, [onUpdateBlockPosition, RUNG_BOUNDS, getBlockWidth, getBlockHeight, RUNG_HEIGHT]);
+    let x = Math.max(RUNG_BOUNDS.minX, Math.min(RUNG_BOUNDS.maxX - bw, node.position.x));
+    let y = Math.max(0, Math.min(Math.max(0, RUNG_HEIGHT - bh), node.position.y));
+    // Magnet: released with the power handle near the power line → sit ON it.
+    const off = powerHandleOffsetY(node.id);
+    if (off != null && Math.abs((y + off) - MIDDLE_Y) <= POWER_SNAP_DRAG) {
+      y = Math.max(0, MIDDLE_Y - off);
+    }
+    onUpdateBlockPosition(node.id, { x, y });
+  }, [onUpdateBlockPosition, RUNG_BOUNDS, getBlockWidth, getBlockHeight, RUNG_HEIGHT, powerHandleOffsetY, MIDDLE_Y]);
 
   // ── Rubber Band Selection (Right-click drag) ──
   // Returns the bounding box of a node using its position and calculated dimensions

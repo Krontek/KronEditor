@@ -143,11 +143,17 @@ func buildShmSpecs(variableTableJSON string) []ShmSpec {
 	return specs
 }
 
-// writeHotSwapVariable force-writes a variable into the hot-swap loader-host's
+// writeHotSwapVariable writes a variable into the hot-swap loader-host's
 // /dev/shm mirror (the DEFAULT sim runtime). The generated plc_shm_pull only
 // copies a slot into PlcState when its force flag is set (and plc_shm_sync
 // skips forced slots), so a bare value write would be a no-op — value + flag
 // together are exactly what KronServer's WriteVar does on the target.
+//
+// req.Mode picks the flag value: "force" (default) writes flag 1 so the value
+// is re-injected every scan (held constant); "pulse" writes flag 2 so the value
+// is applied for a SINGLE scan — plc_shm_pull auto-clears a pulse flag right
+// after applying it, so the logic resumes from the injected value (e.g. a
+// counter seeded to 0 counts up again next scan).
 func (s *Server) writeHotSwapVariable(w http.ResponseWriter, req writeVariableReq) {
 	s.hotswap.mu.Lock()
 	running := s.hotswap.cmd != nil
@@ -184,7 +190,11 @@ func (s *Server) writeHotSwapVariable(w http.ResponseWriter, req writeVariableRe
 		return
 	}
 	if spec.ForceOff > 0 {
-		if _, err := f.WriteAt([]byte{1}, int64(spec.ForceOff)); err != nil {
+		flag := byte(1) // FORCE — held every scan
+		if req.Mode == "pulse" {
+			flag = 2 // PULSE — applied once, then plc_shm_pull auto-clears it
+		}
+		if _, err := f.WriteAt([]byte{flag}, int64(spec.ForceOff)); err != nil {
 			writeError(w, http.StatusInternalServerError, fmt.Sprintf("shm force flag at 0x%x: %v", spec.ForceOff, err))
 			return
 		}

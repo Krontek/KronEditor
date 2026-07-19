@@ -135,7 +135,13 @@ const variableTableSignature = (struct) => {
     ...(struct?.programs || []),
     ...(struct?.functionBlocks || []),
     ...(struct?.functions || []),
-  ].flatMap((p) => (p.variables || []).map((v) => ({ owner: p.name, ...norm(v) })));
+    // Unified rung-based POUs keep their locals at content.variables (legacy
+    // shapes had p.variables). Reading only p.variables made `locals` ALWAYS
+    // empty — so a while-running edit that auto-declared an FB instance (e.g.
+    // dropping a CTD → `CTD0 : CTD`) never tripped this guard; the swap went
+    // to the C layout-hash, was rolled back by the loader-host, and the OLD
+    // logic silently kept running (a CTD that "counts up").
+  ].flatMap((p) => ((p.content?.variables ?? p.variables) || []).map((v) => ({ owner: p.name, ...norm(v) })));
   return JSON.stringify({ globals, locals });
 };
 
@@ -155,10 +161,42 @@ const udtSignature = (struct) => JSON.stringify(struct?.dataTypes || []);
 const ioEcSignature = (boardId, buses, busConfigs) =>
   JSON.stringify({ boardId, buses: buses || [], busConfigs: busConfigs || {} });
 
+// State-shaping ladder blocks — PlcState fields that exist WITHOUT any declared
+// variable changing: every FB-style block emits per-pin shadow fields
+// (prog_X_in/out_<inst>_<pin>) and every Rising/Falling contact/coil emits an
+// edge-memory field keyed by its BLOCK id (__edge_<id>). So adding/removing/
+// renaming such a block changes the PlcState layout even when the variable
+// table is identical (the exact CTD case: instance var already declared, block
+// added later — the old signature saw nothing, the C hash rolled the swap
+// back, and the old logic silently kept running). Plain NO/NC contacts and
+// Normal/Set/Reset coils carry no state and stay hot-reloadable. Document
+// order is kept deliberately: the C layout hash is order-sensitive too.
+const stateBlocksSignature = (struct) => {
+  const pous = [
+    ...(struct?.programs || []),
+    ...(struct?.functionBlocks || []),
+    ...(struct?.functions || []),
+  ];
+  return JSON.stringify(pous.map((p) => ({
+    pou: p.name,
+    blocks: (p.content?.rungs || []).flatMap((r) => (r.blocks || [])
+      .map((b) => {
+        const t = b.data?.type || b.type;
+        if (t === 'Contact' || t === 'Coil') {
+          const st = b.data?.subType || (t === 'Contact' ? 'NO' : 'Normal');
+          return (st === 'Rising' || st === 'Falling') ? { edge: b.id } : null;
+        }
+        return { fb: b.data?.instanceName || b.id, type: b.data?.label || t };
+      })
+      .filter(Boolean)),
+  })));
+};
+
 const layoutSignature = (struct, boardId, buses, busConfigs) => ({
   task: taskSignature(struct),
   variables: variableTableSignature(struct),
   udts: udtSignature(struct),
+  blocks: stateBlocksSignature(struct),
   ioEc: ioEcSignature(boardId, buses, busConfigs),
 });
 
@@ -171,6 +209,7 @@ const layoutSignatureDiff = (a, b) => {
   if (a.task !== b.task) reasons.push('task timing/scheduling changed (task durations are not hot-reloadable)');
   if (a.variables !== b.variables) reasons.push('variable table changed (a variable or FB/UDT instance was added, removed, or retyped)');
   if (a.udts !== b.udts) reasons.push('a data type (struct/array/enum) definition changed');
+  if (a.blocks !== b.blocks) reasons.push('a state-carrying ladder block changed (an FB or Rising/Falling contact/coil was added, removed, renamed, or reordered)');
   if (a.ioEc !== b.ioEc) reasons.push('board or EtherCAT/bus configuration changed (the runtime binary itself needs rebuilding)');
   return reasons;
 };
@@ -370,6 +409,42 @@ function App() {
   // losing the connection. Drives the "Go Live" toolbar toggle.
   const [fieldHotSwap, setFieldHotSwap] = useState(false);
   const [hotSwapBusy, setHotSwapBusy] = useState(false); // Go Live deploy in flight
+  // A compile/build is in flight: 'sim' (Simulation toggle) or 'build' (Build /
+  // Build & Send). Drives the toolbar spinner + the busy (progress) cursor so
+  // the multi-second clang run has visible feedback instead of a frozen-looking
+  // button.
+  const [compileBusy, setCompileBusy] = useState(null);
+  // Manual online-change (CoDeSys-style): while a hot-swap runtime is live, the
+  // LOGIC editors stay editable; edits are NOT pushed automatically — they set
+  // pendingOnlineChange, which surfaces a "Hot Reload" toolbar button that
+  // applies them through the same guarded path as agent edits
+  // (handleAgentHotSwap: layoutSignature pre-check + the C-level
+  // plc_state_layout_hash safety net, state preserved). Layout-owning editors
+  // (variable table, sidebar structure, tasks) stay LOCKED while running so a
+  // manual edit can't silently change the PlcState shape.
+  const [pendingOnlineChange, setPendingOnlineChange] = useState(false);
+  const [hotReloadBusy, setHotReloadBusy] = useState(false); // manual hot reload in flight
+  // Project-structure snapshot the running logic was built from (set at session
+  // start / re-attach, refreshed after each confirmed swap; null when no
+  // hot-swap runtime is live). Any structure change away from it = pending.
+  const runStructSnapRef = React.useRef(null);
+  const hotSwapLive = (isRunning && isHotSwap) || fieldHotSwap;
+  useEffect(() => {
+    if (hotSwapLive) {
+      // Session (re)started or re-attached: the current structure IS what runs.
+      runStructSnapRef.current = projectStructureRef.current;
+    } else {
+      // Stopped / disconnected / Build & Send: nothing live to diff against.
+      runStructSnapRef.current = null;
+      setPendingOnlineChange(false);
+    }
+  }, [hotSwapLive]); // eslint-disable-line react-hooks/exhaustive-deps
+  useEffect(() => {
+    // Structural edit while a hot-swap runtime is live → offer Hot Reload.
+    if (runStructSnapRef.current && projectStructure !== runStructSnapRef.current) {
+      setPendingOnlineChange(true);
+    }
+  }, [projectStructure]);
 
   // Save-confirm dialog state
   const [saveConfirmOpen, setSaveConfirmOpen] = useState(false);
@@ -419,6 +494,24 @@ function App() {
   const isSimulationModeRef = React.useRef(isSimulationMode);
   useEffect(() => { isRunningRef.current = isRunning; }, [isRunning]);
   useEffect(() => { isSimulationModeRef.current = isSimulationMode; }, [isSimulationMode]);
+  // Busy cursor for the whole app while a compile/build runs (the toolbar
+  // spinner alone is easy to miss when the user is looking at the editor).
+  // The sim-compile cursor is suppressed once the sim is actually running —
+  // same stale-state guard as the button spinner. ('build' may legitimately
+  // run while a remote runtime is running, so it is not gated on isRunning.)
+  useEffect(() => {
+    const busy = compileBusy === 'build' || (compileBusy === 'sim' && !isRunning);
+    document.body.style.cursor = busy ? 'progress' : '';
+    return () => { document.body.style.cursor = ''; };
+  }, [compileBusy, isRunning]);
+  // Publish "local hot-swap sim is active" so ForceWriteModal can offer the
+  // Pulse (one-scan) write mode without threading isSimulationMode through every
+  // force entry point (watch table, ladder canvas, ST editor). Pulse only works
+  // in the local sim; a remote PLC always force-writes.
+  useEffect(() => {
+    window.__kronSimActive = isRunning && isSimulationMode;
+    return () => { window.__kronSimActive = false; };
+  }, [isRunning, isSimulationMode]);
 
   useEffect(() => {
     if (!plcAddress || !connectionEnabled) {
@@ -1252,6 +1345,7 @@ function App() {
     const nextMode = !isSimulationMode;
 
     if (nextMode) {
+      setCompileBusy('sim');
       addLog('info', t('logs.compilingSimulationTranspile') || 'Compiling Project for Simulation (C Transpilation)...');
       try {
         const standardHeaders = await host.getStandardHeaders().catch(() => []);
@@ -1279,6 +1373,10 @@ function App() {
           hostGlue: cCode.hostGlue || '',
         });
         addLog('success', 'Simulation built (hot-swap enabled — live code is reloadable).');
+        // Compile phase is over — stop the spinner NOW, before the run starts
+        // (the finally below is only the error-path safety net). Keeping it
+        // spinning through runSimulationNow made a healthy start look busy.
+        setCompileBusy(null);
 
         setIsSimulationMode(true);
 
@@ -1302,6 +1400,8 @@ function App() {
         if (error && error.log && String(error.log).trim()) {
           String(error.log).trim().split('\n').forEach(line => addLog('error', line));
         }
+      } finally {
+        setCompileBusy(null);
       }
     } else {
       setIsSimulationMode(false);
@@ -1407,7 +1507,9 @@ function App() {
     }
   };
 
-  const handleForceWrite = useCallback(async (key, value) => {
+  // mode: 'force' (hold, default) or 'pulse' (apply for one scan). Pulse is only
+  // wired for the local hot-swap sim; a remote PLC always force-writes.
+  const handleForceWrite = useCallback(async (key, value, mode = 'force') => {
     if (!isRunning) return;
     if (plcClientRef.current && !isSimulationMode) {
       const normalizedValue = (() => {
@@ -1426,7 +1528,7 @@ function App() {
       });
     } else {
       try {
-        await host.writeVariable(key, value);
+        await host.writeVariable(key, value, mode);
       } catch (err) {
         addLog('error', `Force write failed for '${key}': ${err.message || err}`);
       }
@@ -1501,6 +1603,7 @@ function App() {
     const boardInfo = getBoardById(selectedBoard);
     checkBaremetalConcurrency();
     addLog('info', `Build started for board: ${boardInfo?.name || selectedBoard}...`);
+    setCompileBusy('build');
     try {
       const standardHeaders = await host.getStandardHeaders().catch(() => []);
       const cCode = transpileToC(projectStructure, standardHeaders, selectedBoard, true, buses, busConfigs);
@@ -1514,6 +1617,8 @@ function App() {
       addLog('success', 'Build successful.');
     } catch (err) {
       addLog('error', `Build failed: ${err.message || err}`);
+    } finally {
+      setCompileBusy(null);
     }
   };
 
@@ -1547,6 +1652,7 @@ function App() {
     const boardInfo = getBoardById(selectedBoard);
     checkBaremetalConcurrency();
     addLog('info', `Build & Send for ${boardInfo?.name || selectedBoard}...`);
+    setCompileBusy('build');
     try {
       const standardHeaders = await host.getStandardHeaders().catch(() => []);
       const cCode = transpileToC(projectStructure, standardHeaders, selectedBoard, false, buses, busConfigs);
@@ -1662,6 +1768,8 @@ function App() {
       if (err && err.log && String(err.log).trim()) {
         String(err.log).trim().split('\n').forEach(line => addLog('error', line));
       }
+    } finally {
+      setCompileBusy(null);
     }
   };
 
@@ -2310,6 +2418,70 @@ function App() {
   // recompile logic.so for the target, upload to KronServer, swap. A
   // layout-changing edit can't be swapped (the runtime rolls back / errors —
   // surface it; the user should redeploy). Field swaps confirm first (live HW).
+  // Offer + perform a full rebuild & restart of the LOCAL simulation when a
+  // change cannot be hot-reloaded (layout change). Shared by the JS pre-check
+  // AND the C-level layout-hash rejection path (the loader-host's rollback),
+  // so a refused reload always surfaces as an actionable dialog — never only
+  // as a log line that is easy to miss while the OLD logic keeps running.
+  const offerSimRestart = useCallback(async (reasonText) => {
+    if (!window.confirm(`${reasonText}\n\nRestart the SIMULATION with the new code now?\n\nValues of variables that exist in BOTH versions (counters, timers, flags) are carried over, so the program resumes from its current state. Brand-new variables/FB instances start at their initial values.\n\nCancel keeps the OLD code running; the edit stays in the project.`)) {
+      addLog('warning', `Not applied — ${reasonText} The old code keeps running; the edit is kept in the project.`);
+      return;
+    }
+    setCompileBusy('sim');
+    try {
+      // STATE CARRY-OVER: snapshot the last live values BEFORE stopping. After
+      // the restart, every scalar that still exists (same live key) in the new
+      // build is re-injected as a PULSE (one-scan write, then the logic owns
+      // it) — so a counter at 35 resumes from 35 instead of resetting, which
+      // is what an operator expects from an "online" layout change. FB-internal
+      // edge memory isn't carried (not in SHM); a NEW instance starts fresh.
+      const preserved = { ...(liveVarsRef.current || {}) };
+      await host.hotswapStop().catch(() => {});
+      setIsRunning(false);
+      const standardHeaders = await host.getStandardHeaders().catch(() => []);
+      const cCode = transpileToC(projectStructure, standardHeaders, selectedBoard, true, buses, busConfigs);
+      await host.hotswapBuild({
+        header: cCode.header,
+        source: cCode.source,
+        variableTable: JSON.stringify(cCode.variableTable, null, 2),
+        hal: cCode.hal || '',
+        hostGlue: cCode.hostGlue || '',
+      });
+      setCompileBusy(null);
+      await runSimulationNow(); // refreshes layoutSigRef via its own snapshot
+      runStructSnapRef.current = projectStructure;
+      setPendingOnlineChange(false);
+      let carried = 0;
+      const newDefaults = cCode.variableTable?.debugDefaults || {};
+      for (const key of Object.keys(newDefaults)) {
+        if (!(key in preserved)) continue;             // new variable — starts fresh
+        if (key.startsWith('prog____exec_us')) continue; // diagnostics, not state
+        // FB pin shadows are NOT state and must NOT be carried:
+        //  - in_ shadows (prog_X_in_<inst>_<pin>) hold the PROGRAM SOURCE's pin
+        //    literal — seeded from the (possibly just-edited) literal at init and
+        //    only READ per scan. Carrying the old runtime value would silently
+        //    revert a pin-literal edit (PT 500ms→2s would come back as 500ms).
+        //  - out_ shadows are recomputed from the FB every scan; carrying them
+        //    only adds transient mixing before the first call settles them.
+        // Real state lives in bare vars + FB struct members (keys with a dot,
+        // e.g. prog_X_CTU0.CV) which never match this pattern.
+        if (!key.includes('.') && /_(?:in|out)_/.test(key)) continue;
+        const v = preserved[key];
+        if (v === null || v === undefined || typeof v === 'object') continue; // composites/NaN
+        try { await host.writeVariable(key, v, 'pulse'); carried++; } catch { /* type changed / no slot — skip */ }
+      }
+      addLog('success', `Simulation restarted with the new code — ${carried} variable value(s) carried over.`);
+    } catch (e) {
+      addLog('error', `Simulation restart failed: ${e.message || e}`);
+      if (e && e.log && String(e.log).trim()) {
+        String(e.log).trim().split('\n').forEach(line => addLog('error', line));
+      }
+    } finally {
+      setCompileBusy(null);
+    }
+  }, [projectStructure, selectedBoard, buses, busConfigs, addLog, runSimulationNow]); // eslint-disable-line react-hooks/exhaustive-deps
+
   const handleAgentHotSwap = useCallback(async (touchedPous) => {
     const what = (touchedPous || []).join(', ') || 'logic';
     // A layout-changing edit (task table / variable table / UDTs / board-EC
@@ -2324,7 +2496,16 @@ function App() {
       layoutSigRef.current && layoutSignature(projectStructure, selectedBoard, buses, busConfigs)
     );
     if (layoutReasons.length > 0) {
-      addLog('warning', `Not applied as an online change — ${layoutReasons.join('; ')}. The change is kept; use Build & Send to deploy it (the runtime will restart).`);
+      const why = layoutReasons.join('; ');
+      // LOCAL SIM: a layout change can't hot-reload, but a sim restart is cheap —
+      // offer it right here instead of leaving only a log line (which read as
+      // "applied" while the OLD logic silently kept running after the rollback).
+      if (hotSwapActiveRef.current) {
+        await offerSimRestart(`This change is NOT hot-reloadable — ${why}.`);
+        return;
+      }
+      // FIELD (real PLC): never auto-restart hardware — keep the explicit path.
+      addLog('warning', `Not applied as an online change — ${why}. The change is kept; use Build & Send to deploy it (the runtime will restart).`);
       return;
     }
     const standardHeaders = await host.getStandardHeaders().catch(() => []);
@@ -2337,6 +2518,8 @@ function App() {
         const cCode = transpileToC(projectStructure, standardHeaders, selectedBoard, true, buses, busConfigs);
         await host.hotswapSwap({ header: cCode.header, source: cCode.source });
         addLog('success', `Hot reload applied (sim): ${what}`);
+        runStructSnapRef.current = projectStructure; // this structure is now what runs
+        setPendingOnlineChange(false);
       } else if (fieldHotSwap && isPlcConnected && plcAddress) {
         if (!window.confirm(`The PLC at ${plcAddress} is RUNNING.\n\nThis applies your change LIVE as an online change — the logic is swapped without stopping the runtime, so outputs may change immediately on real hardware (timers/counters/latches are preserved).\n\nChanged: ${what}\n\nApply to the live PLC now?`)) {
           addLog('info', 'Online change to target cancelled.');
@@ -2350,11 +2533,36 @@ function App() {
         await host.hotswapTargetLogic({ header: cCode.header, source: cCode.source, boardId: selectedBoard });
         await host.hotswapDeploySwap(plcAddress);
         addLog('success', `Online change applied to target: ${what}`);
+        runStructSnapRef.current = projectStructure; // this structure is now what runs
+        setPendingOnlineChange(false);
       }
     } catch (e) {
-      addLog('error', `Hot-swap apply failed (a layout change needs a full redeploy): ${e.message || e}`);
+      const msg = String(e?.message || e);
+      // The loader-host's plc_state_layout_hash rejected the swap (the JS
+      // pre-check can miss exotic layout changes — the C hash is the hard
+      // net). For the local sim, turn that rejection into the same restart
+      // offer instead of a log-only error the user won't see.
+      if (hotSwapActiveRef.current && /LAYOUT/i.test(msg)) {
+        await offerSimRestart('The running program\'s memory layout differs from this change (the safety check rejected the live swap and rolled back — the OLD logic is still running).');
+        return;
+      }
+      addLog('error', `Hot-swap apply failed (a layout change needs a full redeploy): ${msg}`);
     }
-  }, [projectStructure, selectedBoard, buses, busConfigs, isHotSwap, fieldHotSwap, isPlcConnected, plcAddress, addLog]);
+  }, [projectStructure, selectedBoard, buses, busConfigs, isHotSwap, fieldHotSwap, isPlcConnected, plcAddress, addLog, offerSimRestart]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Manual "Hot Reload" (toolbar): apply the user's own edits to the running
+  // logic through the SAME guarded path as agent edits — the layoutSignature
+  // pre-check refuses layout changes with a precise reason, and the loader-host
+  // still verifies plc_state_layout_hash before binding, so the running state
+  // machine (timers/counters/latches) is preserved or the swap is rolled back.
+  const manualHotReload = useCallback(async () => {
+    setHotReloadBusy(true);
+    try {
+      await handleAgentHotSwap(['edited logic']);
+    } finally {
+      setHotReloadBusy(false);
+    }
+  }, [handleAgentHotSwap]);
 
   // --- Resize Effects ---
   useEffect(() => {
@@ -2543,14 +2751,19 @@ function App() {
               // When connected, Build & Send stays available even during Simulation /
               // while running — it confirms (and restarts the runtime) instead of
               // being blocked. Local Build (not connected) still waits for the sim to stop.
-              disabled={isPlcConnected ? false : isRunning}
+              disabled={!!compileBusy || (isPlcConnected ? false : isRunning)}
               title={
-                isPlcConnected && (isRunning || isSimulationMode) ? 'Build & Send to PLC (runtime is running — you will be asked to confirm)'
-                  : isPlcConnected ? 'Build & Send to PLC' : (t('actions.build') || 'Build')
+                compileBusy ? 'Compiling…'
+                  : isPlcConnected && (isRunning || isSimulationMode) ? 'Build & Send to PLC (runtime is running — you will be asked to confirm)'
+                    : isPlcConnected ? 'Build & Send to PLC' : (t('actions.build') || 'Build')
               }
             >
-              {isPlcConnected ? <UploadIcon /> : <BuildIcon />}
-              <span>{isPlcConnected ? 'Build & Send' : (t('actions.build') || 'Build')}</span>
+              {compileBusy === 'build' ? <span className="tb-spinner" /> : isPlcConnected ? <UploadIcon /> : <BuildIcon />}
+              <span>
+                {compileBusy === 'build'
+                  ? (isPlcConnected ? 'Building & Sending…' : 'Building…')
+                  : isPlcConnected ? 'Build & Send' : (t('actions.build') || 'Build')}
+              </span>
             </button>
 
             {/* Go Live: deploy a hot-swap loader-host to the connected target so
@@ -2573,21 +2786,44 @@ function App() {
               </button>
             )}
 
+            {/* Hot Reload: appears only while a hot-swap runtime is live AND the
+                user has edited logic since the running build — applies the edits
+                online (state preserved) via the same guarded path as agent
+                edits. Layout changes are refused with the exact reason. */}
+            {hotSwapLive && pendingOnlineChange && (
+              <button
+                className="tb-btn tb-text tb-toggle-on"
+                onClick={manualHotReload}
+                disabled={hotReloadBusy}
+                title="You edited logic while the PLC is running. Apply it live as a hot reload — timers/counters/latches are preserved. Variable/task/UDT changes can't hot-reload and will be refused (use Build & Send)."
+              >
+                <BoltIcon />
+                <span>{hotReloadBusy ? 'Reloading…' : 'Hot Reload'}</span>
+              </button>
+            )}
+
             <div className="tb-divider" />
 
             {/* ── Group: Run ───────────────────────────────────────────── */}
+            {/* simCompiling: spinner strictly for the COMPILE phase — once the
+                sim is running (isRunning) the button must never look busy, even
+                if a stale compileBusy survived an HMR/interrupted handler. */}
+            {(() => { const simCompiling = compileBusy === 'sim' && !isRunning; return (
             <button
               className={`tb-btn tb-text ${isSimulationMode ? 'tb-toggle-on' : 'tb-toggle-off'}`}
               onClick={handleToggleSimulation}
-              disabled={isRunning}
-              title="Toggle Simulation Mode"
+              disabled={isRunning || !!compileBusy}
+              title={simCompiling ? 'Compiling simulation…' : 'Toggle Simulation Mode'}
             >
-              <FlaskIcon />
-              <span>Simulation</span>
-              <span className={`tb-pill ${isSimulationMode ? 'on' : ''}`}>
-                {isSimulationMode ? 'ON' : 'OFF'}
-              </span>
+              {simCompiling ? <span className="tb-spinner" /> : <FlaskIcon />}
+              <span>{simCompiling ? 'Compiling…' : 'Simulation'}</span>
+              {!simCompiling && (
+                <span className={`tb-pill ${isSimulationMode ? 'on' : ''}`}>
+                  {isSimulationMode ? 'ON' : 'OFF'}
+                </span>
+              )}
             </button>
+            ); })()}
             <button
               className="tb-btn tb-icon tb-run"
               onClick={handleStartExecution}
@@ -2812,6 +3048,7 @@ function App() {
                           parentName={activeItem.name}
                           isRunning={isRunning}
                           isSimulationMode={isSimulationMode}
+                          allowLiveEdit={hotSwapLive}
                           onForceWrite={isRunning ? handleForceWrite : null}
                           onAddToWatchTable={addToWatchTable}
                           hwPortVars={hwPortVars}

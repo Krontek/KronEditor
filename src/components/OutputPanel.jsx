@@ -962,7 +962,7 @@ const OutputPanel = ({
                     varType={forceModal.varType}
                     currentValue={forceModal.currentValue}
                     liveKey={forceModal.liveKey}
-                    onConfirm={(key, val) => { onForceWrite && onForceWrite(key, val); setForceModal(null); }}
+                    onConfirm={(key, val, mode) => { onForceWrite && onForceWrite(key, val, mode); setForceModal(null); }}
                 />
             )}
         </div>

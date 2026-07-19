@@ -73,7 +73,14 @@ const EditorPane = ({
   onAddToWatchTable = null,
   hwPortVars = [],
   errorCodeService = null,
+  // While a hot-swap runtime is live, LOGIC editing (ST/ladder) stays enabled
+  // so the user can prepare an online change (applied via the toolbar "Hot
+  // Reload" button). The VariableManager below deliberately stays locked on
+  // isRunning regardless — variable edits change the PlcState layout, which a
+  // hot reload cannot carry.
+  allowLiveEdit = false,
 }) => {
+  const logicEditLocked = readOnly || (isRunning && !allowLiveEdit);
   // --- STATE MANAGEMENT ---
   // We use separate state checks to ensure safety
   const [variables, setVariables] = useState(initialContent?.variables || initialContent?.globalVars || []);
@@ -961,7 +968,7 @@ const EditorPane = ({
             dataTypes={projectStructure?.dataTypes || []}
             liveVariables={liveVariables}
             parentName={parentName}
-            readOnly={isRunning}
+            readOnly={logicEditLocked}
             onForceWrite={onForceWrite}
             programType={fileType}
             hwPortVars={hwPortVars}
@@ -992,8 +999,8 @@ const EditorPane = ({
                 lineNumbers: 'on',
                 scrollBeyondLastLine: false,
                 automaticLayout: true,
-                readOnly: readOnly || isRunning,
-                dnd: !isRunning
+                readOnly: logicEditLocked,
+                dnd: !logicEditLocked
               }}
               onMount={handleEditorDidMount}
             />
@@ -1030,8 +1037,9 @@ const EditorPane = ({
           varType={stForceWriteData.varType}
           currentValue={stForceWriteData.currentValue}
           liveKey={stForceWriteData.liveKey}
-          onConfirm={(key, val) => {
-            if (onForceWrite) onForceWrite(key, val);
+          allowPulse={isSimulationMode}
+          onConfirm={(key, val, mode) => {
+            if (onForceWrite) onForceWrite(key, val, mode);
           }}
         />
       )}

@@ -946,6 +946,9 @@ const RungEditorNew = ({ variables, setVariables, rungs, setRungs, availableBloc
     });
     setRungs(newRungs);
     saveHistory(newRungs, newVariables);
+    // The new block's id — lets the drop handler find the mounted node (e.g.
+    // to measure its power handle and snap it onto the rung's power line).
+    return blockId;
   }, [rungs, setRungs, saveHistory]);
 
   // Main Add Block Handler
@@ -985,11 +988,11 @@ const RungEditorNew = ({ variables, setVariables, rungs, setRungs, availableBloc
         };
         const newVariables = [...variables, newVar];
         setVariables(newVariables);
-        insertBlock(rungId, blockType, position, newName, customData, newVariables);
+        return insertBlock(rungId, blockType, position, newName, customData, newVariables);
       }
       // Case B: BOOL variable exists → leave as empty placeholder
       else {
-        insertBlock(rungId, blockType, position, '', customData, variables);
+        return insertBlock(rungId, blockType, position, '', customData, variables);
       }
       return;
     }
@@ -1089,7 +1092,7 @@ const RungEditorNew = ({ variables, setVariables, rungs, setRungs, availableBloc
       setVariables(newVariables);
     }
 
-    insertBlock(rungId, blockType, position, instanceName, customData, newVariables);
+    return insertBlock(rungId, blockType, position, instanceName, customData, newVariables);
   }, [readOnly, variables, globalVars, insertBlock, setVariables]);
 
   // Delete block from rung; also remove its variable if unused, then save history
@@ -1249,7 +1252,13 @@ const RungEditorNew = ({ variables, setVariables, rungs, setRungs, availableBloc
     addOption('USINT', portVar.name, { includeAnyFamilies: false });
   });
 
-  const uniqueTypes = Object.keys(varsByType).filter(t => t !== 'ANY');
+  // Family datalists (ANY_NUM etc.) are ALWAYS rendered, even when empty — a
+  // pin whose suggestion list references a family id must never point at a
+  // non-existent datalist (which silently disables autocomplete for that pin).
+  const uniqueTypes = [...new Set([
+    ...Object.keys(varsByType),
+    'ANY_NUM', 'ANY_INT', 'ANY_REAL', 'ANY_BIT', 'ANY_STRING',
+  ])].filter(t => t !== 'ANY');
 
   return (
     <div
@@ -1564,7 +1573,7 @@ const RungEditorNew = ({ variables, setVariables, rungs, setRungs, availableBloc
           varType={simForceModal.varType}
           currentValue={simForceModal.currentValue}
           liveKey={simForceModal.liveKey}
-          onConfirm={(key, val) => { onForceWrite && onForceWrite(key, val); setSimForceModal(null); }}
+          onConfirm={(key, val, mode) => { onForceWrite && onForceWrite(key, val, mode); setSimForceModal(null); }}
         />
       )}
     </div>
