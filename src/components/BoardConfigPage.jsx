@@ -826,63 +826,6 @@ const ProtocolPortCard = ({ board, protocol, port, value, onChange }) => {
 };
 
 // ===== MAIN BOARD CONFIG PAGE =====
-// Servo / ESC software-PWM outputs — a board runtime service (not a ladder
-// block). Each channel binds a GPIO pin to a REAL global setpoint variable
-// (pulse width in µs); the KRON_SERVO_* thread in the HAL produces the 50 Hz
-// waveform. Stored as interfaceConfig.SERVO = [{ id, enabled, pin, freqHz, variable }].
-const ServoOutputsCard = ({ boardId, interfaceConfig, onInterfaceConfigChange }) => {
-  const channels = Array.isArray(interfaceConfig?.SERVO) ? interfaceConfig.SERVO : [];
-  if (!boardId || boardId.startsWith('rpi_pico')) return null; // no software-PWM on baremetal Pico
-
-  const commit = (next) => {
-    if (!onInterfaceConfigChange) return;
-    onInterfaceConfigChange({ ...interfaceConfig, SERVO: next });
-  };
-  const addChannel = () => {
-    const n = channels.length;
-    commit([...channels, { id: `servo_${Date.now()}_${n}`, enabled: true, pin: 16, freqHz: 50, variable: `servo${n}` }]);
-  };
-  const updateChannel = (idx, patch) => commit(channels.map((c, i) => (i === idx ? { ...c, ...patch } : c)));
-  const removeChannel = (idx) => commit(channels.filter((_, i) => i !== idx));
-
-  const inp = { width: '100%', background: '#1e1e1e', color: '#ddd', border: '1px solid #3a3a3a', borderRadius: 4, padding: '3px 5px', fontSize: '11px', boxSizing: 'border-box' };
-  const btn = { background: 'transparent', border: '1px solid #3a3a3a', borderRadius: 4, color: '#aaa', fontSize: '11px', padding: '3px 8px', cursor: 'pointer' };
-
-  return (
-    <div style={{ background: '#252526', borderRadius: 6, border: '1px solid #333', padding: '10px 12px' }}>
-      <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 8 }}>
-        <span style={{ color: '#ff9800' }}>⎓</span>
-        <span style={{ fontWeight: 'bold', fontSize: '12px', color: '#ccc' }}>Servo / ESC Outputs (software PWM)</span>
-        <span style={{ fontSize: '10px', color: '#666', marginLeft: 'auto' }}>RT bit-bang · Build &amp; Send</span>
-      </div>
-      <div style={{ fontSize: '10px', color: '#777', marginBottom: 8, lineHeight: 1.45 }}>
-        A background real-time thread drives each pin with a precise pulse. From your logic, write the pulse width
-        (µs, 1000–2000, 1500 = neutral) into the REAL global named here. Set that global's initial value to 1500 so
-        the ESC arms at neutral. One channel per pin.
-      </div>
-      {channels.length === 0 && (
-        <div style={{ fontSize: '11px', color: '#666', fontStyle: 'italic', padding: '4px 0' }}>No servo outputs configured.</div>
-      )}
-      {channels.map((c, idx) => (
-        <div key={c.id || idx} style={{ display: 'grid', gridTemplateColumns: 'auto 58px 58px 1fr auto', gap: 6, alignItems: 'end', marginBottom: 6 }}>
-          <input type="checkbox" checked={c.enabled !== false} onChange={(e) => updateChannel(idx, { enabled: e.target.checked })} title="Enabled" style={{ marginBottom: 4 }} />
-          <label style={{ fontSize: '9px', color: '#888' }}>Pin
-            <input type="number" min={1} max={40} value={c.pin ?? ''} onChange={(e) => updateChannel(idx, { pin: parseInt(e.target.value, 10) })} style={inp} />
-          </label>
-          <label style={{ fontSize: '9px', color: '#888' }}>Hz
-            <input type="number" min={1} value={c.freqHz ?? 50} onChange={(e) => updateChannel(idx, { freqHz: parseFloat(e.target.value) })} style={inp} />
-          </label>
-          <label style={{ fontSize: '9px', color: '#888' }}>Setpoint var (REAL)
-            <input type="text" value={c.variable ?? ''} placeholder="servo0" onChange={(e) => updateChannel(idx, { variable: e.target.value })} style={inp} />
-          </label>
-          <button onClick={() => removeChannel(idx)} title="Remove" style={btn}>✕</button>
-        </div>
-      ))}
-      <button onClick={addChannel} style={{ ...btn, marginTop: 4, color: '#4a90d9' }}>+ Add servo output</button>
-    </div>
-  );
-};
-
 const BoardConfigPage = ({ boardId, interfaceConfig = {}, onInterfaceConfigChange }) => {
   const { t } = useTranslation();
   const [selectedPin, setSelectedPin] = useState(null);
@@ -1054,11 +997,6 @@ const BoardConfigPage = ({ boardId, interfaceConfig = {}, onInterfaceConfigChang
           <div style={{ overflow: 'auto', display: 'flex', flexDirection: 'column', gap: 12, minHeight: 0 }}>
             <BoardSpecsCard board={board} />
             <InterfacesCard board={board} />
-            <ServoOutputsCard
-              boardId={boardId}
-              interfaceConfig={interfaceConfig}
-              onInterfaceConfigChange={onInterfaceConfigChange}
-            />
           </div>
 
           <>

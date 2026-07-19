@@ -347,63 +347,6 @@ const ST_KEYWORDS_LOWER = new Set([
 // coding all 90+ combinations.
 const ST_CONVERSION_REGEX = /^(?:BOOL|BYTE|WORD|DWORD|LWORD|SINT|USINT|INT|UINT|DINT|UDINT|LINT|ULINT|REAL|LREAL)_TO_(?:BOOL|BYTE|WORD|DWORD|LWORD|SINT|USINT|INT|UINT|DINT|UDINT|LINT|ULINT|REAL|LREAL)$/i;
 
-// HAL families that provide software-PWM (GPIO_Write) — servo outputs are only
-// emitted for these (Pico/baremetal have no such runtime).
-const SERVO_HAL_FAMILIES = new Set([
-    'HAL_BOARD_FAMILY_RPI', 'HAL_BOARD_FAMILY_BB', 'HAL_BOARD_FAMILY_JETSON',
-]);
-
-/**
- * Build the servo/ESC software-PWM board-service wiring from the interface
- * config. Each channel binds a GPIO pin to a REAL global setpoint variable
- * (pulse width µs); the KRON_SERVO_* runtime thread (kronhal.h) produces the
- * waveform. Returns C fragments for PLC_Init (init) and PLC_Cleanup (cleanup).
- *
- * @param {string} boardId
- * @param {object} interfaceConfig  content.deviceInterfaceConfig
- * @param {Array}  globalVarsList   config.content.globalVars
- */
-const buildServoRuntime = (boardId, interfaceConfig, globalVarsList) => {
-    const empty = { init: '', cleanup: '' };
-    const channels = interfaceConfig?.SERVO;
-    if (!Array.isArray(channels) || channels.length === 0) return empty;
-
-    const family = getBoardFamilyDefine(boardId);
-    if (!SERVO_HAL_FAMILIES.has(family)) {
-        console.warn(`[servo] board "${boardId}" (${family || 'no HAL family'}) has no software-PWM GPIO HAL — servo outputs ignored`);
-        return empty;
-    }
-
-    const gmap = new Map((globalVarsList || []).map(v => [String(v.name || '').trim().toLowerCase(), v]));
-    let init = `\n    /* ── Servo / ESC software-PWM outputs (board service) ── */\n`;
-    let idx = 0;
-    channels.forEach((ch) => {
-        if (ch?.enabled === false) return;
-        const pin = parseInt(ch.pin, 10);
-        if (!Number.isFinite(pin) || pin < 1 || pin > 40) {
-            console.warn(`[servo] invalid pin "${ch.pin}" — channel skipped`);
-            return;
-        }
-        const varName = String(ch.variable || '').trim();
-        const g = gmap.get(varName.toLowerCase());
-        if (!g) {
-            console.warn(`[servo] setpoint variable "${varName}" (pin ${pin}) is not a declared global — channel skipped`);
-            return;
-        }
-        if (String(g.type || '').toUpperCase() !== 'REAL') {
-            console.warn(`[servo] setpoint variable "${varName}" must be REAL (is ${g.type}) — channel skipped`);
-            return;
-        }
-        const freq = parseFloat(ch.freqHz) || 50;
-        const periodNs = Math.round(1e9 / Math.max(1, freq));
-        init += `    KRON_SERVO_Register(${idx}, ${pin}, ${periodNs}L, (volatile float*)&S->${g.name});\n`;
-        idx++;
-    });
-    if (idx === 0) return empty;
-    init += `    KRON_SERVO_RuntimeInit();\n`;
-    return { init, cleanup: `    KRON_SERVO_RuntimeCleanup();\n` };
-};
-
 /**
  * Validate all ST/SCL code in the project before compilation.
  * Returns an array of { program, rung, line, column, word } error objects.
@@ -1236,11 +1179,10 @@ ${boardDefines}${runtimePortHelpers}${customIncludes}${ecCfgEarly.motionIncludes
     if (ecCfg.headerDecl) {
         source += ecCfg.headerDecl; // KRON_EC_Config definition in plc.c
     }
-    const servoRt = buildServoRuntime(boardId, config?.content?.deviceInterfaceConfig || {}, globalVarsList);
     const mainLoop = generateMainLoop(
         projectStructure, config, boardId, shmEntries.length > 0, execTimeVars,
-        deviceArtifacts.initCode + ecCfg.initCode + servoRt.init,
-        servoRt.cleanup + ecCfg.cleanupCode + deviceArtifacts.cleanupCode,
+        deviceArtifacts.initCode + ecCfg.initCode,
+        ecCfg.cleanupCode + deviceArtifacts.cleanupCode,
         ecCfg.pdoReadCode,
         ecCfg.pdoWriteCode,
         ecCfg.ecThreadCode      || '',
