@@ -2,7 +2,9 @@ package main
 
 import (
 	"bytes"
+	"crypto/sha256"
 	_ "embed"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -243,10 +245,35 @@ func (s *Server) compileLogic(buildDir string, ver int) (string, string, error) 
 // project), the HAL is compiled INTO the host (so its device fds survive a
 // swap) and exported via -rdynamic; the host is then board-specific and is
 // rebuilt whenever HAL/board/IO changes (a cold-restart case anyway).
+// hostInputsHash captures everything that determines the local loader-host
+// binary: the embedded loader source (changes when the host-agent is upgraded)
+// and host_glue.c (changes with the project's HAL usage). It is the cache key
+// for plc_host so a stale binary from an earlier build/version is never reused
+// (an old loader that doesn't write the cold-start swap_result would otherwise
+// make every sim start time out with "cold-start outcome unknown").
+func hostInputsHash(buildDir string) string {
+	h := sha256.New()
+	h.Write([]byte(hotswapHostC))
+	if b, err := os.ReadFile(filepath.Join(buildDir, "host_glue.c")); err == nil {
+		h.Write([]byte("glue"))
+		h.Write(b)
+	}
+	return hex.EncodeToString(h.Sum(nil))
+}
+
 func (s *Server) compileHost(buildDir string) (string, error) {
 	hostBin := filepath.Join(buildDir, "plc_host")
-	if _, err := os.Stat(hostBin); err == nil {
-		return hostBin, nil
+	// Cache on the CONTENT of the loader inputs, not mere existence — otherwise a
+	// plc_host built by an older host-agent (before the cold-start-result ABI, or
+	// with different HAL trampolines) is reused forever.
+	curHash := hostInputsHash(buildDir)
+	hashFile := hostBin + ".hash"
+	if curHash != "" {
+		if prev, e := os.ReadFile(hashFile); e == nil && string(prev) == curHash {
+			if _, e := os.Stat(hostBin); e == nil {
+				return hostBin, nil
+			}
+		}
 	}
 	compiler, baseArgs, err := s.bundledHostClangArgs()
 	if err != nil {
@@ -277,6 +304,9 @@ func (s *Server) compileHost(buildDir string) (string, error) {
 	args = append(args, "-lpthread", "-ldl", "-lrt", "-o", hostBin)
 	if out, err := exec.Command(compiler, args...).CombinedOutput(); err != nil {
 		return "", fmt.Errorf("host build failed: %v\n%s", err, out)
+	}
+	if curHash != "" {
+		_ = os.WriteFile(hashFile, []byte(curHash), 0o644)
 	}
 	return hostBin, nil
 }

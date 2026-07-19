@@ -421,7 +421,7 @@ function focusTarget(steps) {
 // (POU names + globals only — small, so it fits a modest context window and the
 // model always sees every POU). Details come on demand via read_pou /
 // get_project_overview, not by embedding the full overview each turn.
-function buildSystemPrompt(projectStructure, board, activeItem, libraryData = []) {
+function buildSystemPrompt(projectStructure, board, activeItem, libraryData = [], agentMode = 'manual') {
   const overview = buildProjectOverview(projectStructure, board);
   const active = activeItem ? `${activeItem.name} (${activeItem.type})` : 'none';
   const pous = overview.pous.map((p) => `${p.name}[${p.language}${p.returnType ? ' ' + p.returnType : ''}]`).join(', ') || '(none)';
@@ -476,7 +476,9 @@ function buildSystemPrompt(projectStructure, board, activeItem, libraryData = []
     '- set_ladder example with a timer: {"pou":"Main","rungs":[{"branches":[[{"contact":"Sensor"}]],"fb":{"type":"TON","instance":"delayT","inputs":{"PT":"T#5s"}},"outputs":[{"coil":"Lamp"}]}]} — Lamp energizes 5s after Sensor. The trigger pin (IN/CU/CLK…) is fed by the rung power flow automatically; never put it in fb.inputs.',
     '- A correct TON blink is EXACTLY: declare `blink : TON;` (add_variable type TON) and `led : BOOL`, then body `blink(IN := NOT blink.Q, PT := T#500ms); IF blink.Q THEN led := NOT led; END_IF;`. Do not also toggle led outside the IF.',
     '- CRITICAL: you change the project ONLY by emitting tool calls. NEVER write code in prose and claim it is done; NEVER output "APPLIED:" or "I have set the code" — the SYSTEM applies + confirms. To write code into a POU you MUST call set_st_code/set_ladder.',
-    '- Every change is shown as a diff the user approves/rejects; if rejected, adapt. When done, reply with a short summary in the user\'s language.',
+    agentMode === 'auto'
+      ? '- AUTO mode is active: your changes are applied to the project immediately (no approval step). Still make each change deliberately and verify it; the user sees every change as an applied diff. When done, reply with a short summary in the user\'s language.'
+      : '- Every change is shown as a diff the user approves/rejects; if rejected, adapt. When done, reply with a short summary in the user\'s language.',
     '- To SEE the existing program before editing it, call read_pou: it returns the full ST code AND, for LD/SCL, each rung rendered as boolean logic (e.g. `Motor := (Start OR Motor) AND NOT Stop`) plus the variable table. Use get_project_overview for the project-wide picture.',
     '- While the program is RUNNING, read_live_variables returns the current values AND a buffered time-series `history` per variable (min/max/last, change count, flags like constant/oscillating/rising/falling, a recent sample series). Read it to diagnose real behaviour (a value stuck, oscillating, drifting, out of range) BEFORE proposing a fix, and refer to the concrete numbers when you explain the problem.',
     '- For TIME-DEPENDENT behaviour use watch_live_variables: it actively WAITS a real window and returns a per-variable summary, and EACH variable can be watched for its own duration (e.g. watch a 5 s timer output for 12 s but a fast pulse for 2 s). read_live_variables is just an instant snapshot; watch_live_variables is for "does it toggle / settle / ramp over time". There is NO fixed cap — pick whatever window the behaviour under diagnosis actually needs (a few seconds for a fast pulse, minutes for a slow ramp/drift/long sequence), but default to the SHORTEST window that answers the question; do not pick a long duration "just in case". The user sees a live elapsed-time counter while you watch and can stop it early, so an overly long pick wastes their time waiting on you, not just yours.',
@@ -579,6 +581,18 @@ export default function AiAgentPanel({
   const [busy, setBusy] = useState(false);          // waiting on a model turn
   const [running, setRunning] = useState(false);    // agent loop is active (busy, or between turns/waits) — Stop is shown whenever this is true
   const [pending, setPending] = useState(null);     // a proposal awaiting approve/reject
+  // Agent mode: 'manual' → every change is shown as a diff to approve/reject;
+  // 'auto' → the agent applies changes itself (still rendered as an applied diff).
+  const [agentMode, setAgentMode] = useState(() => {
+    try { return localStorage.getItem('aiAgentMode') === 'auto' ? 'auto' : 'manual'; } catch { return 'manual'; }
+  });
+  // Mirror in a ref so runTurn (a useCallback) reads the current mode without a
+  // stale closure and without being recreated on every toggle.
+  const agentModeRef = useRef(agentMode);
+  useEffect(() => {
+    agentModeRef.current = agentMode;
+    try { localStorage.setItem('aiAgentMode', agentMode); } catch { /* ignore */ }
+  }, [agentMode]);
   const scrollRef = useRef(null);
   // The AbortController for the in-flight fetch/wait of the CURRENT turn, and a
   // flag checked between turns so Stop also breaks the auto-continue recursion
@@ -812,7 +826,7 @@ export default function AiAgentPanel({
     try {
       assistant = await host.aiChat({
         provider: config.provider, model: config.model, apiKey: config.apiKey, baseUrl: config.baseUrl,
-        system: buildSystemPrompt(psRef.current, selectedBoard, activeItem, libraryData),
+        system: buildSystemPrompt(psRef.current, selectedBoard, activeItem, libraryData, agentModeRef.current),
         messages: apiMessages,
         tools: TOOL_DEFS,
       }, controller.signal);
@@ -979,12 +993,35 @@ export default function AiAgentPanel({
       return;
     }
 
-    // Pause for approval. dryStruct is the fully-composed result of this turn.
     const viewId = nextId();
+    // AUTO mode: apply the change ourselves and keep the loop going — no gate.
+    // The turn is still rendered as an (already-applied) diff for transparency.
+    if (agentModeRef.current === 'auto') {
+      setMessages((m) => [...m, { id: viewId, role: 'proposal', steps, status: 'approved' }]);
+      commitTurn(steps, working);
+      const toolMsgs = steps.map((s) => toolResultMessage({ ...s, outcome: 'applied' }));
+      runTurn([...convoRef.current, ...toolMsgs], turn + 1);
+      return;
+    }
+    // MANUAL mode: pause for approval. dryStruct is the fully-composed result.
     setMessages((m) => [...m, { id: viewId, role: 'proposal', steps, status: 'pending' }]);
     setPending({ steps, dryStruct: working, viewId, turn });
     setRunning(false);
   }, [config, selectedBoard, activeItem, liveVariables]);
+
+  // Commit a turn's composed result into the live project and push it online if
+  // a hot-swap session is active. Shared by AUTO mode and manual approval.
+  const commitTurn = (steps, dryStruct) => {
+    setProjectStructure && setProjectStructure(dryStruct);
+    workingRef.current = dryStruct;
+    const touched = affectedPOUs(steps);
+    // Pass the committed structure + the POU to focus so App can open it on
+    // screen (race-free: don't rely on App's not-yet-updated state).
+    onApplied && onApplied(touched, { structure: dryStruct, focus: focusTarget(steps) });
+    // If a hot-swap session is live, push the change online (App decides
+    // whether a swap is possible or a cold restart is needed).
+    onHotSwap && onHotSwap(touched);
+  };
 
   const send = (text) => {
     const prompt = (text ?? input).trim();
@@ -1012,17 +1049,7 @@ export default function AiAgentPanel({
   const resolvePending = (approved) => {
     if (!pending) return;
     const { steps, dryStruct, viewId, turn } = pending;
-    if (approved) {
-      setProjectStructure && setProjectStructure(dryStruct);
-      workingRef.current = dryStruct;
-      const touched = affectedPOUs(steps);
-      // Pass the committed structure + the POU to focus so App can open it on
-      // screen (race-free: don't rely on App's not-yet-updated state).
-      onApplied && onApplied(touched, { structure: dryStruct, focus: focusTarget(steps) });
-      // If a hot-swap session is live, push the change online (App decides
-      // whether a swap is possible or a cold restart is needed).
-      onHotSwap && onHotSwap(touched);
-    }
+    if (approved) commitTurn(steps, dryStruct);
     setViewStatus(viewId, approved ? 'approved' : 'rejected');
     const toolMsgs = steps.map((s) => toolResultMessage({ ...s, outcome: approved ? 'applied' : 'rejected' }));
     setPending(null);
@@ -1059,6 +1086,15 @@ export default function AiAgentPanel({
       <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '6px 10px', background: C.panel, borderBottom: `1px solid ${C.border}`, flexShrink: 0 }}>
         <span style={{ fontSize: 13 }}>🤖</span>
         <span style={{ fontWeight: 600, marginRight: 'auto' }}>PLC Agent</span>
+        {/* mode toggle: Manual (approve each change) vs Auto (agent applies directly) */}
+        <div style={{ display: 'flex', background: C.input, border: `1px solid ${C.border2}`, borderRadius: 10, padding: 1 }}>
+          {[['manual', 'Manual', 'Review and approve every change'], ['auto', 'Auto', 'The agent applies changes automatically']].map(([id, lbl, tip]) => (
+            <button key={id} onClick={() => setAgentMode(id)} title={tip}
+              style={{ background: agentMode === id ? (id === 'auto' ? '#7a4a12' : C.accentBtn) : 'transparent', border: 'none', color: agentMode === id ? '#fff' : C.sub, fontSize: 10, fontWeight: 600, padding: '2px 8px', borderRadius: 9, cursor: 'pointer' }}>
+              {lbl}
+            </button>
+          ))}
+        </div>
         {activeOllamaModel && <RuntimeBadge rt={runtime} />}
         <button
           onClick={() => { setDraftCfg(config || draftCfg); setConfigOpen(o => !o); }}
