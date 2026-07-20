@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+# AppRun — entry point for the KronEditor AppImage.
+#
+# Launches the embedded kron-host-agent, pointing it at the bundled resources/
+# and toolchains/ (which live under usr/share/kron/, NOT next to the binary, so
+# they must be passed explicitly). The agent serves the editor UI + API on
+# :7171 — open http://localhost:7171 in a browser. It is terminal-only: when
+# launched from a shell it stays in the foreground; when double-clicked from a
+# file manager it opens a terminal so the access URL + log are visible.
+set -e
+
+SELF="$(readlink -f "${0}")"
+HERE="$(dirname "$SELF")"
+AGENT="$HERE/usr/bin/kron-host-agent"
+RES="$HERE/usr/share/kron/resources"
+TC="$HERE/usr/share/kron/toolchains"
+
+run() {
+    exec "$AGENT" \
+        --resources-root "$RES" \
+        --toolchains-root "$TC" \
+        "$@"
+}
+
+# Already attached to a terminal (launched from a shell) → run in foreground.
+if [ -t 1 ]; then
+    run "$@"
+fi
+
+# No terminal (desktop / file-manager launch) → open one so the URL is visible.
+for term in x-terminal-emulator gnome-terminal konsole xfce4-terminal xterm; do
+    if command -v "$term" >/dev/null 2>&1; then
+        case "$term" in
+            gnome-terminal) exec "$term" -- "$SELF" "$@" ;;
+            *)              exec "$term" -e "$SELF" "$@" ;;
+        esac
+    fi
+done
+
+# No terminal emulator found — run headless (URL still logged to stdout).
+run "$@"

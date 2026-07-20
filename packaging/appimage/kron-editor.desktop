@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=KronEditor
+GenericName=PLC Editor
+Comment=Browser-based IEC 61131-3 PLC editor (Ladder + Structured Text)
+Exec=AppRun
+Icon=kron-editor
+Categories=Development;IDE;
+Terminal=true
