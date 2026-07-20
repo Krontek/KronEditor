@@ -95,6 +95,7 @@ func main() {
 	mux.HandleFunc("/api/host/ollama-pull", srvState.handleOllamaPull)
 	mux.HandleFunc("/api/host/ollama-runtime", srvState.handleOllamaRuntime)
 	mux.HandleFunc("/api/host/ollama-unload", srvState.handleOllamaUnload)
+	mux.HandleFunc("/api/host/ollama-stop", srvState.handleOllamaStop)
 
 	// AI Agent — provider-agnostic chat proxy with tool-calling
 	mux.HandleFunc("/api/host/ai/chat", srvState.handleAIChat)

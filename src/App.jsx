@@ -901,6 +901,20 @@ function App() {
   });
   const [isResizing, setIsResizing] = useState(null); // 'left', 'right', 'console'
   const [rightTab, setRightTab] = useState('blocks'); // 'blocks' | 'agent' — right sidebar tabs
+  // Lazy-mount the agent panel on first open, then keep it MOUNTED (hidden with
+  // display:none) so switching tabs never unmounts it and loses a pending
+  // approval. Users who never open the agent don't pay for its effects.
+  const [agentEverOpened, setAgentEverOpened] = useState(false);
+  useEffect(() => { if (rightTab === 'agent') setAgentEverOpened(true); }, [rightTab]);
+  // Bridge: "Ask agent" from the output-panel error popup. Reveals the agent
+  // tab (mounting it if first use) and hands it a prompt to send. The {text,id}
+  // shape lets AiAgentPanel fire once per request even if the same text repeats.
+  const [agentAsk, setAgentAsk] = useState(null);
+  const askAgentAbout = useCallback((text) => {
+    setAgentEverOpened(true);
+    setRightTab('agent');
+    setAgentAsk({ text, id: Date.now() });
+  }, []);
 
   // Console Scroll Ref
   const [logs, setLogs] = useState([
@@ -1009,13 +1023,17 @@ function App() {
     const onKey = (e) => {
       if (!(e.ctrlKey || e.metaKey)) return;
       const k = e.key.toLowerCase();
-      if (k !== 'z' && k !== 'y') return;
+      // Physical-key resolve (e.code) with e.key fallback — Ctrl+Shift+Z's e.key
+      // can differ by layout, which used to swallow project-tree redo.
+      const isZ = e.code === 'KeyZ' || k === 'z';
+      const isY = e.code === 'KeyY' || k === 'y';
+      if (!isZ && !isY) return;
       const el = document.activeElement;
       if (el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.isContentEditable)) return;
       const scope = getEditorScope();
       if (scope && scope !== EDITOR_SCOPE.SIDEBAR) return; // LD/variables own their undo
-      if (k === 'y' || (k === 'z' && e.shiftKey)) { e.preventDefault(); redoProject(); }
-      else if (k === 'z') { e.preventDefault(); undoProject(); }
+      if (isY || (isZ && e.shiftKey)) { e.preventDefault(); redoProject(); }
+      else if (isZ) { e.preventDefault(); undoProject(); }
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
@@ -3088,6 +3106,7 @@ function App() {
                   isRunning={isRunning}
                   projectStructure={projectStructure}
                   errorCodeService={errorCodeService}
+                  onAskAgent={askAgentAbout}
                 />
               </div>
 
@@ -3138,8 +3157,13 @@ function App() {
                       }
                     />
                   </div>
-                  {rightTab === 'agent' && (
-                    <div style={{ flex: 1, minHeight: 0, overflow: 'hidden', display: 'flex', flexDirection: 'column' }}>
+                  {/* Kept MOUNTED (display:none when hidden) like the blocks tab —
+                      NOT `rightTab==='agent' && …`. Conditional mount unmounted the
+                      agent on every tab switch, wiping its in-memory `pending`
+                      approval; the mount-restore then marked the un-approved
+                      proposal "rejected" and the Accept/Reject buttons vanished. */}
+                  {agentEverOpened && (
+                    <div style={{ flex: 1, minHeight: 0, overflow: 'hidden', display: rightTab === 'agent' ? 'flex' : 'none', flexDirection: 'column' }}>
                       <AiAgentPanel
                         activeItem={activeItem}
                         projectStructure={projectStructure}
@@ -3153,6 +3177,7 @@ function App() {
                         onStartHotSwap={startHotSwapSession}
                         onStopHotSwap={stopHotSwapSession}
                         onCheckCompile={handleAgentCheckCompile}
+                        askRequest={agentAsk}
                       />
                     </div>
                   )}

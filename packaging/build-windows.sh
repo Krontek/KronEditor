@@ -69,6 +69,7 @@ cp -a "$SRC_TC"/*.json "$PAYLOAD/toolchains/" 2>/dev/null || true
 echo
 # Single-source the installer version too: emit the AppVersion define the .iss includes.
 # (Only used if you later build the optional Inno Setup installer ON WINDOWS.)
+mkdir -p "$ROOT/packaging/windows"
 printf '#define AppVersion "%s"\n' "$VERSION" > "$ROOT/packaging/windows/version.iss"
 echo "Wrote packaging/windows/version.iss (AppVersion $VERSION)"
 

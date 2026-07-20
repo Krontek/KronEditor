@@ -421,21 +421,40 @@ function focusTarget(steps) {
 // (POU names + globals only — small, so it fits a modest context window and the
 // model always sees every POU). Details come on demand via read_pou /
 // get_project_overview, not by embedding the full overview each turn.
-function buildSystemPrompt(projectStructure, board, activeItem, libraryData = [], agentMode = 'manual') {
+// Volatile project state — sent as the separate `context` field so the host
+// agent can place it AFTER the Anthropic prompt-cache breakpoints (a trailing
+// <project-context> block). Keeping it OUT of the system prompt is what lets
+// the big prefix (tools + rules + block catalog + history) stay byte-identical
+// across agent-loop turns: with it inlined, every project edit invalidated the
+// whole cache and each turn re-billed everything at full input price.
+function buildProjectContext(projectStructure, board, activeItem) {
   const overview = buildProjectOverview(projectStructure, board);
   const active = activeItem ? `${activeItem.name} (${activeItem.type})` : 'none';
   const pous = overview.pous.map((p) => `${p.name}[${p.language}${p.returnType ? ' ' + p.returnType : ''}]`).join(', ') || '(none)';
   const globals = overview.globalVariables.map((g) => g.name).join(', ') || '(none)';
   const dts = overview.dataTypes.map((d) => d.name).join(', ');
+  const projBlocks = [
+    ...(projectStructure?.functionBlocks || []).map((p) => p.name),
+    ...(projectStructure?.functions || []).map((p) => p.name),
+  ].join(', ');
+  return [
+    `Board: ${board || 'none'}. Currently open POU: ${active}.`,
+    `POUs (${overview.pous.length}): ${pous}.`,
+    `Global variables: ${globals}.`,
+    dts ? `Data types: ${dts}.` : '',
+    projBlocks ? `Project-defined blocks (call list_blocks for their pins): ${projBlocks}` : '',
+  ].filter(Boolean).join('\n');
+}
+
+// STABLE system prompt — must stay byte-identical across turns (it is the
+// prompt-cache prefix). Only libraryData (static per session) and agentMode
+// (rarely toggled) feed it; live project state goes via buildProjectContext.
+function buildSystemPrompt(libraryData = [], agentMode = 'manual') {
   // Compact catalog: standard block type names grouped by category + project FB/
   // function names. NAMES only (scales as the XML grows); pins come from list_blocks.
   const libLine = (Array.isArray(libraryData) ? libraryData : [])
     .map((c) => { const names = (c.blocks || []).map((b) => b.blockType).filter(Boolean); return names.length ? `${c.title}: ${names.join(', ')}` : ''; })
     .filter(Boolean).join(' | ');
-  const projBlocks = [
-    ...(projectStructure?.functionBlocks || []).map((p) => p.name),
-    ...(projectStructure?.functions || []).map((p) => p.name),
-  ].join(', ');
   return [
     'You are the embedded engineering agent for KronEditor, an IEC 61131-3 PLC editor.',
     'You edit the project by calling tools: create/rename/delete POUs, rewrite Structured Text, set ladder, and add/update/remove variables (local + global).',
@@ -485,12 +504,8 @@ function buildSystemPrompt(projectStructure, board, activeItem, libraryData = []
     '- VERIFY-AFTER-CHANGE LOOP: live monitoring is automatic whenever the program is running (simulation or a connected PLC) — your edits are committed to the project on approval, but to take effect on the RUNNING target they must be DEPLOYED by the user (Build & Send). When the program is running, after your change is in effect call watch_live_variables on the variables your fix targets, compare the observed behaviour against what the user asked for, and report explicitly whether the desired result was achieved (if not, propose another fix). If the live values do NOT yet reflect your change, it has not been deployed — tell the user to Build & Send. Keep watch durations only as long as needed.',
     '- C-LEVEL DIAGNOSTICS: call check_compile to transpile the project to C and run the REAL bundled clang on it. Use it when (a) you cannot spot the problem by reading the ST/LD source, or (b) the user asks you to check for compile/build errors. On failure the result contains the raw compiler output (file:line:col + offending C line + caret) — scan it for identifiers, FB names, or struct members you recognise from the IEC source to pinpoint which POU/line to fix, then propose and apply the fix. On success it confirms no compile errors exist (NOT that the logic is correct). Do NOT call it as a routine "verification" after every change — it is a diagnostic tool for when source-level reading is insufficient.',
     '',
-    `Board: ${board || 'none'}. Currently open POU: ${active}.`,
-    `POUs (${overview.pous.length}): ${pous}.`,
-    `Global variables: ${globals}.`,
-    dts ? `Data types: ${dts}.` : '',
     libLine ? `Standard library blocks (names only — call list_blocks for pins): ${libLine}` : '',
-    projBlocks ? `Project-defined blocks (call list_blocks for their pins): ${projBlocks}` : '',
+    'The CURRENT project state (selected board, open POU, POU list, global variables, data types, project-defined blocks) arrives in a <project-context> block at the END of the conversation, refreshed every turn — always trust the latest one.',
   ].filter(Boolean).join('\n');
 }
 
@@ -507,6 +522,7 @@ export default function AiAgentPanel({
   onStartHotSwap = null,       // () → build+run a hot-swap session (online change)
   onStopHotSwap = null,        // () → stop the hot-swap session
   onCheckCompile = null,       // async () → transpile + compile; returns {ok, stage, message?, error?, log?, errors?}
+  askRequest = null,           // {text, id} pushed from the output-panel "Ask agent" — auto-sends once
 }) {
   const [config, setConfig] = useState(loadConfig);
   const [configOpen, setConfigOpen] = useState(false);
@@ -720,12 +736,42 @@ export default function AiAgentPanel({
     }
   };
 
+  const [stoppingOllama, setStoppingOllama] = useState(false);
+  const stopOllama = async () => {
+    setStoppingOllama(true);
+    try {
+      const r = await host.ollamaStop(ollamaBase);
+      if (r?.stopped) {
+        setOllama((o) => ({ ...o, running: false, models: [], error: '' }));
+        setRuntime(null);
+      } else {
+        // External daemon (systemd/terminal) — we won't kill it; tell the user.
+        setOllama((o) => ({ ...o, error: r?.error || 'Could not stop Ollama.' }));
+      }
+    } catch (e) {
+      setOllama((o) => ({ ...o, error: e.message || 'stop failed' }));
+    } finally {
+      setStoppingOllama(false);
+      refreshOllama();
+    }
+  };
+
   // When an Ollama model is active, make sure we know whether the daemon is up
   // (the Download-tab effect only refreshes while that tab is open).
   const activeOllamaModel = config?.provider === 'ollama' ? config.model : null;
   useEffect(() => {
     if (activeOllamaModel && !ollama.checked) refreshOllama();
   }, [activeOllamaModel, ollama.checked, refreshOllama]);
+
+  // Self-heal the header pill: while Ollama is the provider but the daemon is
+  // NOT up, re-poll every 4 s so starting `ollama serve` externally flips the
+  // pill green without reopening settings. Stops once running (no busy-poll of
+  // a healthy daemon — the runtime effect below handles the running case).
+  useEffect(() => {
+    if (!activeOllamaModel || ollama.running) return;
+    const id = setInterval(refreshOllama, 4000);
+    return () => clearInterval(id);
+  }, [activeOllamaModel, ollama.running, refreshOllama]);
 
   // Poll the active local model's runtime placement (CPU/GPU split + GPU VRAM)
   // so both the header badge and the Download tab reflect where it's running.
@@ -760,11 +806,25 @@ export default function AiAgentPanel({
     saveConvo(messages, convoRef.current);
   }, [messages]);
 
-  const configured = !!(config && config.model && (
+  // A model is SELECTED (settings filled in) — distinct from READY to use.
+  const modelSelected = !!(config && config.model && (
     config.provider === 'ollama' ||
-    (config.provider === 'anthropic-oauth' && oauth.connected) ||
+    config.provider === 'anthropic-oauth' ||
     config.apiKey || config.baseUrl
   ));
+  // READY = actually usable right now. Ollama additionally needs its local
+  // daemon reachable (a selected model is useless if `ollama serve` isn't up —
+  // the green pill must reflect that, not just that a name was picked); OAuth
+  // needs an authenticated session.
+  const configured = modelSelected && (
+    config?.provider === 'ollama' ? ollama.running :
+    config?.provider === 'anthropic-oauth' ? oauth.connected :
+    true
+  );
+  // Ollama model chosen but daemon down → amber "selected but not running".
+  const ollamaNotRunning = config?.provider === 'ollama' && modelSelected && ollama.checked && !ollama.running;
+  // Ollama status not resolved yet — avoid a "No model" flash before the check.
+  const ollamaChecking = config?.provider === 'ollama' && modelSelected && !ollama.checked;
   const imagesSupported = IMAGE_CAPABLE_PROVIDERS.has(config?.provider);
 
   // Validate + add files as pending attachments (paste or the file picker).
@@ -826,7 +886,8 @@ export default function AiAgentPanel({
     try {
       assistant = await host.aiChat({
         provider: config.provider, model: config.model, apiKey: config.apiKey, baseUrl: config.baseUrl,
-        system: buildSystemPrompt(psRef.current, selectedBoard, activeItem, libraryData, agentModeRef.current),
+        system: buildSystemPrompt(libraryData, agentModeRef.current),
+        context: buildProjectContext(psRef.current, selectedBoard, activeItem),
         messages: apiMessages,
         tools: TOOL_DEFS,
       }, controller.signal);
@@ -1032,7 +1093,9 @@ export default function AiAgentPanel({
     setAttachError('');
     if (!configured) {
       pushView({ role: 'user', text: prompt, images: imgs });
-      pushView({ role: 'note', text: 'No model configured yet. Click the ⚙ gear above to connect a model, then ask again.' });
+      pushView({ role: 'note', text: ollamaNotRunning
+        ? `Ollama is not running, so "${config.model}" can't respond. Open the ⚙ settings → Download & Setup and start Ollama, then ask again.`
+        : 'No model configured yet. Click the ⚙ gear above to connect a model, then ask again.' });
       return;
     }
     pushView({ role: 'user', text: prompt, images: imgs });
@@ -1045,6 +1108,19 @@ export default function AiAgentPanel({
     const apiMessages = [...convoRef.current, userMsg];
     runTurn(apiMessages, 0);
   };
+
+  // "Ask agent" from the output-panel error popup: send the prompt once per
+  // request id. If the agent is mid-turn or a proposal is pending, send() bails
+  // but leaves the text in the input box (fallback) so nothing is lost.
+  const lastAskIdRef = useRef(null);
+  useEffect(() => {
+    if (!askRequest || askRequest.id === lastAskIdRef.current) return;
+    lastAskIdRef.current = askRequest.id;
+    const text = (askRequest.text || '').trim();
+    if (!text) return;
+    setInput(text);
+    send(text);
+  }, [askRequest]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const resolvePending = (approved) => {
     if (!pending) return;
@@ -1098,11 +1174,16 @@ export default function AiAgentPanel({
         {activeOllamaModel && <RuntimeBadge rt={runtime} />}
         <button
           onClick={() => { setDraftCfg(config || draftCfg); setConfigOpen(o => !o); }}
-          title="Model settings"
-          style={{ background: configured ? '#1e3a2a' : 'transparent', border: `1px solid ${configured ? '#2e5a3e' : C.border2}`, color: configured ? C.green : C.sub, fontSize: 11, padding: '2px 8px', borderRadius: 10, cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 5, maxWidth: 150 }}
+          title={ollamaNotRunning ? 'Ollama is not running — open settings → Download & Setup to start it' : 'Model settings'}
+          style={{ background: configured ? '#1e3a2a' : (ollamaNotRunning ? '#3a2e12' : 'transparent'), border: `1px solid ${configured ? '#2e5a3e' : (ollamaNotRunning ? '#7a5a1a' : C.border2)}`, color: configured ? C.green : (ollamaNotRunning ? '#e0a94f' : C.sub), fontSize: 11, padding: '2px 8px', borderRadius: 10, cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 5, maxWidth: 170 }}
         >
-          <span style={{ width: 6, height: 6, borderRadius: '50%', background: configured ? C.green : '#777', flexShrink: 0 }} />
-          <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{configured ? config.model : 'No model'}</span>
+          <span style={{ width: 6, height: 6, borderRadius: '50%', background: configured ? C.green : (ollamaNotRunning ? '#e0a94f' : '#777'), flexShrink: 0 }} />
+          <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+            {configured ? config.model
+              : ollamaNotRunning ? `${config.model} (off)`
+              : ollamaChecking ? config.model
+              : 'No model'}
+          </span>
           <span style={{ color: C.muted }}>⚙</span>
         </button>
       </div>
@@ -1126,6 +1207,7 @@ export default function AiAgentPanel({
               activeModel={config?.provider === 'ollama' ? config.model : null}
               baseUrl={draftCfg.baseUrl} onBaseUrl={(v) => setDraftCfg(d => ({ ...d, baseUrl: v }))}
               onRefresh={refreshOllama} onSetup={startSetup} onPull={startPull} onUse={useLocalModel} onUnload={unloadLocalModel}
+              onStop={stopOllama} stopping={stoppingOllama}
             />
           ) : (
           <>
@@ -1223,7 +1305,10 @@ export default function AiAgentPanel({
         )}
         {running && (
           <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-            <span style={{ color: C.muted, fontSize: 11, fontStyle: 'italic' }}>● ● ●  {busy ? 'thinking…' : 'working…'}</span>
+            <span style={{ display: 'inline-flex', alignItems: 'center', gap: 7 }}>
+              <span className="agent-think-dots" aria-hidden="true"><i /><i /><i /></span>
+              <span className="agent-think-label">{busy ? 'thinking…' : 'working…'}</span>
+            </span>
             <button onClick={stopAgent} title="Stop the agent"
               style={{ background: 'transparent', border: `1px solid ${C.border2}`, color: '#e06c75', fontSize: 10, padding: '1px 8px', borderRadius: 10, cursor: 'pointer' }}>
               ■ Stop
@@ -1431,7 +1516,7 @@ function ProposalCard({ steps, status, onApprove, onReject }) {
             ✓ Approve & apply
           </button>
           <button onClick={onReject}
-            style={{ flex: 1, background: 'transparent', border: `1px solid ${C.border2}`, color: C.sub, fontSize: 12, padding: '5px 0', borderRadius: 3, cursor: 'pointer' }}>
+            style={{ flex: 1, background: '#3a1e1e', border: '1px solid #5a2e2e', color: '#e06c75', fontSize: 12, padding: '5px 0', borderRadius: 3, cursor: 'pointer' }}>
             ✕ Reject
           </button>
         </div>
@@ -1441,7 +1526,7 @@ function ProposalCard({ steps, status, onApprove, onReject }) {
 }
 
 // ── local-model (Ollama) download & setup catalog ───────────────────────────
-function OllamaCatalog({ ollama, pulls, setup, runtime, installedSet, activeModel, baseUrl, onBaseUrl, onRefresh, onSetup, onPull, onUse, onUnload }) {
+function OllamaCatalog({ ollama, pulls, setup, runtime, installedSet, activeModel, baseUrl, onBaseUrl, onRefresh, onSetup, onPull, onUse, onUnload, onStop, stopping }) {
   const settingUp = setup && !setup.done;
   const setupFailed = setup && setup.done && setup.error;
   const setupPhaseLabel = { checking: 'Checking…', downloading: 'Downloading Ollama…', starting: 'Starting daemon…', ready: 'Ready' }[setup?.phase] || setup?.phase || '';
@@ -1515,8 +1600,14 @@ function OllamaCatalog({ ollama, pulls, setup, runtime, installedSet, activeMode
         <span style={{ fontSize: 11, color: C.sub }}>
           {!ollama.checked ? 'Checking Ollama…' : ollama.running ? 'Ollama running' : 'Ollama not reachable'}
         </span>
+        {ollama.running && onStop && (
+          <button onClick={onStop} disabled={stopping} title="Stop the editor-managed Ollama daemon"
+            style={{ marginLeft: 'auto', background: 'transparent', border: '1px solid #7a2e2e', color: '#e06c75', fontSize: 10, padding: '2px 8px', borderRadius: 3, cursor: stopping ? 'default' : 'pointer' }}>
+            {stopping ? 'Stopping…' : '■ Stop'}
+          </button>
+        )}
         <button onClick={onRefresh} title="Refresh"
-          style={{ marginLeft: 'auto', background: 'transparent', border: `1px solid ${C.border2}`, color: C.sub, fontSize: 10, padding: '2px 8px', borderRadius: 3, cursor: 'pointer' }}>
+          style={{ marginLeft: ollama.running && onStop ? 0 : 'auto', background: 'transparent', border: `1px solid ${C.border2}`, color: C.sub, fontSize: 10, padding: '2px 8px', borderRadius: 3, cursor: 'pointer' }}>
           ↻ Refresh
         </button>
       </div>

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -72,11 +73,18 @@ type aiTool struct {
 }
 
 type aiChatReq struct {
-	Provider    string      `json:"provider"`
-	Model       string      `json:"model"`
-	APIKey      string      `json:"apiKey"`
-	BaseURL     string      `json:"baseUrl"`
-	System      string      `json:"system"`
+	Provider string `json:"provider"`
+	Model    string `json:"model"`
+	APIKey   string `json:"apiKey"`
+	BaseURL  string `json:"baseUrl"`
+	System   string `json:"system"`
+	// Context carries the VOLATILE project state (board, POU list, globals,
+	// open POU). It is kept out of System on purpose: Anthropic prompt caching
+	// is a byte-exact prefix match over tools→system→messages, so anything
+	// that changes per turn must ride AFTER the cache breakpoints. callAnthropic
+	// appends it as a trailing <project-context> block; other providers just
+	// get it folded into the system prompt (handleAIChat).
+	Context     string      `json:"context"`
 	Messages    []aiMessage `json:"messages"`
 	Tools       []aiTool    `json:"tools"`
 	MaxTokens   int         `json:"maxTokens"`
@@ -104,6 +112,18 @@ func (s *Server) handleAIChat(w http.ResponseWriter, r *http.Request) {
 	// Tool-calling can take a while on a big local model; give it room.
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Minute)
 	defer cancel()
+
+	// Non-Anthropic providers have no cache-placement concern — fold the
+	// volatile project context straight into the system prompt for them.
+	switch strings.ToLower(strings.TrimSpace(req.Provider)) {
+	case "anthropic", "anthropic-oauth", "claude-account":
+		// callAnthropic places req.Context after the cache breakpoint itself.
+	default:
+		if strings.TrimSpace(req.Context) != "" {
+			req.System = strings.TrimRight(req.System, "\n") + "\n\n<project-context>\n" + req.Context + "\n</project-context>"
+			req.Context = ""
+		}
+	}
 
 	var (
 		msg aiMessage
@@ -171,6 +191,9 @@ func (s *Server) logAIChat(req aiChatReq, msg aiMessage, callErr error) {
 	var b strings.Builder
 	fmt.Fprintf(&b, "\n===== %s  %s / %s =====\n", time.Now().Format("2006-01-02 15:04:05"), req.Provider, req.Model)
 	fmt.Fprintf(&b, "--- request: system ---\n%s\n", truncForLog(req.System, 4000))
+	if strings.TrimSpace(req.Context) != "" {
+		fmt.Fprintf(&b, "--- request: project context ---\n%s\n", truncForLog(req.Context, 2000))
+	}
 	fmt.Fprintf(&b, "--- request: messages (%d) ---\n", len(req.Messages))
 	for _, m := range req.Messages {
 		imgNote := ""
@@ -336,6 +359,34 @@ func callAnthropic(ctx context.Context, req aiChatReq, oauthToken string) (aiMes
 		}
 	}
 
+	// ── Prompt caching ──
+	// The agent loop re-sends tools + system + the whole history on every turn
+	// (up to MAX_AGENT_TURNS times per user request). Without cache_control each
+	// turn re-bills all of it at full input price — the dominant token cost.
+	// Three breakpoints (max is 4): last tool (caches the tool schemas), last
+	// system block (caches the system prompt), last history block (caches the
+	// conversation incrementally). Cache reads bill ~0.1x; writes 1.25x, so a
+	// single reuse already pays for itself.
+	cacheMark := block{"type": "ephemeral"}
+
+	// Breakpoint 3: the last content block of the final (stable) history
+	// message — the volatile <project-context> block is appended AFTER this.
+	if n := len(msgs); n > 0 {
+		if c := msgs[n-1].Content; len(c) > 0 {
+			c[len(c)-1]["cache_control"] = cacheMark
+		}
+	}
+	// The volatile project state rides after the breakpoint, so a project
+	// change between turns re-bills only this small block, not the prefix.
+	if strings.TrimSpace(req.Context) != "" {
+		ctxBlock := block{"type": "text", "text": "<project-context>\n" + req.Context + "\n</project-context>"}
+		if n := len(msgs); n > 0 && msgs[n-1].Role == "user" {
+			msgs[n-1].Content = append(msgs[n-1].Content, ctxBlock)
+		} else {
+			msgs = append(msgs, wireMsg{Role: "user", Content: []block{ctxBlock}})
+		}
+	}
+
 	tools := make([]map[string]any, 0, len(req.Tools))
 	for _, t := range req.Tools {
 		tools = append(tools, map[string]any{
@@ -343,6 +394,11 @@ func callAnthropic(ctx context.Context, req aiChatReq, oauthToken string) (aiMes
 			"description":  t.Description,
 			"input_schema": json.RawMessage(orEmptyObj(t.Parameters)),
 		})
+	}
+	// Breakpoint 1: tools render first in the prompt; marking the last one
+	// caches the whole (static) tool list.
+	if len(tools) > 0 {
+		tools[len(tools)-1]["cache_control"] = cacheMark
 	}
 
 	payload := map[string]any{
@@ -357,9 +413,11 @@ func callAnthropic(ctx context.Context, req aiChatReq, oauthToken string) (aiMes
 		if strings.TrimSpace(req.System) != "" {
 			sys = append(sys, block{"type": "text", "text": req.System})
 		}
+		// Breakpoint 2: caches identity + system prompt.
+		sys[len(sys)-1]["cache_control"] = cacheMark
 		payload["system"] = sys
 	} else if strings.TrimSpace(req.System) != "" {
-		payload["system"] = req.System
+		payload["system"] = []block{{"type": "text", "text": req.System, "cache_control": cacheMark}}
 	}
 	if len(tools) > 0 {
 		payload["tools"] = tools
@@ -376,6 +434,12 @@ func callAnthropic(ctx context.Context, req aiChatReq, oauthToken string) (aiMes
 			Name  string          `json:"name"`
 			Input json.RawMessage `json:"input"`
 		} `json:"content"`
+		Usage struct {
+			InputTokens              int `json:"input_tokens"`
+			OutputTokens             int `json:"output_tokens"`
+			CacheCreationInputTokens int `json:"cache_creation_input_tokens"`
+			CacheReadInputTokens     int `json:"cache_read_input_tokens"`
+		} `json:"usage"`
 		Error struct {
 			Message string `json:"message"`
 		} `json:"error"`
@@ -393,6 +457,11 @@ func callAnthropic(ctx context.Context, req aiChatReq, oauthToken string) (aiMes
 	if out.Error.Message != "" {
 		return aiMessage{}, fmt.Errorf("anthropic: %s", out.Error.Message)
 	}
+	// Cache effectiveness at a glance: after the first turn of a loop,
+	// cache_read should carry most of the prompt and input stay small. A
+	// persistent cache_read=0 means a silent prefix invalidator crept in.
+	log.Printf("[ai] anthropic usage: input=%d cache_read=%d cache_write=%d output=%d",
+		out.Usage.InputTokens, out.Usage.CacheReadInputTokens, out.Usage.CacheCreationInputTokens, out.Usage.OutputTokens)
 
 	var msg aiMessage
 	var text strings.Builder

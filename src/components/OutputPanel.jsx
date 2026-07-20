@@ -1,4 +1,5 @@
 import { useState, useRef, useEffect, useCallback } from 'react';
+import { createPortal } from 'react-dom';
 import ForceWriteModal from './common/ForceWriteModal';
 import { ErrorCodeService } from '../services/ErrorCodeService';
 
@@ -415,6 +416,7 @@ const OutputPanel = ({
     isRunning = false,
     projectStructure = null,
     errorCodeService = null,
+    onAskAgent = null,
 }) => {
     const [activeTab, setActiveTab] = useState('messages');
     const [forceModal, setForceModal] = useState(null);
@@ -422,6 +424,21 @@ const OutputPanel = ({
     const [editValue, setEditValue] = useState('');
     const [hoveredLog, setHoveredLog] = useState(null);
     const [popupLog, setPopupLog] = useState(null);
+    const [popupCopied, setPopupCopied] = useState(false);
+    const copyPopup = useCallback(async (text) => {
+        try { await navigator.clipboard.writeText(text); }
+        catch { /* clipboard denied — ignore */ }
+        setPopupCopied(true);
+        setTimeout(() => setPopupCopied(false), 1500);
+    }, []);
+    const askAgentAboutLog = useCallback((log) => {
+        if (!onAskAgent) return;
+        // Strip the leading "[HH:MM:SS] " timestamp addLog prepends.
+        const raw = String(log.msg || '').replace(/^\[\d{1,2}:\d{2}:\d{2}\]\s*/, '').trim();
+        const prompt = `I got this ${log.type === 'error' ? 'error' : 'message'} in the PLC editor. Explain what it means and, if it's a problem in my project, propose a fix:\n\n\`\`\`\n${raw}\n\`\`\``;
+        onAskAgent(prompt);
+        setPopupLog(null);
+    }, [onAskAgent]);
     const [pickerOpen, setPickerOpen] = useState(false);
     const [errorTooltip, setErrorTooltip] = useState(null);
     const logEndRef = useRef(null);
@@ -878,39 +895,38 @@ const OutputPanel = ({
             )}
 
             {/* Full Message Popup */}
-            {popupLog && (
+            {popupLog && createPortal(
                 <div
                     onClick={() => setPopupLog(null)}
                     style={{
-                        position: 'absolute',
+                        position: 'fixed',
                         inset: 0,
                         background: 'rgba(0,0,0,0.6)',
                         display: 'flex',
                         alignItems: 'center',
                         justifyContent: 'center',
-                        zIndex: 200,
+                        zIndex: 1000,
                     }}
                 >
                     <div
                         onClick={e => e.stopPropagation()}
                         style={{
                             background: '#1e1e1e',
-                            border: '1px solid #3a3a3a',
-                            borderRadius: 4,
-                            maxWidth: '80%',
-                            maxHeight: '60%',
+                            border: `1px solid ${LOG_COLORS[popupLog.type] || '#3a3a3a'}`,
+                            borderRadius: 6,
+                            width: 'min(760px, 88vw)',
+                            maxHeight: '80vh',
                             display: 'flex',
                             flexDirection: 'column',
-                            minWidth: 320,
+                            boxShadow: '0 8px 32px rgba(0,0,0,0.6)',
                         }}
                     >
                         <div style={{
-                            padding: '6px 12px',
+                            padding: '8px 14px',
                             borderBottom: '1px solid #2a2a2a',
                             display: 'flex',
                             alignItems: 'center',
-                            justifyContent: 'space-between',
-                            gap: 12,
+                            gap: 10,
                         }}>
                             <span style={{
                                 color: LOG_COLORS[popupLog.type] || '#c8c8c8',
@@ -921,36 +937,45 @@ const OutputPanel = ({
                             }}>
                                 {popupLog.type}
                             </span>
-                            <button
-                                onClick={() => setPopupLog(null)}
-                                style={{
-                                    background: 'transparent',
-                                    border: 'none',
-                                    color: '#666',
-                                    cursor: 'pointer',
-                                    fontSize: 14,
-                                    lineHeight: 1,
-                                    padding: '0 2px',
-                                }}
-                            >✕</button>
+                            <div style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: 6 }}>
+                                {onAskAgent && (
+                                    <button
+                                        onClick={() => askAgentAboutLog(popupLog)}
+                                        title="Send this to the PLC Agent to explain / fix"
+                                        style={{ background: '#1e3a2a', border: '1px solid #2e5a3e', color: '#4ec9b0', cursor: 'pointer', fontSize: 11, padding: '3px 10px', borderRadius: 4, display: 'flex', alignItems: 'center', gap: 5 }}
+                                    >🤖 Ask agent</button>
+                                )}
+                                <button
+                                    onClick={() => copyPopup(popupLog.msg)}
+                                    title="Copy message"
+                                    style={{ background: 'transparent', border: '1px solid #3e3e42', color: popupCopied ? '#4ec9b0' : '#bbb', cursor: 'pointer', fontSize: 11, padding: '3px 10px', borderRadius: 4 }}
+                                >{popupCopied ? '✓ Copied' : '⧉ Copy'}</button>
+                                <button
+                                    onClick={() => setPopupLog(null)}
+                                    title="Close"
+                                    style={{ background: 'transparent', border: 'none', color: '#666', cursor: 'pointer', fontSize: 16, lineHeight: 1, padding: '0 2px' }}
+                                >✕</button>
+                            </div>
                         </div>
                         <pre style={{
                             margin: 0,
-                            padding: '10px 14px',
+                            padding: '12px 16px',
                             overflowY: 'auto',
                             overflowX: 'auto',
                             color: LOG_COLORS[popupLog.type] || '#c8c8c8',
                             fontFamily: '"Consolas", "Cascadia Code", monospace',
-                            fontSize: 12,
+                            fontSize: 12.5,
                             lineHeight: '1.6',
                             whiteSpace: 'pre-wrap',
                             wordBreak: 'break-word',
                             flex: 1,
+                            userSelect: 'text',
                         }}>
                             {popupLog.msg}
                         </pre>
                     </div>
-                </div>
+                </div>,
+                document.body
             )}
 
             {/* Force Write Modal */}

@@ -445,7 +445,7 @@ const getSymbolPath = (type, subType) => {
 const BlockNode = ({ id, data, selected }) => {
   const { setNodes } = useReactFlow();
   const edges = useEdges();
-  const { variables = [], globalVars = [], dataTypes = [], liveVariables = null, errorCodeService = null } = data; // Receive vars from data context
+  const { variables = [], globalVars = [], dataTypes = [], hwPortVars = [], liveVariables = null, errorCodeService = null } = data; // Receive vars from data context
 
   // Build map of array type names → their definitions for validation
   const arrayTypeMap = React.useMemo(() => {
@@ -453,6 +453,36 @@ const BlockNode = ({ id, data, selected }) => {
     dataTypes.forEach(dt => { if (dt.type === 'Array') m[dt.name] = dt; });
     return m;
   }, [dataTypes]);
+
+  // Every name a pin may legitimately reference without a red flag: declared
+  // locals/globals, system hardware-port vars, and enum constants (referenced
+  // by name). Used to catch a pin wired to an UNDECLARED variable (e.g. an
+  // output assigned to a name never added to the table) so it is flagged with
+  // a reason instead of silently building into a broken/undefined symbol.
+  const declaredNames = React.useMemo(() => {
+    const s = new Set();
+    [...variables, ...globalVars, ...(hwPortVars || [])].forEach(v => { if (v?.name) s.add(v.name); });
+    (dataTypes || []).forEach(dt => {
+      if (dt.type === 'Enumerated') {
+        (dt.content?.members || dt.content?.values || []).forEach(m => {
+          const n = typeof m === 'string' ? m : m?.name; if (n) s.add(n);
+        });
+      }
+    });
+    return s;
+  }, [variables, globalVars, hwPortVars, dataTypes]);
+
+  // True when a pin value is a VARIABLE reference (not a literal) that isn't
+  // declared anywhere. Literals (numbers, T#/TIME#, 16#/2#/8# radix, TRUE/FALSE)
+  // and member/array access on a declared base are NOT flagged.
+  const undeclaredRefBase = React.useCallback((raw) => {
+    const c = String(raw || '').replace(/[🌍🏠⊞⊡⊟]/g, '').trim();
+    if (!c || c.includes('#')) return null;               // empty or T#/16#… literal
+    if (!/^[A-Za-z_]/.test(c)) return null;               // numeric/other literal
+    if (/^(TRUE|FALSE|NULL)$/i.test(c)) return null;       // keyword literals
+    const base = c.split(/[\[.]/)[0];
+    return base && !declaredNames.has(base) ? base : null;
+  }, [declaredNames]);
 
   // LOCAL STATE to prevent cursor jumping due to async prop updates
   const [localInstanceName, setLocalInstanceName] = useState(
@@ -932,7 +962,11 @@ const BlockNode = ({ id, data, selected }) => {
             const allowsWholeArrayRef = !!pin.passByReference;
             const isArrayWithoutIndex = valVarDef && arrayTypeMap[valVarDef.type] && !cleanVal.includes('[');
             const isInvalidWholeArrayUsage = isArrayWithoutIndex && !allowsWholeArrayRef;
-            const isValid = !isInvalidWholeArrayUsage && (!isTime || !val || TIME_FORMAT_REGEX.test(val));
+            const undeclaredIn = undeclaredRefBase(val);
+            const isValid = !isInvalidWholeArrayUsage && !undeclaredIn && (!isTime || !val || TIME_FORMAT_REGEX.test(val));
+            const inTitle = undeclaredIn
+              ? `"${undeclaredIn}" is not declared. Add it in the variable table (or it will fail to build).`
+              : (isInvalidWholeArrayUsage ? 'Array needs an index, e.g. arr[0]' : '');
             // Literal value: starts with digit, sign, T#, 0x/0b/0o, or true/false — not a variable ref
             const isLiteralVal = cleanVal && !/^[A-Za-z_]/.test(cleanVal);
 
@@ -1009,6 +1043,7 @@ const BlockNode = ({ id, data, selected }) => {
 
                     <input
                       type="text"
+                      title={inTitle}
                       className="nodrag nopan nowheel"
                       value={localPinValues[pin.name] !== undefined ? localPinValues[pin.name] : (val || '')}
                       list={data.readOnly ? undefined : getPinSuggestionList(pin)}
@@ -1114,6 +1149,11 @@ const BlockNode = ({ id, data, selected }) => {
             const outBaseVarName = outCleanVal.split(/[\[.]/)[0];
             const outVarDef = [...variables, ...globalVars].find(v => v.name === outBaseVarName);
             const outIsArrayWithoutIndex = outVarDef && arrayTypeMap[outVarDef.type] && !outCleanVal.includes('[');
+            const undeclaredOut = undeclaredRefBase(val);
+            const outInvalid = outIsArrayWithoutIndex || !!undeclaredOut;
+            const outTitle = undeclaredOut
+              ? `"${undeclaredOut}" is not declared. Add it in the variable table (or it will fail to build).`
+              : (outIsArrayWithoutIndex ? 'Array needs an index, e.g. arr[0]' : '');
 
             // Live value lookup for this output pin
             const lv = liveVariables;
@@ -1213,6 +1253,7 @@ const BlockNode = ({ id, data, selected }) => {
 
                     <input
                       type="text"
+                      title={outTitle}
                       className="nodrag nopan nowheel"
                       value={localPinValues[pin.name] !== undefined ? localPinValues[pin.name] : val}
                       list={data.readOnly ? undefined : getPinSuggestionList(pin)}
@@ -1232,8 +1273,8 @@ const BlockNode = ({ id, data, selected }) => {
                         maxWidth: 160,
                         fontSize: 9,
                         background: '#1e1e1e',
-                        border: outIsArrayWithoutIndex ? '1px solid #f44336' : '1px solid #444',
-                        color: outIsArrayWithoutIndex ? '#f44336' : '#ddd',
+                        border: outInvalid ? '1px solid #f44336' : '1px solid #444',
+                        color: outInvalid ? '#f44336' : '#ddd',
                         padding: '1px 3px',
                         borderRadius: 2,
                         outline: 'none',

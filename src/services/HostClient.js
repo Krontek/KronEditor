@@ -256,6 +256,11 @@ export class HostClient {
   async ollamaUnload(model, baseUrl) {
     return _post(this._p('/api/host/ollama-unload'), { model, baseUrl });
   }
+  // Stops the editor-managed `ollama serve` (refuses to touch an externally
+  // launched daemon). → { ok, stopped, external, error? }
+  async ollamaStop(baseUrl) {
+    return _post(this._p('/api/host/ollama-stop'), { baseUrl });
+  }
 
   /**
    * One turn of a tool-calling chat, normalized across providers. The agent

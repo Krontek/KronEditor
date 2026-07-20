@@ -31,10 +31,11 @@ Source files:
 user prompt (+ optional images)
   │
   ▼
-buildSystemPrompt(projectStructure, board, activeItem, libraryData)   ← rebuilt EVERY turn
+buildSystemPrompt(libraryData, agentMode)          ← STABLE (byte-identical across turns — it is the prompt-cache prefix)
+buildProjectContext(projectStructure, board, activeItem)  ← volatile state, rebuilt EVERY turn
   │
   ▼
-host.aiChat({ provider, model, apiKey, baseUrl, system, messages, tools: TOOL_DEFS })
+host.aiChat({ provider, model, apiKey, baseUrl, system, context, messages, tools: TOOL_DEFS })
   │            (host-agent /api/host/ai/chat normalizes all providers to
   │             one assistant message { content, toolCalls })
   ▼
@@ -224,7 +225,7 @@ The system prompt routes STRICTLY per rung, not per POU:
 
 ## 8. System prompt policies (summary)
 
-Rebuilt every turn by `buildSystemPrompt` with the live project overview, board, open POU, and the library block names. Key policies (see the source for exact wording):
+Built by `buildSystemPrompt(libraryData, agentMode)` — **stable** (rules + library block names only). The live project overview (board, open POU, POU/global/data-type lists, project blocks) travels separately via `buildProjectContext` → the `context` request field → a trailing `<project-context>` block, so Anthropic prompt caching keeps the big prefix cached across turns (see CLAUDE.md §8). ⚠️ Never put per-turn/per-project text back into `buildSystemPrompt`. Key policies (see the source for exact wording):
 
 - **Clarify-first:** on a material ambiguity, ask 1–3 short questions and emit NO tool calls that turn. Never ask the user to write the code — clarify *requirements* only, once.
 - **"Block" terminology:** a user-named "block" matching a standard block (mc_power→MC_Power) is an FB *instance* of that type — never a plain BOOL with that name.

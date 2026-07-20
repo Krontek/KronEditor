@@ -538,14 +538,19 @@ const RungEditorNew = ({ variables, setVariables, rungs, setRungs, availableBloc
 
       if (e.ctrlKey || e.metaKey) {
         const key = e.key.toLowerCase();
+        // Resolve undo/redo by PHYSICAL key (e.code) with e.key as fallback —
+        // under Ctrl+Shift some layouts/browsers report e.key as something other
+        // than 'z'/'y', which made Ctrl+Shift+Z (redo) silently miss.
+        const isZ = e.code === 'KeyZ' || key === 'z';
+        const isY = e.code === 'KeyY' || key === 'y';
         const scope = getEditorScope();
-        if (key === 'z' || key === 'y') {
+        if (isZ || isY) {
           // Scope-gate undo/redo like copy/paste: without this, a single
           // Ctrl+Z fired BOTH the App project-tree undo and this rung undo.
           if (scope !== EDITOR_SCOPE.LD) return;
           e.preventDefault();
           e.stopPropagation();
-          if (key === 'y' || e.shiftKey) {
+          if (isY || e.shiftKey) {
             redo();
           } else {
             undo();

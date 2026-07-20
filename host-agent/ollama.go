@@ -78,7 +78,7 @@ func NewOllamaState() *OllamaState {
 // Stop kills the managed daemon (if we started one) on agent shutdown.
 // exec.Cmd.Wait must only ever be called once, so Stop never calls Wait —
 // the reaper in startOllamaServe owns Wait and closes serveDone.
-func (o *OllamaState) Stop() {
+func (o *OllamaState) Stop() bool {
 	o.mu.Lock()
 	cmd, done := o.serveCmd, o.serveDone
 	o.serveCmd, o.serveDone = nil, nil
@@ -91,7 +91,51 @@ func (o *OllamaState) Stop() {
 			case <-time.After(5 * time.Second):
 			}
 		}
+		return true
 	}
+	return false
+}
+
+// owns reports whether WE launched the running daemon (so a UI "Stop" knows
+// whether it can actually stop it, vs. an externally-managed daemon it must not
+// touch — systemd/user terminal).
+func (o *OllamaState) owns() bool {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return o.serveCmd != nil && o.serveCmd.Process != nil
+}
+
+// handleOllamaStop stops the editor-managed `ollama serve`. It deliberately
+// refuses to kill a daemon the editor didn't start (reachable but not ours) —
+// that one belongs to systemd or the user's own terminal.
+func (s *Server) handleOllamaStop(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "POST required")
+		return
+	}
+	var req ollamaStatusReq
+	_ = json.NewDecoder(r.Body).Decode(&req) // body optional (baseUrl)
+	base := normalizeOllamaBase(req.BaseURL)
+	if !s.ollama.owns() {
+		// Not ours. If something is still answering, say so precisely.
+		external := ollamaReachable(base)
+		writeJSON(w, http.StatusOK, map[string]any{
+			"ok": true, "stopped": false, "external": external,
+			"error": ifThen(external,
+				"Ollama is running but was not started by the editor — stop it where you launched it (e.g. `systemctl stop ollama` or its terminal).",
+				"No editor-managed Ollama to stop."),
+		})
+		return
+	}
+	stopped := s.ollama.Stop()
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "stopped": stopped, "external": false})
+}
+
+func ifThen(cond bool, a, b string) string {
+	if cond {
+		return a
+	}
+	return b
 }
 
 func normalizeOllamaBase(raw string) string {
