@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"syscall"
@@ -46,7 +47,20 @@ import (
 //go:embed hotswaphost/host.c
 var hotswapHostC string
 
-const hotswapShmName = "/plc_runtime" // matches PLC_SHM_NAME in generated plc.c
+// hotswapShmName must match PLC_SHM_NAME in the generated plc.c. The two
+// platforms name the object differently: POSIX shm names start with "/", while
+// a Win32 section lives in the object namespace ("Local\\..." = per session).
+var hotswapShmName = func() string {
+	if runtime.GOOS == "windows" {
+		return `Local\plc_runtime`
+	}
+	return "/plc_runtime"
+}()
+
+// hotswapShmSize must match PLC_SHM_SIZE in the generated plc.c. Only needed on
+// Windows (a named section has no size to stat), but kept platform-neutral so
+// the two mirror implementations share one signature.
+const hotswapShmSize = 65536
 
 // swapResultTimeout bounds how long we wait for the loader-host to report a
 // swap/cold-start outcome before giving up and reporting "unknown" (never
@@ -179,13 +193,13 @@ func (s *Server) writeHotSwapVariable(w http.ResponseWriter, req writeVariableRe
 		writeError(w, http.StatusBadRequest, fmt.Sprintf("Cannot encode %q as %s", req.Value, spec.VType))
 		return
 	}
-	f, err := os.OpenFile("/dev/shm"+hotswapShmName, os.O_WRONLY, 0)
+	m, err := openShmMirror(hotswapShmName, hotswapShmSize, true)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "open shm mirror: "+err.Error())
 		return
 	}
-	defer f.Close()
-	if _, err := f.WriteAt(data, int64(spec.Offset)); err != nil {
+	defer m.Close()
+	if err := m.WriteAt(data, int64(spec.Offset)); err != nil {
 		writeError(w, http.StatusInternalServerError, fmt.Sprintf("shm write at 0x%x: %v", spec.Offset, err))
 		return
 	}
@@ -194,7 +208,7 @@ func (s *Server) writeHotSwapVariable(w http.ResponseWriter, req writeVariableRe
 		if req.Mode == "pulse" {
 			flag = 2 // PULSE — applied once, then plc_shm_pull auto-clears it
 		}
-		if _, err := f.WriteAt([]byte{flag}, int64(spec.ForceOff)); err != nil {
+		if err := m.WriteAt([]byte{flag}, int64(spec.ForceOff)); err != nil {
 			writeError(w, http.StatusInternalServerError, fmt.Sprintf("shm force flag at 0x%x: %v", spec.ForceOff, err))
 			return
 		}
@@ -209,12 +223,16 @@ func swapRequestPath(buildDir string) string { return filepath.Join(buildDir, "s
 // caller decides ver (the ping-pong slot, via hotswaplib.PingPongGeneration off
 // the confirmed-running generation) and is responsible for cleanup — this
 // function only compiles (atomically: temp file then rename), never deletes.
+// ⚠️ resInclude/HAL is a SEPARATE -I: kronhal.h lives only under
+// krontek-include/HAL/, and both the generated kron_hal.h and host_glue.c
+// include it by bare name. Without this, any project that touches the HAL
+// failed to build with "kronhal.h file not found" — on Linux too.
 func (s *Server) compileLogic(buildDir string, ver int) (string, string, error) {
-	resInclude, err := s.paths.ResourceTargetIncludeDir("x86_64/linux")
+	resInclude, err := s.paths.ResourceTargetIncludeDir(hostResourceTarget())
 	if err != nil {
 		return "", "", err
 	}
-	libDir, err := s.paths.ResourceTargetLibDir("x86_64/linux")
+	libDir, err := s.paths.ResourceTargetLibDir(hostResourceTarget())
 	if err != nil {
 		return "", "", err
 	}
@@ -234,15 +252,29 @@ func (s *Server) compileLogic(buildDir string, ver int) (string, string, error) 
 	args := append([]string{}, baseArgs...)
 	args = append(args,
 		"-shared", "-fPIC", "-DPLC_HOTSWAP", "-DKRON_EC_SIM",
-		"-I", buildDir, "-I", resInclude,
+		"-I", buildDir, "-I", resInclude, "-I", filepath.Join(resInclude, "HAL"),
 		"-I", simInc, "-I", filepath.Join(resInclude, "soem/include"),
 		"-fuse-ld=lld", "-O2", "-o", tmpSO, plcC,
 	)
 	args = append(args, CollectStaticArchives(libDir)...)
 	args = append(args, "-lm")
+	if runtime.GOOS == "windows" {
+		// ⚠️ The Windows equivalent of the host's -rdynamic. A PE DLL cannot
+		// resolve a symbol from the EXE that loads it the way a .so resolves
+		// against a -rdynamic host: every import must be bound at LINK time
+		// through an import library. compileHost therefore emits plc_host.lib
+		// and the logic DLL links against it — that is what keeps the HAL
+		// trampolines (__hs_*) and the host-owned us_tick / plc_stop /
+		// __plc_shm in the host, so they survive a swap.
+		implib := filepath.Join(buildDir, hostImportLibName)
+		if _, e := os.Stat(implib); e != nil {
+			return "", "", fmt.Errorf("loader-host import library missing (%s) — build the loader-host first", implib)
+		}
+		args = append(args, implib, "-lwinpthread")
+	}
 	if out, err := exec.Command(compiler, args...).CombinedOutput(); err != nil {
 		_ = os.Remove(tmpSO)
-		return "", "", fmt.Errorf("logic.so build failed: %v\n%s", err, out)
+		return "", "", fmt.Errorf("logic module build failed: %v\n%s", err, out)
 	}
 	if err := os.Rename(tmpSO, logicSO); err != nil {
 		_ = os.Remove(tmpSO)
@@ -261,6 +293,19 @@ func (s *Server) compileLogic(buildDir string, ver int) (string, string, error) 
 // for plc_host so a stale binary from an earlier build/version is never reused
 // (an old loader that doesn't write the cold-start swap_result would otherwise
 // make every sim start time out with "cold-start outcome unknown").
+// hostBinName is the loader-host executable name. Windows will not execute a
+// file without a .exe extension, so it differs by platform.
+func hostBinName() string {
+	if runtime.GOOS == "windows" {
+		return "plc_host.exe"
+	}
+	return "plc_host"
+}
+
+// hostImportLibName is the import library the Windows loader-host emits so the
+// logic DLL can bind to its symbols at link time (Windows only).
+const hostImportLibName = "plc_host.lib"
+
 func hostInputsHash(buildDir string) string {
 	h := sha256.New()
 	h.Write([]byte(hotswapHostC))
@@ -272,7 +317,7 @@ func hostInputsHash(buildDir string) string {
 }
 
 func (s *Server) compileHost(buildDir string) (string, error) {
-	hostBin := filepath.Join(buildDir, "plc_host")
+	hostBin := filepath.Join(buildDir, hostBinName())
 	// Cache on the CONTENT of the loader inputs, not mere existence — otherwise a
 	// plc_host built by an older host-agent (before the cold-start-result ABI, or
 	// with different HAL trampolines) is reused forever.
@@ -294,24 +339,39 @@ func (s *Server) compileHost(buildDir string) (string, error) {
 		return "", err
 	}
 	args := append([]string{}, baseArgs...)
-	args = append(args, "-O2", "-rdynamic", hostC)
+	args = append(args, "-O2", hostC)
+	if runtime.GOOS == "windows" {
+		// --export-all-symbols + --out-implib is mingw's stand-in for -rdynamic:
+		// it makes the host's symbols linkable from the logic DLL.
+		args = append(args,
+			"-Wl,--export-all-symbols",
+			"-Wl,--out-implib,"+filepath.Join(buildDir, hostImportLibName))
+	} else {
+		args = append(args, "-rdynamic")
+	}
 
 	// host_glue.c (HAL trampolines) needs the resource/sim includes + the libs.
 	glueC := filepath.Join(buildDir, "host_glue.c")
 	if _, err := os.Stat(glueC); err == nil {
-		resInclude, e1 := s.paths.ResourceTargetIncludeDir("x86_64/linux")
-		libDir, e2 := s.paths.ResourceTargetLibDir("x86_64/linux")
+		resInclude, e1 := s.paths.ResourceTargetIncludeDir(hostResourceTarget())
+		libDir, e2 := s.paths.ResourceTargetLibDir(hostResourceTarget())
 		if e1 != nil || e2 != nil {
 			return "", fmt.Errorf("resource paths: %v %v", e1, e2)
 		}
 		simInc := filepath.Join(s.paths.LLVMSysroot("simulation_env"), "include")
 		args = append(args, "-DKRON_EC_SIM",
-			"-I", buildDir, "-I", resInclude, "-I", simInc, "-I", filepath.Join(resInclude, "soem/include"),
+			"-I", buildDir, "-I", resInclude, "-I", filepath.Join(resInclude, "HAL"),
+			"-I", simInc, "-I", filepath.Join(resInclude, "soem/include"),
 			glueC)
 		args = append(args, CollectStaticArchives(libDir)...)
 		args = append(args, "-lm")
 	}
-	args = append(args, "-lpthread", "-ldl", "-lrt", "-o", hostBin)
+	if runtime.GOOS == "windows" {
+		args = append(args, hostSimLinkArgs()...) // -lwinpthread; LoadLibrary lives in kernel32
+	} else {
+		args = append(args, "-lpthread", "-ldl", "-lrt")
+	}
+	args = append(args, "-o", hostBin)
 	if out, err := exec.Command(compiler, args...).CombinedOutput(); err != nil {
 		return "", fmt.Errorf("host build failed: %v\n%s", err, out)
 	}
@@ -376,7 +436,7 @@ func (s *Server) compileLogicForTarget(buildDir, boardID string, ver int) (strin
 	for _, inc := range sysIncs {
 		args = append(args, "-isystem", inc)
 	}
-	args = append(args, "-I", buildDir, "-I", resInclude)
+	args = append(args, "-I", buildDir, "-I", resInclude, "-I", filepath.Join(resInclude, "HAL"))
 	args = append(args, soemIncludeArgs(resInclude)...)
 	args = append(args, "-o", tmpSO, filepath.Join(buildDir, "plc.c"))
 	for _, l := range s.paths.LLVMTargetLibraryDirs(llvmTarget) {
@@ -425,7 +485,7 @@ func (s *Server) compileHostForTarget(buildDir, boardID string) (string, error) 
 	for _, inc := range sysIncs {
 		args = append(args, "-isystem", inc)
 	}
-	args = append(args, "-I", buildDir, "-I", resInclude, hostC)
+	args = append(args, "-I", buildDir, "-I", resInclude, "-I", filepath.Join(resInclude, "HAL"), hostC)
 	args = append(args, soemIncludeArgs(resInclude)...)
 	if _, e := os.Stat(filepath.Join(buildDir, "host_glue.c")); e == nil {
 		args = append(args, filepath.Join(buildDir, "host_glue.c"))
@@ -669,7 +729,7 @@ func (s *Server) handleHotSwapRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	buildDir := s.paths.BuildDir()
-	hostBin := filepath.Join(buildDir, "plc_host")
+	hostBin := filepath.Join(buildDir, hostBinName())
 	logicSO := hotswaplib.GenerationPath(buildDir, 0)
 	if _, err := os.Stat(hostBin); err != nil {
 		writeError(w, http.StatusBadRequest, "not built — call hotswap/build first")
@@ -685,7 +745,7 @@ func (s *Server) handleHotSwapRun(w http.ResponseWriter, r *http.Request) {
 	// Fresh mirror each run. This MUST happen after the already-running
 	// early-return above: the poller opens the mirror by path each tick, so
 	// removing it while a host is live would silently kill the live stream.
-	_ = os.Remove("/dev/shm" + hotswapShmName)
+	removeShmMirror(hotswapShmName)
 	// Clear any stale result from a previous run BEFORE spawning, so a
 	// leftover file can never be misread as THIS run's cold-start outcome.
 	_ = hotswaplib.ClearResultFile(swapResultPath(buildDir))
@@ -870,7 +930,6 @@ func (s *Server) handleHotSwapStop(w http.ResponseWriter, r *http.Request) {
 // hotswapPoller reads the host-owned /dev/shm mirror by offset and streams live
 // variables, identical to the editor's existing simulation-output feed.
 func (s *Server) hotswapPoller(specs []ShmSpec, stop <-chan struct{}) {
-	shmPath := "/dev/shm" + hotswapShmName
 	time.Sleep(150 * time.Millisecond)
 	ticker := time.NewTicker(200 * time.Millisecond)
 	defer ticker.Stop()
@@ -880,7 +939,7 @@ func (s *Server) hotswapPoller(specs []ShmSpec, stop <-chan struct{}) {
 			return
 		case <-ticker.C:
 		}
-		f, err := os.Open(shmPath)
+		mirror, err := openShmMirror(hotswapShmName, hotswapShmSize, false)
 		if err != nil {
 			continue // mirror not up yet
 		}
@@ -892,12 +951,12 @@ func (s *Server) hotswapPoller(specs []ShmSpec, stop <-chan struct{}) {
 				continue
 			}
 			buf := make([]byte, size)
-			if _, err := f.ReadAt(buf, int64(sp.Offset)); err == nil {
+			if err := mirror.ReadAt(buf, int64(sp.Offset)); err == nil {
 				vars[sp.Key] = decodeValue(buf, sp.VType)
 				anyOK = true
 			}
 		}
-		f.Close()
+		mirror.Close()
 		if anyOK {
 			s.events.Emit("simulation-output", map[string]any{"vars": vars})
 			broadcastPlcVars(vars)

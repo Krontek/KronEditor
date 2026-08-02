@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -78,6 +79,18 @@ func (s *SimState) Stop() bool {
 func (s *Server) handleRunSimulation(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeError(w, http.StatusMethodNotAllowed, "POST required")
+		return
+	}
+	// ⚠️ This is the LEGACY plain-sim path: it runs the binary and reads its
+	// variables out of /proc/<pid>/mem using ELF/DWARF symbol offsets. Neither
+	// exists on Windows, and porting it would mean a PE/DWARF reader plus
+	// ReadProcessMemory for no user-visible gain — hot-swap is the default sim
+	// runtime and reads the shared-memory mirror by variables.json offset, so
+	// it needs no debug info at all. Fail with a clear reason rather than
+	// letting parseELFSymbols report "bad magic" on a PE file.
+	if runtime.GOOS == "windows" {
+		writeError(w, http.StatusBadRequest,
+			"the plain simulation runtime is Linux-only; Windows uses the hot-swap runtime (POST /api/host/hotswap/run)")
 		return
 	}
 	buildDir := s.paths.BuildDir()

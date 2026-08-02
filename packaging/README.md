@@ -9,7 +9,7 @@ Turn the repo into **two self-contained artifacts** — one per OS — that a us
 | Script | Artifact | Runs the whole product? |
 |---|---|---|
 | `build-appimage.sh` | `KronEditor-x86_64.AppImage` | **Yes** — editor, transpiler, AI agent, local simulation, hot-swap, Build & Send |
-| `build-windows.sh` | `KronEditor-Setup-x64.exe` | Everything **except local simulation / hot-swap** — see [Windows limitation](#windows-limitation) |
+| `build-windows.sh` | `KronEditor-Setup-x64.exe` | **Yes** — same set; local simulation runs on Windows via the hot-swap runtime (see [Windows notes](#windows-notes)) |
 
 Both are built **on Linux**. No Windows machine and no Wine are involved: Go cross-compiles the agent, and NSIS cross-builds the installer.
 
@@ -34,6 +34,8 @@ packaging/
 If you find yourself wanting to add `packaging/something.conf`, put it in the script instead.
 
 **Staging dirs**: `packaging/tmplinux/` and `packaging/tmpwin/`. Each script removes its own on an `EXIT` trap, so a failed or Ctrl-C'd build still cleans up. They are **separate roots on purpose** — with one shared `tmp/` the two builds could not run at the same time, because either trap would delete the other's tree.
+
+⚠️ Separate staging dirs are necessary but not sufficient for concurrency: both scripts drive the SAME Vite build into the same `dist/`, and running them together crashed one mid-build. `frontend_build()` therefore holds an `flock` for that ~2 s step; the expensive parts (toolchain copy, squashfs/LZMA) still overlap fully.
 
 ```bash
 KEEP_TMP=1 ./packaging/build-windows.sh   # keep the staging tree to debug a build
@@ -66,11 +68,16 @@ Common: `go`, `node`/`npm`, `python3`, `curl`, and a repo-root `toolchains/` (ru
 
 On a non-dpkg distro the script stops with an explicit "install NSIS" message rather than guessing.
 
-## Windows limitation
+## Windows notes
 
-**Local simulation and hot-swap do not work on Windows, and no packaging change can fix that.** The runtime reads `/proc/<pid>/mem` and `/dev/shm`, and hot-swap needs `dlopen` + `SIGUSR1` — `host-agent/hotswap_signal_windows.go` returns an explicit error rather than pretending. The editor, transpiler, AI agent, and Build & Send to a real PLC all work on Windows.
+**Local simulation works on Windows.** It runs the same hot-swap runtime as Linux: the loader-host creates a named section (`Local\plc_runtime`) instead of a `/dev/shm` object, loads the logic with `LoadLibrary` instead of `dlopen`, and takes its swap signal from a named Event instead of `SIGUSR1`. Everything above that — the scan barrier, the ping-pong slots, the force/pulse flag semantics — is the same code. CLAUDE.md §6 "Windows simulation" has the details and the traps found while porting.
+
+Only the LEGACY plain-sim path stays Linux-only (it reads `/proc/<pid>/mem` and needs ELF/DWARF); `handleRunSimulation` returns an explicit error on Windows. Users never pick that path — hot-swap is the default runtime.
+
+⚠️ **Verified under wine64, not yet on real Windows.** Treat the first run on a real machine as the acceptance test, and watch for the two things wine cannot tell us: scan-timing jitter, and Defender/SmartScreen reacting to an app that compiles and loads DLLs at run time.
 
 ⚠️ `GOOS=windows go build ./...` must keep succeeding — it is a release invariant, checked by this script every time.
+
 
 ## Design decisions worth not re-litigating
 

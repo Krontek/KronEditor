@@ -50,8 +50,21 @@ mkdir -p "$APPDIR/usr/bin" "$SHARE" "$CACHE"
 # Single source of truth for the version: package.json (§4 of CLAUDE.md).
 VERSION="$(node -p "require('$ROOT/package.json').version")"
 
+# ⚠️ Serialise the Vite build. Both scripts emit into the SAME dist/ tree, so
+# running them concurrently (which the separate tmp dirs otherwise allow) makes
+# one clobber the other's output mid-build — observed as a Vite crash. flock
+# costs nothing for a solo build and only holds for the ~2 s frontend step; the
+# expensive parts (toolchain copy, squashfs/LZMA) still overlap fully.
+frontend_build() {
+    if command -v flock >/dev/null 2>&1; then
+        flock "$ROOT/node_modules/.vite-build.lock" -c "cd '$ROOT' && npm run build:frontend"
+    else
+        ( cd "$ROOT" && npm run build:frontend )
+    fi
+}
+
 echo "==> 1/6 Frontend (v$VERSION)"
-( cd "$ROOT" && npm run build:frontend )
+frontend_build
 
 echo "==> 2/6 Host agent (linux/amd64)"
 ( cd "$ROOT/host-agent" && GOOS=linux GOARCH=amd64 \

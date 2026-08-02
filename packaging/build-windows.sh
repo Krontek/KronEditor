@@ -15,11 +15,12 @@
 #   - toolchains\          (WINDOWS-host clang.exe/lld + the shared target
 #                           sysroots → Build & Send to an ARM PLC works offline)
 #
-# ⚠️ LOCAL SIMULATION IS LINUX-ONLY and therefore not available in this build.
-# The runtime reads /proc/<pid>/mem and /dev/shm and hot-swap needs dlopen +
-# SIGUSR1 (host-agent/hotswap_signal_windows.go returns an explicit error). That
-# is a runtime limitation, not a packaging one — no bundling can fix it. The
-# editor, the transpiler, the AI agent and Build & Send to a real PLC all work.
+# LOCAL SIMULATION WORKS on Windows: it runs the same hot-swap runtime as Linux
+# (named section instead of /dev/shm, LoadLibrary instead of dlopen, a named
+# Event instead of SIGUSR1). That is why the mingw-w64 sysroot and the Windows
+# Krontek archives must ship — they are what the agent compiles the sim against
+# ON the user's machine. Only the LEGACY plain-sim path stays Linux-only.
+# ⚠️ Verified under wine64, not yet on real Windows — see packaging/README.md.
 #
 # ⚠️ Everything transient goes to packaging/tmpwin/ and is deleted on exit, so
 # packaging/ only ever holds the two build scripts and the two artifacts. Set
@@ -55,8 +56,21 @@ mkdir -p "$PAYLOAD" "$CACHE"
 # Single source of truth for the version: package.json (§4 of CLAUDE.md).
 VERSION="$(node -p "require('$ROOT/package.json').version")"
 
+# ⚠️ Serialise the Vite build. Both scripts emit into the SAME dist/ tree, so
+# running them concurrently (which the separate tmp dirs otherwise allow) makes
+# one clobber the other's output mid-build — observed as a Vite crash. flock
+# costs nothing for a solo build and only holds for the ~2 s frontend step; the
+# expensive parts (toolchain copy, squashfs/LZMA) still overlap fully.
+frontend_build() {
+    if command -v flock >/dev/null 2>&1; then
+        flock "$ROOT/node_modules/.vite-build.lock" -c "cd '$ROOT' && npm run build:frontend"
+    else
+        ( cd "$ROOT" && npm run build:frontend )
+    fi
+}
+
 echo "==> 1/6 Frontend (v$VERSION)"
-( cd "$ROOT" && npm run build:frontend )
+frontend_build
 
 echo "==> 2/6 Host agent (windows/amd64)"
 # ⚠️ Release invariant: this cross-build must keep succeeding (CLAUDE.md §4).
@@ -220,4 +234,5 @@ fi
 echo
 echo "Done: $OUT  ($(du -h "$OUT" | cut -f1))"
 echo "On Windows: run it, then start KronEditor and open http://localhost:7171."
-echo "(Local simulation is Linux-only — see the note at the top of this script.)"
+echo "Local simulation runs on Windows (hot-swap runtime) — verified under wine64,"
+echo "so treat the first run on a real Windows machine as the acceptance test."

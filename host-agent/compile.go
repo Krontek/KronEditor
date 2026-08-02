@@ -58,10 +58,7 @@ func (s *Server) compileSimulation() (string, string, error) {
 		}
 	}
 
-	resourceTarget := "x86_64/linux"
-	if runtime.GOOS == "darwin" {
-		resourceTarget = "x86_64/macos"
-	}
+	resourceTarget := hostResourceTarget()
 	resInclude, err := s.paths.ResourceTargetIncludeDir(resourceTarget)
 	if err != nil {
 		return "", "", err
@@ -81,6 +78,7 @@ func (s *Server) compileSimulation() (string, string, error) {
 		"-DKRON_EC_SIM",
 		"-I", buildDir,
 		"-I", resInclude,
+		"-I", filepath.Join(resInclude, "HAL"),
 		"-I", filepath.Join(s.paths.LLVMSysroot("simulation_env"), "include"),
 		"-I", filepath.Join(resInclude, "soem/include"),
 		"-fuse-ld=lld",
@@ -102,16 +100,18 @@ func (s *Server) compileSimulation() (string, string, error) {
 		plcC,
 	)
 	if runtime.GOOS != "darwin" {
+		// Also correct on Windows: mingw links libwinpthread statically, so the
+		// produced sim binary carries no DLL dependency the user must have.
 		args = append(args, "-static")
 	}
 
 	archives := CollectStaticArchives(hostLibDir)
 	args = append(args, archives...)
-	args = append(args, "-lm", "-lpthread")
-	if runtime.GOOS != "darwin" {
-		args = append(args, "-lrt")
+	args = append(args, "-lm")
+	if runtime.GOOS == "darwin" {
+		args = append(args, "-lpthread", "-framework", "CoreFoundation", "-framework", "IOKit")
 	} else {
-		args = append(args, "-framework", "CoreFoundation", "-framework", "IOKit")
+		args = append(args, hostSimLinkArgs()...)
 	}
 
 	cmd := exec.Command(compiler, args...)
@@ -266,7 +266,7 @@ func (s *Server) compileForTarget(req *compileForTargetReq) (string, string, err
 	for _, inc := range sysIncs {
 		args = append(args, "-isystem", inc)
 	}
-	args = append(args, "-I", buildDir, "-I", resInclude)
+	args = append(args, "-I", buildDir, "-I", resInclude, "-I", filepath.Join(resInclude, "HAL"))
 
 	soemBase := filepath.Join(resInclude, "soem")
 	soemPaths := []string{
@@ -326,7 +326,54 @@ func (s *Server) bundledHostClangArgs() (string, []string, error) {
 		"--target=" + triple,
 		"-resource-dir", clangRes,
 	}
+	// ⚠️ Windows host: the mingw-w64 target needs its OWN sysroot, resource dir
+	// and runtime selection, or every link dies with "unable to find library
+	// -lgcc". llvm-mingw ships compiler-rt + libunwind (no libgcc at all), and
+	// its builtins live in the SYSROOT's lib/clang tree — not in the bundled
+	// LLVM's, which only carries the MSVC-flavoured .lib. Without all four
+	// flags a Windows host cannot compile anything, which is why local
+	// simulation looked "Linux-only" at the toolchain level too.
+	if runtime.GOOS == "windows" {
+		sysroot := s.paths.LLVMSysroot("x86_64-w64-mingw32")
+		if res := s.paths.MinGWResourceDir(); res != "" {
+			args[len(args)-1] = res // replace clangRes
+		}
+		args = append(args,
+			"--sysroot="+sysroot,
+			"-rtlib=compiler-rt",
+			"--unwindlib=libunwind",
+			"-fuse-ld=lld",
+			"-L", s.paths.MinGWLibDir(),
+		)
+	}
 	return clang, args, nil
+}
+
+// hostResourceTarget is the resources/<triple> key for the machine the agent is
+// RUNNING on — i.e. where a local simulation executes. Every local-sim compile
+// (sim binary, hot-swap loader-host, logic module) must agree on this: the
+// static Krontek archives are per-ABI, so linking the Linux .a files into a
+// Windows build silently fails at link time.
+func hostResourceTarget() string {
+	switch runtime.GOOS {
+	case "windows":
+		return "x86_64/win32"
+	case "darwin":
+		return "x86_64/macos"
+	default:
+		return "x86_64/linux"
+	}
+}
+
+// hostSimLinkArgs returns the platform's link-time extras for a local-sim
+// binary/module (threading + timing runtime).
+func hostSimLinkArgs() []string {
+	if runtime.GOOS == "windows" {
+		// winpthreads supplies pthreads AND clock_gettime/clock_nanosleep, so
+		// the generated scan loop and the loader-host barrier need no #ifdef.
+		return []string{"-lwinpthread"}
+	}
+	return []string{"-lpthread", "-lrt"}
 }
 
 func (s *Server) llvmCompileBaseArgs(target string) (string, []string, []string, error) {

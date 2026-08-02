@@ -268,6 +268,32 @@ func (p *Paths) LLVMTargetLibraryDirs(triple string) []string {
 	return filterExisting(dirs)
 }
 
+// MinGWResourceDir returns the clang resource dir that carries the mingw-w64
+// compiler-rt builtins (<sysroot>/lib/clang/<ver>), or "" if absent.
+//
+// ⚠️ It must come from the MINGW SYSROOT, not from ToolchainsRoot/lib/clang.
+// The bundled LLVM's own resource dir ships only the MSVC-flavoured
+// clang_rt.builtins-x86_64.LIB, which does not satisfy a
+// --target=x86_64-w64-windows-gnu link: clang looks for
+// libclang_rt.builtins.a and dies with "unable to find library -lgcc"
+// (it falls back to a libgcc that llvm-mingw does not ship). The llvm-mingw
+// sysroot we harvest DOES contain the right .a, under its own lib/clang tree.
+func (p *Paths) MinGWResourceDir() string {
+	matches, err := filepath.Glob(filepath.Join(p.LLVMSysroot("x86_64-w64-mingw32"), "lib", "clang", "*"))
+	if err != nil || len(matches) == 0 {
+		return ""
+	}
+	sort.Slice(matches, func(i, j int) bool {
+		return compareVersionStrings(filepath.Base(matches[i]), filepath.Base(matches[j])) < 0
+	})
+	return matches[len(matches)-1]
+}
+
+// MinGWLibDir returns the mingw-w64 target library dir (libwinpthread etc.).
+func (p *Paths) MinGWLibDir() string {
+	return filepath.Join(p.LLVMSysroot("x86_64-w64-mingw32"), "x86_64-w64-mingw32", "lib")
+}
+
 // LLVMGCCInstallDir locates the bundled GCC installation inside a sysroot
 // (<sysroot>/lib/gcc/<vendor-triple>/<version>), or "" when absent.
 //
