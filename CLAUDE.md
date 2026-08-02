@@ -150,12 +150,21 @@ The binary embeds the React app (`host-agent/embed.go`) and looks for `resources
 It propagates everywhere; never hardcode a version string:
 - **Frontend:** Vite injects `__APP_VERSION__` (`vite.config.ts`); components import `APP_VERSION` from `src/version.js`.
 - **Host agent** (`/api/host/health`): `main.go` `var appVersion = "dev"`, overridden at build via `-ldflags "-X main.appVersion=$npm_package_version"`. `go run .` shows `"dev"`.
-- **Windows installer** (`kron-editor.iss`): `build-windows.sh` generates `packaging/windows/version.iss` from package.json.
+- **Windows installer**: `build-windows.sh` interpolates the version straight into the NSIS script it generates (`APPVERSION`), which sets the installer's version, its Add/Remove Programs entry and the exe's VERSIONINFO resource.
 
 ### Distributables (`packaging/`)
-Each bundle = host-agent binary + `resources/` + a **host-specific** `toolchains/`:
-- `build-appimage.sh` → `KronEditor-x86_64.AppImage` (linux toolchains; sim + Build & Send work).
-- `build-windows.sh` → payload packaged by `kron-editor.iss` (Inno Setup) into `KronEditor-Setup.exe`.
+⚠️ **`packaging/` holds only the two build scripts plus `packaging/README.md`, and each script emits exactly ONE self-contained artifact beside itself.** No committed ASSET files, no `dist/` tree. Both artifacts are gitignored. **[`packaging/README.md`](packaging/README.md) is the full packaging reference** — purpose, host requirements, the directory contract, the Windows limitation, and how to verify a build; keep it current with these scripts.
+
+| Script | Artifact | Contents |
+|---|---|---|
+| `build-appimage.sh` | `packaging/KronEditor-x86_64.AppImage` | agent + `resources/` + **linux-host** toolchains → sim AND Build & Send work |
+| `build-windows.sh` | `packaging/KronEditor-Setup-x64.exe` | agent.exe + `resources/` + **windows-host** toolchains → Build & Send works (sim is Linux-only) |
+
+- ⚠️ **Anything the artifact needs that used to live in `packaging/` is now GENERATED INLINE by its script** — the AppImage's `AppRun`/`.desktop` come from HEREDOCs, and the Windows installer script is an NSIS `.nsi` written at build time. Adding a committed asset file back to `packaging/` breaks the directory contract; put it in the script.
+- ⚠️ **Staging dirs are per-target and self-deleting**: `packaging/tmplinux/` and `packaging/tmpwin/`, each removed by an `EXIT` trap (so a failed or Ctrl-C'd build cleans up too). They are **separate roots on purpose** — one shared `tmp/` meant the two builds could not run concurrently, because either trap would delete the other's tree. `KEEP_TMP=1` preserves the staging tree for debugging.
+- ⚠️ **Downloaded build TOOLS are cached outside `packaging/`**, in `~/.cache/kron-editor-packaging/` — otherwise "delete the temp dir" would re-download ~15 MB of `appimagetool` and ~1.7 MB of NSIS on every build.
+- ⚠️ **The Windows installer is built with NSIS, not Inno Setup**, because `makensis` runs natively on Linux — the whole release is cut from one machine with no Windows box and no Wine. If `makensis` is not installed the script provisions it with `apt-get download nsis nsis-common` + `dpkg -x` into the cache: **no sudo, nothing installed system-wide** (an unpacked NSIS needs `NSISDIR` pointed at its share tree, or it cannot find its stubs/plugins). The previous flow only produced a payload **zip** and left the `.exe` to `iscc` run by hand on Windows — so `build-windows.sh` never actually produced an exe.
+- The NSIS uninstaller removes **only the directories the installer created** (`resources\`, `toolchains\`, the exe, the uninstaller), never a blind `RMDir /r $INSTDIR` — that would take anything the user put beside it.
 
 Facts a packaging change must respect:
 - **Toolchains are per-host; sysroots are shared.** `setup_toolchain.py --host {linux|windows}` downloads the matching LLVM; target sysroots are identical, so Windows `clang.exe` cross-compiles to the Linux PLC targets — **Build & Send works on Windows.**
