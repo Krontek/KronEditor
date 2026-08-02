@@ -9,7 +9,7 @@ import DragDropManager from '../utils/DragDropManager';
 import { registerIECSTLanguage } from '../utils/iecSTLanguage';
 import { findStMarkers } from '../utils/stValidation';
 import { writeClipboard, readClipboard, useKronClipboard, CLIP_KIND } from '../utils/kronClipboard';
-import { setEditorScope, getEditorScope, EDITOR_SCOPE } from '../utils/editorScope';
+import { setEditorScope, getEditorScope, EDITOR_SCOPE, hasTextSelection } from '../utils/editorScope';
 
 // IEC ST identifier validation for SCL inline editors.
 // Returns Monaco markers for undeclared identifiers.
@@ -537,6 +537,7 @@ const RungEditorNew = ({ variables, setVariables, rungs, setRungs, availableBloc
       }
 
       if (e.ctrlKey || e.metaKey) {
+        if (hasTextSelection()) return; // user is copying TEXT — never hijack
         const key = e.key.toLowerCase();
         // Resolve undo/redo by PHYSICAL key (e.code) with e.key as fallback —
         // under Ctrl+Shift some layouts/browsers report e.key as something other

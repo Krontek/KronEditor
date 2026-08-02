@@ -2684,6 +2684,14 @@ _CONV_TYPES.forEach(src => _CONV_TYPES.forEach(dst => {
     FB_OUTPUTS[k] = ['ENO', 'OUT'];
 }));
 
+// Exported for agentTools.js (add_variable): the agent must be able to declare
+// an instance of a standard stateful FB (TON, CTU, MC_Power…). FB_OUTPUTS is the
+// widest catalogue of known block types — combined with FB_TRIGGER_PIN !== 'EN'
+// (which filters out the inline math/compare/convert ops, none of which are
+// instances) it is exactly the set of types a variable may be declared as.
+// Exported AFTER the generated conversion entries so importers see the full set.
+export { FB_OUTPUTS };
+
 // ── Math FB blocks: use struct-based _Call from kronmath.h ──
 // Integer structs by default; _REAL variants used when inputs are REAL/LREAL.
 // No EN/ENO fields. Struct type names may differ from block type.

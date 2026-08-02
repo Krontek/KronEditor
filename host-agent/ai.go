@@ -8,8 +8,10 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 )
@@ -43,10 +45,28 @@ import (
 // tool calls and tool results are encoded) is contained in its call* function.
 // "custom" is treated as an OpenAI-compatible endpoint.
 
+// Required on every Anthropic REST call (both /v1/messages and /v1/models),
+// in API-key and OAuth mode alike.
+const anthropicVersion = "2023-06-01"
+
+// DeepSeek's OpenAI-compatible host. Deliberately WITHOUT a version segment:
+// both callOpenAI ("/chat/completions") and listOpenAIModels ("/models") append
+// their own path, and DeepSeek serves them at the root. (Its docs also accept
+// ".../v1", but that "v1" is OpenAI-SDK compatibility, not an API version —
+// adding it here would just make the two appended paths inconsistent.)
+const deepseekBase = "https://api.deepseek.com"
+
 type aiToolCall struct {
 	ID        string          `json:"id"`
 	Name      string          `json:"name"`
 	Arguments json.RawMessage `json:"arguments"` // a JSON object
+	// Extra is the provider's opaque per-tool-call blob, echoed back VERBATIM on
+	// the next turn. ⚠️ Required by Gemini 3: its tool calls carry
+	// `extra_content.google.thought_signature`, and replaying the assistant turn
+	// without it fails the whole request with
+	// 400 "Function call is missing a thought_signature in functionCall parts".
+	// Opaque on purpose — never parse or synthesize it, just round-trip it.
+	Extra json.RawMessage `json:"extra,omitempty"`
 }
 
 // aiImage is a user-turn image attachment (Anthropic + OpenAI-compatible
@@ -113,6 +133,13 @@ func (s *Server) handleAIChat(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Minute)
 	defer cancel()
 
+	// Kept for the log: the fold below clears req.Context, and the folded copy
+	// lands at the END of a ~14k-char system prompt that the log truncates at
+	// 4k — so the project context (which POUs exist, the board, the open POU)
+	// was invisible in every non-Anthropic exchange. That is exactly what you
+	// need when diagnosing "why did the agent invent a POU that isn't there".
+	projectContext := req.Context
+
 	// Non-Anthropic providers have no cache-placement concern — fold the
 	// volatile project context straight into the system prompt for them.
 	switch strings.ToLower(strings.TrimSpace(req.Provider)) {
@@ -151,6 +178,10 @@ func (s *Server) handleAIChat(w http.ResponseWriter, r *http.Request) {
 		// The base already contains "/v1beta", so callOpenAI appends only
 		// "/chat/completions" → .../v1beta/openai/chat/completions.
 		msg, err = callOpenAI(ctx, req, "https://generativelanguage.googleapis.com/v1beta/openai")
+	case "deepseek":
+		// OpenAI-compatible (Bearer auth, tool_calls). The base carries no version
+		// segment, so callOpenAI appends "/chat/completions" directly.
+		msg, err = callOpenAI(ctx, req, deepseekBase)
 	case "custom":
 		msg, err = callOpenAI(ctx, req, "") // baseUrl required; OpenAI-compatible
 	case "ollama", "":
@@ -161,9 +192,9 @@ func (s *Server) handleAIChat(w http.ResponseWriter, r *http.Request) {
 	}
 	// Log the exchange (request + raw model output) so failures/odd outputs can
 	// be inspected later — see {AppDataDir}/ai-agent.log.
-	s.logAIChat(req, msg, err)
+	s.logAIChat(req, projectContext, msg, err)
 	if err != nil {
-		writeError(w, http.StatusBadGateway, err.Error())
+		writeError(w, http.StatusBadGateway, friendlyProviderError(req.Model, err))
 		return
 	}
 	msg.Role = "assistant"
@@ -180,7 +211,7 @@ func truncForLog(s string, n int) string {
 // logAIChat appends one agent exchange — the request we sent (system prompt,
 // messages, tool names) and the model's raw output (text + tool calls, or the
 // error) — to {AppDataDir}/ai-agent.log. Best-effort; never fails the request.
-func (s *Server) logAIChat(req aiChatReq, msg aiMessage, callErr error) {
+func (s *Server) logAIChat(req aiChatReq, projectContext string, msg aiMessage, callErr error) {
 	path := filepath.Join(s.paths.AppDataDir, "ai-agent.log")
 	f, e := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
 	if e != nil {
@@ -191,8 +222,10 @@ func (s *Server) logAIChat(req aiChatReq, msg aiMessage, callErr error) {
 	var b strings.Builder
 	fmt.Fprintf(&b, "\n===== %s  %s / %s =====\n", time.Now().Format("2006-01-02 15:04:05"), req.Provider, req.Model)
 	fmt.Fprintf(&b, "--- request: system ---\n%s\n", truncForLog(req.System, 4000))
-	if strings.TrimSpace(req.Context) != "" {
-		fmt.Fprintf(&b, "--- request: project context ---\n%s\n", truncForLog(req.Context, 2000))
+	// Logged from the caller's saved copy, not req.Context: for non-Anthropic
+	// providers that field has already been folded into System and cleared.
+	if strings.TrimSpace(projectContext) != "" {
+		fmt.Fprintf(&b, "--- request: project context ---\n%s\n", truncForLog(projectContext, 2000))
 	}
 	fmt.Fprintf(&b, "--- request: messages (%d) ---\n", len(req.Messages))
 	for _, m := range req.Messages {
@@ -444,7 +477,7 @@ func callAnthropic(ctx context.Context, req aiChatReq, oauthToken string) (aiMes
 			Message string `json:"message"`
 		} `json:"error"`
 	}
-	headers := map[string]string{"anthropic-version": "2023-06-01"}
+	headers := map[string]string{"anthropic-version": anthropicVersion}
 	if oauthToken != "" {
 		headers["Authorization"] = "Bearer " + oauthToken
 		headers["anthropic-beta"] = anthropicOAuthBeta
@@ -531,6 +564,8 @@ func callOpenAI(ctx context.Context, req aiChatReq, defaultBase string) (aiMessa
 						Name      string `json:"name"`
 						Arguments string `json:"arguments"` // JSON-encoded string
 					} `json:"function"`
+					// Gemini rides its thought_signature here; kept opaque.
+					ExtraContent json.RawMessage `json:"extra_content"`
 				} `json:"tool_calls"`
 			} `json:"message"`
 		} `json:"choices"`
@@ -560,6 +595,7 @@ func callOpenAI(ctx context.Context, req aiChatReq, defaultBase string) (aiMessa
 		}
 		msg.ToolCalls = append(msg.ToolCalls, aiToolCall{
 			ID: tc.ID, Name: tc.Function.Name, Arguments: json.RawMessage(args),
+			Extra: tc.ExtraContent,
 		})
 	}
 	return msg, nil
@@ -605,6 +641,12 @@ func buildOpenAIMessages(req aiChatReq, argsAsString bool) []map[string]any {
 					call := map[string]any{"type": "function", "function": fn}
 					if tc.ID != "" {
 						call["id"] = tc.ID
+					}
+					// Echo the provider's opaque blob back untouched — Gemini 3
+					// rejects the whole request if its thought_signature is
+					// missing from a replayed functionCall.
+					if len(tc.Extra) > 0 {
+						call["extra_content"] = json.RawMessage(tc.Extra)
 					}
 					calls = append(calls, call)
 				}
@@ -742,4 +784,327 @@ func orEmptyObj(raw json.RawMessage) json.RawMessage {
 		return json.RawMessage("{}")
 	}
 	return raw
+}
+
+// ── Model discovery (/api/host/ai/models) ────────────────────────────────────
+//
+// The panel's "Connect a model" tab calls this before it renders, so the model
+// picker always offers what the provider CURRENTLY serves rather than a list
+// hardcoded at build time (which goes stale every time a model ships). Each
+// provider exposes a list endpoint; failures are non-fatal — the panel falls
+// back to its built-in suggestions and shows the reason.
+//
+//   POST /api/host/ai/models  { provider, apiKey, baseUrl }
+//   → { ok, models: ["claude-opus-5", ...], error? }
+
+type aiModelsReq struct {
+	Provider string `json:"provider"`
+	APIKey   string `json:"apiKey"`
+	BaseURL  string `json:"baseUrl"`
+}
+
+func (s *Server) handleAIModels(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "POST required")
+		return
+	}
+	var req aiModelsReq
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	// Short timeout: this gates the settings UI, so a hung provider must not
+	// keep the user staring at "Updating…".
+	ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
+	defer cancel()
+
+	var (
+		models []string
+		err    error
+	)
+	switch strings.ToLower(strings.TrimSpace(req.Provider)) {
+	case "anthropic":
+		models, err = listAnthropicModels(ctx, req.BaseURL, map[string]string{
+			"x-api-key":         req.APIKey,
+			"anthropic-version": anthropicVersion,
+		})
+	case "anthropic-oauth", "claude-account":
+		// Subscription sign-in: Bearer + the oauth beta header. Mirrors
+		// handleAIChat's 401 force-refresh retry.
+		var tok string
+		if tok, err = s.anthropicOAuth.accessToken(false); err == nil {
+			hdr := func(t string) map[string]string {
+				return map[string]string{
+					"Authorization":     "Bearer " + t,
+					"anthropic-beta":    anthropicOAuthBeta,
+					"anthropic-version": anthropicVersion,
+				}
+			}
+			models, err = listAnthropicModels(ctx, req.BaseURL, hdr(tok))
+			if err != nil && strings.Contains(err.Error(), "HTTP 401") {
+				if tok, err = s.anthropicOAuth.accessToken(true); err == nil {
+					models, err = listAnthropicModels(ctx, req.BaseURL, hdr(tok))
+				}
+			}
+		}
+	case "openai":
+		models, err = listOpenAIModels(ctx, req.BaseURL, "https://api.openai.com", req.APIKey)
+	case "gemini", "google":
+		// Listing uses Gemini's NATIVE endpoint even though chat goes through its
+		// OpenAI-compat surface: the compat /models route 404s without auth (a
+		// routing 404 that reads as "endpoint gone" rather than "add a key"), and
+		// the native one reports supportedGenerationMethods — the provider's own
+		// answer to "can this model chat", which beats guessing from the id.
+		models, err = listGeminiModels(ctx, req.BaseURL, req.APIKey)
+	case "deepseek":
+		models, err = listOpenAIModels(ctx, req.BaseURL, deepseekBase, req.APIKey)
+	case "custom":
+		models, err = listOpenAIModels(ctx, req.BaseURL, "", req.APIKey)
+	case "ollama", "":
+		models, err = listOllamaModels(ctx, req.BaseURL)
+	default:
+		writeError(w, http.StatusBadRequest, "unknown provider: "+req.Provider)
+		return
+	}
+	if err != nil {
+		// 200 with an error string: an unreachable provider or a missing key is
+		// an expected state in a settings dialog, not a request failure. The
+		// panel keeps its built-in suggestions and surfaces the reason inline.
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "models": []string{}, "error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "models": models})
+}
+
+// listAnthropicModels reads GET /v1/models. Auth differs by mode (API key vs
+// OAuth Bearer), so the caller supplies the full header set.
+func listAnthropicModels(ctx context.Context, baseURL string, headers map[string]string) ([]string, error) {
+	base := strings.TrimSpace(baseURL)
+	if base == "" {
+		base = "https://api.anthropic.com"
+	}
+	var out struct {
+		Data []struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if err := httpGetJSON(ctx, joinURL(base, "/v1/models?limit=100"), headers, &out); err != nil {
+		return nil, err
+	}
+	ids := make([]string, 0, len(out.Data))
+	for _, m := range out.Data {
+		if m.ID != "" {
+			ids = append(ids, m.ID)
+		}
+	}
+	return ids, nil
+}
+
+// Model families that are NOT conversational, matched as substrings against a
+// lowercased model id. OpenAI's /v1/models returns the whole account catalogue —
+// embeddings, speech, image and moderation models included — and a picker for a
+// tool-calling agent must not offer them. Kept deliberately conservative: the
+// combo box is free-text, so anything wrongly filtered can still be typed, but a
+// wrongly OFFERED model fails only later, mid-conversation.
+var nonChatModelMarkers = []string{
+	"embedding", "embed-",
+	"whisper", "-tts", "tts-", "-audio", "-realtime", "-transcribe", "speech",
+	"dall-e", "-image", "image-", "imagen", "sora", "veo",
+	"moderation", "-rerank", "rerank-", "guard",
+	"babbage", "ada-", "curie", "davinci", // legacy completion-only families
+}
+
+func isChatModelID(id string) bool {
+	l := strings.ToLower(id)
+	for _, bad := range nonChatModelMarkers {
+		if strings.Contains(l, bad) {
+			return false
+		}
+	}
+	return true
+}
+
+// listOpenAIModels reads GET {base}/models — the OpenAI list shape, which most
+// "custom" gateways also serve. Non-chat families are filtered out and the list
+// is ordered newest-first via the `created` timestamp OpenAI returns (its raw
+// order is arbitrary, which would bury the current model mid-list).
+func listOpenAIModels(ctx context.Context, baseURL, defaultBase, apiKey string) ([]string, error) {
+	base := strings.TrimSpace(baseURL)
+	if base == "" {
+		base = defaultBase
+	}
+	if base == "" {
+		return nil, fmt.Errorf("base URL is required for this provider")
+	}
+	suffix := "/models"
+	// The first-party OpenAI host serves the list under /v1; compat bases
+	// (self-hosted gateways) already carry their version segment.
+	if strings.Contains(base, "api.openai.com") {
+		suffix = "/v1/models"
+	}
+	headers := map[string]string{}
+	if strings.TrimSpace(apiKey) != "" {
+		headers["Authorization"] = "Bearer " + apiKey
+	}
+	var out struct {
+		Data []struct {
+			ID      string `json:"id"`
+			Created int64  `json:"created"`
+		} `json:"data"`
+	}
+	if err := httpGetJSON(ctx, joinURL(base, suffix), headers, &out); err != nil {
+		return nil, err
+	}
+	kept := out.Data[:0]
+	for _, m := range out.Data {
+		id := strings.TrimPrefix(m.ID, "models/")
+		if id != "" && isChatModelID(id) {
+			m.ID = id
+			kept = append(kept, m)
+		}
+	}
+	// Stable so ids sharing a release timestamp keep the provider's own order.
+	sort.SliceStable(kept, func(i, j int) bool { return kept[i].Created > kept[j].Created })
+	ids := make([]string, 0, len(kept))
+	for _, m := range kept {
+		ids = append(ids, m.ID)
+	}
+	return ids, nil
+}
+
+// listGeminiModels reads Gemini's NATIVE GET /v1beta/models (auth via the
+// ?key= query param, which is what that surface accepts — not a Bearer header).
+// Chat capability comes from the provider: only models advertising
+// generateContent can hold a conversation, so embedding/imagen/veo/aqa entries
+// drop out without any name guessing.
+func listGeminiModels(ctx context.Context, baseURL, apiKey string) ([]string, error) {
+	if strings.TrimSpace(apiKey) == "" {
+		return nil, fmt.Errorf("an API key is required to list Gemini models")
+	}
+	base := strings.TrimSpace(baseURL)
+	if base == "" {
+		base = "https://generativelanguage.googleapis.com/v1beta"
+	}
+	var out struct {
+		Models []struct {
+			Name        string   `json:"name"`
+			Methods     []string `json:"supportedGenerationMethods"`
+			Description string   `json:"description"`
+		} `json:"models"`
+	}
+	if err := httpGetJSON(ctx, joinURL(base, "/models?pageSize=200&key="+url.QueryEscape(apiKey)), nil, &out); err != nil {
+		return nil, err
+	}
+	ids := make([]string, 0, len(out.Models))
+	for _, m := range out.Models {
+		id := strings.TrimPrefix(m.Name, "models/")
+		if id == "" {
+			continue
+		}
+		for _, meth := range m.Methods {
+			if meth == "generateContent" {
+				ids = append(ids, id)
+				break
+			}
+		}
+	}
+	return ids, nil
+}
+
+// listOllamaModels reads the locally pulled tags from a running daemon.
+func listOllamaModels(ctx context.Context, baseURL string) ([]string, error) {
+	base := strings.TrimSpace(baseURL)
+	if base == "" {
+		base = defaultOllamaBase
+	}
+	var out struct {
+		Models []struct {
+			Name string `json:"name"`
+		} `json:"models"`
+	}
+	if err := httpGetJSON(ctx, joinURL(base, "/api/tags"), nil, &out); err != nil {
+		return nil, err
+	}
+	ids := make([]string, 0, len(out.Models))
+	for _, m := range out.Models {
+		if m.Name != "" {
+			ids = append(ids, m.Name)
+		}
+	}
+	return ids, nil
+}
+
+// httpGetJSON is httpJSON's GET twin — same non-2xx-body-as-error behaviour so
+// the panel can show the provider's own message ("invalid x-api-key", …).
+func httpGetJSON(ctx context.Context, url string, headers map[string]string, out any) error {
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return err
+	}
+	for k, v := range headers {
+		httpReq.Header.Set(k, v)
+	}
+	resp, err := (&http.Client{}).Do(httpReq)
+	if err != nil {
+		return fmt.Errorf("connect: %w", err)
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		snippet := strings.TrimSpace(string(raw))
+		if len(snippet) > 300 {
+			snippet = snippet[:300] + "…"
+		}
+		return fmt.Errorf("provider HTTP %d: %s", resp.StatusCode, snippet)
+	}
+	if err := json.Unmarshal(raw, out); err != nil {
+		return fmt.Errorf("decode response: %w", err)
+	}
+	return nil
+}
+
+// friendlyProviderError turns a provider's raw HTTP error body into one
+// actionable sentence.
+//
+// ⚠️ Written for the panel, which shows the message verbatim. Google's quota
+// body in particular is ~800 characters of repeated per-metric lines
+// ("Quota exceeded for metric: …generate_content_free_tier_input_token_count,
+// limit: 0, model: gemini-3.1-pro" ×N plus two doc links), which tells the user
+// nothing they can act on and buries the one fact that matters: the model needs
+// a plan this key doesn't have. The raw text still goes to the agent log — only
+// the surfaced message is condensed.
+func friendlyProviderError(model string, err error) string {
+	if err == nil {
+		return ""
+	}
+	msg := err.Error()
+	named := model
+	if named == "" {
+		named = "this model"
+	}
+	switch {
+	case strings.Contains(msg, "HTTP 429"):
+		// `limit: 0` means the plan grants NO quota for this model at all —
+		// a different situation from "you've used up today's allowance", and
+		// retrying will never help.
+		if strings.Contains(msg, "limit: 0") {
+			return fmt.Sprintf("%s is not included in this API key's plan (quota limit is 0). Pick a different model — the flash models are the ones available on Gemini's free tier — or enable billing for this key.", named)
+		}
+		return fmt.Sprintf("Rate limit / quota exceeded for %s. Wait and retry, pick a lighter model, or check your plan's limits.", named)
+	case strings.Contains(msg, "HTTP 404") && strings.Contains(strings.ToLower(msg), "no longer available"):
+		return fmt.Sprintf("%s has been withdrawn by the provider and can't be used by new keys. Pick a current model from the list (the \"-latest\" aliases always resolve to one).", named)
+	case strings.Contains(msg, "HTTP 404"):
+		return fmt.Sprintf("%s was not found by the provider. Check the model name, or pick one from the list.", named)
+	case strings.Contains(msg, "HTTP 401"), strings.Contains(msg, "HTTP 403"):
+		return "The provider rejected the credentials. Re-check the API key (or sign in again) in the agent settings."
+	}
+	// ⚠️ Not every bad-credential answer is a 401 — Google returns **400**
+	// "Please pass a valid API key", so match on the text too or a plain typo in
+	// the key surfaces as a raw JSON blob.
+	low := strings.ToLower(msg)
+	if strings.Contains(low, "api key not valid") || strings.Contains(low, "pass a valid api key") ||
+		strings.Contains(low, "invalid api key") || strings.Contains(low, "incorrect api key") {
+		return "The provider rejected the API key. Re-check it in the agent settings."
+	}
+	return msg
 }

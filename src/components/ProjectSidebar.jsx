@@ -6,7 +6,7 @@ import EtherCATIconSrc from '../assets/icons/ethercat.png';
 import {
     writeClipboard, readClipboard, refreshClipboard, useKronClipboard, CLIP_KIND,
 } from '../utils/kronClipboard';
-import { setEditorScope, getEditorScope, EDITOR_SCOPE } from '../utils/editorScope';
+import { setEditorScope, getEditorScope, EDITOR_SCOPE, hasTextSelection } from '../utils/editorScope';
 
 // Collects every string token from an object graph (POU content) and
 // intersects with a list of global variables to decide which globals
@@ -313,6 +313,7 @@ const ProjectSidebar = ({
             const el = document.activeElement;
             if (el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.isContentEditable || el.closest?.('.monaco-editor'))) return;
             if (!(e.ctrlKey || e.metaKey)) return;
+            if (hasTextSelection()) return; // user is copying TEXT — never hijack
             const scope = getEditorScope();
             if (scope && scope !== EDITOR_SCOPE.SIDEBAR) return;
             const key = e.key.toLowerCase();

@@ -22,7 +22,7 @@ import { isReservedTranspilerName } from '../utils/reservedNames';
 // Single source of truth for FB power-flow wiring: the transpiler reads the
 // trigger pin (power in) and Q pin (power out) from these tables, so the
 // ladder the agent authors must use exactly the same pins.
-import { FB_TRIGGER_PIN, FB_Q_OUTPUT } from './CTranspilerService';
+import { FB_TRIGGER_PIN, FB_Q_OUTPUT, FB_OUTPUTS } from './CTranspilerService';
 import { GENERIC_FB_DEFS } from '../utils/libraryTree';
 
 const POU_CATEGORIES = ['programs', 'functionBlocks', 'functions'];
@@ -109,9 +109,24 @@ function buildArrayDataType(name, baseType, dimensions) {
   };
 }
 
+// Standard STATEFUL function blocks a variable may be an instance of, keyed by
+// UPPERCASE name → the canonical spelling the transpiler expects ('MC_Power',
+// not 'MC_POWER'). FB_OUTPUTS is the widest catalogue of known block types; the
+// EN-trigger entries are the INLINE math/compare/convert ops (ADD, GT, INT_TO_REAL…)
+// which are expressions, not instances, so they are excluded. Without this the
+// system prompt's own instruction — "add_variable with type = the FB type name" —
+// was rejected for every standard FB, and the agent had to detour through
+// set_ladder just to get a TON instance declared.
+const STANDARD_FB_TYPES = new Map(
+  Object.keys(FB_OUTPUTS)
+    .filter((type) => FB_TRIGGER_PIN[type] !== 'EN')
+    .map((type) => [type.toUpperCase(), type])
+);
+
 // Resolves a variable's requested `type` string into either a known scalar,
-// an existing data-type/FB-instance name, or — for the one recoverable inline
-// form (ARRAY[..] OF TYPE) — a newly auto-created named Array data type. This
+// a standard stateful FB type, an existing data-type/FB-instance name, or —
+// for the one recoverable inline form (ARRAY[..] OF TYPE) — a newly
+// auto-created named Array data type. This
 // is the single choke point add_variable/update_variable funnel `type`
 // through, so an unrecognized/inline-composite type is caught and either
 // fixed transparently (array literal) or REJECTED with actionable guidance,
@@ -122,19 +137,74 @@ function resolveVarType(struct, rawType) {
   if (!t) return { ok: true, type: 'BOOL' };
   const upper = t.toUpperCase();
   if (SCALAR_IEC_TYPES.has(upper)) return { ok: true, type: upper };
+  // Project types/POUs win over the standard catalogue: a user FB named "TON"
+  // shadows the standard one, exactly as the transpiler resolves it.
   const dt = findDataType(struct, t);
   if (dt) return { ok: true, type: dt.item.name };
   const pou = findPOU(struct, t);
-  if (pou) return { ok: true, type: pou.item.name };
+  if (pou) return { ok: true, type: pou.item.name, isInstance: pou.category === 'functionBlocks' };
+  // Case-insensitive so "ton"/"Ton" resolve, but store the CANONICAL spelling —
+  // the transpiler's FB tables are keyed exactly ('MC_Power', 'R_TRIG').
+  if (STANDARD_FB_TYPES.has(upper)) return { ok: true, type: STANDARD_FB_TYPES.get(upper), isInstance: true };
   const arr = parseInlineArrayType(t);
   if (arr) {
     const name = uniqueArrayTypeName(struct, arr.baseType, arr.dimensions);
     return { ok: true, type: name, newDataType: buildArrayDataType(name, arr.baseType, arr.dimensions) };
   }
+  // An inline math/compare op reached here only if the model tried to declare it
+  // as an instance — name the real fix instead of the generic "unknown type".
+  if (FB_TRIGGER_PIN[upper] === 'EN' || FB_TRIGGER_PIN[t] === 'EN') {
+    return {
+      ok: false,
+      error: `"${t}" is an inline math/compare/conversion operation, not a stateful function block — it has no instance to declare. Use it directly in an ST expression (e.g. "result := a + b;") instead of adding a variable of this type.`,
+    };
+  }
   return {
     ok: false,
-    error: `Unknown type "${t}". Scalars are ${[...SCALAR_IEC_TYPES].join(', ')}. For an array/struct/enum, call create_data_type first (kind ARRAY, STRUCT, or ENUM) and reference its NAME here — do not write the array/struct/enum shape inline into a variable's type.`,
+    error: `Unknown type "${t}". Scalars are ${[...SCALAR_IEC_TYPES].join(', ')}. Standard function blocks (TON, CTU, R_TRIG, MC_Power, …) may be used as an instance type. For an array/struct/enum, call create_data_type first (kind ARRAY, STRUCT, or ENUM) and reference its NAME here — do not write the array/struct/enum shape inline into a variable's type.`,
   };
+}
+
+// Actionable "which POU?" error. A weak model handed `POU "undefined" not found`
+// has nothing to act on: the panel's recovery layers can synthesize a call with
+// no `pou` at all, and `inferPou` returns null when there is nothing to infer
+// from (empty project), so the raw interpolation leaked the JS `undefined`
+// straight into the message — after which the model typically gave up entirely.
+// Name the actual problem AND the way out, and list what does exist.
+function pouTargetError(struct, raw) {
+  const names = POU_CATEGORIES.flatMap((c) => (struct[c] || []).map((p) => p.name)).filter(Boolean);
+  const have = names.length ? `Existing POUs: ${names.join(', ')}.` : 'This project has no POUs yet.';
+  const fix = names.length
+    ? 'Retry with one of those names.'
+    : 'Call create_pou first, then retry using the name you created.';
+  const missing = raw == null || String(raw).trim() === '' || String(raw) === 'undefined';
+  return missing
+    ? `No POU was named — the "pou" argument is required. ${have} ${fix}`
+    : `POU "${raw}" not found. ${have} ${fix}`;
+}
+
+// Globals a POU actually mentions — scanned over its ST code and every ladder
+// block's variable/pin values. Returned by read_pou so the model can see the
+// declaration of a name it meets in the logic instead of assuming it's missing.
+function referencedGlobals(struct, pou) {
+  const globals = getGlobals(struct);
+  if (!globals.length) return undefined;
+  const text = [];
+  const c = pou.content || {};
+  if (typeof c.code === 'string') text.push(c.code);
+  for (const r of (c.rungs || [])) {
+    if (r.code) text.push(r.code);
+    for (const b of (r.blocks || [])) {
+      if (b.data?.instanceName) text.push(String(b.data.instanceName));
+      for (const v of Object.values(b.data?.values || {})) text.push(String(v));
+    }
+  }
+  const hay = text.join('\n');
+  // Word-boundary match so `Motor` doesn't hit inside `MotorRun`.
+  const used = globals.filter((g) => g.name && new RegExp(`\\b${g.name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`).test(hay));
+  return used.length
+    ? used.map((g) => ({ name: g.name, type: g.type, address: g.address || undefined, scope: 'GLOBAL' }))
+    : undefined;
 }
 
 function configResource(struct) {
@@ -164,7 +234,7 @@ function newVarId() {
   return `${Date.now()}_${Math.floor(Math.random() * 1e6)}`;
 }
 
-function makeVar(scope, { name, type, initialValue = '', address = '', description = '', class: cls }) {
+function makeVar(scope, { name, type, initialValue = '', address = '', description = '', class: cls, isInstance }) {
   return {
     id: newVarId(),
     name,
@@ -173,6 +243,9 @@ function makeVar(scope, { name, type, initialValue = '', address = '', descripti
     initialValue: initialValue ?? '',
     description: description ?? '',
     address: address ?? '',
+    // FB instances are flagged so the ladder editor keeps them out of the
+    // scalar pin-suggestion lists (mirrors the editor's own inline declare).
+    ...(isInstance ? { _isInstance: true } : {}),
   };
 }
 
@@ -236,23 +309,50 @@ function pouPins(pou) {
 // libraryData) + the project's own function blocks/functions, each with pins.
 // `library` is App's `libraryData` = [{ id, title, blocks:[{blockType, class,
 // inputs, outputs, desc}] }]. Returns { standard:[…], project:[…] }.
+// Which pin carries POWER FLOW in and out of a block. ⚠️ Single source of truth
+// for BOTH the catalogue the model reads and the wiring compileLadderRung
+// performs — they must agree, or the catalogue documents pins the compiler
+// doesn't use. Same fallback the compiler applies to project FBs with no entry
+// in the transpiler's tables (first BOOL input / first BOOL output).
+export function powerPins(type, inputs, outputs) {
+  const trigger = FB_TRIGGER_PIN[type]
+    || ((inputs || []).find((p) => p.type === 'BOOL') || (inputs || [])[0] || {}).name || null;
+  const powerOutput = FB_Q_OUTPUT[type]
+    || ((outputs || []).find((p) => p.type === 'BOOL') || {}).name || null;
+  return { trigger, powerOutput };
+}
+
 export function buildBlockCatalog(struct, library, filter) {
   const f = (filter || '').trim().toLowerCase();
   const matches = (type, category) => !f || (type || '').toLowerCase().includes(f) || (category || '').toLowerCase().includes(f);
   const pinList = (arr) => (arr || []).map((p) => ({ name: p.name, type: p.type }));
+  // ⚠️ Naming the trigger/power pins is the difference between a model that can
+  // wire a rung and one that guesses. set_ladder wires power INTO `trigger` from
+  // the contact network and OUT of `powerOutput` to the coils, so the trigger
+  // must NOT be passed in fb.inputs — without this the catalogue looked like a
+  // flat pin list and models routinely mis-wired or produced coil-less rungs.
+  const withPower = (entry, inputs, outputs) => {
+    const { trigger, powerOutput } = powerPins(entry.type, inputs, outputs);
+    return {
+      ...entry,
+      ...(trigger ? { triggerPin: trigger, triggerNote: `power flows in via "${trigger}" — do NOT pass it in fb.inputs` } : {}),
+      ...(powerOutput ? { powerOutputPin: powerOutput } : {}),
+    };
+  };
 
   const standard = [];
   for (const cat of (Array.isArray(library) ? library : [])) {
     for (const b of (cat.blocks || [])) {
       if (!b.blockType || !matches(b.blockType, cat.title)) continue;
-      standard.push({
+      const inputs = pinList(b.inputs);
+      const outputs = pinList(b.outputs);
+      standard.push(withPower({
         type: b.blockType,
         kind: b.class || 'FunctionBlock',
         category: cat.title,
         description: b.desc || undefined,
-        inputs: pinList(b.inputs),
-        outputs: pinList(b.outputs),
-      });
+        inputs, outputs,
+      }, inputs, outputs));
     }
   }
 
@@ -261,13 +361,15 @@ export function buildBlockCatalog(struct, library, filter) {
     for (const p of (struct[category] || [])) {
       if (!matches(p.name, category)) continue;
       const { inputs, outputs } = pouPins(p);
-      project.push({
+      const entry = {
         type: p.name,
         kind: category === 'functions' ? 'Function' : 'FunctionBlock',
         language: p.type,
         returnType: p.returnType || undefined,
         inputs, outputs,
-      });
+      };
+      // Functions are called inline from ST — they have no ladder power flow.
+      project.push(category === 'functions' ? entry : withPower(entry, inputs, outputs));
     }
   }
   return { standard, project };
@@ -511,7 +613,7 @@ export function applyToolCall(struct, name, args = {}) {
 
       case 'read_pou': {
         const hit = findPOU(struct, args.name);
-        if (!hit) return { ok: false, error: `POU "${args.name}" not found` };
+        if (!hit) return { ok: false, error: pouTargetError(struct, args.name) };
         const c = hit.item.content || {};
         // SCL keeps ST in per-rung code; surface it as `code` so the model sees it.
         const sclStCode = (c.rungs || []).filter((r) => r.lang === 'ST').map((r) => r.code || '').filter(Boolean).join('\n');
@@ -528,6 +630,13 @@ export function applyToolCall(struct, name, args = {}) {
             variables: (c.variables || []).map((v) => ({
               name: v.name, type: v.type, class: v.class, initialValue: v.initialValue, address: v.address, description: v.description,
             })),
+            // ⚠️ Globals this POU actually references. Without them the model
+            // reads logic like `MotorRun := (Start OR MotorRun) AND NOT Stop`
+            // with MotorRun declared NOWHERE in sight (it isn't a POU local) —
+            // and a weak model "fixes" that by re-declaring it as a local,
+            // silently shadowing the global. Scoped to referenced names so a
+            // project with many globals doesn't flood the response.
+            globals: referencedGlobals(struct, hit.item),
           },
         };
       }
@@ -543,7 +652,7 @@ export function applyToolCall(struct, name, args = {}) {
         if (!args.name || !args.name.trim()) return { ok: false, error: 'name is required' };
         if (!isValidIecName(args.name)) return { ok: false, error: `invalid name "${args.name}" — POU names must be IEC identifiers (letters, digits, underscore; no spaces; can't start with a digit)` };
         if (isReservedTranspilerName(args.name)) return { ok: false, error: `"${args.name}" is reserved by the transpiler/runtime — pick a different POU name` };
-        if (findPOU(struct, args.name)) return { ok: false, error: `a POU named "${args.name}" already exists` };
+        if (findPOU(struct, args.name)) return { ok: false, error: `a POU named "${args.name}" already exists — edit it directly with set_ladder / set_st_code (read_pou first to see what it contains), or choose a different name.` };
         // Unified rung model: every POU is 'SCL' (a list of rungs, each LD or
         // ST). The requested language is honored PER RUNG — set_ladder adds LD
         // rungs, set_st_code adds an ST rung — so we no longer create distinct
@@ -568,7 +677,7 @@ export function applyToolCall(struct, name, args = {}) {
 
       case 'rename_pou': {
         const hit = findPOU(struct, args.name);
-        if (!hit) return { ok: false, error: `POU "${args.name}" not found` };
+        if (!hit) return { ok: false, error: pouTargetError(struct, args.name) };
         if (!args.newName || !args.newName.trim()) return { ok: false, error: 'newName is required' };
         if (!isValidIecName(args.newName)) return { ok: false, error: `invalid name "${args.newName}" — must be an IEC identifier (no spaces; can't start with a digit)` };
         if (isReservedTranspilerName(args.newName)) return { ok: false, error: `"${args.newName}" is reserved by the transpiler/runtime — pick a different name` };
@@ -592,7 +701,7 @@ export function applyToolCall(struct, name, args = {}) {
 
       case 'delete_pou': {
         const hit = findPOU(struct, args.name);
-        if (!hit) return { ok: false, error: `POU "${args.name}" not found` };
+        if (!hit) return { ok: false, error: pouTargetError(struct, args.name) };
         const list = struct[hit.category].filter((_, i) => i !== hit.index);
         const next = { ...struct, [hit.category]: list };
         return {
@@ -605,7 +714,7 @@ export function applyToolCall(struct, name, args = {}) {
 
       case 'set_st_code': {
         const hit = findPOU(struct, args.pou);
-        if (!hit) return { ok: false, error: `POU "${args.pou}" not found` };
+        if (!hit) return { ok: false, error: pouTargetError(struct, args.pou) };
         if (hit.item.type === 'LD') return { ok: false, error: `"${args.pou}" is a Ladder POU — edit it with set_ladder, not set_st_code` };
         if (typeof args.code !== 'string') return { ok: false, error: 'code must be a string' };
         // The editor's ST box is BODY-ONLY (variables live in the table). Models
@@ -622,10 +731,15 @@ export function applyToolCall(struct, name, args = {}) {
         if (hit.item.type === 'SCL') {
           // SCL stores logic per-rung (each rung has lang ST|LD + code). The ST
           // body goes into a single ST rung — content.code is NOT read for SCL.
-          const old = (content.rungs || []).filter((r) => r.lang === 'ST').map((r) => r.code || '').join('\n');
+          // set_st_code replaces only the ST rungs; LD rungs (from set_ladder)
+          // are preserved untouched — this tool's contract is "entire ST body",
+          // not "entire rung list".
+          const existingRungs = content.rungs || [];
+          const old = existingRungs.filter((r) => r.lang === 'ST').map((r) => r.code || '').join('\n');
           oldCode = old;
+          const ldRungs = existingRungs.filter((r) => r.lang !== 'ST');
           const rung = { id: `rung_${Date.now()}_0`, label: '000', lang: 'ST', blocks: [], connections: [], code };
-          next = withPOUContent(struct, hit.category, hit.index, { ...content, rungs: [rung] });
+          next = withPOUContent(struct, hit.category, hit.index, { ...content, rungs: [...ldRungs, rung] });
         } else {
           oldCode = content.code || '';
           next = withPOUContent(struct, hit.category, hit.index, { ...content, code });
@@ -672,7 +786,7 @@ export function applyToolCall(struct, name, args = {}) {
 
       case 'set_ladder': {
         const hit = findPOU(struct, args.pou);
-        if (!hit) return { ok: false, error: `POU "${args.pou}" not found` };
+        if (!hit) return { ok: false, error: pouTargetError(struct, args.pou) };
         // LD POUs are pure ladder; SCL POUs are mixed and accept ladder rungs too
         // (each tagged lang:'LD'). ST POUs cannot hold ladder.
         if (hit.item.type !== 'LD' && hit.item.type !== 'SCL') return { ok: false, error: `"${args.pou}" is not a Ladder/SCL POU — use set_st_code for ST` };
@@ -680,7 +794,7 @@ export function applyToolCall(struct, name, args = {}) {
         if (dsl.length === 0) return { ok: false, error: 'rungs must be a non-empty array' };
         const fbVarHints = []; // pin-typed declare candidates from fb.inputs/fb.outputs
         let compiled;
-        try { compiled = dsl.map((r, i) => compileLadderRung(r, i, { struct, library: args.__library, collect: (h) => fbVarHints.push(h) })); }
+        try { compiled = dsl.map((r, i) => compileLadderRung(r, i, { struct, pou: hit.item, library: args.__library, collect: (h) => fbVarHints.push(h) })); }
         catch (e) { return { ok: false, error: `ladder: ${e.message}` }; }
         // SCL rungs carry a per-rung language tag; ladder rungs are 'LD'.
         if (hit.item.type === 'SCL') compiled = compiled.map((r) => ({ ...r, lang: 'LD' }));
@@ -717,10 +831,15 @@ export function applyToolCall(struct, name, args = {}) {
         // captures like ET⇒elapsed) — typed by the PIN, collected during compile.
         for (const h of fbVarHints) declare(h.name, h.type, h.isInstance);
 
-        const oldRungs = hit.item.content?.rungs || [];
+        // set_ladder replaces only the LD rungs; ST rungs (from set_st_code)
+        // are preserved untouched — this tool's contract is "entire ladder",
+        // not "entire rung list".
+        const allOldRungs = hit.item.content?.rungs || [];
+        const stRungs = allOldRungs.filter((r) => r.lang === 'ST');
+        const oldRungs = allOldRungs.filter((r) => r.lang !== 'ST');
         const next = withPOUContent(struct, hit.category, hit.index, {
           ...hit.item.content,
-          rungs: compiled,
+          rungs: [...stRungs, ...compiled],
           ...(newVars.length ? { variables: [...(hit.item.content?.variables || []), ...newVars] } : {}),
         });
         const lines = [
@@ -751,7 +870,7 @@ export function applyToolCall(struct, name, args = {}) {
           base = { ...struct, dataTypes: [...(struct.dataTypes || []), resolved.newDataType] };
           extraLines.push({ type: 'add', text: `data type  ${resolved.newDataType.name} = ARRAY[${resolved.newDataType.content.dimensions.map((d) => `${d.min}..${d.max}`).join(',')}] OF ${resolved.newDataType.content.baseType}` });
         }
-        const v = makeVar(scope, { ...args, name: args.name.trim(), type: resolved.type });
+        const v = makeVar(scope, { ...args, name: args.name.trim(), type: resolved.type, isInstance: resolved.isInstance });
         if (scope === 'global') {
           const globals = getGlobals(base);
           if (globals.some((g) => (g.name || '').toLowerCase() === v.name.toLowerCase()))
@@ -763,10 +882,18 @@ export function applyToolCall(struct, name, args = {}) {
           };
         }
         const hit = findPOU(base, args.pou);
-        if (!hit) return { ok: false, error: `POU "${args.pou}" not found (required for local scope)` };
+        if (!hit) return { ok: false, error: pouTargetError(base, args.pou) };
         const vars = hit.item.content?.variables || [];
         if (vars.some((x) => (x.name || '').toLowerCase() === v.name.toLowerCase()))
-          return { ok: false, error: `"${args.pou}" already has a variable named "${v.name}"` };
+          return { ok: false, error: `"${args.pou}" already has a variable named "${v.name}". Use update_variable to change it, or pick a different name.` };
+        // ⚠️ Refuse to SHADOW a global. set_ladder's auto-declare resolves a
+        // contact/coil against locals AND globals, so adding a local with a
+        // global's name silently re-binds every existing reference to the new
+        // local — observed with a BOOL global `counter` followed by a local
+        // `counter : INT`, which quietly retargeted the rung's coil.
+        const shadowed = getGlobals(base).find((g) => (g.name || '').toLowerCase() === v.name.toLowerCase());
+        if (shadowed)
+          return { ok: false, error: `a GLOBAL variable named "${shadowed.name}" (${shadowed.type}) already exists — a local with the same name would shadow it and silently re-bind existing references. Use the global directly, or choose a different local name.` };
         const next = withPOUContent(base, hit.category, hit.index, { ...hit.item.content, variables: [...vars, v] });
         return {
           mutation: true, ok: true, summary: `Add ${v.name} : ${v.type} to ${hit.item.name}`,
@@ -792,6 +919,10 @@ export function applyToolCall(struct, name, args = {}) {
           const resolved = resolveVarType(struct, args.type);
           if (!resolved.ok) return { ok: false, error: resolved.error };
           changes.type = resolved.type;
+          // Retype BOOL→TON (or back) must move the instance flag with it, or a
+          // stale flag would keep an ordinary scalar out of the pin suggestions.
+          if (resolved.isInstance) changes._isInstance = true;
+          else changes._isInstance = undefined;
           if (resolved.newDataType) {
             base = { ...struct, dataTypes: [...(struct.dataTypes || []), resolved.newDataType] };
             extraLines.push({ type: 'add', text: `data type  ${resolved.newDataType.name} = ARRAY[${resolved.newDataType.content.dimensions.map((d) => `${d.min}..${d.max}`).join(',')}] OF ${resolved.newDataType.content.baseType}` });
@@ -812,7 +943,7 @@ export function applyToolCall(struct, name, args = {}) {
           };
         }
         const hit = findPOU(base, args.pou);
-        if (!hit) return { ok: false, error: `POU "${args.pou}" not found` };
+        if (!hit) return { ok: false, error: pouTargetError(struct, args.pou) };
         const vars = hit.item.content?.variables || [];
         const idx = vars.findIndex((x) => (x.name || '').toLowerCase() === String(args.name).toLowerCase());
         if (idx < 0) return { ok: false, error: `"${args.pou}" has no variable "${args.name}"` };
@@ -839,7 +970,7 @@ export function applyToolCall(struct, name, args = {}) {
           };
         }
         const hit = findPOU(struct, args.pou);
-        if (!hit) return { ok: false, error: `POU "${args.pou}" not found` };
+        if (!hit) return { ok: false, error: pouTargetError(struct, args.pou) };
         const vars = hit.item.content?.variables || [];
         const idx = vars.findIndex((x) => (x.name || '').toLowerCase() === String(args.name).toLowerCase());
         if (idx < 0) return { ok: false, error: `"${args.pou}" has no variable "${args.name}"` };
@@ -1247,12 +1378,74 @@ const LD_COL = 90;   // horizontal spacing between elements
 const LD_ROW = 80;   // vertical spacing between parallel branches
 const LD_X0 = 60;    // first column x (just right of the left rail)
 
-function normContactSub(s) {
-  // Rising/Falling get real one-scan edge semantics (transpiler edge memory).
-  return ['NC', 'Rising', 'Falling'].includes(s) ? s : 'NO';
+// ── Vertical placement: sit ON the rung's power line ─────────────────────────
+// ⚠️ A block's POWER HANDLE must land on the power line, not the block's top
+// edge. The editor draws that line at RungContainer's `MIDDLE_Y` and, on
+// drag/drop, snaps a node to `MIDDLE_Y - <handle offset measured from the DOM>`
+// (RungContainer `powerHandleOffsetY`, which returns FLOW units — it divides by
+// scaleFactor). Agent-authored blocks never travel that path, so they have to
+// carry the same arithmetic with the node geometry inlined. These used to all
+// be y=0, which parked every contact and coil at the TOP of the rung, ~75px
+// above the rail, with every wire running diagonally to reach it.
+// Keep in sync with RungContainer: MIN_RUNG_HEIGHT and the node boxes.
+const LD_MIDDLE_Y = 75;                                    // = MIN_RUNG_HEIGHT (150) / 2
+const LD_CONTACT_Y = LD_MIDDLE_Y - 27 / 2;                 // contact/coil box is 27×27, handle at top:50%
+// An FB's power handle is its TRIGGER ROW, not its middle: instance bar (~17)
+// + label bar (~21) + body top padding (8) + half a pin row (~9). Approximate
+// by nature (row height depends on the pin's controls) — the editor's magnet
+// (POWER_SNAP_DRAG = 16px) absorbs the residual, and any drag re-snaps it
+// exactly from the DOM.
+const LD_FB_Y = LD_MIDDLE_Y - 55;
+
+const CONTACT_SUBS = ['NO', 'NC', 'Rising', 'Falling'];
+const COIL_SUBS = ['Normal', 'Set', 'Reset', 'Negated', 'Rising', 'Falling'];
+// Comparison/arithmetic names a model reaches for when it wants a COMPARISON but
+// only has contacts to work with. Silently normalizing these to "NO" produced a
+// program with nothing to do with the request (observed: `{contact:"counter",
+// subType:"EQ"}` + `{contact:"10"}` became `counter AND 10`), so they get a
+// routing error instead.
+const COMPARISON_SUBS = new Set(['EQ', 'NE', 'GT', 'GE', 'LT', 'LE', '=', '<>', '>', '>=', '<', '<=']);
+
+// Lenient variants for DISPLAY only (ladderRungText renders the approval diff
+// and must never throw). Compilation uses the strict req* pair below.
+function normContactSub(s) { return CONTACT_SUBS.includes(s) ? s : 'NO'; }
+function normCoilSub(s) { return COIL_SUBS.includes(s) ? s : 'Normal'; }
+
+// ⚠️ Unknown subTypes ERROR rather than falling back. A silent fallback turns a
+// model's misunderstanding into a plausible-looking but wrong program, and the
+// model never learns it asked for something ladder can't express.
+function reqContactSub(s, idx) {
+  if (s == null || s === '') return 'NO';
+  if (CONTACT_SUBS.includes(s)) return s;
+  if (COMPARISON_SUBS.has(String(s).toUpperCase())) {
+    throw new Error(`rung ${idx + 1}: "${s}" is a COMPARISON, not a contact type. Ladder contacts only test a BOOL (${CONTACT_SUBS.join('/')}). Put the comparison in an ST rung (set_st_code), e.g. "IF counter >= 10 THEN …".`);
+  }
+  throw new Error(`rung ${idx + 1}: unknown contact subType "${s}" — use one of ${CONTACT_SUBS.join(', ')}.`);
 }
-function normCoilSub(s) {
-  return ['Normal', 'Set', 'Reset', 'Negated', 'Rising', 'Falling'].includes(s) ? s : 'Normal';
+function reqCoilSub(s, idx) {
+  if (s == null || s === '') return 'Normal';
+  if (COIL_SUBS.includes(s)) return s;
+  throw new Error(`rung ${idx + 1}: unknown coil subType "${s}" — use one of ${COIL_SUBS.join(', ')}.`);
+}
+
+// A contact/coil drives BOOLEAN power flow, so its target must be a BOOL. An
+// undeclared name is fine (auto-declared as BOOL later); a name already declared
+// as something else is not — it silently produced invalid IEC (a coil assigning
+// power flow into an INT) that only failed much later, in generated C.
+// Member access (`blink.Q`) is allowed through: it addresses an FB output pin.
+function checkBoolTarget(ctx, kind, name, idx) {
+  if (!isValidIecName(name)) {
+    if (String(name).includes('.')) return;  // FB output pin, e.g. blink.Q
+    throw new Error(`rung ${idx + 1}: ${kind} "${name}" is not a variable name. Contacts and coils reference BOOL variables — a literal or expression must go in an ST rung (set_st_code).`);
+  }
+  const struct = ctx.struct;
+  if (!struct) return;
+  const local = (ctx.pou?.content?.variables || []).find((v) => v.name === name);
+  const global = getGlobals(struct).find((v) => v.name === name);
+  const found = local || global;
+  if (found && String(found.type).toUpperCase() !== 'BOOL') {
+    throw new Error(`rung ${idx + 1}: ${kind} "${name}" is ${found.type}, but contacts and coils only work on BOOL. Use a different BOOL variable, or express this in an ST rung (set_st_code).`);
+  }
 }
 
 // Resolve a function-block type into its pin metadata, searching (in order):
@@ -1307,14 +1500,16 @@ function compileLadderRung(r, idx, ctx = {}) {
 
   const mkContact = (c, x, y) => {
     if (!c || !c.contact) throw new Error(`rung ${idx + 1}: a contact is missing its variable name`);
-    const sub = normContactSub(c.subType);
+    const sub = reqContactSub(c.subType, idx);
+    checkBoolTarget(ctx, 'contact', String(c.contact), idx);
     const id = bid();
     blocks.push({ id, type: 'Contact', position: { x, y }, data: { label: 'Contact', instanceName: c.contact, customData: { subType: sub }, subType: sub, values: { var: c.contact } } });
     return id;
   };
   const mkCoil = (o, x, y) => {
     if (!o || !o.coil) throw new Error(`rung ${idx + 1}: an output is missing its coil variable name`);
-    const sub = normCoilSub(o.subType);
+    const sub = reqCoilSub(o.subType, idx);
+    checkBoolTarget(ctx, 'coil', String(o.coil), idx);
     const id = bid();
     blocks.push({ id, type: 'Coil', position: { x, y }, data: { label: 'Coil', instanceName: o.coil, customData: { subType: sub }, subType: sub, values: { coil: o.coil } } });
     return id;
@@ -1336,10 +1531,9 @@ function compileLadderRung(r, idx, ctx = {}) {
     if ((fbDef.inputs || []).some((p) => p.type === 'AXIS_REF')) throw new Error(`rung ${idx + 1}: "${fb.type}" is a motion FB (needs an Axis) — author motion in an ST rung (set_st_code)`);
     const inputNames = (fbDef.inputs || []).map((p) => p.name);
     const outputNames = (fbDef.outputs || []).map((p) => p.name);
-    fbTrigger = FB_TRIGGER_PIN[fb.type]
-      || (fbDef.inputs.find((p) => p.type === 'BOOL') || fbDef.inputs[0] || {}).name || null;
-    fbQ = FB_Q_OUTPUT[fb.type]
-      || (fbDef.outputs.find((p) => p.type === 'BOOL') || {}).name || null;
+    // Shared with buildBlockCatalog so the pins the model is TOLD about are
+    // exactly the pins wired here.
+    ({ trigger: fbTrigger, powerOutput: fbQ } = powerPins(fb.type, fbDef.inputs, fbDef.outputs));
     if (outputs.length > 0 && !fbQ) throw new Error(`rung ${idx + 1}: "${fb.type}" has no boolean output to drive coils — remove the outputs or use ST`);
     // ctx.collect gathers auto-declare candidates WITH pin-accurate types:
     // an identifier fed to a TIME pin declares as TIME, a CTU.R reference as
@@ -1368,11 +1562,11 @@ function compileLadderRung(r, idx, ctx = {}) {
   const chainIds = [];
   const chainInPins = [];  // target pin name for the wire INTO each chain element
   const chainOutPins = []; // source pin name for the wire OUT of each chain element
-  for (const c of after) { chainIds.push(mkContact(c, colX, 0)); chainInPins.push('in'); chainOutPins.push('out'); colX += LD_COL; }
+  for (const c of after) { chainIds.push(mkContact(c, colX, LD_CONTACT_Y)); chainInPins.push('in'); chainOutPins.push('out'); colX += LD_COL; }
   if (fb) {
     const id = bid();
     blocks.push({
-      id, type: fb.type, position: { x: colX, y: 0 },
+      id, type: fb.type, position: { x: colX, y: LD_FB_Y },
       data: { label: fb.type, instanceName: fb.instance, customData: fbDef.customData, values: fbValues },
     });
     chainIds.push(id);
@@ -1384,13 +1578,14 @@ function compileLadderRung(r, idx, ctx = {}) {
     chainOutPins.push(fbQ ? `out_${fbQ}` : 'out');
     colX += LD_COL * 2; // FB nodes are wider than contacts
   }
-  for (const o of outputs) { chainIds.push(mkCoil(o, colX, 0)); chainInPins.push('in'); chainOutPins.push('out'); colX += LD_COL; }
+  for (const o of outputs) { chainIds.push(mkCoil(o, colX, LD_CONTACT_Y)); chainInPins.push('in'); chainOutPins.push('out'); colX += LD_COL; }
   const mergeTarget = chainIds[0];
   const mergePin = chainInPins[0];
 
   // Branches (OR): each is an AND-series of contacts from the left rail to the merge point.
   branches.forEach((b, bi) => {
-    const y = bi * LD_ROW;
+    // Branch 0 rides the power line; extra parallel branches stack below it.
+    const y = LD_CONTACT_Y + bi * LD_ROW;
     let prev = LEFT_RAIL;
     (Array.isArray(b) ? b : []).forEach((c, ci) => {
       const id = mkContact(c, LD_X0 + ci * LD_COL, y);

@@ -280,6 +280,16 @@ export class HostClient {
     if (!j.ok) throw new Error(j.error || 'aiChat failed');
     return j.message;
   }
+  /**
+   * List the models the provider CURRENTLY serves, so the picker never offers a
+   * list frozen at build time. Never throws on a provider-side failure (missing
+   * key, daemon down): those come back as `{ ok:true, models:[], error }` so the
+   * settings UI can fall back to its built-in suggestions and show why.
+   * payload = { provider, apiKey, baseUrl }
+   */
+  async aiModels(payload) {
+    return _post(this._p('/api/host/ai/models'), payload);
+  }
   /** Clear the agent exchange log (called on New chat). */
   async aiLogClear() {
     return _post(this._p('/api/host/ai/log-clear'), {});
@@ -310,6 +320,7 @@ export class HostClient {
   async anthropicOAuthLogout() {
     return _post(this._p('/api/host/anthropic-oauth/logout'), {});
   }
+
 
   // ── Hot-swap (online change) — local simulation ─────────────────────────────
   /**

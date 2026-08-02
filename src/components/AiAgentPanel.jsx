@@ -1,6 +1,7 @@
 import { useState, useRef, useEffect, useCallback } from 'react';
 import { host } from '../services/HostClient';
 import { TOOL_DEFS, applyToolCall, buildProjectOverview, findPOU, summarizeLiveSamples, summarizeWatch } from '../services/agentTools';
+import { setEditorScope, EDITOR_SCOPE } from '../utils/editorScope';
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -9,6 +10,9 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 // callOpenAI — the latter also covers "custom" and "gemini"/"google", which
 // route through the same OpenAI-compatible /chat/completions shape). Ollama
 // is excluded for now — its /api/chat image field is a different scheme.
+// 'deepseek' and 'ollama' are absent on purpose: DeepSeek's chat models are
+// text-only, and a local model's vision support depends on the pulled tag —
+// attaching an image to either would fail at the provider, not here.
 const IMAGE_CAPABLE_PROVIDERS = new Set(['anthropic', 'anthropic-oauth', 'openai', 'custom', 'gemini', 'google']);
 const MAX_IMAGE_BYTES = 8 * 1024 * 1024;   // 8MB per image — generous but catches accidental huge pastes early
 const MAX_IMAGES = 5;                       // mirrors typical chat-UI limits (VS Code Copilot Chat, Claude.ai)
@@ -78,14 +82,70 @@ const C = {
   green: '#4ec9b0', user: '#37373d', code: '#1b1b1b',
 };
 
+// ⚠️ These `models` lists are only the OFFLINE FALLBACK. The settings tab asks
+// the provider for its real catalogue on open (host.aiModels → /api/host/ai/models)
+// and shows that instead; a hardcoded list goes stale every time a model ships,
+// which is exactly how this list came to offer Opus 4.8 as its newest Claude.
+// Keep them short and current — they are what the user sees when the provider is
+// unreachable or no key/sign-in is configured yet.
+// `auth` groups the picker: 'login' = sign in with an existing subscription (no
+// key to paste), 'key' = paste an API key, 'local' = runs on this machine,
+// 'custom' = your own OpenAI-compatible endpoint. ⚠️ Only providers with a
+// working OAuth backend belong in 'login' — see AUTH_GROUPS below.
 const PROVIDERS = [
-  { id: 'anthropic', label: 'Anthropic (API key)', models: ['claude-opus-4-8', 'claude-sonnet-4-6', 'claude-haiku-4-5'] },
-  { id: 'anthropic-oauth', label: 'Claude account (sign in)', models: ['claude-opus-4-8', 'claude-sonnet-4-6', 'claude-haiku-4-5'] },
-  { id: 'openai', label: 'OpenAI', models: ['gpt-4.1', 'gpt-4o', 'o4-mini'] },
-  { id: 'gemini', label: 'Google (Gemini)', models: ['gemini-2.5-pro', 'gemini-2.5-flash', 'gemini-2.5-flash-lite', 'gemini-2.0-flash', 'gemini-2.0-flash-lite'] },
-  { id: 'ollama', label: 'Local (Ollama)', models: ['llama3.1', 'qwen2.5-coder', 'deepseek-coder'] },
-  { id: 'custom', label: 'Custom endpoint', models: [] },
+  { id: 'anthropic-oauth', label: 'Claude account', auth: 'login', models: ['claude-opus-5', 'claude-sonnet-5', 'claude-opus-4-8', 'claude-sonnet-4-6', 'claude-haiku-4-5'] },
+  { id: 'anthropic', label: 'Anthropic', auth: 'key', models: ['claude-opus-5', 'claude-sonnet-5', 'claude-opus-4-8', 'claude-sonnet-4-6', 'claude-haiku-4-5'] },
+  { id: 'openai', label: 'OpenAI', auth: 'key', models: ['gpt-4.1', 'gpt-4o', 'o4-mini'] },
+  // ⚠️ Uses the `-latest` ALIASES first: they always resolve to the current
+  // model, so this list cannot go stale the way the old `gemini-2.5-*` entries
+  // did (those now 404 with "no longer available to new users" for any new key).
+  // Ordered by capability, NOT by what some particular key has quota for —
+  // whether a given model is reachable depends on the account's plan, and the
+  // 429/404 handling in ai.go explains that when it isn't.
+  { id: 'gemini', label: 'Google (Gemini)', auth: 'key', models: ['gemini-pro-latest', 'gemini-flash-latest', 'gemini-3.1-pro-preview', 'gemini-3-pro-preview', 'gemini-3.5-flash', 'gemini-3-flash-preview', 'gemini-3.1-flash-lite'] },
+  // deepseek-chat leads: it's the tool-calling model, and the agent is useless
+  // without tool calls. deepseek-reasoner is listed but is a reasoning model —
+  // check DeepSeek's docs for its current function-calling support before use.
+  { id: 'deepseek', label: 'DeepSeek', auth: 'key', models: ['deepseek-chat', 'deepseek-reasoner'] },
+  // Ollama's live list is what's INSTALLED, so its fallback must be pullable
+  // tags from OLLAMA_CATALOG below — bare names like "qwen2.5-coder" aren't.
+  { id: 'ollama', label: 'Ollama', auth: 'local', models: ['qwen2.5-coder:7b', 'qwen2.5-coder:14b', 'deepseek-coder-v2:16b', 'llama3.1:8b'] },
+  { id: 'custom', label: 'Custom endpoint', auth: 'custom', models: [] },
 ];
+
+// ⚠️ 'login' currently holds ONLY anthropic-oauth, and that is a capability
+// limit rather than an oversight. OpenAI and Google both expose PKCE OAuth
+// (verified: auth.openai.com and accounts.google.com serve OIDC discovery with
+// S256), but a subscription token from those flows is scoped to their OWN
+// coding agent's backend — it does NOT authenticate /v1/chat/completions or
+// generativelanguage.googleapis.com, so `callOpenAI` cannot use it. Adding
+// either means writing a new backend dialect (as callAnthropic needed for its
+// OAuth mode), not just an entry here. DeepSeek serves no OIDC discovery at all
+// — API key only. Do not move a provider into 'login' before its token is
+// verified end-to-end against a chat endpoint this app actually calls.
+// Per-provider sign-in wiring: which HostClient methods drive the flow, plus
+// the copy shown in the settings block. Adding a `login` provider means adding
+// a row here — the UI is fully driven off it.
+const LOGIN_PROVIDERS = {
+  'anthropic-oauth': {
+    start: 'anthropicOAuthStart', status: 'anthropicOAuthStatus', logout: 'anthropicOAuthLogout',
+    button: '🔐 Sign in with Claude', signedIn: '✓ Signed in to your Claude account',
+    blurb: 'Sign in with your Claude Pro/Max subscription — no API key. Opens claude.ai in your browser; once you authorize, it connects automatically (no code to paste).',
+    note: "Uses Claude Code's OAuth; gray-area for 3rd-party use — your call.",
+  },
+};
+
+const AUTH_GROUPS = [
+  ['login', 'Sign in with your subscription'],
+  ['key', 'API key'],
+  ['local', 'Local (runs on this machine)'],
+  ['custom', 'Self-hosted / other'],
+];
+
+// Default model per provider — the first fallback entry (Claude providers lead
+// with the current Opus, so a fresh install lands on it rather than on whatever
+// happened to be newest when this file was last edited).
+const defaultModelFor = (providerId) => PROVIDERS.find((p) => p.id === providerId)?.models[0] || '';
 
 // Curated catalog of local (Ollama) models the user can pull with one click.
 // `id` must match the exact Ollama tag so installed-state detection works.
@@ -214,6 +274,28 @@ function findJsonObjects(text) {
 // The last KNOWN tool name mentioned in `text` (and where). Used to pair a bare
 // args object with the tool whose name the model wrote in surrounding prose
 // (e.g. a markdown heading "**create_pou**" right before the JSON args).
+// ⚠️ Route a BARE args object by its SHAPE before falling back to the prose.
+// `lastToolMention` scans the text preceding the object, but that text includes
+// EARLIER JSON BLOCKS — so a second, unnamed block inherits the first block's
+// tool name. Observed with llama3.1:8b: it emitted `{"name":"create_pou",…}`
+// and then a bare `{"pou":"Counter","rungs":[…]}`, which was routed to
+// create_pou and died with "name is required" instead of running as set_ladder.
+// A distinctive argument key is far stronger evidence than a name that merely
+// appeared somewhere earlier. Only unambiguous keys belong here: add/update/
+// remove_variable all share {name,pou,scope}, so they stay with the prose scan.
+const ARG_SHAPE_TOOL = [
+  ['rungs', 'set_ladder'],
+  ['code', 'set_st_code'],
+  ['newName', 'rename_pou'],
+  ['kind', 'create_data_type'],
+];
+function toolFromArgShape(o) {
+  for (const [key, tool] of ARG_SHAPE_TOOL) {
+    if (o && o[key] !== undefined && KNOWN_TOOLS.has(tool)) return tool;
+  }
+  return null;
+}
+
 function lastToolMention(text) {
   let best = null, bestIdx = -1;
   for (const name of KNOWN_TOOLS) {
@@ -260,7 +342,10 @@ function extractInlineToolCalls(content) {
       pushCall(o.name, flat);
       return;
     }
-    if (fallbackName) pushCall(fallbackName, o);  // bare args; name came from prose
+    // Bare args: shape first (a distinctive key), prose only as a last resort.
+    const byShape = toolFromArgShape(o);
+    if (byShape) { pushCall(byShape, o); return; }
+    if (fallbackName) pushCall(fallbackName, o);
   };
 
   // A whole-array / single-object form first: [ {…}, {…} ] or { name, arguments }.
@@ -470,9 +555,12 @@ function buildSystemPrompt(libraryData = [], agentMode = 'manual') {
     '',
     'LANGUAGE CHOICE (per RUNG, not per POU):',
     '- Every POU is a list of RUNGS; each rung is Ladder OR Structured Text. create_pou makes the unified rung-based POU — then author ladder rungs with set_ladder and/or ST with set_st_code (both work on every POU).',
-    '- If the user mentions "ladder", "LD", "merdiven", "ladder diagram", "rung", "kontak/coil" → author with set_ladder. Ladder handles: contacts (NO/NC/Rising/Falling), coils (Normal/Set/Reset/Negated), AND one stateful function block per rung via `fb` (TON/TOF/TP/TONR, CTU/CTD, R_TRIG/F_TRIG, SR/RS, communication FBs, user FBs). Timers and counters BELONG in ladder — do NOT switch to ST for them.',
-    '- Use ST (set_st_code) for: math/expressions (ADD/MOVE/comparison), loops/CASE/IF chains, motion (MC_*), multi-FB interactions, string/array handling.',
-    '- If the user does not specify: boolean interlocks + timers/counters → ladder; computation-heavy logic → ST. Mixing both in one POU is normal (it is one rung list).',
+    '- ⚠️ WHEN THE USER ASKS FOR LADDER ("ladder", "LD", "merdiven", "ladder diagram", "rung", "kontak/coil") THAT IS A HARD REQUIREMENT, NOT A HINT. You MUST call set_ladder. It OVERRIDES every content-based preference below. Writing the whole thing in ST after the user said "ladder" is a FAILED response, even if the ST is correct.',
+    '- Ladder handles: contacts (NO/NC/Rising/Falling), coils (Normal/Set/Reset/Negated), AND one stateful function block per rung via `fb` (TON/TOF/TP/TONR, CTU/CTD/CTUD, R_TRIG/F_TRIG, SR/RS, communication FBs, user FBs).',
+    '- ⚠️ COUNTING AND TIMING ARE LADDER-NATIVE — they are NOT "math". A count-up/count-down to a limit is CTU/CTD/CTUD, whose PV pin IS the limit and whose Q/QU/QD output already tells you the limit was reached: you do NOT need a comparison block for "count to 10". A periodic pulse is a self-resetting TON (`branches:[[{"contact":"tick.Q","subType":"NC"}]], fb:{type:"TON",instance:"tick",inputs:{"PT":"T#1s"}}`). Latching a direction is SR/RS. Reaching for ST because you saw "+ 1" or ">= 10" is the single most common mistake here.',
+    '- Use ST (set_st_code) ONLY for what ladder genuinely cannot express: arithmetic on values (ADD/MOVE/scaling), comparisons that are not an FB pin, loops/CASE/IF chains, motion (MC_*), string/array handling.',
+    '- If the user asked for ladder but ONE part truly needs ST, still build the ladder rungs with set_ladder and put only that part in an ST rung — then say in your reply which part had to be ST and why. Mixing both in one POU is normal (it is one rung list).',
+    '- If the user does NOT specify a language: boolean interlocks + timers/counters → ladder; computation-heavy logic → ST.',
     '- A minimal LD rung exists — even a single coil with no contacts is valid: `rungs: [{ "outputs": [{"coil": "mc_power"}] }]`. Do NOT fall back to ST just because the requested logic is trivial.',
     '- set_ladder AUTO-DECLARES referenced variables that do not exist (contacts/coils → BOOL, fb.instance → the FB type) and lists them in the diff — do not emit add_variable calls for plain ladder contacts/coils/instances unless you need a non-default type, initial value or address.',
     '',
@@ -526,62 +614,84 @@ export default function AiAgentPanel({
 }) {
   const [config, setConfig] = useState(loadConfig);
   const [configOpen, setConfigOpen] = useState(false);
-  const [draftCfg, setDraftCfg] = useState(() => config || { provider: 'anthropic', model: 'claude-opus-4-8', apiKey: '', baseUrl: '' });
-  // Claude-account OAuth: connection status + the "waiting in browser" flow.
-  const [oauth, setOauth] = useState({ connected: false, checked: false, busy: false, error: '' });
+  const [draftCfg, setDraftCfg] = useState(() => config || { provider: 'anthropic', model: defaultModelFor('anthropic'), apiKey: '', baseUrl: '' });
+  // Account OAuth: connection status + the "waiting in browser" flow.
+  // ⚠️ Keyed BY PROVIDER. There is more than one sign-in provider now, and a
+  // single shared flag would report "signed in" for Google merely because the
+  // user had signed in to Claude (and vice-versa) — the settings block and the
+  // header's ready-pill both read it.
+  const [oauthByProvider, setOauthByProvider] = useState({}); // id → {connected, checked}
+  const [oauth, setOauth] = useState({ busy: false, error: '' }); // transient, current flow only
   const [oauthPending, setOauthPending] = useState(false); // authorize URL opened, polling for completion
   const oauthPollRef = useRef(null);
 
-  const refreshOauth = useCallback(async () => {
-    try { const r = await host.anthropicOAuthStatus(); setOauth((o) => ({ ...o, connected: !!r.connected, checked: true })); }
-    catch { setOauth((o) => ({ ...o, checked: true })); }
+  const refreshOauth = useCallback(async (providerId) => {
+    const def = LOGIN_PROVIDERS[providerId];
+    if (!def) return;
+    const mark = (connected) => setOauthByProvider((m) => ({ ...m, [providerId]: { connected, checked: true } }));
+    try { const r = await host[def.status](); mark(!!r.connected); }
+    catch { mark(false); }
   }, []);
-  useEffect(() => { refreshOauth(); }, [refreshOauth]);
+  // Check every sign-in provider once at mount: the saved provider needs it for
+  // the ready-pill, and the settings block needs it the moment it's opened.
+  useEffect(() => { Object.keys(LOGIN_PROVIDERS).forEach(refreshOauth); }, [refreshOauth]);
   useEffect(() => () => { if (oauthPollRef.current) clearInterval(oauthPollRef.current); }, []);
 
   // Loopback flow (matches VSCode): open the authorize URL, then poll status —
   // the host-agent catches the browser redirect at :7171/callback and stores
   // the tokens, so there is NO code to paste.
-  const startClaudeSignIn = async () => {
-    setOauth((o) => ({ ...o, busy: true, error: '' }));
+  const startSignIn = async (providerId) => {
+    const def = LOGIN_PROVIDERS[providerId];
+    if (!def) return;
+    setOauth({ busy: true, error: '' });
     try {
-      const r = await host.anthropicOAuthStart();
+      const r = await host[def.start]();
       window.open(r.authorizeUrl, '_blank', 'noopener');
       setOauthPending(true);
-      setOauth((o) => ({ ...o, busy: false }));
+      setOauth({ busy: false, error: '' });
       if (oauthPollRef.current) clearInterval(oauthPollRef.current);
       const t0 = Date.now();
       oauthPollRef.current = setInterval(async () => {
         try {
-          const s = await host.anthropicOAuthStatus();
+          const s = await host[def.status]();
           if (s.connected) {
             clearInterval(oauthPollRef.current); oauthPollRef.current = null;
-            setOauth({ connected: true, checked: true, busy: false, error: '' });
+            setOauthByProvider((m) => ({ ...m, [providerId]: { connected: true, checked: true } }));
+            setOauth({ busy: false, error: '' });
             setOauthPending(false);
-            const next = { provider: 'anthropic-oauth', model: draftCfg.model || 'claude-opus-4-8', apiKey: '', baseUrl: '' };
+            const next = { provider: providerId, model: draftCfg.model || defaultModelFor(providerId), apiKey: '', baseUrl: '' };
             setDraftCfg(next); saveConfig(next); setConfig(next);
+            // The catalogue fetch before sign-in had no token to send, so it fell
+            // back to the built-in list — re-read it now that we're authorized.
+            refreshModelsRef.current?.();
           } else if (Date.now() - t0 > 180000) {
             clearInterval(oauthPollRef.current); oauthPollRef.current = null;
             setOauthPending(false);
-            setOauth((o) => ({ ...o, error: 'Timed out waiting for authorization.' }));
+            setOauth({ busy: false, error: 'Timed out waiting for authorization.' });
           }
         } catch { /* keep polling */ }
       }, 1500);
     } catch (e) {
-      setOauth((o) => ({ ...o, busy: false, error: e.message || 'sign-in failed' }));
+      setOauth({ busy: false, error: e.message || 'sign-in failed' });
     }
   };
-  const cancelClaudeSignIn = () => {
+  const cancelSignIn = () => {
     if (oauthPollRef.current) { clearInterval(oauthPollRef.current); oauthPollRef.current = null; }
     setOauthPending(false);
-    setOauth((o) => ({ ...o, busy: false }));
+    setOauth({ busy: false, error: '' });
   };
-  const claudeSignOut = async () => {
+  const signOut = async (providerId) => {
+    const def = LOGIN_PROVIDERS[providerId];
     if (oauthPollRef.current) { clearInterval(oauthPollRef.current); oauthPollRef.current = null; }
-    try { await host.anthropicOAuthLogout(); } catch { /* ignore */ }
-    setOauth({ connected: false, checked: true, busy: false, error: '' });
+    try { if (def) await host[def.logout](); } catch { /* ignore */ }
+    setOauthByProvider((m) => ({ ...m, [providerId]: { connected: false, checked: true } }));
+    setOauth({ busy: false, error: '' });
     setOauthPending(false);
+    refreshModelsRef.current?.(); // the token is gone — drop back to the built-in list
   };
+  // The OAuth handlers above are defined before the catalogue fetch (which needs
+  // draftCfg); reach it through a ref so neither has to move.
+  const refreshModelsRef = useRef(null);
   // Restore the persisted conversation. A proposal left mid-approval is marked
   // not-applied on restore (it was never committed). _mid is advanced past the
   // restored ids so new view items don't collide.
@@ -616,10 +726,36 @@ export default function AiAgentPanel({
   const turnControllerRef = useRef(null);
   const stopRequestedRef = useRef(false);
 
+  // What the agent is doing right now, and when this run started. A dot
+  // animation alone can't be told apart from a hung request — the label + a
+  // ticking elapsed time are what actually show it's still alive.
+  const [activity, setActivity] = useState('');
+  const [runStartedAt, setRunStartedAt] = useState(0);
+  const [turnNo, setTurnNo] = useState(0);
+
+  // Every agent run carries a generation. Stop bumps it, which permanently
+  // invalidates the in-flight loop: aborting the fetch alone is not enough
+  // because the loop recurses BETWEEN turns (read-only turns chain straight
+  // into the next runTurn with no request in flight), and because `send()`
+  // resets stopRequestedRef — so a stopped loop could otherwise resume and run
+  // alongside the new one.
+  const runGenRef = useRef(0);
+
   const stopAgent = () => {
     stopRequestedRef.current = true;
-    turnControllerRef.current?.abort();
+    runGenRef.current++;               // orphan the running loop for good
+    turnControllerRef.current?.abort(); // and unblock it if a request is in flight
+    // Clear the UI immediately rather than waiting for the loop to notice: if it
+    // is parked between turns there is nothing to abort, and "working…" would
+    // otherwise stay on screen with no way to dismiss it.
+    setBusy(false);
+    setRunning(false);
+    setActivity('');
+    pushViewRef.current?.({ role: 'note', text: 'Stopped.' });
   };
+  // pushView is defined further down (it needs nextId); reach it through a ref
+  // so stopAgent doesn't have to move.
+  const pushViewRef = useRef(null);
   if (_restored.current?.messages?.length) {
     _mid = Math.max(_mid, ...(_restored.current.messages.map((m) => (m.id || 0) + 1)));
     _restored.current = { ..._restored.current, messages: null }; // bump once
@@ -678,6 +814,46 @@ export default function AiAgentPanel({
   useEffect(() => {
     if (configOpen && cfgTab === 'download') refreshOllama();
   }, [configOpen, cfgTab, refreshOllama]);
+
+  // ── live model catalogue for the Connect tab ─────────────────────────────
+  // Providers ship models faster than this file gets edited, so the picker asks
+  // the provider what it actually serves. The form is WITHHELD until the first
+  // fetch settles ("Updating…") — otherwise the stale fallback list is on screen
+  // during the fetch and the user picks from it before the real list lands.
+  const [modelCat, setModelCat] = useState({ loading: false, settled: false, models: [], error: '' });
+  const modelReqRef = useRef(0); // guards against an out-of-order response overwriting a newer one
+
+  const refreshModels = useCallback(async () => {
+    const seq = ++modelReqRef.current;
+    setModelCat((c) => ({ ...c, loading: true, error: '' }));
+    try {
+      const r = await host.aiModels({ provider: draftCfg.provider, apiKey: draftCfg.apiKey, baseUrl: draftCfg.baseUrl });
+      if (seq !== modelReqRef.current) return;
+      setModelCat({ loading: false, settled: true, models: r.models || [], error: r.error || '' });
+    } catch (e) {
+      if (seq !== modelReqRef.current) return;
+      setModelCat({ loading: false, settled: true, models: [], error: e.message || 'could not reach the provider' });
+    }
+  }, [draftCfg.provider, draftCfg.apiKey, draftCfg.baseUrl]);
+  useEffect(() => { refreshModelsRef.current = refreshModels; }, [refreshModels]);
+
+  // Fetch on open and on every provider switch. Deliberately NOT keyed on the
+  // API-key/baseUrl keystrokes — refetching per character would hammer the
+  // provider; the inline Refresh button covers "I just pasted my key".
+  //
+  // Only the OPEN gates the form. A provider switch must keep it on screen —
+  // hiding the Provider select the user just used would yank the control out
+  // from under them — so it refetches with the inline "updating…" instead, and
+  // clears `models` so the PREVIOUS provider's list can't linger in the picker.
+  const gatedForRef = useRef(null); // non-null once this open has been gated
+  useEffect(() => {
+    if (!configOpen || cfgTab !== 'connect') { gatedForRef.current = null; return; }
+    const firstForThisOpen = gatedForRef.current === null;
+    gatedForRef.current = draftCfg.provider;
+    setModelCat((c) => ({ loading: true, settled: firstForThisOpen ? false : c.settled, models: [], error: '' }));
+    refreshModels();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [configOpen, cfgTab, draftCfg.provider]);
 
   // Subscribe to pull + setup progress on the host-agent event bus for the panel's lifetime.
   useEffect(() => {
@@ -806,19 +982,21 @@ export default function AiAgentPanel({
     saveConvo(messages, convoRef.current);
   }, [messages]);
 
+  // Auth style of the SAVED provider. Driven off the PROVIDERS table rather than
+  // hardcoded ids so a newly added provider gets the right key/sign-in handling
+  // from its `auth` field alone. Unknown (legacy config) → treat as key-based.
+  const savedAuth = PROVIDERS.find((p) => p.id === config?.provider)?.auth || 'key';
   // A model is SELECTED (settings filled in) — distinct from READY to use.
   const modelSelected = !!(config && config.model && (
-    config.provider === 'ollama' ||
-    config.provider === 'anthropic-oauth' ||
-    config.apiKey || config.baseUrl
+    savedAuth === 'local' || savedAuth === 'login' || config.apiKey || config.baseUrl
   ));
-  // READY = actually usable right now. Ollama additionally needs its local
+  // READY = actually usable right now. A local model additionally needs its
   // daemon reachable (a selected model is useless if `ollama serve` isn't up —
-  // the green pill must reflect that, not just that a name was picked); OAuth
-  // needs an authenticated session.
+  // the green pill must reflect that, not just that a name was picked); a
+  // sign-in provider needs an authenticated session.
   const configured = modelSelected && (
-    config?.provider === 'ollama' ? ollama.running :
-    config?.provider === 'anthropic-oauth' ? oauth.connected :
+    savedAuth === 'local' ? ollama.running :
+    savedAuth === 'login' ? !!oauthByProvider[config?.provider]?.connected :
     true
   );
   // Ollama model chosen but daemon down → amber "selected but not running".
@@ -861,25 +1039,33 @@ export default function AiAgentPanel({
   };
 
   const pushView = (item) => setMessages((m) => [...m, { id: nextId(), ...item }]);
+  pushViewRef.current = pushView;
   const setViewStatus = (viewId, status) =>
     setMessages((m) => m.map((x) => (x.id === viewId ? { ...x, status } : x)));
 
   // One model turn: ask the provider for the assistant's next message, run any
   // read tools automatically, and surface write tools as a proposal to approve.
-  const runTurn = useCallback(async (apiMessages, turn) => {
+  const runTurn = useCallback(async (apiMessages, turn, gen) => {
+    // A stopped (or superseded) run must not emit anything further. stopAgent
+    // already cleared the UI and posted "Stopped.", so this just unwinds.
+    if (gen !== runGenRef.current) return;
     if (stopRequestedRef.current) {
       stopRequestedRef.current = false;
       setBusy(false);
       setRunning(false);
+      setActivity('');
       pushView({ role: 'note', text: 'Stopped.' });
       return;
     }
     if (turn > MAX_AGENT_TURNS) {
       pushView({ role: 'note', text: 'Stopped — too many tool iterations. Ask me to continue if needed.' });
       setRunning(false);
+      setActivity('');
       return;
     }
     setBusy(true);
+    setTurnNo(turn + 1);
+    setActivity('thinking');
     const controller = new AbortController();
     turnControllerRef.current = controller;
     let assistant;
@@ -892,8 +1078,11 @@ export default function AiAgentPanel({
         tools: TOOL_DEFS,
       }, controller.signal);
     } catch (e) {
+      // A stop already reported itself and reset the UI — don't double-post.
+      if (gen !== runGenRef.current) return;
       setBusy(false);
       setRunning(false);
+      setActivity('');
       if (e.name === 'AbortError') {
         stopRequestedRef.current = false;
         pushView({ role: 'note', text: 'Stopped.' });
@@ -902,7 +1091,9 @@ export default function AiAgentPanel({
       }
       return;
     }
+    if (gen !== runGenRef.current) return; // stopped while the request was in flight
     setBusy(false);
+    setActivity('applying');
 
     let calls = assistant.toolCalls || [];
     let assistantText = stripSpecialTokens(assistant.content || '');
@@ -996,11 +1187,13 @@ export default function AiAgentPanel({
           }, 1000);
 
           try {
+            setActivity('watching live variables');
             await sleepAbortable(wait * 1000, controller.signal);
             args.__watch = { running: true, waitedSeconds: wait, history: summarizeWatch(liveBufRef.current, specs) };
           } catch {
             // Stop was pressed mid-watch — abandon this turn entirely below.
           } finally {
+            setActivity('applying');
             clearInterval(tickId);
             const finalElapsed = Math.floor((Date.now() - startTs) / 1000);
             setMessages((m) => m.map((x) => (x.id === watchViewId
@@ -1050,7 +1243,7 @@ export default function AiAgentPanel({
     if (!hasMutations) {
       // Reads / errors only — feed results back and keep going automatically.
       const toolMsgs = steps.map(toolResultMessage);
-      runTurn([...convoRef.current, ...toolMsgs], turn + 1);
+      runTurn([...convoRef.current, ...toolMsgs], turn + 1, gen);
       return;
     }
 
@@ -1061,7 +1254,7 @@ export default function AiAgentPanel({
       setMessages((m) => [...m, { id: viewId, role: 'proposal', steps, status: 'approved' }]);
       commitTurn(steps, working);
       const toolMsgs = steps.map((s) => toolResultMessage({ ...s, outcome: 'applied' }));
-      runTurn([...convoRef.current, ...toolMsgs], turn + 1);
+      runTurn([...convoRef.current, ...toolMsgs], turn + 1, gen);
       return;
     }
     // MANUAL mode: pause for approval. dryStruct is the fully-composed result.
@@ -1103,10 +1296,14 @@ export default function AiAgentPanel({
     workingRef.current = psRef.current;
     stopRequestedRef.current = false;
     setRunning(true);
+    setRunStartedAt(Date.now());
+    setActivity('thinking');
     const userMsg = { role: 'user', content: prompt };
     if (imgs.length > 0) userMsg.images = imgs.map((a) => ({ mimeType: a.mimeType, data: a.data }));
     const apiMessages = [...convoRef.current, userMsg];
-    runTurn(apiMessages, 0);
+    // A fresh generation: anything still unwinding from a previous run is now
+    // stale and will bail instead of interleaving with this one.
+    runTurn(apiMessages, 0, ++runGenRef.current);
   };
 
   // "Ask agent" from the output-panel error popup: send the prompt once per
@@ -1129,7 +1326,16 @@ export default function AiAgentPanel({
     setViewStatus(viewId, approved ? 'approved' : 'rejected');
     const toolMsgs = steps.map((s) => toolResultMessage({ ...s, outcome: approved ? 'applied' : 'rejected' }));
     setPending(null);
-    runTurn([...convoRef.current, ...toolMsgs], turn + 1);
+    // ⚠️ The loop RESUMES here, so the run state has to come back on. Without
+    // this the agent kept working after an approval while the UI showed nothing
+    // running and offered no Stop button. The clock restarts from the resume
+    // rather than the original send, so it measures work and not how long the
+    // proposal sat waiting for a human.
+    stopRequestedRef.current = false;
+    setRunning(true);
+    setRunStartedAt(Date.now());
+    setActivity('thinking');
+    runTurn([...convoRef.current, ...toolMsgs], turn + 1, ++runGenRef.current);
   };
 
   const resetChat = () => {
@@ -1155,9 +1361,17 @@ export default function AiAgentPanel({
   const applyConfig = () => { saveConfig(draftCfg); setConfig(draftCfg); setConfigOpen(false); };
 
   const providerDef = PROVIDERS.find(p => p.id === draftCfg.provider) || PROVIDERS[0];
+  const loginDef = LOGIN_PROVIDERS[draftCfg.provider] || null;
+  // Live catalogue when the provider answered; the built-in list only as a
+  // fallback (no key yet, daemon down, endpoint without a /models route).
+  const modelSuggestions = modelCat.models.length ? modelCat.models : providerDef.models;
 
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', flex: 1, minHeight: 0, height: '100%', background: C.bg, color: C.text, fontSize: 12 }}>
+    // Claim the interaction scope so the sidebar/LD global Ctrl+C handlers bail
+    // instead of copying a POU while the user is working in the chat. (Belt and
+    // braces — hasTextSelection() already covers the copy-selected-text case.)
+    <div onMouseDownCapture={() => setEditorScope(EDITOR_SCOPE.AGENT)}
+      style={{ display: 'flex', flexDirection: 'column', flex: 1, minHeight: 0, height: '100%', background: C.bg, color: C.text, fontSize: 12 }}>
       {/* ── header: title + model pill + gear ─────────────────────────── */}
       <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '6px 10px', background: C.panel, borderBottom: `1px solid ${C.border}`, flexShrink: 0 }}>
         <span style={{ fontSize: 13 }}>🤖</span>
@@ -1209,53 +1423,94 @@ export default function AiAgentPanel({
               onRefresh={refreshOllama} onSetup={startSetup} onPull={startPull} onUse={useLocalModel} onUnload={unloadLocalModel}
               onStop={stopOllama} stopping={stoppingOllama}
             />
+          ) : !modelCat.settled ? (
+            /* First fetch still in flight — withhold the form rather than show a
+               stale model list the user might pick from before the real one lands. */
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '18px 8px', color: C.sub, fontSize: 12 }}>
+              <span className="agent-think-dots" aria-hidden="true"><i /><i /><i /></span>
+              <span>Updating available models…</span>
+            </div>
           ) : (
           <>
           <label style={{ fontSize: 11, color: C.sub }}>Provider</label>
-          <select value={draftCfg.provider} onChange={e => setDraftCfg(d => ({ ...d, provider: e.target.value, model: (PROVIDERS.find(p => p.id === e.target.value)?.models[0]) || '' }))}
+          <select value={draftCfg.provider} onChange={e => setDraftCfg(d => ({ ...d, provider: e.target.value, model: defaultModelFor(e.target.value) }))}
             style={{ background: C.panel, border: `1px solid ${C.border2}`, color: C.text, fontSize: 12, padding: '4px 6px' }}>
-            {PROVIDERS.map(p => <option key={p.id} value={p.id}>{p.label}</option>)}
+            {/* Grouped so "sign in with my subscription" and "paste an API key"
+                are visibly different choices — they were an undifferentiated
+                flat list, so the account sign-in read as just another vendor. */}
+            {AUTH_GROUPS.map(([kind, title]) => {
+              const items = PROVIDERS.filter((p) => p.auth === kind);
+              return items.length ? (
+                <optgroup key={kind} label={title}>
+                  {items.map(p => <option key={p.id} value={p.id}>{p.label}</option>)}
+                </optgroup>
+              ) : null;
+            })}
           </select>
-          <label style={{ fontSize: 11, color: C.sub }}>Model</label>
-          {/* Editable combo: known models are SUGGESTIONS but any name is typeable
-              (Gemini ships far more models than we can hardcode). */}
-          <ModelCombo value={draftCfg.model} suggestions={providerDef.models}
+          <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+            <label style={{ fontSize: 11, color: C.sub }}>Model</label>
+            {modelCat.loading && <span style={{ fontSize: 10, color: C.muted }}>updating…</span>}
+            <button type="button" onClick={refreshModels} disabled={modelCat.loading} title="Re-read the provider's model list"
+              style={{ marginLeft: 'auto', background: 'transparent', border: `1px solid ${C.border2}`, color: C.sub, fontSize: 10, padding: '1px 7px', borderRadius: 3, cursor: modelCat.loading ? 'default' : 'pointer' }}>
+              ⟳ Refresh
+            </button>
+          </div>
+          <ModelPicker value={draftCfg.model} options={modelSuggestions}
             onChange={(m) => setDraftCfg(d => ({ ...d, model: m }))} />
-          {draftCfg.provider === 'anthropic-oauth' ? (
+          {/* Say plainly whether the list is LIVE or the built-in fallback — the
+              two look identical in the dropdown, and picking a model the
+              provider doesn't serve only fails later, mid-conversation. */}
+          {modelCat.error ? (
+            <span style={{ fontSize: 9, color: '#e0a94f' }}>
+              Live list unavailable ({modelCat.error}) — showing built-in suggestions.
+              {draftCfg.provider === 'ollama' ? ' Start the daemon in Download & Setup, then Refresh.'
+                : providerDef.auth === 'login' ? ' Sign in below, then Refresh.'
+                : ' Add your API key, then Refresh.'}
+            </span>
+          ) : modelCat.models.length === 0 ? (
+            <span style={{ fontSize: 9, color: '#e0a94f' }}>
+              {draftCfg.provider === 'ollama'
+                ? 'No models pulled yet — grab one in Download & Setup. Suggestions below are pullable tags.'
+                : 'This provider returned no usable chat models — showing built-in suggestions.'}
+            </span>
+          ) : (
+            <span style={{ fontSize: 9, color: '#777' }}>{modelCat.models.length} chat models available — live from this provider.</span>
+          )}
+          {providerDef.auth === 'login' ? (
             <div style={{ display: 'flex', flexDirection: 'column', gap: 6, background: C.code, border: `1px solid ${C.border2}`, borderRadius: 4, padding: 8 }}>
-              {oauth.connected ? (
+              {loginDef && oauthByProvider[draftCfg.provider]?.connected ? (
                 <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                  <span style={{ fontSize: 11, color: C.green }}>✓ Signed in to your Claude account</span>
-                  <button onClick={claudeSignOut} style={{ marginLeft: 'auto', background: 'transparent', border: `1px solid ${C.border2}`, color: C.sub, fontSize: 10, padding: '2px 8px', borderRadius: 3, cursor: 'pointer' }}>Sign out</button>
+                  <span style={{ fontSize: 11, color: C.green }}>{loginDef.signedIn}</span>
+                  <button onClick={() => signOut(draftCfg.provider)} style={{ marginLeft: 'auto', background: 'transparent', border: `1px solid ${C.border2}`, color: C.sub, fontSize: 10, padding: '2px 8px', borderRadius: 3, cursor: 'pointer' }}>Sign out</button>
                 </div>
               ) : !oauthPending ? (
                 <>
                   <div style={{ fontSize: 10, color: C.muted, lineHeight: 1.5 }}>
-                    Sign in with your Claude Pro/Max subscription — no API key. Opens claude.ai in your browser; once you authorize, it connects automatically (no code to paste).
+                    {loginDef?.blurb}
                   </div>
-                  <button onClick={startClaudeSignIn} disabled={oauth.busy}
+                  <button onClick={() => startSignIn(draftCfg.provider)} disabled={oauth.busy}
                     style={{ alignSelf: 'flex-start', background: C.accentBtn, border: 'none', color: '#fff', fontSize: 11, padding: '5px 12px', borderRadius: 3, cursor: 'pointer' }}>
-                    {oauth.busy ? 'Opening…' : '🔐 Sign in with Claude'}
+                    {oauth.busy ? 'Opening…' : loginDef?.button}
                   </button>
                 </>
               ) : (
                 <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
                   <span style={{ fontSize: 11, color: C.sub }}>⏳ Waiting for you to authorize in the browser… (connects automatically)</span>
-                  <button onClick={cancelClaudeSignIn}
+                  <button onClick={cancelSignIn}
                     style={{ marginLeft: 'auto', background: 'transparent', border: `1px solid ${C.border2}`, color: C.sub, fontSize: 10, padding: '2px 8px', borderRadius: 3, cursor: 'pointer' }}>Cancel</button>
                 </div>
               )}
               {oauth.error && <span style={{ fontSize: 9, color: '#e06c75' }}>{oauth.error}</span>}
-              <span style={{ fontSize: 9, color: '#777' }}>Uses Claude Code's OAuth; gray-area for 3rd-party use — your call.</span>
+              <span style={{ fontSize: 9, color: '#777' }}>{loginDef?.note}</span>
             </div>
-          ) : draftCfg.provider !== 'ollama' && (
+          ) : providerDef.auth !== 'local' && (   /* key + custom take an API key; local takes none */
             <>
               <label style={{ fontSize: 11, color: C.sub }}>API key</label>
               <input type="password" value={draftCfg.apiKey} onChange={e => setDraftCfg(d => ({ ...d, apiKey: e.target.value }))} placeholder="sk-..."
                 style={{ background: C.panel, border: `1px solid ${C.border2}`, color: C.text, fontSize: 12, padding: '4px 6px', fontFamily: 'monospace' }} />
             </>
           )}
-          {(draftCfg.provider === 'custom' || draftCfg.provider === 'ollama') && (
+          {(providerDef.auth === 'custom' || providerDef.auth === 'local') && (
             <>
               <label style={{ fontSize: 11, color: C.sub }}>Base URL</label>
               <input value={draftCfg.baseUrl} onChange={e => setDraftCfg(d => ({ ...d, baseUrl: e.target.value }))} placeholder="http://localhost:11434"
@@ -1307,7 +1562,15 @@ export default function AiAgentPanel({
           <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
             <span style={{ display: 'inline-flex', alignItems: 'center', gap: 7 }}>
               <span className="agent-think-dots" aria-hidden="true"><i /><i /><i /></span>
-              <span className="agent-think-label">{busy ? 'thinking…' : 'working…'}</span>
+              <span className="agent-think-label">
+                {(activity || (busy ? 'thinking' : 'working'))}…
+              </span>
+            </span>
+            {/* Ticking elapsed + turn counter: this is what distinguishes "still
+                working" from "hung". Isolated in its own component so the 1s
+                tick re-renders ~20 characters, not the whole message list. */}
+            <span style={{ fontSize: 10, color: C.muted }}>
+              <ElapsedTimer since={runStartedAt} />{turnNo > 1 ? ` · step ${turnNo}` : ''}
             </span>
             <button onClick={stopAgent} title="Stop the agent"
               style={{ background: 'transparent', border: `1px solid ${C.border2}`, color: '#e06c75', fontSize: 10, padding: '1px 8px', borderRadius: 10, cursor: 'pointer' }}>
@@ -1354,7 +1617,12 @@ export default function AiAgentPanel({
           <textarea
             value={input}
             onChange={e => setInput(e.target.value)}
-            onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); } }}
+            onKeyDown={e => {
+              // Esc stops a running agent from the box you're already typing in
+              // (VSCode-style) — no hunting for the button.
+              if (e.key === 'Escape' && running) { e.preventDefault(); stopAgent(); return; }
+              if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); }
+            }}
             onPaste={handlePaste}
             placeholder={pending ? 'Approve or reject the proposed changes first…' : 'Describe the change you want…'}
             rows={2}
@@ -1369,11 +1637,33 @@ export default function AiAgentPanel({
               style={{ background: 'transparent', border: `1px solid ${C.border2}`, color: imagesSupported ? C.sub : '#555', fontSize: 12, width: 26, height: 26, borderRadius: 4, cursor: imagesSupported ? 'pointer' : 'not-allowed' }}>
               🖼
             </button>
-            <span style={{ marginLeft: 'auto', fontSize: 10, color: '#666' }}>↵ send · ⇧↵ newline</span>
-            <button onClick={() => send()} disabled={(!input.trim() && attachments.length === 0) || running || !!pending}
-              style={{ background: (input.trim() || attachments.length > 0) && !running && !pending ? C.accentBtn : '#333', border: 'none', color: (input.trim() || attachments.length > 0) && !running && !pending ? '#fff' : '#777', width: 26, height: 26, borderRadius: 4, cursor: (input.trim() || attachments.length > 0) && !running && !pending ? 'pointer' : 'default', fontSize: 13 }}>
-              ➤
-            </button>
+            {/* While running, show what it's doing right here in the input bar.
+                The in-thread indicator scrolls away in a long conversation —
+                this one can't, which is the point. */}
+            {running ? (
+              <span style={{ marginLeft: 'auto', display: 'inline-flex', alignItems: 'center', gap: 6, fontSize: 10, color: C.sub }}>
+                <span className="agent-think-dots" aria-hidden="true"><i /><i /><i /></span>
+                {(activity || 'working')}… <ElapsedTimer since={runStartedAt} />
+              </span>
+            ) : (
+              <span style={{ marginLeft: 'auto', fontSize: 10, color: '#666' }}>↵ send · ⇧↵ newline</span>
+            )}
+            {/* ⚠️ VSCode-style: while the agent runs, the SEND button becomes
+                STOP. Stop used to live only at the bottom of the scrolling
+                message list, so in a long conversation it was below the fold —
+                the agent looked unstoppable because the control was off-screen.
+                Keep this control in the input bar; it must never scroll away. */}
+            {running ? (
+              <button onClick={stopAgent} title="Stop the agent (Esc)"
+                style={{ background: '#5a1e1e', border: '1px solid #8b3a3a', color: '#ff9b9b', width: 26, height: 26, borderRadius: 4, cursor: 'pointer', fontSize: 11, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                ■
+              </button>
+            ) : (
+              <button onClick={() => send()} disabled={(!input.trim() && attachments.length === 0) || !!pending}
+                style={{ background: (input.trim() || attachments.length > 0) && !pending ? C.accentBtn : '#333', border: 'none', color: (input.trim() || attachments.length > 0) && !pending ? '#fff' : '#777', width: 26, height: 26, borderRadius: 4, cursor: (input.trim() || attachments.length > 0) && !pending ? 'pointer' : 'default', fontSize: 13 }}>
+                ➤
+              </button>
+            )}
           </div>
         </div>
       </div>
@@ -1381,54 +1671,55 @@ export default function AiAgentPanel({
   );
 }
 
-// ── editable model combobox (dark-theme; type any model, pick a suggestion) ──
-function ModelCombo({ value, suggestions = [], onChange }) {
-  const [open, setOpen] = useState(false);
-  const ref = useRef(null);
+// Ticking "how long has it been working" readout. Owns its own interval so the
+// 1s tick re-renders only this span — putting the timer in the panel's state
+// would re-render the whole message list (and every ProposalCard) every second.
+const secsSince = (since) => (since ? Math.max(0, Math.round((Date.now() - since) / 1000)) : 0);
+function ElapsedTimer({ since }) {
+  // Seeded from `since` rather than 0: the timer also mounts mid-run (the
+  // indicator appears/disappears with `running`), and starting at 0 would make
+  // an agent that has been working for a minute look like it just began.
+  const [secs, setSecs] = useState(() => secsSince(since));
   useEffect(() => {
-    if (!open) return;
-    const onDoc = (e) => { if (ref.current && !ref.current.contains(e.target)) setOpen(false); };
-    document.addEventListener('mousedown', onDoc);
-    return () => document.removeEventListener('mousedown', onDoc);
-  }, [open]);
+    if (!since) { setSecs(0); return; }
+    const tick = () => setSecs(secsSince(since));
+    tick();
+    const id = setInterval(tick, 1000);
+    return () => clearInterval(id);
+  }, [since]);
+  return <span>{secs < 60 ? `${secs}s` : `${Math.floor(secs / 60)}m ${secs % 60}s`}</span>;
+}
 
-  const q = (value || '').trim().toLowerCase();
-  const filtered = suggestions.filter((m) => m.toLowerCase().includes(q));
-  const list = filtered.length ? filtered : suggestions;
+// ── model picker (dark-theme, select-only) ──────────────────────────────────
+// ⚠️ SELECT-ONLY, and opening it must always reveal the WHOLE list.
+// This was previously an editable combo whose text box doubled as the filter.
+// Since that box also held the CURRENT selection, opening it filtered the list
+// down to entries containing the already-selected name — so a user on
+// "claude-opus-4-8" saw only that one and could not reach any other model.
+// A native <select> (same styling as the Provider field above) fixes it
+// structurally: click shows everything, plus keyboard nav and type-ahead.
+// Do NOT reintroduce free-text-as-filter here.
+function ModelPicker({ value, options = [], onChange }) {
+  // A saved model the provider no longer lists must remain selectable — without
+  // this, opening settings would silently switch the user to whatever option
+  // happens to render first, and Save would persist that.
+  const list = value && !options.includes(value) ? [value, ...options] : options;
 
+  // Nothing to choose from (a custom gateway with no /models route, or a
+  // provider that returned an empty list) — typing is then the ONLY way to
+  // configure anything, so the escape hatch survives exactly where it's needed.
+  if (list.length === 0) {
+    return (
+      <input value={value || ''} onChange={(e) => onChange(e.target.value)} placeholder="model name"
+        style={{ background: C.panel, border: `1px solid ${C.border2}`, color: C.text, fontSize: 12, padding: '4px 6px', fontFamily: 'monospace' }} />
+    );
+  }
   return (
-    <div ref={ref} style={{ position: 'relative' }}>
-      <div style={{ display: 'flex', alignItems: 'center', background: C.panel, border: `1px solid ${open ? C.accent : C.border2}`, borderRadius: 4 }}>
-        <input
-          value={value || ''}
-          onChange={(e) => { onChange(e.target.value); if (!open) setOpen(true); }}
-          onFocus={() => setOpen(true)}
-          onKeyDown={(e) => { if (e.key === 'Escape') setOpen(false); }}
-          placeholder={suggestions[0] || 'model name'}
-          style={{ flex: 1, minWidth: 0, background: 'transparent', border: 'none', outline: 'none', color: C.text, fontSize: 12, padding: '5px 8px' }}
-        />
-        <button type="button" onClick={() => setOpen((o) => !o)} title="Suggestions"
-          style={{ background: 'transparent', border: 'none', color: C.muted, cursor: 'pointer', fontSize: 11, padding: '0 8px', alignSelf: 'stretch' }}>
-          {open ? '▴' : '▾'}
-        </button>
-      </div>
-      {open && list.length > 0 && (
-        <div style={{ position: 'absolute', top: '100%', left: 0, right: 0, zIndex: 50, marginTop: 3, background: C.panel, border: `1px solid ${C.border2}`, borderRadius: 4, maxHeight: 220, overflowY: 'auto', boxShadow: '0 8px 22px rgba(0,0,0,0.45)' }}>
-          {list.map((m) => {
-            const active = m === value;
-            return (
-              <div key={m}
-                onMouseDown={(e) => { e.preventDefault(); onChange(m); setOpen(false); }}
-                style={{ padding: '6px 9px', fontSize: 12, color: active ? C.green : C.text, background: active ? C.hover : 'transparent', cursor: 'pointer', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}
-                onMouseEnter={(e) => { e.currentTarget.style.background = C.hover; }}
-                onMouseLeave={(e) => { e.currentTarget.style.background = active ? C.hover : 'transparent'; }}>
-                {m}
-              </div>
-            );
-          })}
-        </div>
-      )}
-    </div>
+    <select value={value || ''} onChange={(e) => onChange(e.target.value)}
+      style={{ background: C.panel, border: `1px solid ${C.border2}`, color: C.text, fontSize: 12, padding: '4px 6px' }}>
+      {!value && <option value="" disabled>Select a model…</option>}
+      {list.map((m) => <option key={m} value={m}>{m}</option>)}
+    </select>
   );
 }
 

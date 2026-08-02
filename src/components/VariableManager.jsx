@@ -5,7 +5,7 @@ import { useTranslation } from 'react-i18next';
 import { formatTimeUs, isTimeType, normalizeTimeLiteral } from '../utils/plcStandards';
 import { blockConfig } from './RungContainer';
 import { writeClipboard, readClipboard, useKronClipboard, CLIP_KIND } from '../utils/kronClipboard';
-import { setEditorScope, getEditorScope, EDITOR_SCOPE } from '../utils/editorScope';
+import { setEditorScope, getEditorScope, EDITOR_SCOPE, hasTextSelection } from '../utils/editorScope';
 import { isReservedTranspilerName, isValidIecIdentifier } from '../utils/reservedNames';
 
 const ALL_CLASSES = ['Local', 'Global', 'Input', 'Output', 'InOut', 'Temp'];
@@ -350,6 +350,7 @@ const VariableManager = ({
   useEffect(() => {
     const handler = async (e) => {
       if (!(e.ctrlKey || e.metaKey)) return;
+      if (hasTextSelection()) return; // user is copying TEXT — never hijack
       const ae = document.activeElement;
       if (ae && (
         (ae.tagName === 'INPUT' && ae.type === 'text') ||
