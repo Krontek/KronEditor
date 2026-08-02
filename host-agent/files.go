@@ -64,7 +64,6 @@ func (s *Server) handleGetStandardHeaders(w http.ResponseWriter, r *http.Request
 		"kronhal_rpi.h":     true,
 		"kronhal_bb.h":      true,
 		"kronhal_jetson.h":  true,
-		"kronhal_pico.h":    true,
 		"kronhal_sim.h":     true,
 	}
 

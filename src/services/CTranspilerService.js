@@ -4,7 +4,6 @@ import { getPortOptions } from '../utils/devicePortMapping';
 
 const getBoardFamilyDefine = (boardId) => {
     if (!boardId) return null;
-    if (boardId.startsWith('rpi_pico')) return 'HAL_BOARD_FAMILY_PICO';
     if (boardId.startsWith('rpi_')) return 'HAL_BOARD_FAMILY_RPI';
     if (boardId.startsWith('bb_')) return 'HAL_BOARD_FAMILY_BB';
     if (boardId.startsWith('jetson_')) return 'HAL_BOARD_FAMILY_JETSON';
@@ -460,7 +459,7 @@ export const transpileToC = (projectStructure, standardHeaders = [], boardId = n
     // because HAL/kronhal.h conditionally includes the right one based on defines.
     // Filenames match what get_standard_headers returns ("HAL/<name>" prefix).
     const HAL_IMPL_HEADERS = new Set([
-        'HAL/kronhal_sim.h', 'HAL/kronhal_pico.h', 'HAL/kronhal_rpi.h',
+        'HAL/kronhal_sim.h', 'HAL/kronhal_rpi.h',
         'HAL/kronhal_bb.h', 'HAL/kronhal_jetson.h'
     ]);
 

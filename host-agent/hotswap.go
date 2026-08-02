@@ -339,8 +339,9 @@ func soemIncludeArgs(resInclude string) []string {
 // compileForTarget. Linux ARM targets only (hot-swap needs dlopen).
 func targetTriples(boardID string) (string, string, error) {
 	switch {
+	// Legacy-project guard — rpi_pico boards were removed from the board list.
 	case strings.HasPrefix(boardID, "rpi_pico"):
-		return "", "", fmt.Errorf("Pico (Cortex-M) cannot hot-swap (no dlopen)")
+		return "", "", fmt.Errorf("Pico boards are no longer supported — reselect a Linux board in Board Config")
 	case strings.HasPrefix(boardID, "bb_") && !strings.HasPrefix(boardID, "bb_ai64"):
 		return "arm-linux-gnueabihf", "arm/armv7", nil
 	default:

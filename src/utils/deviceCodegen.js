@@ -125,7 +125,6 @@ const decodeCStringBytes = (value) => {
 
 const getBoardFamilyDefine = (boardId) => {
   if (!boardId) return null;
-  if (boardId.startsWith('rpi_pico')) return 'HAL_BOARD_FAMILY_PICO';
   if (boardId.startsWith('rpi_')) return 'HAL_BOARD_FAMILY_RPI';
   if (boardId.startsWith('bb_')) return 'HAL_BOARD_FAMILY_BB';
   if (boardId.startsWith('jetson_')) return 'HAL_BOARD_FAMILY_JETSON';
@@ -895,7 +894,7 @@ static inline uint8_t __kron_bcd_to_u8(uint8_t value) { return (uint8_t)(((value
 
 export const buildGeneratedDeviceArtifacts = (projectStructure, config, boardId) => {
   const boardFamily = getBoardFamilyDefine(boardId);
-  if (!boardFamily || boardFamily === 'HAL_BOARD_FAMILY_PICO') return EMPTY_ARTIFACTS;
+  if (!boardFamily) return EMPTY_ARTIFACTS;
 
   const devices = normalizeDeviceDefinitions(projectStructure, config);
   if (devices.length === 0) return EMPTY_ARTIFACTS;

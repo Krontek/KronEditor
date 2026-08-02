@@ -102,6 +102,16 @@ These make qwen2.5-coder-class models workable, but they are heuristics — expe
 
 All tools live in `TOOL_DEFS` (schema sent to the model) and are executed by `applyToolCall`. Errors are returned as `{ ok: false, error }` and fed back to the model verbatim — **error messages are written to teach the model the correct next call** (they name valid pins, suggest `list_blocks`, etc.).
 
+### Interaction tool (pauses the loop for a human)
+
+| Tool | Purpose |
+|---|---|
+| `ask_user` | Ask ONE clarifying question and WAIT. `options: [{label, description?}]` → clickable buttons (VSCode quick-pick); omit `options` → a focused text box. `allowOther` (default true) keeps a free-text escape under the buttons. Several calls in one turn are presented **one at a time** with an `n / total` counter, and all answers return together. |
+
+⚠️ `ask_user` is **intercepted by `runTurn`** before the `applyToolCall` dispatch — it is the only tool whose result comes from the user rather than the project struct, so the pure executor merely guards it with an error. A turn containing `ask_user` runs no other tool; the ones the model bundled alongside get an explicit `not executed — re-issue after the answers` result, because every `tool_call_id` must be answered or the provider rejects the next request. The card renders **outside the scrolling message list** (above the input bar), for the same reason the Stop button does: a question the run is blocked on must never scroll out of view.
+
+Before this tool the prompt told the model to write its questions as prose with no tool calls — which produced a numbered list of three questions in one bubble, answerable only by typing, and ended the loop instead of pausing it.
+
 ### Read tools (auto-run, no approval)
 
 | Tool | Purpose |

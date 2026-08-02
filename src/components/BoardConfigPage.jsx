@@ -103,55 +103,6 @@ const Rpi40PinHeader = ({ pinout, onPinClick, selectedPin }) => {
   );
 };
 
-// ===== PICO PIN RENDERER =====
-const PicoPinHeader = ({ pinout, onPinClick, selectedPin }) => {
-  // Pico is also 40 pins, left/right like RPi
-  const rows = [];
-  for (let i = 0; i < pinout.length; i += 2) {
-    rows.push([pinout[i], pinout[i + 1]]);
-  }
-
-  return (
-    <div style={{ display: 'flex', flexDirection: 'column', gap: 2, padding: '10px' }}>
-      {rows.map(([left, right], idx) => (
-        <div key={idx} style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
-          <PinLabel pin={left} align="right" />
-          <div
-            onClick={() => onPinClick && onPinClick(left)}
-            style={{
-              width: 24, height: 24, borderRadius: 4, flexShrink: 0,
-              background: selectedPin?.pin === left.pin ? '#fff' : left.color,
-              color: selectedPin?.pin === left.pin ? '#000' : '#fff',
-              display: 'flex', alignItems: 'center', justifyContent: 'center',
-              fontSize: '8px', fontWeight: 'bold', cursor: 'pointer',
-              border: `2px solid ${selectedPin?.pin === left.pin ? '#007acc' : 'transparent'}`,
-            }}
-            title={`Pin ${left.pin}: ${left.name}${left.alt ? ` (${left.alt})` : ''}`}
-          >
-            {left.pin}
-          </div>
-          <div style={{ width: 16, height: 2, background: '#444', flexShrink: 0 }} />
-          <div
-            onClick={() => onPinClick && onPinClick(right)}
-            style={{
-              width: 24, height: 24, borderRadius: 4, flexShrink: 0,
-              background: selectedPin?.pin === right.pin ? '#fff' : right.color,
-              color: selectedPin?.pin === right.pin ? '#000' : '#fff',
-              display: 'flex', alignItems: 'center', justifyContent: 'center',
-              fontSize: '8px', fontWeight: 'bold', cursor: 'pointer',
-              border: `2px solid ${selectedPin?.pin === right.pin ? '#007acc' : 'transparent'}`,
-            }}
-            title={`Pin ${right.pin}: ${right.name}${right.alt ? ` (${right.alt})` : ''}`}
-          >
-            {right.pin}
-          </div>
-          <PinLabel pin={right} align="left" />
-        </div>
-      ))}
-    </div>
-  );
-};
-
 // ===== BEAGLEBONE HEADER RENDERER =====
 const BeagleBoneHeaders = ({ pinout, onPinClick, selectedPin }) => {
   const [activeHeader, setActiveHeader] = useState('P9');
@@ -949,9 +900,6 @@ const BoardConfigPage = ({ boardId, interfaceConfig = {}, onInterfaceConfigChang
             <div style={{ display: 'flex', justifyContent: 'center', padding: '0 8px 8px' }}>
               {board.pinLayout === 'rpi40' && (
                 <Rpi40PinHeader pinout={board.pinout} onPinClick={handlePinClick} selectedPin={selectedPin} />
-              )}
-              {board.pinLayout === 'pico' && (
-                <PicoPinHeader pinout={board.pinout} onPinClick={handlePinClick} selectedPin={selectedPin} />
               )}
               {board.pinLayout === 'beaglebone' && (
                 <BeagleBoneHeaders pinout={board.pinout} onPinClick={handlePinClick} selectedPin={selectedPin} />

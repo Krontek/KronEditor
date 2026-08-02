@@ -548,10 +548,12 @@ function buildSystemPrompt(libraryData = [], agentMode = 'manual') {
     '- The selected board is READ-ONLY context. Never change hardware.',
     '- All generated code, names and comments in English. Names must be IEC identifiers (letters/digits/underscore, no spaces, no leading digit).',
     '',
-    'CLARIFY FIRST when the request is ambiguous:',
-    '- If a MATERIAL detail is missing or ambiguous, ask 1–3 short, specific questions and STOP for that turn: emit NO tool calls, just write the question(s) in the user\'s language. Continue once they answer.',
+    'CLARIFY FIRST when the request is ambiguous — ALWAYS via the ask_user TOOL:',
+    '- ⚠️ NEVER write a question as prose. A question typed into your reply text is a FAILED response: it does not pause the loop and the user cannot click it. Every question goes through ask_user, one question per call.',
+    '- ⚠️ GIVE `options` WHENEVER THE ANSWER IS A CHOICE. They become clickable buttons — one click instead of typing. Almost every clarification you need here IS a choice: language (Ladder / Structured Text), FB vs plain variable (MC_Power motion FB / BOOL flag), ramp vs instant step, which I/O channel (UART0 / UART1 / USB0), which data type (INT / DINT / REAL), trigger style (level / rising edge). Omit `options` ONLY for a genuinely open answer — a number, a name, an IEC address — which then renders as a text box.',
+    '- Emit ALL the questions you need as separate ask_user calls in the SAME turn. They are shown to the user one at a time and the answers come back together, so you still get a single round without cramming several questions into one message. Emit no other tool in that turn.',
     '- Ask when, for example: a named "block" could be a FUNCTION BLOCK or a plain variable (e.g. "mc_power" → the MC_Power motion FB, or a BOOL?); the language (ST / LD / SCL) is unspecified for non-trivial logic; a variable\'s type / range / IEC address, or an FB\'s axis / pin wiring, is needed but unknown; which I/O channel (UART/USB/GPIO…) to use is unclear; or any choice would otherwise be a GUESS that changes the result.',
-    '- Prefer ONE round of questions covering everything you need, then build. Do NOT interrogate over trivia you can reasonably default, and NEVER ask the user to write the code/ladder for you — you author it; you only clarify REQUIREMENTS.',
+    '- Do NOT interrogate over trivia you can reasonably default, and NEVER ask the user to write the code/ladder for you — you author it; you only clarify REQUIREMENTS.',
     '',
     'LANGUAGE CHOICE (per RUNG, not per POU):',
     '- Every POU is a list of RUNGS; each rung is Ladder OR Structured Text. create_pou makes the unified rung-based POU — then author ladder rungs with set_ladder and/or ST with set_st_code (both work on every POU).',
@@ -615,6 +617,18 @@ export default function AiAgentPanel({
   const [config, setConfig] = useState(loadConfig);
   const [configOpen, setConfigOpen] = useState(false);
   const [draftCfg, setDraftCfg] = useState(() => config || { provider: 'anthropic', model: defaultModelFor('anthropic'), apiKey: '', baseUrl: '' });
+  // ⚠️ apiKey and baseUrl belong to ONE provider and must not ride along to the
+  // next one. Switching provider used to keep both: an Ollama baseUrl left in
+  // the draft made a freshly-pasted Gemini key POST to http://localhost:11434
+  // ("connection refused" while the key was perfectly fine), and a key entered
+  // for one vendor would be sent as a Bearer token to another. The fields are
+  // stashed per provider so flipping back and forth is still non-destructive.
+  const credStashRef = useRef({});
+  const switchProvider = (id) => setDraftCfg((d) => {
+    credStashRef.current = { ...credStashRef.current, [d.provider]: { apiKey: d.apiKey, baseUrl: d.baseUrl } };
+    const prev = credStashRef.current[id] || {};
+    return { provider: id, model: defaultModelFor(id), apiKey: prev.apiKey || '', baseUrl: prev.baseUrl || '' };
+  });
   // Account OAuth: connection status + the "waiting in browser" flow.
   // ⚠️ Keyed BY PROVIDER. There is more than one sign-in provider now, and a
   // single shared flag would report "signed in" for Google merely because the
@@ -707,6 +721,11 @@ export default function AiAgentPanel({
   const [busy, setBusy] = useState(false);          // waiting on a model turn
   const [running, setRunning] = useState(false);    // agent loop is active (busy, or between turns/waits) — Stop is shown whenever this is true
   const [pending, setPending] = useState(null);     // a proposal awaiting approve/reject
+  // A batch of ask_user questions awaiting answers. The model may emit several
+  // in one turn; they are presented ONE AT A TIME (VSCode quick-pick style) and
+  // every answer is sent back together when the last one is in.
+  //   { calls, answers, idx, otherCalls, turn }
+  const [asking, setAsking] = useState(null);
   // Agent mode: 'manual' → every change is shown as a diff to approve/reject;
   // 'auto' → the agent applies changes itself (still rendered as an applied diff).
   const [agentMode, setAgentMode] = useState(() => {
@@ -751,6 +770,7 @@ export default function AiAgentPanel({
     setBusy(false);
     setRunning(false);
     setActivity('');
+    setAsking(null);                   // a blocked question is part of the run
     pushViewRef.current?.({ role: 'note', text: 'Stopped.' });
   };
   // pushView is defined further down (it needs nextId); reach it through a ref
@@ -1130,6 +1150,24 @@ export default function AiAgentPanel({
 
     if (calls.length === 0) { setRunning(false); return; } // final answer, loop ends
 
+    // ── ask_user: pause the loop for a human ────────────────────────────────
+    // Intercepted BEFORE the applyToolCall dispatch: it is the one tool whose
+    // result comes from the user, not from the project struct. Every ask_user
+    // in this turn is queued and asked one at a time; anything else the model
+    // bundled alongside is refused with an explanation, so a turn is either
+    // "ask" or "act" and we never have to gate a question and a diff at once.
+    const askCalls = calls.filter((c) => c.name === 'ask_user');
+    if (askCalls.length > 0) {
+      const otherCalls = calls.filter((c) => c.name !== 'ask_user');
+      setAsking({
+        calls: askCalls.map((c) => ({ tc: c, args: parseArgs(c.arguments) || {} })),
+        answers: [], idx: 0, otherCalls, turn,
+      });
+      setRunning(false);   // waiting on a human — no clock, no Stop spinner
+      setActivity('');
+      return;
+    }
+
     // Dry-run every call in order, chaining mutations through a working copy so
     // composed diffs (e.g. add_variable then set_st_code) are computed correctly.
     let working = workingRef.current;
@@ -1280,7 +1318,7 @@ export default function AiAgentPanel({
   const send = (text) => {
     const prompt = (text ?? input).trim();
     const imgs = attachments;
-    if ((!prompt && imgs.length === 0) || running || pending) return;
+    if ((!prompt && imgs.length === 0) || running || pending || asking) return;
     setInput('');
     setAttachments([]);
     setAttachError('');
@@ -1338,11 +1376,52 @@ export default function AiAgentPanel({
     runTurn([...convoRef.current, ...toolMsgs], turn + 1, ++runGenRef.current);
   };
 
+  // One answer to the current ask_user question. Advances to the next question,
+  // or — when the last one is answered — feeds every answer back and resumes.
+  const answerAsk = (text) => {
+    const answer = String(text ?? '').trim();
+    if (!asking || !answer) return;
+    const { calls, answers, idx, otherCalls, turn } = asking;
+    const nextAnswers = [...answers, answer];
+    pushView({ role: 'answer', question: calls[idx].args.question || '', text: answer });
+    if (idx + 1 < calls.length) { setAsking({ ...asking, answers: nextAnswers, idx: idx + 1 }); return; }
+
+    setAsking(null);
+    // Every tool_call_id in the assistant turn MUST get a result or the next
+    // request is rejected by the provider — including the calls we refused.
+    const toolMsgs = [
+      ...calls.map((c, i) => toolResultMessage({
+        tc: c.tc, args: c.args, res: { ok: true, result: { answer: nextAnswers[i] } },
+      })),
+      ...otherCalls.map((c) => toolResultMessage({
+        tc: c, args: parseArgs(c.arguments) || {},
+        res: { ok: false, error: 'not executed — this turn contained ask_user, so only the questions ran. Re-issue this call now that you have the answers.' },
+      })),
+    ];
+    stopRequestedRef.current = false;
+    setRunning(true);
+    setRunStartedAt(Date.now());
+    setActivity('thinking');
+    runTurn([...convoRef.current, ...toolMsgs], turn + 1, ++runGenRef.current);
+  };
+
+  // Abandoning a question ends the run — the model cannot proceed without it,
+  // and silently answering "skip" for them would put a guess in the transcript.
+  const cancelAsk = () => {
+    if (!asking) return;
+    setAsking(null);
+    runGenRef.current++;
+    setRunning(false);
+    setActivity('');
+    pushView({ role: 'note', text: 'Stopped — question left unanswered.' });
+  };
+
   const resetChat = () => {
     if (running) return;
     convoRef.current = [];
     liveBufRef.current = [];           // drop buffered live samples for the fresh chat
     setPending(null);
+    setAsking(null);
     setMessages([]);
     try { localStorage.removeItem(CONVO_KEY); } catch { /* ignore */ }
     host.aiLogClear().catch(() => {}); // start a fresh agent log too
@@ -1433,7 +1512,7 @@ export default function AiAgentPanel({
           ) : (
           <>
           <label style={{ fontSize: 11, color: C.sub }}>Provider</label>
-          <select value={draftCfg.provider} onChange={e => setDraftCfg(d => ({ ...d, provider: e.target.value, model: defaultModelFor(e.target.value) }))}
+          <select value={draftCfg.provider} onChange={e => switchProvider(e.target.value)}
             style={{ background: C.panel, border: `1px solid ${C.border2}`, color: C.text, fontSize: 12, padding: '4px 6px' }}>
             {/* Grouped so "sign in with my subscription" and "paste an API key"
                 are visibly different choices — they were an undifferentiated
@@ -1581,6 +1660,19 @@ export default function AiAgentPanel({
         </div>
       </div>
 
+      {/* ── ask_user prompt ───────────────────────────────────────────────
+          ⚠️ Deliberately OUTSIDE the scrolling message list, directly above the
+          input bar — same rule as the Stop button. A question the run is
+          blocked on must never be able to scroll out of view; in a long
+          conversation the agent would just look hung. */}
+      {asking && (
+        <AskCard
+          spec={asking.calls[asking.idx].args}
+          index={asking.idx} total={asking.calls.length}
+          onAnswer={answerAsk} onCancel={cancelAsk}
+        />
+      )}
+
       {/* ── input bar ─────────────────────────────────────────────────── */}
       <div style={{ borderTop: `1px solid ${C.border}`, padding: 8, background: C.panel, flexShrink: 0 }}>
         {/* context chip + new-chat */}
@@ -1601,7 +1693,7 @@ export default function AiAgentPanel({
             </button>
           )}
         </div>
-        <div style={{ border: `1px solid ${C.border2}`, borderRadius: 6, background: C.input, padding: 6, opacity: pending ? 0.55 : 1 }}>
+        <div style={{ border: `1px solid ${C.border2}`, borderRadius: 6, background: C.input, padding: 6, opacity: (pending || asking) ? 0.55 : 1 }}>
           {attachments.length > 0 && (
             <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', marginBottom: 6 }}>
               {attachments.map((a) => (
@@ -1624,15 +1716,16 @@ export default function AiAgentPanel({
               if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); }
             }}
             onPaste={handlePaste}
-            placeholder={pending ? 'Approve or reject the proposed changes first…' : 'Describe the change you want…'}
+            placeholder={pending ? 'Approve or reject the proposed changes first…'
+              : asking ? 'Answer the question above…' : 'Describe the change you want…'}
             rows={2}
-            disabled={!!pending}
+            disabled={!!pending || !!asking}
             style={{ width: '100%', resize: 'none', background: 'transparent', border: 'none', outline: 'none', color: C.text, fontSize: 12, fontFamily: 'inherit' }}
           />
           <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginTop: 4 }}>
             <input ref={fileInputRef} type="file" accept="image/*" multiple style={{ display: 'none' }}
               onChange={(e) => { addAttachments(e.target.files); e.target.value = ''; }} />
-            <button onClick={() => fileInputRef.current?.click()} disabled={!imagesSupported || running || !!pending}
+            <button onClick={() => fileInputRef.current?.click()} disabled={!imagesSupported || running || !!pending || !!asking}
               title={imagesSupported ? 'Attach an image' : 'This provider does not support image input'}
               style={{ background: 'transparent', border: `1px solid ${C.border2}`, color: imagesSupported ? C.sub : '#555', fontSize: 12, width: 26, height: 26, borderRadius: 4, cursor: imagesSupported ? 'pointer' : 'not-allowed' }}>
               🖼
@@ -1659,14 +1752,78 @@ export default function AiAgentPanel({
                 ■
               </button>
             ) : (
-              <button onClick={() => send()} disabled={(!input.trim() && attachments.length === 0) || !!pending}
-                style={{ background: (input.trim() || attachments.length > 0) && !pending ? C.accentBtn : '#333', border: 'none', color: (input.trim() || attachments.length > 0) && !pending ? '#fff' : '#777', width: 26, height: 26, borderRadius: 4, cursor: (input.trim() || attachments.length > 0) && !pending ? 'pointer' : 'default', fontSize: 13 }}>
+              <button onClick={() => send()} disabled={(!input.trim() && attachments.length === 0) || !!pending || !!asking}
+                style={{ background: (input.trim() || attachments.length > 0) && !pending && !asking ? C.accentBtn : '#333', border: 'none', color: (input.trim() || attachments.length > 0) && !pending && !asking ? '#fff' : '#777', width: 26, height: 26, borderRadius: 4, cursor: (input.trim() || attachments.length > 0) && !pending && !asking ? 'pointer' : 'default', fontSize: 13 }}>
                 ➤
               </button>
             )}
           </div>
         </div>
       </div>
+    </div>
+  );
+}
+
+// ── ask_user question card (VSCode quick-pick) ──────────────────────────────
+// Two shapes, chosen by the model: with `options` it is a list of clickable
+// choices; without, a single focused text box. Either way ONE question at a
+// time — the old behaviour was a numbered list of 3 questions in a chat bubble
+// that the user had to read and answer in prose.
+function AskCard({ spec, index, total, onAnswer, onCancel }) {
+  const [other, setOther] = useState('');
+  const boxRef = useRef(null);
+  const options = Array.isArray(spec?.options) ? spec.options.filter((o) => o && o.label) : [];
+  const allowOther = spec?.allowOther !== false;   // default: never box the user in
+  const freeText = options.length === 0;
+  // Autofocus so a text answer is typed immediately and Esc/Enter work without
+  // a click. Re-runs per question so the next one in the queue grabs focus too.
+  useEffect(() => { boxRef.current?.focus(); setOther(''); }, [index]);
+
+  const submitOther = () => { const v = other.trim(); if (v) onAnswer(v); };
+
+  return (
+    <div style={{ borderTop: `1px solid ${C.border}`, background: '#1b2430', padding: '10px 10px 8px', flexShrink: 0 }}>
+      <div style={{ display: 'flex', alignItems: 'baseline', gap: 6, marginBottom: 7 }}>
+        <span style={{ fontSize: 10, color: '#6aa9e0', letterSpacing: 0.4 }}>QUESTION</span>
+        {total > 1 && <span style={{ fontSize: 10, color: C.muted }}>{index + 1} / {total}</span>}
+        <button onClick={onCancel} title="Cancel — ends the run"
+          style={{ marginLeft: 'auto', background: 'transparent', border: `1px solid ${C.border2}`, color: C.sub, fontSize: 10, padding: '1px 8px', borderRadius: 10, cursor: 'pointer' }}>
+          Cancel
+        </button>
+      </div>
+      <div style={{ fontSize: 12, color: C.text, marginBottom: 8, whiteSpace: 'pre-wrap' }}>{spec?.question || '…'}</div>
+
+      {!freeText && (
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 4, marginBottom: allowOther ? 8 : 0 }}>
+          {options.map((o, i) => (
+            <button key={i} ref={i === 0 ? boxRef : null} onClick={() => onAnswer(o.label)}
+              style={{ textAlign: 'left', background: C.input, border: `1px solid ${C.border2}`, color: C.text, fontSize: 12, padding: '6px 9px', borderRadius: 4, cursor: 'pointer' }}>
+              {o.label}
+              {o.description && <div style={{ fontSize: 10, color: C.muted, marginTop: 2 }}>{o.description}</div>}
+            </button>
+          ))}
+        </div>
+      )}
+
+      {(freeText || allowOther) && (
+        <div style={{ display: 'flex', gap: 6 }}>
+          <input
+            ref={freeText ? boxRef : null}
+            value={other}
+            onChange={(e) => setOther(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter') { e.preventDefault(); submitOther(); }
+              if (e.key === 'Escape') { e.preventDefault(); onCancel(); }
+            }}
+            placeholder={freeText ? 'Type your answer…' : 'Other… (type your own answer)'}
+            style={{ flex: 1, background: C.input, border: `1px solid ${C.border2}`, color: C.text, fontSize: 12, padding: '5px 8px', borderRadius: 4, outline: 'none' }}
+          />
+          <button onClick={submitOther} disabled={!other.trim()}
+            style={{ background: other.trim() ? C.accentBtn : '#333', border: 'none', color: other.trim() ? '#fff' : '#777', fontSize: 12, padding: '5px 12px', borderRadius: 4, cursor: other.trim() ? 'pointer' : 'default' }}>
+            ➤
+          </button>
+        </div>
+      )}
     </div>
   );
 }
@@ -1727,6 +1884,18 @@ function ModelPicker({ value, options = [], onChange }) {
 function Bubble({ msg }) {
   if (msg.role === 'note') {
     return <div style={{ fontSize: 11, color: C.muted, fontStyle: 'italic', textAlign: 'center' }}>{msg.text}</div>;
+  }
+  // An answered ask_user question — keep the QUESTION next to the answer so the
+  // transcript still reads as a conversation once the card is gone.
+  if (msg.role === 'answer') {
+    return (
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 3, alignItems: 'flex-end' }}>
+        {msg.question && <div style={{ fontSize: 10, color: C.muted, maxWidth: '92%' }}>{msg.question}</div>}
+        <div style={{ maxWidth: '92%', background: C.user, border: `1px solid ${C.border2}`, borderRadius: 6, padding: '5px 10px', fontSize: 12, lineHeight: 1.45 }}>
+          {msg.text}
+        </div>
+      </div>
+    );
   }
   const isUser = msg.role === 'user';
   return (

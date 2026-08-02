@@ -1583,17 +1583,6 @@ function App() {
     return () => clearInterval(interval);
   }, [isRunning, isSimulationMode, handleForceWrite]);
 
-  const isBaremetalBoard = (boardId) => boardId === 'rpi_pico' || boardId === 'rpi_pico_w';
-
-  const checkBaremetalConcurrency = () => {
-    if (!isBaremetalBoard(selectedBoard)) return true;
-    const taskCount = (projectStructure.taskConfig?.tasks || []).length;
-    if (taskCount > 1) {
-      addLog('warning', `⚠ Baremetal target (${selectedBoard}) detected with ${taskCount} concurrent tasks. Concurrent pthreads are not supported on baremetal; tasks will run cooperatively via timer wheel. Ensure total CPU load fits within a single core.`);
-    }
-    return true;
-  };
-
   const checkTaskAssignments = () => {
     const tasks = projectStructure?.taskConfig?.tasks || [];
     const programs = projectStructure?.programs || [];
@@ -1619,7 +1608,6 @@ function App() {
       return;
     }
     const boardInfo = getBoardById(selectedBoard);
-    checkBaremetalConcurrency();
     addLog('info', `Build started for board: ${boardInfo?.name || selectedBoard}...`);
     setCompileBusy('build');
     try {
@@ -1668,7 +1656,6 @@ function App() {
       }
     }
     const boardInfo = getBoardById(selectedBoard);
-    checkBaremetalConcurrency();
     addLog('info', `Build & Send for ${boardInfo?.name || selectedBoard}...`);
     setCompileBusy('build');
     try {

@@ -26,6 +26,10 @@
 #include <termios.h>
 #include <errno.h>
 #include <dirent.h>
+#include <linux/can.h>
+#include <linux/can/raw.h>
+#include <net/if.h>
+#include <sys/socket.h>
 
 #ifndef KRON_GPIO_CHIP
 #define KRON_GPIO_CHIP "/dev/gpiochip0"
@@ -67,20 +71,28 @@ static int _rpi_spi_fd[4][4] = {
  *     skip sysfs writes when the value has not changed — the per-scan
  *     overhead collapses to zero on a steady-state duty cycle.
  *
- * Only two channels are usable per the hardware constraint (each PWM
- * channel drives exactly one GPIO, and both candidate pins for a given
- * channel share the same sysfs line), so writes to ch >= KRON_PWM_MAX
- * are rejected with ERR_INVALID_CHANNEL. */
-#define KRON_PWM_MAX 2
+ * ⚠️ Channels are FLATTENED ACROSS pwmchips, not taken from one chip.
+ * A Pi really does expose both channels on a single pwmchip, but this
+ * header also serves every generic-Linux SBC, and those SoCs publish one
+ * pwmchip PER PWM CELL: an ODROID-C4 (S905X3) puts PWM_A..PWM_F on
+ * several 1-2 channel chips, and Rockchip does the same. Probing "the
+ * first chip with >= KRON_PWM_MAX channels" therefore found NOTHING on
+ * those boards (no single chip has enough), so PWM was dead on all 12
+ * generic-Linux boards. Chips are walked in ascending index and their
+ * npwm counts concatenated, so global channel 0.. maps onto
+ * (chip, local) pairs — the same scheme kronhal_bb.h uses for AM335x. */
+#define KRON_PWM_MAX 8
 
-static int      _rpi_pwm_chip          = -1;   /* -1 = not probed; -2 = absent; >=0 = chip index */
-static int      _rpi_pwm_exported[KRON_PWM_MAX] = { 0 };
-static int      _rpi_pwm_period_fd[KRON_PWM_MAX] = { -1, -1 };
-static int      _rpi_pwm_duty_fd  [KRON_PWM_MAX] = { -1, -1 };
-static int      _rpi_pwm_enable_fd[KRON_PWM_MAX] = { -1, -1 };
-static uint64_t _rpi_pwm_last_period_ns[KRON_PWM_MAX] = { 0 };
-static uint64_t _rpi_pwm_last_duty_ns  [KRON_PWM_MAX] = { 0 };
-static int      _rpi_pwm_last_enabled  [KRON_PWM_MAX] = { 0 };
+static int      _rpi_pwm_mapped        = 0;    /* 0 = not probed yet */
+static int8_t   _rpi_pwm_map_chip [KRON_PWM_MAX];   /* -1 = channel absent */
+static int8_t   _rpi_pwm_map_local[KRON_PWM_MAX];
+static int      _rpi_pwm_exported[KRON_PWM_MAX];
+static int      _rpi_pwm_period_fd[KRON_PWM_MAX];
+static int      _rpi_pwm_duty_fd  [KRON_PWM_MAX];
+static int      _rpi_pwm_enable_fd[KRON_PWM_MAX];
+static uint64_t _rpi_pwm_last_period_ns[KRON_PWM_MAX];
+static uint64_t _rpi_pwm_last_duty_ns  [KRON_PWM_MAX];
+static int      _rpi_pwm_last_enabled  [KRON_PWM_MAX];
 
 /* ---------------------------------------------------------------------------
  * Lifecycle
@@ -89,6 +101,14 @@ static int      _rpi_pwm_last_enabled  [KRON_PWM_MAX] = { 0 };
 static inline void HAL_Init(void) {
     if (_gpio_hal_ready) return;
     for (int i = 0; i < _RPi_GPIO_MAX; i++) { _line_fd[i] = -1; _gpio_dir[i] = _GPIO_DIR_NONE; }
+    /* ⚠️ PWM fds MUST start at -1, not at the static zero-init: every
+     * "is this open?" test is `fd >= 0`, so a 0 would make HAL_Cleanup
+     * write "0" to fd 0 and close STDIN. */
+    for (int i = 0; i < KRON_PWM_MAX; i++) {
+        _rpi_pwm_period_fd[i] = -1;
+        _rpi_pwm_duty_fd[i]   = -1;
+        _rpi_pwm_enable_fd[i] = -1;
+    }
     _chip_fd = open(KRON_GPIO_CHIP, O_RDWR);
     _gpio_hal_ready = 1;
 }
@@ -123,7 +143,7 @@ static inline void HAL_Cleanup(void) {
         _rpi_pwm_last_duty_ns[i]   = 0;
         _rpi_pwm_last_enabled[i]   = 0;
     }
-    _rpi_pwm_chip = -1;
+    _rpi_pwm_mapped = 0;   /* re-probe the chip map on the next HAL_Init */
     _gpio_hal_ready = 0;
 }
 
@@ -138,6 +158,23 @@ static inline void HAL_Cleanup(void) {
  *
  * -1 = power / ground / EEPROM / reserved. Writing to these pins is a
  * user error and surfaces as ERR_ID = 1 (ERR_INVALID_CHANNEL).
+ *
+ * ⚠️⚠️ KNOWN GAP — THIS TABLE IS RASPBERRY-PI-ONLY, BUT THIS HEADER ALSO
+ * SERVES 12 GENERIC-LINUX SBCs (Orange Pi, Radxa, ODROID, Banana Pi,
+ * Libre Computer, Pine64). Those SoCs number their gpiochip lines
+ * completely differently:
+ *     Rockchip : line = bank*32 + port*8 + pin
+ *                (ROCK64 header pin 3 = GPIO2_D1 = line 89, NOT 2)
+ *     Amlogic  : ODROID-C4 header pin 3 = GPIOX.17 (sysfs export 493)
+ *     Allwinner: line = (bank_letter - 'A')*32 + pin
+ * So on those boards a GPIO block resolves to the WRONG kernel line and
+ * silently drives a different pad — it does not fail, which is worse than
+ * a stub. Only GPIO is affected: I2C/SPI/UART/USB address device nodes,
+ * and PWM/ADC/CAN go through sysfs/IIO/SocketCAN.
+ *
+ * Fixing it needs a per-board phys→line table chosen at compile time (the
+ * same -D channel compile.go already uses for KRON_GPIO_CHIP). Verified
+ * header pinouts are currently on hand for ODROID-C4 and ROCK64 only.
  * -------------------------------------------------------------------------*/
 static const int8_t _RPI_PHYS_TO_BCM[41] = {
     /*  0 */ -1,                /* 1-indexed, slot 0 is unused */
@@ -306,31 +343,47 @@ static inline void GPIO_SetMode_Call(GPIO_SetMode *inst) {
  * case HAL_PWM_Call sets ERR_ID=ERR_IO and ACTIVE=false.
  * -------------------------------------------------------------------------*/
 
-/* Detects the first pwmchip that exposes at least KRON_PWM_MAX channels.
- * Cached for the rest of the process — failure is sticky to avoid
- * hammering sysfs every scan when no PWM overlay is present. */
-static inline int _rpi_pwm_detect_chip(void) {
-    if (_rpi_pwm_chip != -1) return _rpi_pwm_chip;
+/* Builds the global-channel -> (pwmchip, local channel) map once by walking
+ * /sys/class/pwm in ascending chip index and concatenating each chip's npwm.
+ * Cached for the rest of the process — a failed probe stays failed so we do
+ * not hammer sysfs every scan when no PWM overlay is present. */
+static inline void _rpi_pwm_build_map(void) {
+    if (_rpi_pwm_mapped) return;
+    _rpi_pwm_mapped = 1;
+    for (int i = 0; i < KRON_PWM_MAX; i++) { _rpi_pwm_map_chip[i] = -1; _rpi_pwm_map_local[i] = -1; }
+
+    /* Collect chip indices first — readdir order is not sorted, and the
+     * channel numbering the user sees must be stable across boots. */
+    int chips[KRON_PWM_MAX * 2], nchips = 0;
     DIR *d = opendir("/sys/class/pwm");
-    if (!d) { _rpi_pwm_chip = -2; return -2; }
+    if (!d) return;
     struct dirent *ent;
-    int best = -2;
-    while ((ent = readdir(d)) != NULL) {
+    while ((ent = readdir(d)) != NULL && nchips < (int)(sizeof(chips)/sizeof(chips[0]))) {
         if (strncmp(ent->d_name, "pwmchip", 7) != 0) continue;
         int idx = atoi(ent->d_name + 7);
-        if (idx < 0) continue;
+        if (idx >= 0) chips[nchips++] = idx;
+    }
+    closedir(d);
+    for (int i = 1; i < nchips; i++) {           /* insertion sort, tiny n */
+        int v = chips[i], j = i - 1;
+        while (j >= 0 && chips[j] > v) { chips[j + 1] = chips[j]; j--; }
+        chips[j + 1] = v;
+    }
+
+    int global = 0;
+    for (int c = 0; c < nchips && global < KRON_PWM_MAX; c++) {
         char path[96];
-        snprintf(path, sizeof(path), "/sys/class/pwm/pwmchip%d/npwm", idx);
+        snprintf(path, sizeof(path), "/sys/class/pwm/pwmchip%d/npwm", chips[c]);
         FILE *f = fopen(path, "r");
         if (!f) continue;
         int npwm = 0;
         if (fscanf(f, "%d", &npwm) != 1) npwm = 0;
         fclose(f);
-        if (npwm >= KRON_PWM_MAX) { best = idx; break; }
+        for (int local = 0; local < npwm && global < KRON_PWM_MAX; local++, global++) {
+            _rpi_pwm_map_chip[global]  = (int8_t)chips[c];
+            _rpi_pwm_map_local[global] = (int8_t)local;
+        }
     }
-    closedir(d);
-    _rpi_pwm_chip = best;
-    return best;
 }
 
 static inline int _rpi_pwm_write_str(int fd, const char *s) {
@@ -346,8 +399,10 @@ static inline int _rpi_pwm_write_str(int fd, const char *s) {
 static inline int _rpi_pwm_open(uint8_t ch) {
     if (ch >= KRON_PWM_MAX) return -1;
     if (_rpi_pwm_exported[ch]) return 0;
-    int chip = _rpi_pwm_detect_chip();
-    if (chip < 0) return -1;
+    _rpi_pwm_build_map();
+    int chip  = _rpi_pwm_map_chip[ch];
+    int local = _rpi_pwm_map_local[ch];
+    if (chip < 0 || local < 0) return -1;
 
     char path[96];
 
@@ -356,16 +411,16 @@ static inline int _rpi_pwm_open(uint8_t ch) {
     int exp_fd = open(path, O_WRONLY);
     if (exp_fd >= 0) {
         char buf[8];
-        int n = snprintf(buf, sizeof(buf), "%u", (unsigned)ch);
+        int n = snprintf(buf, sizeof(buf), "%d", local);
         (void)write(exp_fd, buf, n);
         close(exp_fd);
     }
 
-    snprintf(path, sizeof(path), "/sys/class/pwm/pwmchip%d/pwm%u/period", chip, (unsigned)ch);
+    snprintf(path, sizeof(path), "/sys/class/pwm/pwmchip%d/pwm%d/period", chip, local);
     _rpi_pwm_period_fd[ch] = open(path, O_WRONLY);
-    snprintf(path, sizeof(path), "/sys/class/pwm/pwmchip%d/pwm%u/duty_cycle", chip, (unsigned)ch);
+    snprintf(path, sizeof(path), "/sys/class/pwm/pwmchip%d/pwm%d/duty_cycle", chip, local);
     _rpi_pwm_duty_fd[ch] = open(path, O_WRONLY);
-    snprintf(path, sizeof(path), "/sys/class/pwm/pwmchip%d/pwm%u/enable", chip, (unsigned)ch);
+    snprintf(path, sizeof(path), "/sys/class/pwm/pwmchip%d/pwm%d/enable", chip, local);
     _rpi_pwm_enable_fd[ch] = open(path, O_WRONLY);
 
     if (_rpi_pwm_period_fd[ch] < 0 || _rpi_pwm_duty_fd[ch] < 0 || _rpi_pwm_enable_fd[ch] < 0) {
@@ -444,14 +499,29 @@ static inline void HAL_PWM_Call(HAL_PWM *inst, uint8_t ch) {
 }
 
 /* ---------------------------------------------------------------------------
- * SPI  (single-byte — TODO: full implementation)
+ * SPI single byte — one full-duplex byte on /dev/spidev<ch>.<CS>
+ * (was a fake DONE=EN stub; uses the same fd cache as the burst block)
  * -------------------------------------------------------------------------*/
+static inline int _rpi_spi_open(uint8_t bus, uint8_t cs, uint8_t mode, int32_t clk_hz);
+
 static inline void HAL_SPI_Call(HAL_SPI *inst, uint8_t ch) {
-    (void)ch;
     inst->ENO     = inst->EN;
     inst->RX_DATA = 0;
-    inst->DONE    = inst->EN;
-    /* TODO: /dev/spidevN.0 ioctl */
+    inst->DONE    = false;
+    inst->ERR_ID  = 0;
+    if (!inst->EN) return;
+    uint8_t cs = (inst->CS >= 0 && inst->CS < 4) ? (uint8_t)inst->CS : 0;
+    int fd = _rpi_spi_open(ch, cs, 0, inst->CLK_HZ);
+    if (fd < 0) { inst->ERR_ID = 2; return; }
+    uint8_t tx = inst->TX_DATA, rx = 0;
+    struct spi_ioc_transfer tr;
+    memset(&tr, 0, sizeof(tr));
+    tr.tx_buf = (unsigned long)(uintptr_t)&tx;
+    tr.rx_buf = (unsigned long)(uintptr_t)&rx;
+    tr.len    = 1;
+    if (ioctl(fd, SPI_IOC_MESSAGE(1), &tr) < 1) { inst->ERR_ID = 3; return; }
+    inst->RX_DATA = rx;
+    inst->DONE    = true;
 }
 
 /* ---------------------------------------------------------------------------
@@ -835,23 +905,148 @@ static inline void HAL_USB_Receive_Call(HAL_USB_Receive *inst, uint8_t ch) {
 }
 
 /* ---------------------------------------------------------------------------
- * ADC  (RPi has no built-in ADC — stub)
+ * ADC — generic Linux IIO
+ *
+ * Real RPi silicon has no ADC, but this header also serves every
+ * generic-Linux SBC (Rockchip/Amlogic/Allwinner SARADC) plus any I2C/SPI
+ * ADC HAT with an IIO driver. Scans for the first iio:deviceN exposing
+ * in_voltage<ch>_raw. VOLTAGE uses the driver's in_voltage*_scale (mV per
+ * LSB) when present, else KRON_ADC_VREF/KRON_ADC_MAX_RAW when configured.
+ * No IIO device → ERR_ID=2 (honest error — was a silent 0 before).
  * -------------------------------------------------------------------------*/
+#ifndef KRON_ADC_VREF
+#define KRON_ADC_VREF 0.0f       /* 0 = unknown reference, VOLTAGE stays 0 */
+#endif
+#ifndef KRON_ADC_MAX_RAW
+#define KRON_ADC_MAX_RAW 4095.0f
+#endif
+static int _rpi_adc_dev = -1;    /* -1 unknown, -2 scan failed, >=0 index */
+
+static inline int _rpi_adc_find_dev(uint8_t ch) {
+    if (_rpi_adc_dev == -2) return -1;
+    if (_rpi_adc_dev >= 0)  return _rpi_adc_dev;
+    DIR *d = opendir("/sys/bus/iio/devices");
+    if (!d) { _rpi_adc_dev = -2; return -1; }
+    struct dirent *ent;
+    while ((ent = readdir(d)) != NULL) {
+        int idx;
+        if (sscanf(ent->d_name, "iio:device%d", &idx) != 1) continue;
+        char path[128];
+        snprintf(path, sizeof(path), "/sys/bus/iio/devices/iio:device%d/in_voltage%u_raw", idx, (unsigned)ch);
+        if (access(path, R_OK) == 0) { _rpi_adc_dev = idx; break; }
+    }
+    closedir(d);
+    if (_rpi_adc_dev < 0) _rpi_adc_dev = -2;
+    return (_rpi_adc_dev >= 0) ? _rpi_adc_dev : -1;
+}
+
 static inline void HAL_ADC_Read_Call(HAL_ADC_Read *inst, uint8_t ch) {
-    (void)ch;
     inst->ENO     = inst->EN;
     inst->VALUE   = 0;
     inst->VOLTAGE = 0.0f;
+    inst->ERR_ID  = 0;
+    if (!inst->EN) return;
+    int dev = _rpi_adc_find_dev(ch);
+    if (dev < 0) { inst->ERR_ID = 2; return; }
+    char path[128];
+    snprintf(path, sizeof(path), "/sys/bus/iio/devices/iio:device%d/in_voltage%u_raw", dev, (unsigned)ch);
+    FILE *f = fopen(path, "r");
+    if (!f) { inst->ERR_ID = 3; return; }
+    long raw = 0;
+    int ok = (fscanf(f, "%ld", &raw) == 1);
+    fclose(f);
+    if (!ok) { inst->ERR_ID = 3; return; }
+    inst->VALUE = (int32_t)raw;
+    /* Per-channel scale, then shared scale, then configured VREF. */
+    double scale_mv = -1.0;
+    snprintf(path, sizeof(path), "/sys/bus/iio/devices/iio:device%d/in_voltage%u_scale", dev, (unsigned)ch);
+    f = fopen(path, "r");
+    if (!f) {
+        snprintf(path, sizeof(path), "/sys/bus/iio/devices/iio:device%d/in_voltage_scale", dev);
+        f = fopen(path, "r");
+    }
+    if (f) {
+        if (fscanf(f, "%lf", &scale_mv) != 1) scale_mv = -1.0;
+        fclose(f);
+    }
+    if (scale_mv >= 0.0)
+        inst->VOLTAGE = (float)((double)raw * scale_mv / 1000.0);
+    else if (KRON_ADC_VREF > 0.0f)
+        inst->VOLTAGE = (float)raw * KRON_ADC_VREF / KRON_ADC_MAX_RAW;
 }
 
 /* ---------------------------------------------------------------------------
- * CAN  (not available on standard RPi — stub)
+ * CAN — SocketCAN
+ *
+ * RPi silicon has no CAN controller, but MCP2515/MCP251xFD SPI HATs (with
+ * the stock dtoverlay) and the Rockchip/StarFive boards served by this
+ * header expose a standard SocketCAN interface. Bring it up first:
+ *     ip link set can0 up type can bitrate 500000
+ * No interface → ERR_ID=2 (was a silent no-op stub before).
  * -------------------------------------------------------------------------*/
-static inline void HAL_CAN_Send_Call(HAL_CAN_Send *inst, uint8_t ch) {
-    (void)ch; inst->ENO = inst->EN; inst->DONE = false;
+#ifndef KRON_CAN0
+#define KRON_CAN0 "can0"
+#endif
+#ifndef KRON_CAN1
+#define KRON_CAN1 "can1"
+#endif
+static const char *const _rpi_can_ifaces[2] = { KRON_CAN0, KRON_CAN1 };
+static int _rpi_can_fd[2] = { -1, -1 };
+
+static inline int _rpi_can_open(uint8_t ch) {
+    if (ch >= 2) return -1;
+    if (_rpi_can_fd[ch] >= 0) return _rpi_can_fd[ch];
+    int fd = socket(AF_CAN, SOCK_RAW, CAN_RAW);
+    if (fd < 0) return -1;
+    struct ifreq ifr;
+    memset(&ifr, 0, sizeof(ifr));
+    strncpy(ifr.ifr_name, _rpi_can_ifaces[ch], IFNAMSIZ - 1);
+    if (ioctl(fd, SIOCGIFINDEX, &ifr) < 0) { close(fd); return -1; }
+    struct sockaddr_can addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.can_family  = AF_CAN;
+    addr.can_ifindex = ifr.ifr_ifindex;
+    if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) { close(fd); return -1; }
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (flags >= 0) fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+    _rpi_can_fd[ch] = fd;
+    return fd;
 }
+
+static inline void HAL_CAN_Send_Call(HAL_CAN_Send *inst, uint8_t ch) {
+    inst->ENO    = inst->EN;
+    inst->DONE   = false;
+    inst->ERR_ID = 0;
+    if (!inst->EN) return;
+    int fd = _rpi_can_open(ch);
+    if (fd < 0) { inst->ERR_ID = 2; return; }
+    struct can_frame frame;
+    memset(&frame, 0, sizeof(frame));
+    frame.can_id  = (uint32_t)inst->ID & CAN_SFF_MASK;
+    frame.can_dlc = (inst->DLC > 8) ? 8 : (uint8_t)inst->DLC;
+    if (frame.can_dlc > 0) frame.data[0] = inst->DATA;
+    inst->DONE = (write(fd, &frame, sizeof(frame)) == (ssize_t)sizeof(frame));
+    if (!inst->DONE) inst->ERR_ID = 3;
+}
+
 static inline void HAL_CAN_Receive_Call(HAL_CAN_Receive *inst, uint8_t ch) {
-    (void)ch; inst->ENO = inst->EN; inst->READY = false;
+    inst->ENO    = inst->EN;
+    inst->READY  = false;
+    inst->DATA   = 0;
+    inst->ID     = 0;
+    inst->ERR_ID = 0;
+    if (!inst->EN) return;
+    int fd = _rpi_can_open(ch);
+    if (fd < 0) { inst->ERR_ID = 2; return; }
+    struct can_frame frame;
+    ssize_t n = read(fd, &frame, sizeof(frame));
+    if (n == (ssize_t)sizeof(frame)) {
+        if (inst->FILTER_ID == 0 || (int32_t)(frame.can_id & CAN_SFF_MASK) == inst->FILTER_ID) {
+            inst->ID    = (int32_t)(frame.can_id & CAN_SFF_MASK);
+            inst->DATA  = (frame.can_dlc > 0) ? frame.data[0] : 0;
+            inst->READY = true;
+        }
+    }
 }
 
 /* ---------------------------------------------------------------------------

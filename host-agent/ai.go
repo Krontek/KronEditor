@@ -514,10 +514,22 @@ func callAnthropic(ctx context.Context, req aiChatReq, oauthToken string) (aiMes
 
 // ── OpenAI-compatible (/v1/chat/completions): openai + custom ────────────────
 
+// callOpenAI drives any OpenAI-shaped chat endpoint. defaultBase is the
+// provider's FIXED endpoint, or "" for the `custom` provider.
+//
+// ⚠️ req.BaseURL is honored ONLY when defaultBase is empty (i.e. `custom`).
+// A named provider must always reach its own host: the base used to be
+// "req.BaseURL, else defaultBase", so any stale value in the saved config
+// silently redirected the request — picking Gemini with an Ollama base left
+// over from a previous setup POSTed to http://localhost:11434 and failed with
+// "connection refused" while the user was staring at a valid Gemini key. Worse
+// than the confusion, that path sends the provider's API KEY as a Bearer token
+// to whatever host the base names. Overriding an endpoint is what the `custom`
+// provider is for.
 func callOpenAI(ctx context.Context, req aiChatReq, defaultBase string) (aiMessage, error) {
-	base := strings.TrimSpace(req.BaseURL)
+	base := defaultBase
 	if base == "" {
-		base = defaultBase
+		base = strings.TrimSpace(req.BaseURL)
 	}
 	if base == "" {
 		return aiMessage{}, fmt.Errorf("custom provider requires a base URL")
@@ -824,7 +836,7 @@ func (s *Server) handleAIModels(w http.ResponseWriter, r *http.Request) {
 	)
 	switch strings.ToLower(strings.TrimSpace(req.Provider)) {
 	case "anthropic":
-		models, err = listAnthropicModels(ctx, req.BaseURL, map[string]string{
+		models, err = listAnthropicModels(ctx, "", map[string]string{
 			"x-api-key":         req.APIKey,
 			"anthropic-version": anthropicVersion,
 		})
@@ -840,10 +852,10 @@ func (s *Server) handleAIModels(w http.ResponseWriter, r *http.Request) {
 					"anthropic-version": anthropicVersion,
 				}
 			}
-			models, err = listAnthropicModels(ctx, req.BaseURL, hdr(tok))
+			models, err = listAnthropicModels(ctx, "", hdr(tok))
 			if err != nil && strings.Contains(err.Error(), "HTTP 401") {
 				if tok, err = s.anthropicOAuth.accessToken(true); err == nil {
-					models, err = listAnthropicModels(ctx, req.BaseURL, hdr(tok))
+					models, err = listAnthropicModels(ctx, "", hdr(tok))
 				}
 			}
 		}
@@ -855,7 +867,9 @@ func (s *Server) handleAIModels(w http.ResponseWriter, r *http.Request) {
 		// routing 404 that reads as "endpoint gone" rather than "add a key"), and
 		// the native one reports supportedGenerationMethods — the provider's own
 		// answer to "can this model chat", which beats guessing from the id.
-		models, err = listGeminiModels(ctx, req.BaseURL, req.APIKey)
+		// Fixed endpoint — see listOpenAIModels on why a caller-supplied base
+		// must not reach a named provider.
+		models, err = listGeminiModels(ctx, "", req.APIKey)
 	case "deepseek":
 		models, err = listOpenAIModels(ctx, req.BaseURL, deepseekBase, req.APIKey)
 	case "custom":
@@ -928,10 +942,15 @@ func isChatModelID(id string) bool {
 // "custom" gateways also serve. Non-chat families are filtered out and the list
 // is ordered newest-first via the `created` timestamp OpenAI returns (its raw
 // order is arbitrary, which would bury the current model mid-list).
+// listOpenAIModels lists an OpenAI-shaped catalogue. Same base-URL rule as
+// callOpenAI: a named provider always uses its own defaultBase, and baseURL is
+// honored only for `custom` (defaultBase == ""). Preferring baseURL here meant
+// the settings dialog's model list followed a stale base too, so the picker
+// went empty/errored for exactly the provider the user was trying to set up.
 func listOpenAIModels(ctx context.Context, baseURL, defaultBase, apiKey string) ([]string, error) {
-	base := strings.TrimSpace(baseURL)
+	base := defaultBase
 	if base == "" {
-		base = defaultBase
+		base = strings.TrimSpace(baseURL)
 	}
 	if base == "" {
 		return nil, fmt.Errorf("base URL is required for this provider")

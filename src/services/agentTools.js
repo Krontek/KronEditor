@@ -381,6 +381,34 @@ const S = (props, required = []) => ({ type: 'object', properties: props, requir
 const str = (description) => ({ type: 'string', description });
 
 export const TOOL_DEFS = [
+  // ⚠️ Handled ENTIRELY by AiAgentPanel (runTurn intercepts it before the
+  // applyToolCall dispatch) because it must PAUSE the loop for a human, which a
+  // pure struct→struct executor cannot do. It is declared here so it reaches the
+  // provider in the same tools array as everything else.
+  {
+    name: 'ask_user',
+    description:
+      'Ask the user ONE clarifying question and WAIT for the answer. This is the ONLY way to ask something — never write a question as plain prose, and never number several questions into one message. ' +
+      'Whenever the answer is a choice between knowable alternatives, PASS `options`: they render as clickable buttons, so the user answers in one click instead of typing. ' +
+      'Only omit `options` when the answer is genuinely open (a number, a name, an address) — then it renders as a text box. ' +
+      'You may emit several ask_user calls in one turn; they are presented to the user ONE AT A TIME, in order, and all the answers come back together. ' +
+      'No other tool runs in a turn that contains ask_user — ask first, act after the answers.',
+    parameters: S({
+      question: str('The single question, in the user\'s own language. Short and specific.'),
+      options: {
+        type: 'array',
+        description: 'The choices, when the answer is a choice. 2–5 entries. Omit entirely for a free-text answer.',
+        items: S({
+          label: str('The choice as the user sees it. A few words.'),
+          description: str('Optional one-line explanation of what picking this means.'),
+        }, ['label']),
+      },
+      allowOther: {
+        type: 'boolean',
+        description: 'Default true. Keeps a free-text "Other…" box under the buttons so the user is never boxed in by your options.',
+      },
+    }, ['question']),
+  },
   {
     name: 'get_project_overview',
     description: 'List every POU (programs, function blocks, functions), their language and variable counts, all global variables, data types, and the selected board. Call this first to understand the project.',
@@ -1058,6 +1086,11 @@ export function applyToolCall(struct, name, args = {}) {
           next,
         };
       }
+
+      // ask_user never reaches here — AiAgentPanel intercepts it so the loop can
+      // pause for a human. If it does, something bypassed that intercept.
+      case 'ask_user':
+        return { ok: false, error: 'ask_user is handled by the panel, not the tool executor' };
 
       default:
         return { ok: false, error: `unknown tool "${name}"` };

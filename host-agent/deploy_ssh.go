@@ -41,7 +41,8 @@ var aarch64BoardPrefixes = []string{"rpi_", "jetson_", "opi_", "radxa_", "odroid
 
 // serverBinaryForBoard maps a board id to (resource-target key, binary file name).
 // Mirrors the original Tauri selection: RPi/Jetson/BB-AI64 → arm64, other BB → armv7,
-// everything else → amd64. Pico has no OS to host a server.
+// everything else → amd64. Legacy rpi_pico projects are rejected outright
+// (the board was removed; a Cortex-M part has no OS to host the server).
 func serverBinaryForBoard(boardID string) (resourceTarget, binaryName string, err error) {
 	isAarch64 := boardID == "bb_ai64"
 	for _, p := range aarch64BoardPrefixes {
@@ -52,7 +53,7 @@ func serverBinaryForBoard(boardID string) (resourceTarget, binaryName string, er
 	}
 	switch {
 	case strings.HasPrefix(boardID, "rpi_pico"):
-		return "", "", fmt.Errorf("Pico targets do not support remote server deployment")
+		return "", "", fmt.Errorf("Pico boards are no longer supported — reselect a Linux board in Board Config")
 	case strings.HasPrefix(boardID, "bb_") && !strings.HasPrefix(boardID, "bb_ai64"):
 		return "arm/armv7", "plc-agent_linux_armv7", nil
 	case isAarch64:

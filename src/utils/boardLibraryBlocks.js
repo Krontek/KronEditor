@@ -9,8 +9,6 @@
 import { getBoardById } from './boardDefinitions';
 
 const GENERIC_COMM_INTERFACES = new Set(['I2C', 'SPI', 'UART', 'USB']);
-const isPicoBoard = (boardId) => boardId?.startsWith('rpi_pico');
-
 // ─── Channel counts per board family / board ─────────────────────────────────
 
 const BOARD_CHANNELS = {
@@ -24,9 +22,6 @@ const BOARD_CHANNELS = {
   rpi_3b_plus:  { PWM: 2, SPI: 2, I2C: 1, UART: 1, USB: 4 },
   rpi_3b:       { PWM: 2, SPI: 2, I2C: 1, UART: 1, USB: 4 },
   rpi_zero_2w:  { PWM: 2, SPI: 2, I2C: 1, UART: 1, USB: 1 },
-  // Raspberry Pi Pico
-  rpi_pico:     { PWM: 8, SPI: 2, I2C: 2, UART: 2, ADC: 3 },
-  rpi_pico_w:   { PWM: 8, SPI: 2, I2C: 2, UART: 2, ADC: 3 },
   // BeagleBone
   bb_black:          { PWM: 3, SPI: 2, I2C: 3, UART: 5, ADC: 7, CAN: 2, PRU: 2 },
   bb_black_wireless: { PWM: 3, SPI: 2, I2C: 3, UART: 5, ADC: 7, CAN: 2, PRU: 2 },
@@ -35,8 +30,9 @@ const BOARD_CHANNELS = {
   bb_ai:             { PWM: 4, SPI: 4, I2C: 4, UART: 6, ADC: 7, CAN: 2, PRU: 4 },
   bb_ai64:           { PWM: 4, SPI: 4, I2C: 4, UART: 6, ADC: 7, CAN: 2, PRU: 4 },
   // NVIDIA Jetson — all models have 40-pin header with GPIO/I2C/SPI/UART/CAN
-  jetson_nano:       { PWM: 2, SPI: 1, I2C: 2, UART: 4, CAN: 1, USB: 4 },
-  jetson_tx2:        { PWM: 2, SPI: 1, I2C: 2, UART: 4, CAN: 1, USB: 4 },
+  // Jetson Nano (T210) has NO on-chip CAN controller — MCP2515 HATs ride SPI.
+  jetson_nano:       { PWM: 2, SPI: 1, I2C: 2, UART: 4, USB: 4 },
+  jetson_tx2:        { PWM: 2, SPI: 1, I2C: 2, UART: 4, CAN: 2, USB: 4 },
   jetson_xavier_nx:  { PWM: 2, SPI: 1, I2C: 2, UART: 4, CAN: 1, USB: 4 },
   jetson_agx_xavier: { PWM: 2, SPI: 1, I2C: 2, UART: 4, CAN: 2, USB: 3 },
   jetson_orin_nano:  { PWM: 3, SPI: 1, I2C: 2, UART: 4, CAN: 1, USB: 5 },
@@ -44,21 +40,34 @@ const BOARD_CHANNELS = {
   jetson_agx_orin:   { PWM: 3, SPI: 1, I2C: 2, UART: 4, CAN: 2, USB: 5 },
   // Orange Pi — RK3588S/RK3588 expose many UART/I2C/SPI controllers; counts
   // reflect what is practically reachable on the 40-pin header.
-  opi_5:             { PWM: 4, SPI: 2, I2C: 3, UART: 4, USB: 4 },
-  opi_5_plus:        { PWM: 4, SPI: 2, I2C: 3, UART: 4, USB: 5 },
+  // RK3588S: can0-m0 + can1-m0 device-tree overlays expose both on the 26-pin header.
+  opi_5:             { PWM: 4, SPI: 2, I2C: 3, UART: 4, CAN: 2, USB: 4 },
+  opi_5_plus:        { PWM: 4, SPI: 2, I2C: 3, UART: 4, CAN: 1, USB: 5 },
   opi_zero_2w:       { PWM: 2, SPI: 1, I2C: 2, UART: 3, USB: 1 },
   // Radxa
-  radxa_rock_5b:     { PWM: 4, SPI: 2, I2C: 4, UART: 4, USB: 5 },
+  // RK3588: can1-m1 overlay exposes CAN on the 40-pin header (netdev becomes can0).
+  radxa_rock_5b:     { PWM: 4, SPI: 2, I2C: 4, UART: 4, CAN: 1, USB: 5 },
   radxa_rock_3a:     { PWM: 3, SPI: 2, I2C: 3, UART: 4, USB: 4 },
   radxa_zero_3w:     { PWM: 2, SPI: 1, I2C: 2, UART: 3, USB: 2 },
   // Odroid (Amlogic)
-  odroid_c4:         { PWM: 2, SPI: 1, I2C: 2, UART: 2, USB: 4 },
+  // ODROID-C4 J2 header exposes TWO analog inputs (Expansion Connectors doc,
+  // board rev 1.0): pin 40 = ADC.AIN0, pin 37 = ADC.AIN2, ref pin 38 = 1.8 V.
+  // The channel number IS the IIO index, so ADC0/ADC2 are the wired ones —
+  // AIN1 is not routed to the header (count is 3 only to reach AIN2).
+  // ⚠️ 1.8 V ceiling, NOT 3.3 V like the digital pins — a 3.3 V signal damages it.
+  // PWM: the J2 header carries PWM_A..PWM_F — six outputs, from the S905X3's
+  // three 2-channel cells (PWM_AB / PWM_CD / PWM_EF). The HAL flattens
+  // pwmchips in ascending index, so PWM0..PWM5 land on A,B,C,D,E,F in order;
+  // a cell the device tree has not enabled simply reports ERR_ID.
+  odroid_c4:         { PWM: 6, SPI: 1, I2C: 2, UART: 2, ADC: 3, USB: 4 },
   odroid_n2_plus:    { PWM: 2, SPI: 1, I2C: 2, UART: 2, USB: 4 },
   // Banana Pi (Amlogic)
   bpi_m5:            { PWM: 2, SPI: 1, I2C: 2, UART: 2, USB: 4 },
   // Libre Computer (Amlogic)
   libre_le_potato:   { PWM: 2, SPI: 1, I2C: 2, UART: 2, USB: 4 },
   // Pine64 (Rockchip)
+  // ROCK64 Pi-2 connector (Port V3 definition) carries no analog input at all —
+  // all 40 pins are GPIO/I2C/SPI/UART/I2S. Deliberately no ADC key.
   pine_rock64:       { PWM: 2, SPI: 1, I2C: 2, UART: 2, USB: 3 },
   pine_rockpro64:    { PWM: 2, SPI: 2, I2C: 4, UART: 4, USB: 4 },
 };
@@ -569,7 +578,7 @@ export const getBoardLibraryTree = (boardId) => {
   const subcategories = [];
 
   for (const iface of interfaces) {
-    if (GENERIC_COMM_INTERFACES.has(iface) && !isPicoBoard(boardId)) {
+    if (GENERIC_COMM_INTERFACES.has(iface)) {
       continue;
     }
 

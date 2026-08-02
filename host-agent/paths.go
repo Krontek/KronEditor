@@ -261,7 +261,45 @@ func (p *Paths) LLVMTargetLibraryDirs(triple string) []string {
 			filepath.Join(sysroot, "x86_64-w64-mingw32/lib"),
 		}
 	}
+	// libgcc/libgcc_eh live in the bundled GCC install dir, which -static needs.
+	if gcc := p.LLVMGCCInstallDir(triple); gcc != "" {
+		dirs = append(dirs, gcc)
+	}
 	return filterExisting(dirs)
+}
+
+// LLVMGCCInstallDir locates the bundled GCC installation inside a sysroot
+// (<sysroot>/lib/gcc/<vendor-triple>/<version>), or "" when absent.
+//
+// ⚠️ It must be discovered by GLOB, not built from the compile triple: the
+// bundled sysroots name this directory with a "none" vendor
+// (arm-none-linux-gnueabihf, aarch64-none-linux-gnu) while we compile with
+// --target=arm-linux-gnueabihf. Clang's own GCC auto-detection happens to
+// include the aarch64 "none" spelling in its candidate list but NOT the arm
+// one, so armv7 static links failed with "cannot open crtbeginT.o" and
+// "unable to find library -lgcc" — i.e. Build & Send was broken for every
+// armv7 BeagleBone while aarch64 worked by luck. Passing this dir explicitly
+// as -B (crt objects) and -L (libgcc) makes both targets deterministic.
+func (p *Paths) LLVMGCCInstallDir(triple string) string {
+	matches, err := filepath.Glob(filepath.Join(p.LLVMSysroot(triple), "lib", "gcc", "*", "*"))
+	if err != nil {
+		return ""
+	}
+	var dirs []string
+	for _, m := range matches {
+		if st, err := os.Stat(m); err == nil && st.IsDir() {
+			dirs = append(dirs, m)
+		}
+	}
+	if len(dirs) == 0 {
+		return ""
+	}
+	// Highest version wins, compared NUMERICALLY per component — sort.Strings
+	// would rank "9.3.0" above "10.2.1" and silently select the older GCC.
+	sort.Slice(dirs, func(i, j int) bool {
+		return compareVersionStrings(filepath.Base(dirs[i]), filepath.Base(dirs[j])) < 0
+	})
+	return dirs[len(dirs)-1]
 }
 
 // CollectStaticArchives returns all .a files in a directory (no recursion).

@@ -533,12 +533,28 @@ static int _spi_fd[4][4] = {
     { -1,-1,-1,-1 }, { -1,-1,-1,-1 },
 };
 
+static inline int _spi_open(uint8_t bus, uint8_t cs, uint8_t mode, int32_t clk_hz);
+
+/* Single-byte SPI — one full-duplex byte on /dev/spidev<ch>.<CS>.
+ * (was a fake DONE=EN stub; shares the burst block's fd cache) */
 static inline void HAL_SPI_Call(HAL_SPI *inst, uint8_t ch) {
-    (void)ch;
     inst->ENO     = inst->EN;
     inst->RX_DATA = 0;
-    inst->DONE    = inst->EN;
-    /* TODO: single-byte spidev */
+    inst->DONE    = false;
+    inst->ERR_ID  = 0;
+    if (!inst->EN) return;
+    uint8_t cs = (inst->CS >= 0 && inst->CS < 4) ? (uint8_t)inst->CS : 0;
+    int fd = _spi_open(ch, cs, 0, inst->CLK_HZ);
+    if (fd < 0) { inst->ERR_ID = 2; return; }
+    uint8_t tx = inst->TX_DATA, rx = 0;
+    struct spi_ioc_transfer tr;
+    memset(&tr, 0, sizeof(tr));
+    tr.tx_buf = (unsigned long)(uintptr_t)&tx;
+    tr.rx_buf = (unsigned long)(uintptr_t)&rx;
+    tr.len    = 1;
+    if (ioctl(fd, SPI_IOC_MESSAGE(1), &tr) < 1) { inst->ERR_ID = 3; return; }
+    inst->RX_DATA = rx;
+    inst->DONE    = true;
 }
 
 static inline int _spi_open(uint8_t bus, uint8_t cs, uint8_t mode, int32_t clk_hz) {
@@ -896,11 +912,14 @@ static inline void HAL_USB_Receive_Call(HAL_USB_Receive *inst, uint8_t ch) {
 /* ---------------------------------------------------------------------------
  * ADC  (Jetson has no built-in ADC on 40-pin header — stub)
  * -------------------------------------------------------------------------*/
+/* Jetson dev kits expose no user ADC — fail loudly instead of returning a
+ * silent 0 that reads like a real measurement. Use an I2C/SPI ADC instead. */
 static inline void HAL_ADC_Read_Call(HAL_ADC_Read *inst, uint8_t ch) {
     (void)ch;
     inst->ENO     = inst->EN;
     inst->VALUE   = 0;
     inst->VOLTAGE = 0.0f;
+    inst->ERR_ID  = inst->EN ? 1 : 0;
 }
 
 /* ---------------------------------------------------------------------------

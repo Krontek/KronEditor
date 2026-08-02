@@ -557,8 +557,6 @@ typedef struct {
 #include "kronhal_jetson.h"
 #elif defined(HAL_BOARD_FAMILY_RPI)
 #include "kronhal_rpi.h"
-#elif defined(HAL_BOARD_FAMILY_PICO)
-#include "kronhal_pico.h"
 #elif defined(HAL_BOARD_FAMILY_BB)
 #include "kronhal_bb.h"
 #else

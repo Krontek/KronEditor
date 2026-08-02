@@ -4,8 +4,6 @@
  * Used by the Device Builder UI (to show available ports) and by the
  * C code generator (to embed the correct device path string).
  *
- * Pico (HAL_BOARD_FAMILY_PICO) is intentionally omitted — device FB
- * code generation for Pico is pending toolchain support.
  */
 
 export const BOARD_PORT_DETAILS = {
@@ -229,7 +227,6 @@ export const getPortNumericId = (portId) => {
  */
 export const getBoardFamilyDefine = (boardId) => {
   if (!boardId) return null;
-  if (boardId.startsWith('rpi_pico')) return 'HAL_BOARD_FAMILY_PICO';
   if (boardId.startsWith('rpi_'))    return 'HAL_BOARD_FAMILY_RPI';
   if (boardId.startsWith('bb_'))     return 'HAL_BOARD_FAMILY_BB';
   if (boardId.startsWith('jetson_')) return 'HAL_BOARD_FAMILY_JETSON';

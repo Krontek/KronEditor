@@ -200,8 +200,11 @@ func (s *Server) compileForTarget(req *compileForTargetReq) (string, string, err
 
 	var llvmTarget, resourceTarget string
 	switch {
+	// Legacy-project guard: rpi_pico boards were removed (no Linux userspace).
+	// Without this a stale saved project would fall through to the aarch64
+	// default and silently build a wrong-arch binary.
 	case strings.HasPrefix(req.BoardID, "rpi_pico"):
-		return "", "", fmt.Errorf("Pico (Cortex-M) targets are not supported for remote deployment")
+		return "", "", fmt.Errorf("Pico (Cortex-M) boards are no longer supported — reselect a Linux board in Board Config")
 	case strings.HasPrefix(req.BoardID, "bb_") && !strings.HasPrefix(req.BoardID, "bb_ai64"):
 		llvmTarget, resourceTarget = "arm-linux-gnueabihf", "arm/armv7"
 	default:
@@ -371,6 +374,13 @@ func (s *Server) llvmCompileBaseArgs(target string) (string, []string, []string,
 	}
 	if target == "aarch64-linux-gnu" || target == "arm-linux-gnueabihf" {
 		args = append(args, "--gcc-toolchain="+sysroot)
+		// ⚠️ --gcc-toolchain alone is not enough: the sysroots name their GCC
+		// dir with a "none" vendor (arm-none-linux-gnueabihf) that clang's
+		// candidate list does not match for arm, so -static could not find
+		// crtbeginT.o/crtend.o. -B points the driver straight at it.
+		if gcc := s.paths.LLVMGCCInstallDir(target); gcc != "" {
+			args = append(args, "-B", gcc)
+		}
 	}
 	args = append(args, archFlags...)
 
