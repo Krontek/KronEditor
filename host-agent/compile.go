@@ -300,10 +300,25 @@ func (s *Server) compileForTarget(req *compileForTargetReq) (string, string, err
 
 // ── shared LLVM arg builders ────────────────────────────────────────────────
 
+// missingToolchainError explains HOW to fix an absent bundled binary instead of
+// only naming the path that was probed. When the toolchains root was never
+// found, paths.go falls back to the bare name "toolchains", so the error read
+// as a relative path ("toolchains\bin\clang.exe") with no hint that the whole
+// tree is missing — the toolchains/ dir is gitignored (multi-GB), so a fresh
+// clone on ANY host hits this before it can compile anything.
+func (s *Server) missingToolchainError(what, path string) error {
+	hint := fmt.Sprintf("bundled %s not found: %s (toolchains root: %s)", what, path, s.paths.ToolchainsRoot)
+	if _, err := os.Stat(s.paths.ToolchainsRoot); err != nil {
+		hint += " — the toolchains tree is missing; run `python setup_toolchain.py`" +
+			" in the repo root, or start the agent with -toolchains-root <path to an existing toolchains dir>"
+	}
+	return fmt.Errorf("%s", hint)
+}
+
 func (s *Server) bundledHostClangArgs() (string, []string, error) {
 	clang := s.paths.LLVMBin("clang")
 	if _, err := os.Stat(clang); err != nil {
-		return "", nil, fmt.Errorf("bundled clang not found: %s", clang)
+		return "", nil, s.missingToolchainError("clang", clang)
 	}
 	clangRes, err := s.paths.LLVMClangResourceDir()
 	if err != nil {
@@ -379,11 +394,11 @@ func hostSimLinkArgs() []string {
 func (s *Server) llvmCompileBaseArgs(target string) (string, []string, []string, error) {
 	clang := s.paths.LLVMBin("clang")
 	if _, err := os.Stat(clang); err != nil {
-		return "", nil, nil, fmt.Errorf("bundled clang not found: %s", clang)
+		return "", nil, nil, s.missingToolchainError("clang", clang)
 	}
 	llvmAr := s.paths.LLVMBin("llvm-ar")
 	if _, err := os.Stat(llvmAr); err != nil {
-		return "", nil, nil, fmt.Errorf("bundled llvm-ar not found: %s", llvmAr)
+		return "", nil, nil, s.missingToolchainError("llvm-ar", llvmAr)
 	}
 	clangRes, err := s.paths.LLVMClangResourceDir()
 	if err != nil {

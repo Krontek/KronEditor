@@ -68,6 +68,31 @@ const hotswapShmSize = 65536
 // generous headroom over the sub-100ms cost typically observed.
 const swapResultTimeout = 5 * time.Second
 
+// windowsStaticRuntimeFlag links the mingw runtime (winpthreads above all)
+// STATICALLY into the local-sim loader-host and logic module.
+//
+// ⚠️ Without it a Windows simulation cannot start AT ALL. llvm-mingw ships both
+// libwinpthread.a and libwinpthread.dll.a, and the linker prefers the import
+// library — so plc_host.exe and logic_<n>.so both ended up importing
+// libwinpthread-1.dll, which lives buried in the toolchain sysroot
+// (toolchains/sysroots/x86_64-w64-mingw32/x86_64-w64-mingw32/bin) and is on
+// neither the build dir nor PATH. The host then died with STATUS_DLL_NOT_FOUND
+// (0xC0000135) before reaching main, or — once the host was fixed — its
+// LoadLibraryA of the logic module failed with Win32 error 126. Either way
+// nothing wrote swap_result, so the failure surfaced only as the agent's 5 s
+// "cold-start outcome unknown (timeout) — host killed".
+//
+// ⚠️ It must apply to the LOGIC MODULE too, not just the host: the transpiler's
+// per-task exec-time instrumentation calls clock_gettime, which comes from
+// winpthreads, so every project that has a task (i.e. every real one) pulled in
+// the same DLL import even when the host itself was clean.
+//
+// compileSimulation already passes -static for the same reason; this is the
+// hot-swap path catching up. It is deliberately NOT folded into
+// hostSimLinkArgs(): -static is a driver flag that must precede the sources,
+// while those are trailing -l flags.
+const windowsStaticRuntimeFlag = "-static"
+
 type ShmSpec struct {
 	Key      string
 	Offset   uint64
@@ -250,6 +275,9 @@ func (s *Server) compileLogic(buildDir string, ver int) (string, string, error) 
 	// fresh inode while the old inode stays mapped.
 	tmpSO := hotswaplib.TempGenerationPath(buildDir, ver)
 	args := append([]string{}, baseArgs...)
+	if runtime.GOOS == "windows" {
+		args = append(args, windowsStaticRuntimeFlag)
+	}
 	args = append(args,
 		"-shared", "-fPIC", "-DPLC_HOTSWAP", "-DKRON_EC_SIM",
 		"-I", buildDir, "-I", resInclude, "-I", filepath.Join(resInclude, "HAL"),
@@ -306,9 +334,22 @@ func hostBinName() string {
 // logic DLL can bind to its symbols at link time (Windows only).
 const hostImportLibName = "plc_host.lib"
 
+// hostLinkRecipe names the platform link flags that shape the loader-host
+// binary. It is mixed into hostInputsHash because the cache key otherwise
+// covers only the C SOURCES — so a change to the link recipe alone (exactly
+// what the Windows -static fix is) would leave every existing installation
+// happily reusing the plc_host it built the old, broken way.
+func hostLinkRecipe() string {
+	if runtime.GOOS == "windows" {
+		return "win:static+export-all-symbols+winpthread"
+	}
+	return "unix:rdynamic+pthread+dl+rt"
+}
+
 func hostInputsHash(buildDir string) string {
 	h := sha256.New()
 	h.Write([]byte(hotswapHostC))
+	h.Write([]byte(hostLinkRecipe()))
 	if b, err := os.ReadFile(filepath.Join(buildDir, "host_glue.c")); err == nil {
 		h.Write([]byte("glue"))
 		h.Write(b)
@@ -339,6 +380,9 @@ func (s *Server) compileHost(buildDir string) (string, error) {
 		return "", err
 	}
 	args := append([]string{}, baseArgs...)
+	if runtime.GOOS == "windows" {
+		args = append(args, windowsStaticRuntimeFlag)
+	}
 	args = append(args, "-O2", hostC)
 	if runtime.GOOS == "windows" {
 		// --export-all-symbols + --out-implib is mingw's stand-in for -rdynamic:
@@ -799,13 +843,25 @@ func (s *Server) handleHotSwapRun(w http.ResponseWriter, r *http.Request) {
 	// declaring "started" — a fresh run that can't even bind logic_0.so
 	// (e.g. a stale/mismatched build) exits almost immediately; without this
 	// poll that would look identical to a normal successful start.
-	status, detail, perr := hotswaplib.PollSwapResult(swapResultPath(buildDir), 0, swapResultTimeout)
+	status, detail, perr := awaitColdStart(buildDir, done)
 	if perr != nil {
 		// Outcome unknown: don't leave a half-tracked host running with no
 		// poller — kill it and clean up so the failure is deterministic.
 		s.hotswap.Stop()
 		s.events.Emit("simulation-output", map[string]any{"status": "hotswap-unknown", "phase": "coldstart"})
-		writeJSON(w, http.StatusGatewayTimeout, map[string]any{"ok": false, "error": "cold-start outcome unknown (timeout) — host killed", "pid": pid, "confirmed": false})
+		msg := "cold-start outcome unknown (timeout) — host killed"
+		// A host that died without reporting can still say WHY through its exit
+		// status, which is the only signal left when it never reached main
+		// (Windows STATUS_DLL_NOT_FOUND being the classic case). ProcessState is
+		// safe to read here: the reaper's cmd.Wait has returned iff done closed.
+		if exited(done) && cmd.ProcessState != nil {
+			msg = fmt.Sprintf("loader-host exited (status 0x%08X) without reporting a cold-start result",
+				uint32(cmd.ProcessState.ExitCode()))
+			if uint32(cmd.ProcessState.ExitCode()) == 0xC0000135 {
+				msg += " — a DLL it links against is missing; rebuild the loader-host"
+			}
+		}
+		writeJSON(w, http.StatusGatewayTimeout, map[string]any{"ok": false, "error": msg, "pid": pid, "confirmed": false})
 		return
 	}
 	if status != "OK" {
@@ -816,6 +872,48 @@ func (s *Server) handleHotSwapRun(w http.ResponseWriter, r *http.Request) {
 	s.events.Emit("simulation-output", map[string]any{"status": "started", "mode": "hotswap"})
 	go s.hotswapPoller(specs, stopCh)
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "pid": pid, "confirmed": true})
+}
+
+// exited reports whether ch is already closed, without blocking.
+func exited(ch <-chan struct{}) bool {
+	select {
+	case <-ch:
+		return true
+	default:
+		return false
+	}
+}
+
+// awaitColdStart waits for the loader-host's cold-start result, watching the
+// process's `done` channel alongside the result file.
+//
+// A host that dies before it can report used to burn the whole
+// swapResultTimeout and then be reported as an opaque "outcome unknown", hiding
+// an exit status that names the problem exactly. Watching `done` turns that
+// into an immediate, specific failure.
+//
+// ⚠️ On exit we still RE-READ the file rather than concluding failure: the
+// result is written just before some legitimate exits (a project with zero
+// tasks binds fine, writes OK COLDSTART, then returns because it has no scan
+// threads to join), so treating "process gone" as failure would misreport a
+// successful cold start. The file is the truth; the process state only bounds
+// how long we wait for it.
+func awaitColdStart(buildDir string, done <-chan struct{}) (status, detail string, err error) {
+	type result struct {
+		status, detail string
+		err            error
+	}
+	ch := make(chan result, 1) // buffered: the poller must never block once we stop reading
+	go func() {
+		st, det, e := hotswaplib.PollSwapResult(swapResultPath(buildDir), 0, swapResultTimeout)
+		ch <- result{st, det, e}
+	}()
+	select {
+	case r := <-ch:
+		return r.status, r.detail, r.err
+	case <-done:
+		return hotswaplib.PollSwapResult(swapResultPath(buildDir), 0, 250*time.Millisecond)
+	}
 }
 
 type hotSwapSwapReq struct {

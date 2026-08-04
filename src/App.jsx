@@ -2228,31 +2228,8 @@ function App() {
     [deviceInterfaceConfig, selectedBoard]
   );
 
-  const handleAgentCheckCompile = useCallback(async () => {
-    const stErrors = validateProjectST(projectStructure, [], hwPortVars);
-    if (stErrors.length > 0) {
-      return {
-        ok: false,
-        stage: 'st-validation',
-        errors: stErrors.map(e => `[${e.context}] Line ${e.line}:${e.column} — ${e.word}`),
-        note: `${stErrors.length} ST identifier error(s) found before reaching the C compiler.`,
-      };
-    }
-    try {
-      const standardHeaders = await host.getStandardHeaders().catch(() => []);
-      const cCode = transpileToC(projectStructure, standardHeaders, selectedBoard, true, buses, busConfigs);
-      await host.writePlcFiles({
-        header: cCode.header,
-        source: cCode.source,
-        variableTable: JSON.stringify(cCode.variableTable, null, 2),
-        hal: cCode.hal || '',
-      });
-      await host.compileSimulation();
-      return { ok: true, stage: 'compile', message: 'Compiled successfully — no errors.' };
-    } catch (err) {
-      return { ok: false, stage: 'compile', error: err.message || String(err), log: err.log || '' };
-    }
-  }, [projectStructure, selectedBoard, buses, busConfigs, hwPortVars]);
+  // (The agent's check_compile tool was removed — see agentTools.js. Compiling
+  // is a human, toolbar-initiated action; the agent never builds.)
 
   const boardBlocks = useMemo(() => {
     if (!selectedBoard) return [];
@@ -3163,7 +3140,6 @@ function App() {
                         hotSwapActive={isHotSwap}
                         onStartHotSwap={startHotSwapSession}
                         onStopHotSwap={stopHotSwapSession}
-                        onCheckCompile={handleAgentCheckCompile}
                         askRequest={agentAsk}
                       />
                     </div>

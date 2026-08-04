@@ -156,6 +156,11 @@ func (s *Server) handleAIChat(w http.ResponseWriter, r *http.Request) {
 		msg aiMessage
 		err error
 	)
+	// Wall time of the PROVIDER call only. Without it "the agent is slow" cannot
+	// be attributed: the gaps between log entries also contain the human's
+	// approval time in Manual mode, so they overstate model latency by an
+	// unknown amount. See logAIChat.
+	started := time.Now()
 	switch strings.ToLower(strings.TrimSpace(req.Provider)) {
 	case "anthropic":
 		msg, err = callAnthropic(ctx, req, "")
@@ -192,7 +197,7 @@ func (s *Server) handleAIChat(w http.ResponseWriter, r *http.Request) {
 	}
 	// Log the exchange (request + raw model output) so failures/odd outputs can
 	// be inspected later — see {AppDataDir}/ai-agent.log.
-	s.logAIChat(req, projectContext, msg, err)
+	s.logAIChat(req, projectContext, msg, err, time.Since(started))
 	if err != nil {
 		writeError(w, http.StatusBadGateway, friendlyProviderError(req.Model, err))
 		return
@@ -211,7 +216,7 @@ func truncForLog(s string, n int) string {
 // logAIChat appends one agent exchange — the request we sent (system prompt,
 // messages, tool names) and the model's raw output (text + tool calls, or the
 // error) — to {AppDataDir}/ai-agent.log. Best-effort; never fails the request.
-func (s *Server) logAIChat(req aiChatReq, projectContext string, msg aiMessage, callErr error) {
+func (s *Server) logAIChat(req aiChatReq, projectContext string, msg aiMessage, callErr error, took time.Duration) {
 	path := filepath.Join(s.paths.AppDataDir, "ai-agent.log")
 	f, e := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
 	if e != nil {
@@ -220,7 +225,21 @@ func (s *Server) logAIChat(req aiChatReq, projectContext string, msg aiMessage, 
 	defer f.Close()
 
 	var b strings.Builder
-	fmt.Fprintf(&b, "\n===== %s  %s / %s =====\n", time.Now().Format("2006-01-02 15:04:05"), req.Provider, req.Model)
+	fmt.Fprintf(&b, "\n===== %s  %s / %s  (provider call: %.1fs) =====\n",
+		time.Now().Format("2006-01-02 15:04:05"), req.Provider, req.Model, took.Seconds())
+	// Prompt size is the other half of the latency question: the loop re-sends
+	// system + tools + the whole history every turn, and only Anthropic gets a
+	// cache discount on that prefix (see callAnthropic's cache_control).
+	sysChars := len(req.System) + len(projectContext)
+	histChars := 0
+	for _, m := range req.Messages {
+		histChars += len(m.Content)
+		for _, tc := range m.ToolCalls {
+			histChars += len(tc.Arguments)
+		}
+	}
+	fmt.Fprintf(&b, "--- sizes: system+context %d chars, history %d chars, %d messages, %d tools ---\n",
+		sysChars, histChars, len(req.Messages), len(req.Tools))
 	fmt.Fprintf(&b, "--- request: system ---\n%s\n", truncForLog(req.System, 4000))
 	// Logged from the caller's saved copy, not req.Context: for non-Anthropic
 	// providers that field has already been folded into System and cleared.

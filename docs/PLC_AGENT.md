@@ -18,7 +18,7 @@ Source files:
 ## 1. Design principles
 
 1. **Propose → approve, never mutate.** `applyToolCall(struct, name, args)` is a pure function: it never mutates the project in place. A write tool returns `{ mutation: true, next, diff }` — `next` is a *proposed* new projectStructure, `diff` is what the user sees. Only on approval does the panel commit `next` via `setProjectStructure`. Rejection throws the proposal away and tells the model it was rejected, so it can adapt.
-2. **Read tools run free, write tools are gated.** Reads (`get_project_overview`, `read_pou`, `list_blocks`, `read_live_variables`, `watch_live_variables`, `check_compile`) auto-execute and their results are fed straight back to the model. Writes accumulate into one **proposal card** per assistant turn (`role: 'proposal'`, `status: 'pending'`) with Approve/Reject.
+2. **Read tools run free, write tools are gated.** Reads (`get_project_overview`, `read_pou`, `list_blocks`, `read_live_variables`, `watch_live_variables`) auto-execute and their results are fed straight back to the model. Writes accumulate into one **proposal card** per assistant turn (`role: 'proposal'`, `status: 'pending'`) with Approve/Reject.
 3. **The board is read-only context.** There is deliberately no tool that changes hardware config.
 4. **Agent output must be indistinguishable from human editing.** Whatever a tool produces (rungs, blocks, wires, variables) must be exactly the shape the editor produces by hand and the transpiler consumes — same `customData`, same handle names, same variable objects. This is enforced by construction (shared tables/imports) and by the gate (§9).
 5. **Weak models are a supported floor, not the target.** Multiple recovery layers (§4) keep a 7B local model *usable*; a native-tools cloud model is the intended experience.
@@ -57,8 +57,7 @@ Key mechanics in `AiAgentPanel.jsx`:
 - **Working-copy chaining.** Within one turn, `working` starts as the current project and each approved-tool-in-waiting mutates it (`working = res.next`). This is why `create_pou` + `add_variable` + `set_ladder` in a single response works: the later calls see the POU the earlier one created — *before* any approval.
 - **POU-target inference (weak-model safety net).** A local-scope tool whose `pou` doesn't resolve is rewritten to the last-touched / just-created / currently-open POU. It only ever overrides an *unresolvable* target, never a valid one.
 - **Argument injection.** The panel injects panel-side context the pure module can't know:
-  - `args.__library` (the XML block library) for `list_blocks` **and `set_ladder`** (FB pin resolution);
-  - `args.__compile` (the result of an actual toolbar-equivalent compile) for `check_compile`.
+  - `args.__library` (the XML block library) for `list_blocks` **and `set_ladder`** (FB pin resolution).
 - **Config** persists in `localStorage["aiAgentConfig"]` (`{provider, model, apiKey, baseUrl}`). User-visible name is "PLC Agent"; code symbols keep `AiAgentPanel`/`aiAgentConfig`.
 
 ---
@@ -121,7 +120,6 @@ Before this tool the prompt told the model to write its questions as prose with 
 | `list_blocks` | The block catalog with REAL pin names/types (`buildBlockCatalog`): standard XML library + the project's own FBs/functions. The prompt forbids using any FB's pins from memory — it must call this. |
 | `read_live_variables` | Buffered snapshot + recent history of live values (only meaningful while sim/PLC is running). |
 | `watch_live_variables` | Awaits a trailing time-window of per-variable samples, then injects a condensed summary (`summarizeWatch`) — the tool for time-dependent verification (timers, oscillation). |
-| `check_compile` | Transpiles + actually compiles the current project with the bundled clang (same as the toolbar Build). Failure returns real compiler diagnostics for the model to map back to IEC source. Success ≠ correct logic, only compilable. |
 
 `renderRungs` is the agent's *eyes* for ladder: it traces each rung's power-flow graph into readable boolean logic (`Motor := (Start | Motor) & NOT Stop`), renders edge contacts as `RISING(x)`/`FALLING(x)`, and for each FB reports `{ type, instance, triggeredBy, pins, qOutput }` — downstream coil logic reads `instance.Q`, so the model can reconstruct and edit an existing rung rather than just knowing "there's a timer".
 
@@ -229,7 +227,7 @@ The system prompt routes STRICTLY per rung, not per POU:
 
 - While a simulation/PLC runs, the panel keeps a rolling ring buffer of timestamped live-variable snapshots. `read_live_variables` returns a condensed per-variable series (last/first/min/max, change count, oscillating/constant flags, down-sampled tail); `watch_live_variables` *waits* a window and then summarizes — the prompt routes any time-dependent check (did the timer fire? is it blinking at 1 Hz?) to `watch`, and tells the model to auto-verify after any change/deploy.
 - **Online change:** when a hot-swap session is active, approving a proposal calls `onHotSwap(touchedPous)` → `App.handleAgentHotSwap`, which pre-checks `layoutSignatureDiff` (names exactly which non-swappable thing changed, if any), confirms with the user, then pushes the recompiled logic as a live swap (local sim) or to the target (`hotswapTargetLogic` + `hotswapDeploySwap`) — state preserved, no restart. The C-level `plc_state_layout_hash` remains the unconditional safety net.
-- `check_compile` gives the model the same ground truth the Build button gives the human.
+- ⚠️ **The agent cannot compile — there is deliberately no build tool.** `check_compile` was removed: it ran a real transpile + bundled-clang compile, whose ~242 MB clang cold load dominates the cost, and the model reached for it after almost every change, so each edit paid a full build and the agent felt interminably slow. Compiling is now a human, toolbar-initiated action. `applyToolCall` keeps a `case 'check_compile'` guard that returns a terminal, actionable error (a model can still name it from an older transcript), and the system prompt states plainly that it must never build or "verify by compiling". Do not re-add it without making it opt-in and bounding how often it can run.
 
 ---
 
