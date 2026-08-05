@@ -3,11 +3,13 @@ package main
 import (
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 )
 
 // Path resolver — mirrors the layout that lived under src-tauri/.
@@ -69,6 +71,12 @@ func targetResourceKey(target string) (string, error) {
 		return "x86_64-w64-mingw32", nil
 	case "x86_64/macos":
 		return "x86_64-apple-darwin", nil
+	case "arm64/macos":
+		// Apple Silicon (M-series). Its own key because the Krontek static
+		// archives are per-ABI — linking the x86_64 .a files into an arm64
+		// build fails at link time, so an Intel Mac and an M-series Mac need
+		// separate resources/<triple>/lib trees.
+		return "aarch64-apple-darwin", nil
 	case "arm/aarch64":
 		return "aarch64-linux-gnu", nil
 	case "arm/armv7":
@@ -133,6 +141,49 @@ func (p *Paths) LLVMBin(name string) string {
 // `triple` here is the LLVM triple (e.g. "x86_64-linux-gnu"), NOT the UI target key.
 func (p *Paths) LLVMSysroot(triple string) string {
 	return filepath.Join(p.ToolchainsRoot, "sysroots", triple)
+}
+
+// macSDKOnce caches the macOS SDK path — resolving it shells out to xcrun,
+// and every local-sim compile (sim binary, loader-host, each logic module)
+// would otherwise pay for that.
+var macSDKOnce struct {
+	sync.Once
+	path string
+	err  error
+}
+
+// MacOSSDKPath returns the macOS SDK root for the HOST compile (darwin only).
+//
+// ⚠️ Unlike every other target, macOS has no sysroot bundled under
+// toolchains/sysroots/: Apple does not permit redistributing the SDK, so the
+// libc/framework headers must come from the user's Xcode Command Line Tools.
+// The bundled upstream LLVM clang is not Apple's clang and does not reliably
+// infer the SDK on its own, so the driver is given an explicit -isysroot.
+// A missing CLT is reported here with the exact command to fix it — otherwise
+// it surfaces much later as a wall of "stdio.h file not found".
+func (p *Paths) MacOSSDKPath() (string, error) {
+	macSDKOnce.Do(func() {
+		if sdk := os.Getenv("SDKROOT"); sdk != "" {
+			if _, err := os.Stat(sdk); err == nil {
+				macSDKOnce.path = sdk
+				return
+			}
+		}
+		out, err := exec.Command("xcrun", "--sdk", "macosx", "--show-sdk-path").Output()
+		if err != nil {
+			macSDKOnce.err = fmt.Errorf(
+				"macOS SDK not found: xcrun failed (%v). Install the Xcode Command Line Tools with:\n"+
+					"    xcode-select --install", err)
+			return
+		}
+		sdk := strings.TrimSpace(string(out))
+		if sdk == "" {
+			macSDKOnce.err = fmt.Errorf("macOS SDK not found: `xcrun --show-sdk-path` returned nothing")
+			return
+		}
+		macSDKOnce.path = sdk
+	})
+	return macSDKOnce.path, macSDKOnce.err
 }
 
 // LLVMClangResourceDir returns the highest-version Clang resource dir.

@@ -22,7 +22,11 @@ type shmMirror struct {
 	size int
 }
 
-func openShmMirror(name string, size int, write bool) (*shmMirror, error) {
+// dir is the loader-host's working directory; unused on Windows, where the
+// mapping lives in the kernel object namespace rather than on disk. It exists
+// in the signature for the macOS implementation, which backs the mirror with a
+// real file next to the build output.
+func openShmMirror(dir, name string, size int, write bool) (*shmMirror, error) {
 	if size <= 0 {
 		return nil, fmt.Errorf("invalid mirror size %d", size)
 	}
@@ -82,7 +86,7 @@ func (m *shmMirror) Close() {
 // removeShmMirror is a no-op on Windows: a named section is reference-counted
 // by the kernel and disappears on its own once the loader-host (its only
 // creator) exits. There is no name to unlink.
-func removeShmMirror(string) {}
+func removeShmMirror(dir, name string) {}
 
 // x/sys/windows wraps CreateFileMapping but NOT OpenFileMapping, so bind it
 // directly. Opening (rather than creating) is deliberate — see the type doc.

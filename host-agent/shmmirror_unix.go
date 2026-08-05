@@ -1,4 +1,4 @@
-//go:build !windows
+//go:build !windows && !darwin
 
 package main
 
@@ -9,9 +9,10 @@ import (
 
 // shmMirror is the agent's handle on the loader-host's shared-memory mirror —
 // the single place live values are read from and force-writes are injected
-// into. The two platforms create the segment very differently (POSIX shm object
-// vs Win32 named section), so the difference is confined to this pair of files
-// and everything above addresses the mirror purely by byte offset.
+// into. The three platforms create the segment very differently (POSIX shm
+// object vs Win32 named section vs a plain mmap'd file on macOS), so the
+// difference is confined to this set of files and everything above addresses
+// the mirror purely by byte offset.
 //
 // On Linux a POSIX shm object is just a file under /dev/shm, so ordinary
 // ReadAt/WriteAt is the whole implementation.
@@ -23,7 +24,12 @@ type shmMirror struct {
 // the POSIX shm name emitted by the generated plc.c (plc_shm_name()), e.g.
 // "/plc_runtime". Fails while the host is still starting — callers treat that
 // as "not up yet" and retry.
-func openShmMirror(name string, size int, write bool) (*shmMirror, error) {
+//
+// dir is the loader-host's working directory; unused on Linux, where the
+// segment is named in the global /dev/shm namespace rather than placed on
+// disk. It exists in the signature for the macOS implementation, which backs
+// the mirror with a real file next to the build output.
+func openShmMirror(dir, name string, size int, write bool) (*shmMirror, error) {
 	flag := os.O_RDONLY
 	if write {
 		flag = os.O_RDWR
@@ -52,4 +58,4 @@ func (m *shmMirror) Close() { _ = m.f.Close() }
 
 // removeShmMirror drops a stale segment left by a previous run so a fresh cold
 // start never reads another generation's values.
-func removeShmMirror(name string) { _ = os.Remove("/dev/shm" + name) }
+func removeShmMirror(dir, name string) { _ = os.Remove("/dev/shm" + name) }

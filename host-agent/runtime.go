@@ -83,14 +83,16 @@ func (s *Server) handleRunSimulation(w http.ResponseWriter, r *http.Request) {
 	}
 	// ⚠️ This is the LEGACY plain-sim path: it runs the binary and reads its
 	// variables out of /proc/<pid>/mem using ELF/DWARF symbol offsets. Neither
-	// exists on Windows, and porting it would mean a PE/DWARF reader plus
-	// ReadProcessMemory for no user-visible gain — hot-swap is the default sim
-	// runtime and reads the shared-memory mirror by variables.json offset, so
-	// it needs no debug info at all. Fail with a clear reason rather than
-	// letting parseELFSymbols report "bad magic" on a PE file.
-	if runtime.GOOS == "windows" {
+	// exists on Windows or macOS, and porting it would mean a PE- or
+	// Mach-O-aware reader plus ReadProcessMemory / mach_vm_read (the latter
+	// additionally blocked by SIP and task_for_pid entitlements) for no
+	// user-visible gain — hot-swap is the default sim runtime and reads the
+	// shared-memory mirror by variables.json offset, so it needs no debug info
+	// at all. Fail with a clear reason rather than letting parseELFSymbols
+	// report "bad magic" on a PE or Mach-O file.
+	if runtime.GOOS == "windows" || runtime.GOOS == "darwin" {
 		writeError(w, http.StatusBadRequest,
-			"the plain simulation runtime is Linux-only; Windows uses the hot-swap runtime (POST /api/host/hotswap/run)")
+			"the plain simulation runtime is Linux-only; this platform uses the hot-swap runtime (POST /api/host/hotswap/run)")
 		return
 	}
 	buildDir := s.paths.BuildDir()

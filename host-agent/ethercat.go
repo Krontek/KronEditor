@@ -6,20 +6,13 @@ import (
 	"net/http"
 )
 
-// EtherCAT-related commands. The original Tauri code uses bundled Python
-// scripts and SOEM/CANopen sources to build static archives, and SOEM C ABI
-// to request live EtherCAT state changes. Porting these is deferred — they
-// require shelling out to the same Python build scripts plus a CGO bridge
-// for live SOEM calls, neither of which is critical for the editor's main
-// workflow.
-
-func (s *Server) handleBuildSoem(w http.ResponseWriter, r *http.Request) {
-	writeError(w, http.StatusNotImplemented, "build_soem not yet ported to host-agent")
-}
-
-func (s *Server) handleBuildCanopen(w http.ResponseWriter, r *http.Request) {
-	writeError(w, http.StatusNotImplemented, "build_canopen not yet ported to host-agent")
-}
+// EtherCAT-related commands.
+//
+// build_soem and build_canopen used to live here as stubs; they are real now
+// and live with the rest of the library builder in libraries_deps.go.
+//
+// ec_request_state stays unported: it needs a CGO bridge to call the live SOEM
+// C ABI in the running runtime, which the editor's main workflow never uses.
 
 func (s *Server) handleEcRequestState(w http.ResponseWriter, r *http.Request) {
 	writeError(w, http.StatusNotImplemented, "ec_request_state not yet ported to host-agent")

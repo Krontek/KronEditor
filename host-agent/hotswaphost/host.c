@@ -34,20 +34,29 @@
 #include <time.h>
 
 /* ── Platform shim ───────────────────────────────────────────────────────────
- * The scan engine, the barrier, the generation/ping-pong logic and the swap
- * protocol are IDENTICAL on both platforms; only four primitives differ:
+ * The scan engine, the generation/ping-pong logic and the swap protocol are
+ * IDENTICAL on all three platforms; only a handful of primitives differ:
  *
- *      shared memory   shm_open+ftruncate+mmap  |  CreateFileMapping+MapViewOfFile
- *      dynamic load    dlopen/dlsym/dlclose     |  LoadLibrary/GetProcAddress/FreeLibrary
- *      swap signal     SIGUSR1                  |  named auto-reset Event
- *      module suffix   (none — path is given)   |  (none — path is given)
+ *                     Linux                    | Windows                        | macOS
+ *   shared memory     shm_open+ftruncate+mmap  | CreateFileMapping+MapViewOfFile | open+ftruncate+mmap (real file)
+ *   dynamic load      dlopen/dlsym/dlclose     | LoadLibrary/GetProcAddress/…    | dlopen/dlsym/dlclose
+ *   swap signal       SIGUSR1                  | named auto-reset Event          | SIGUSR1
+ *   sleep to deadline clock_nanosleep ABSTIME  | waitable timer                  | mach_wait_until
+ *   barrier           pthread_barrier_*        | pthread_barrier_* (winpthreads) | shim (mutex + condvar)
  *
- * pthreads and clock_gettime come from winpthreads (link -lwinpthread), so the
- * barrier and the scan structure have ONE implementation. Keep it that way —
- * the barrier/scan logic is the part that must not diverge. The ONE timing
- * primitive that had to differ is the sleep-until-deadline (see
- * plc_sleep_until: winpthreads' clock_nanosleep does not honour
- * TIMER_ABSTIME and returns immediately).
+ * Everything else — the scan structure, the swap protocol, the ping-pong slot
+ * rules — has exactly ONE implementation. Keep it that way; the barrier/scan
+ * logic is the part that must not diverge, which is why macOS gets a barrier
+ * SHIM under the standard names rather than a second copy of the scan loop.
+ *
+ * ⚠️ Two "POSIX" primitives are missing on macOS and both fail at COMPILE
+ * time, so neither can be discovered late:
+ *   - clock_nanosleep() does not exist (no TIMER_ABSTIME sleep at all).
+ *   - pthread_barrier_* was never implemented — Apple skipped the optional
+ *     POSIX barriers entirely, so _POSIX_BARRIERS is undefined.
+ * A third difference is silent and therefore worse: macOS has no /dev/shm, and
+ * a shm_open'd object is invisible to the filesystem, so the Go agent could
+ * never read it back. See mirror_path() below.
  *
  * ⚠️ Windows keeps a LOADED module's file locked, so a slot cannot be
  * overwritten while it is live. The 2-slot ping-pong already guarantees we only
@@ -109,9 +118,103 @@ static plc_module_t plc_dlopen(const char *p)              { return dlopen(p, RT
 static void        *plc_dlsym(plc_module_t h, const char *n) { return dlsym(h, n); }
 static void         plc_dlclose(plc_module_t h)            { if (h) dlclose(h); }
 static const char  *plc_dlerror(void)                      { return dlerror(); }
+
+#if defined(__APPLE__)
+#include <errno.h>
+#include <mach/mach_time.h>
+
+/* ⚠️ macOS has NO clock_nanosleep — not a stubbed one, it is simply absent, so
+ * this is a compile error rather than a silent no-op. mach_wait_until is the
+ * platform's absolute high-resolution sleep and keeps the same zero-drift
+ * property: the caller advances `next` by the interval every scan, so any
+ * overshoot is absorbed on the following iteration instead of accumulating. */
+static void plc_sleep_until(const struct timespec *deadline) {
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    int64_t delta_ns = ((int64_t)deadline->tv_sec - (int64_t)now.tv_sec) * 1000000000LL
+                     + ((int64_t)deadline->tv_nsec - (int64_t)now.tv_nsec);
+    if (delta_ns <= 0) return;   /* already late — run the next scan immediately */
+    /* Benign race: several task threads may initialise this concurrently, but
+     * mach_timebase_info is a constant for the machine, so every writer stores
+     * identical values. ⚠️ numer/denom is NOT 1/1 on Apple Silicon (the
+     * timebase is 24 MHz), so mach ticks must really be converted — treating
+     * them as nanoseconds would make every task run ~41x too fast. */
+    static mach_timebase_info_data_t tb;
+    if (tb.denom == 0) mach_timebase_info(&tb);
+    uint64_t ticks = (uint64_t)delta_ns * (uint64_t)tb.denom / (uint64_t)tb.numer;
+    mach_wait_until(mach_absolute_time() + ticks);
+}
+
+/* ⚠️ macOS ships no pthread_barrier_* at all (the optional POSIX barriers were
+ * never implemented). The scan-boundary barrier is the core of the swap
+ * mechanism, so rather than fork the scan loop we provide the three functions
+ * it uses under their standard names — the loop below stays byte-identical
+ * across platforms.
+ *
+ * Phase-counted so the barrier is safely REUSABLE: a thread records the phase
+ * it entered on and sleeps until the phase advances, which is what makes a
+ * fast thread unable to race ahead into the next barrier round and steal a
+ * slot from a straggler still waiting in the previous one. */
+typedef struct {
+    pthread_mutex_t m;
+    pthread_cond_t  c;
+    unsigned        count;    /* threads required to trip the barrier */
+    unsigned        waiting;
+    unsigned        phase;
+} pthread_barrier_t;
+typedef int pthread_barrierattr_t;
+#define PTHREAD_BARRIER_SERIAL_THREAD 1
+
+static int pthread_barrier_init(pthread_barrier_t *b, const pthread_barrierattr_t *a, unsigned n) {
+    (void)a;
+    if (n == 0) return EINVAL;
+    pthread_mutex_init(&b->m, NULL);
+    pthread_cond_init(&b->c, NULL);
+    b->count = n; b->waiting = 0; b->phase = 0;
+    return 0;
+}
+
+static int pthread_barrier_wait(pthread_barrier_t *b) {
+    pthread_mutex_lock(&b->m);
+    unsigned phase = b->phase;
+    if (++b->waiting == b->count) {
+        b->phase++;
+        b->waiting = 0;
+        pthread_cond_broadcast(&b->c);
+        pthread_mutex_unlock(&b->m);
+        return PTHREAD_BARRIER_SERIAL_THREAD;
+    }
+    while (phase == b->phase) pthread_cond_wait(&b->c, &b->m);
+    pthread_mutex_unlock(&b->m);
+    return 0;
+}
+
+/* mirror_path maps the POSIX shm name the generated plc.c exports
+ * ("/plc_runtime") onto a regular file in this process's working directory
+ * (the build dir, set by the agent via cmd.Dir).
+ *
+ * ⚠️ Why not shm_open, which macOS does have? Because the Go agent has to READ
+ * the mirror, and on macOS a shm object has no filesystem presence — the agent
+ * would need shm_open itself, i.e. cgo, since neither the stdlib nor
+ * x/sys/unix wraps it on darwin. Apple's shm_open also caps names at 31 chars
+ * and permits ftruncate exactly ONCE per object, so a second cold start could
+ * not resize a surviving segment. An mmap(MAP_SHARED) file gives the identical
+ * coherent shared page with none of that.
+ *
+ * ⚠️ shmmirror_darwin.go's mirrorPath() performs the SAME transformation. If
+ * one side changes, the agent reads a file nobody writes and every live value
+ * silently freezes at zero — change both together. */
+static const char *mirror_path(const char *nm) {
+    static char buf[256];
+    if (*nm == '/') nm++;
+    snprintf(buf, sizeof buf, "./%s.mirror", nm);
+    return buf;
+}
+#else
 static void plc_sleep_until(const struct timespec *deadline) {
     clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, deadline, NULL);
 }
+#endif /* __APPLE__ */
 #endif
 
 volatile uint64_t us_tick = 0;   /* owned + exported for the logic.so */
@@ -384,6 +487,18 @@ int main(int argc, char **argv) {
         if (hm) {
             void *m = MapViewOfFile(hm, FILE_MAP_ALL_ACCESS, 0, 0, (SIZE_T)sz);
             if (m) __plc_shm = (unsigned char *)m;
+        }
+#elif defined(__APPLE__)
+        /* File-backed mirror in the cwd (= the build dir the agent spawned us
+         * in), which is exactly where shmmirror_darwin.go looks. See
+         * mirror_path() for why macOS cannot use shm_open here. */
+        int fd = open(mirror_path(shm_name()), O_CREAT | O_RDWR, 0666);
+        if (fd >= 0) {
+            if (ftruncate(fd, (off_t)sz) == 0) {
+                void *m = mmap(NULL, sz, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+                if (m != MAP_FAILED) __plc_shm = (unsigned char *)m;
+            }
+            close(fd);
         }
 #else
         int fd = shm_open(shm_name(), O_CREAT | O_RDWR, 0666);

@@ -19,6 +19,7 @@ This file is the durable knowledge base for anyone (human or AI) working on the 
 12. [Security model](#12-security-model)
 13. [EtherCAT & motion](#13-ethercat--motion)
 14. [Library system & clipboard](#14-library-system--clipboard)
+15. [Library builder (Settings → Libraries)](#15-library-builder-settings--libraries)
 
 ---
 
@@ -53,7 +54,7 @@ Three processes cooperate:
 ### Tauri has been removed
 The old Tauri v2 desktop wrapper (`src-tauri/`) is gone in favour of browser + host-agent. All `invoke('cmd', args)` calls became `host.<method>(args)` (`src/services/HostClient.js`); event listeners became SSE via `host.streamEvents()`; the Tauri fs/dialog/clipboard plugins became `src/services/browserFs.js` + `navigator.clipboard`.
 
-**Intentionally stubbed (501)** in the host agent: `update_libraries`, `update_server`, `build_soem`, `build_canopen`, `ec_request_state`. The core compile/run/deploy path doesn't need them.
+**Intentionally stubbed (501)** in the host agent: `ec_request_state` only — it needs a CGO bridge to the live SOEM C ABI, which the editor's main workflow never uses. (`update_libraries`, `update_server`, `build_soem` and `build_canopen` were stubs and are now real — see §15.)
 
 **`deploy_server_to_target` IS implemented** (`host-agent/deploy_ssh.go`, uses `golang.org/x/crypto/ssh` + `github.com/pkg/sftp`): SFTP-uploads the prebuilt `plc-agent` for the board to `<home>/plc/plc-agent`, installs a supervisor (systemd unit if `/run/systemd/system` exists, else a cron `@reboot` restart loop), starts it, and polls `http://host:7070/status` (5×2s) to verify. Progress streams on the `server-deploy-progress` SSE topic.
 - **Auth tries `ssh.Password` AND `ssh.KeyboardInteractive` (same password)** — PAM-only servers offer only keyboard-interactive, so a correct password fails without the fallback.
@@ -153,12 +154,18 @@ It propagates everywhere; never hardcode a version string:
 - **Windows installer**: `build-windows.sh` interpolates the version straight into the NSIS script it generates (`APPVERSION`), which sets the installer's version, its Add/Remove Programs entry and the exe's VERSIONINFO resource.
 
 ### Distributables (`packaging/`)
-⚠️ **`packaging/` holds only the two build scripts plus `packaging/README.md`, and each script emits exactly ONE self-contained artifact beside itself.** No committed ASSET files, no `dist/` tree. Both artifacts are gitignored. **[`packaging/README.md`](packaging/README.md) is the full packaging reference** — purpose, host requirements, the directory contract, the Windows limitation, and how to verify a build; keep it current with these scripts.
+⚠️ **`packaging/` holds only the three build scripts plus `packaging/README.md`, and each script emits exactly ONE self-contained artifact beside itself.** No committed ASSET files, no `dist/` tree. All artifacts are gitignored. **[`packaging/README.md`](packaging/README.md) is the full packaging reference** — purpose, host requirements, the directory contract, the Windows and macOS limitations, and how to verify a build; keep it current with these scripts.
 
 | Script | Artifact | Contents |
 |---|---|---|
 | `build-appimage.sh` | `packaging/KronEditor-x86_64.AppImage` | agent + `resources/` + **linux-host** toolchains → sim AND Build & Send work |
-| `build-windows.sh` | `packaging/KronEditor-Setup-x64.exe` | agent.exe + `resources/` + **windows-host** toolchains → Build & Send works (sim is Linux-only) |
+| `build-windows.sh` | `packaging/KronEditor-Setup-x64.exe` | agent.exe + `resources/` + **windows-host** toolchains → sim AND Build & Send work |
+| `build-mac.sh` | `packaging/KronEditor-<arch>.dmg` | `KronEditor.app` (agent + `resources/` + **macos-host** toolchains) → Build & Send works; sim also needs Xcode CLT on the user's Mac |
+
+- ⚠️ **`build-mac.sh` MUST RUN ON A MAC** — the only artifact this Linux box cannot cut. Windows is cross-built here because `makensis` runs on Linux; macOS has no equivalent (`hdiutil`, `codesign`, `sips`/`iconutil` and the SDK are Apple-only). The script hard-fails on a non-Darwin host instead of emitting something subtly broken.
+- ⚠️ **The macOS artifact is the one that is NOT fully self-contained.** Apple forbids redistributing its SDK, so no `toolchains/sysroots/*-apple-darwin` exists and none can ship. Compiling *for the Mac itself* (local simulation) resolves the SDK at run time with `xcrun --show-sdk-path` (`paths.go` `MacOSSDKPath`, cached via `sync.Once`), so the end user needs `xcode-select --install`. Build & Send links the bundled **Linux** sysroots and needs nothing extra.
+- ⚠️ **The Krontek `.a` archives for `aarch64-apple-darwin` are NOT in the repo** (building `.a` is the user's job, §1). Without them the DMG still Builds & Sends, but local simulation fails at link. `build-mac.sh` detects this and warns loudly with the exact `clang`/`llvm-ar` commands rather than failing — a Build-&-Send-only artifact is still useful. ⚠️ `hostResourceTarget()` follows **GOARCH** on darwin (`arm64/macos` → `aarch64-apple-darwin`): every other host we ship is x86_64, and returning the Intel key on an M-series Mac links wrong-arch archives.
+- ⚠️ **Ad-hoc signed, not notarized.** On Apple Silicon every Mach-O must carry a signature or the kernel kills it on load ("Killed: 9"), so the script signs the bundled clang/lld and the agent **innermost first** (signing a nested binary after its container invalidates the container). That satisfies the loader but not Gatekeeper, so the user needs a one-time `xattr -dr com.apple.quarantine /Applications/KronEditor.app` (printed by the script). Notarizing would need a paid Developer ID and uploading the whole multi-GB image.
 
 - ⚠️ **Anything the artifact needs that used to live in `packaging/` is now GENERATED INLINE by its script** — the AppImage's `AppRun`/`.desktop` come from HEREDOCs, and the Windows installer script is an NSIS `.nsi` written at build time. Adding a committed asset file back to `packaging/` breaks the directory contract; put it in the script.
 - ⚠️ **Staging dirs are per-target and self-deleting**: `packaging/tmplinux/` and `packaging/tmpwin/`, each removed by an `EXIT` trap (so a failed or Ctrl-C'd build cleans up too). They are **separate roots on purpose** — one shared `tmp/` meant the two builds could not run concurrently, because either trap would delete the other's tree. `KEEP_TMP=1` preserves the staging tree for debugging.
@@ -168,7 +175,7 @@ It propagates everywhere; never hardcode a version string:
 
 Facts a packaging change must respect:
 - **Toolchains are per-host; sysroots are shared.** `setup_toolchain.py --host {linux|windows}` downloads the matching LLVM; target sysroots are identical, so Windows `clang.exe` cross-compiles to the Linux PLC targets — **Build & Send works on Windows.**
-- **Local simulation runs on Windows too** (see §6 "Windows simulation"). Only the LEGACY plain-sim path stays Linux-only (`/proc/<pid>/mem` + ELF/DWARF); Windows uses the hot-swap runtime, which is the default anyway. ⚠️ **`GOOS=windows go build ./...` must keep succeeding** — it's a release invariant.
+- **Local simulation runs on Windows and macOS too** (see §6 "Windows simulation" / "macOS simulation"). Only the LEGACY plain-sim path stays Linux-only (`/proc/<pid>/mem` + ELF/DWARF); the others use the hot-swap runtime, which is the default anyway. ⚠️ **`GOOS=windows go build ./...` AND `GOOS=darwin GOARCH=arm64 go build ./...` must keep succeeding** — both are release invariants.
 - `toolchains/` is embedded whole (no on-demand download), so artifacts are multi-GB.
 - ⚠️ **The bundled GCC install dir must be located by GLOB, not built from the compile triple** (`paths.go` `LLVMGCCInstallDir`, passed as `-B` in `llvmCompileBaseArgs` and as a `-L` from `LLVMTargetLibraryDirs`). The sysroots name it with a **"none" vendor** (`arm-none-linux-gnueabihf`, `aarch64-none-linux-gnu`) while we compile with `--target=arm-linux-gnueabihf`; clang's own GCC auto-detection happens to include the aarch64 "none" spelling in its candidate list but **not** the arm one. So `--gcc-toolchain=<sysroot>` alone silently found nothing on armv7 and every `-static` target build died with `cannot open crtbeginT.o` / `unable to find library -lgcc` — **Build & Send was broken for all armv7 BeagleBones** while aarch64 worked by luck. Version dirs are compared with `compareVersionStrings` (numeric per component): `sort.Strings` ranks `9.3.0` above `10.2.1` and would select the older GCC (covered by `paths_gcc_test.go`).
 - Startup is **terminal-only**: the agent logs the URL to stdout; the user opens `http://localhost:7171`.
@@ -289,7 +296,7 @@ The transpiler **always** emits a single `PlcState` struct holding ALL mutable s
 
 **Compile cache:** the bundled clang is ~242 MB; its cold load dominates perceived compile time (actual codegen ~60 ms). `compileSimulation` skips clang when `simInputsHash` (SHA-256 of `plc.c`+`plc.h`) matches `sim_runtime.bin.hash` and the binary exists — so re-toggling Simulation off→on without code changes is near-instant. The hash is captured *before* clang runs, so a concurrent input rewrite safely forces a rebuild next time.
 
-### Hot-swap (online change) — Linux only
+### Hot-swap (online change) — all three hosts
 State-preserving live code update: change logic while running, timers/counters/latches survive. **Hot-swap is the DEFAULT runtime for simulation** — toggling Simulation ON builds+runs the loader-host; there is no separate "Go live" button.
 
 **Split binary:** a stable **loader-host** owns `PlcState` (host memory → survives swap) + the `/dev/shm` mirror + timing + scan threads; a swappable **`logic.so`** holds the POU logic. `-DPLC_HOTSWAP` turns the same `plc.c` into the `.so`, exporting a fixed ABI (`plc_state_size`, `plc_bind`, `plc_state_init`, `plc_task_body_<i>`, `plc_shm_name`, `plc_state_layout_hash`, …). Without the define it builds as the normal single binary.
@@ -327,14 +334,17 @@ State-preserving live code update: change logic while running, timers/counters/l
 ### Windows simulation ⚠️
 Local simulation is **not** Linux-only any more. Windows runs the SAME hot-swap runtime; only the legacy plain-sim path (`handleRunSimulation`) is Linux-only and returns an explicit error on Windows — porting it would need a PE/DWARF reader plus `ReadProcessMemory` for zero user-visible gain, since hot-swap addresses the mirror by `variables.json` offset and needs no debug info at all.
 
-Four primitives differ; **everything else — the barrier, the scan structure, the ping-pong slots, the swap protocol, the force-flag semantics — has exactly one implementation.** Keep it that way.
+A handful of primitives differ; **everything else — the scan structure, the ping-pong slots, the swap protocol, the force-flag semantics — has exactly one implementation.** Keep it that way.
 
-| | Linux | Windows |
-|---|---|---|
-| mirror | `shm_open`+`ftruncate`+`mmap`, a file under `/dev/shm` | `CreateFileMapping(INVALID_HANDLE_VALUE,…)`+`MapViewOfFile`, a named section `Local\plc_runtime` |
-| agent side | `os.OpenFile("/dev/shm"+name)` | `OpenFileMappingW` + `MapViewOfFile` (`shmmirror_{unix,windows}.go`) |
-| dynamic load | `dlopen`/`dlsym`/`dlclose` | `LoadLibrary`/`GetProcAddress`/`FreeLibrary` (`plc_dlopen` shim in host.c) |
-| swap signal | `SIGUSR1` | named auto-reset Event `Local\kron_plc_swap` + a waiter thread that sets the same `g_swap_req` flag |
+| | Linux | Windows | macOS |
+|---|---|---|---|
+| mirror | `shm_open`+`ftruncate`+`mmap`, a file under `/dev/shm` | `CreateFileMapping(INVALID_HANDLE_VALUE,…)`+`MapViewOfFile`, a named section `Local\plc_runtime` | `open`+`ftruncate`+`mmap` on a REAL file, `<buildDir>/plc_runtime.mirror` |
+| agent side | `os.OpenFile("/dev/shm"+name)` | `OpenFileMappingW` + `MapViewOfFile` | `os.OpenFile(<buildDir>/…)` (`shmmirror_{unix,windows,darwin}.go`) |
+| dynamic load | `dlopen`/`dlsym`/`dlclose` | `LoadLibrary`/`GetProcAddress`/`FreeLibrary` (`plc_dlopen` shim in host.c) | `dlopen`/`dlsym`/`dlclose` |
+| logic module | `-shared` ELF vs `-rdynamic` host | DLL + `plc_host.lib` import library | Mach-O **bundle**, `-bundle -bundle_loader plc_host` |
+| swap signal | `SIGUSR1` | named auto-reset Event `Local\kron_plc_swap` + a waiter thread that sets the same `g_swap_req` flag | `SIGUSR1` |
+| sleep to deadline | `clock_nanosleep(TIMER_ABSTIME)` | `CREATE_WAITABLE_TIMER_HIGH_RESOLUTION` | `mach_wait_until` |
+| scan barrier | `pthread_barrier_*` | `pthread_barrier_*` (winpthreads) | mutex+condvar **shim** under the same names |
 
 - ⚠️ **The agent OPENS the mirror and the event; the loader-host CREATES both.** A Win32 section/event only lives while a handle is open, so if the agent created them a stale segment would outlive a crashed host, and a swap signalled before the host was up would be silently latched by the auto-reset event and look accepted.
 - ⚠️ **A PE DLL cannot resolve symbols from the EXE that loads it** the way a `.so` resolves against a `-rdynamic` host — imports bind at LINK time. `compileHost` therefore links the host with `-Wl,--export-all-symbols -Wl,--out-implib,plc_host.lib` and `compileLogic` links the logic DLL against that import library. That is what keeps the HAL trampolines (`__hs_*`) and the host-owned `us_tick`/`plc_stop`/`__plc_shm` in the host so they survive a swap. (The logic module itself needs no `dllexport`: mingw auto-exports everything when no symbol is explicitly exported — verified by reading the PE export table, all 10 ABI symbols present.)
@@ -343,6 +353,22 @@ Four primitives differ; **everything else — the barrier, the scan structure, t
 - ⚠️ **ISO `rename()` fails on Windows when the destination exists**, so `write_swap_result` uses `MoveFileExA(..., MOVEFILE_REPLACE_EXISTING)`. Without it only the cold-start line would ever be written and every later swap would read as a timeout.
 - **Toolchain**: the mingw-w64 target needs its OWN `--sysroot`, `-resource-dir` (the SYSROOT's `lib/clang/<ver>` — the bundled LLVM ships only the MSVC-flavoured `.lib`), `-rtlib=compiler-rt --unwindlib=libunwind` and `-L <sysroot>/x86_64-w64-mingw32/lib`; llvm-mingw has no libgcc at all. `bundledHostClangArgs` adds all four on Windows. `hostResourceTarget()` picks `x86_64/win32` so the Windows Krontek archives (which already ship in `resources/x86_64-w64-mingw32/lib/`) are linked, not the Linux ELF ones.
 - **Verified under wine64** (a dedicated 64-bit prefix, so no Windows box is needed to iterate): cold start + bind, live values through the mirror, an online swap that **preserved state while changing logic** (counter continued from 5485 and its increment went 1 → 100), FORCE held a value constant, PULSE injected once and let the logic resume. ⚠️ **Not yet verified on real Windows** — wine is not Windows, and timing/AV behaviour in particular can differ.
+
+### macOS simulation ⚠️
+Apple Silicon (and Intel) Macs run the SAME hot-swap runtime. As on Windows, only the legacy plain-sim path is excluded (`handleRunSimulation` returns an explicit error on darwin): it would need a Mach-O/DWARF reader plus `mach_vm_read`, which SIP and the `task_for_pid` entitlement block anyway, for zero gain.
+
+Three "POSIX" primitives are genuinely missing on macOS. **Two fail at COMPILE time and one fails silently — the silent one is the dangerous one:**
+
+- ⚠️ **`clock_nanosleep` does not exist on macOS at all.** `plc_sleep_until` uses `mach_wait_until`, computing the delta from the same absolute deadline so the zero-drift property is preserved. ⚠️ **`mach_timebase_info` numer/denom is NOT 1/1 on Apple Silicon** (24 MHz timebase) — mach ticks must really be converted; treating them as nanoseconds runs every task ~41× too fast. (Same class of bug as the Windows `clock_nanosleep` non-blocking one.)
+- ⚠️ **`pthread_barrier_*` was never implemented by Apple** (the optional POSIX barriers; `_POSIX_BARRIERS` is undefined). host.c provides a **mutex+condvar shim under the standard names** so the scan loop stays byte-identical — do NOT fork the scan loop instead. It is **phase-counted**, which is what makes the barrier safely reusable: a thread waits on the phase it entered with, so a fast thread cannot lap into the next round and be miscounted in the previous one. Verified on Linux by extracting the shim verbatim from host.c and stress-testing 1/2/3/4/8/16 threads × 20 000 rounds against the real double-barrier swap pattern, clean under ThreadSanitizer.
+- ⚠️ **macOS has NO `/dev/shm`, and a `shm_open`'d object is invisible to the filesystem** — so the Go agent could only reach it via cgo (neither the stdlib nor `x/sys/unix` wraps `shm_open` on darwin), which would cost `CGO_ENABLED=0`. Apple's `shm_open` also caps names at 31 chars and permits `ftruncate` exactly ONCE per object, so a second cold start could not resize a surviving segment. The mirror is therefore a **plain `mmap(MAP_SHARED)` file** in the loader-host's cwd (= the build dir). ⚠️ host.c's `mirror_path()` and `shmmirror_darwin.go`'s `mirrorPath()` perform the SAME `/plc_runtime` → `plc_runtime.mirror` transformation — change them together, or the agent reads a file nobody writes and every live value silently freezes at zero.
+
+- ⚠️ **A Mach-O `.dylib` cannot resolve symbols from the executable that loads it** — the two-level namespace binds every undefined symbol at LINK time, so `-shared` against a `-rdynamic` host does not work the way ELF does. `compileLogic` builds the module as **`-bundle -bundle_loader <plc_host>`** (the exact analogue of the Windows import library) and `compileHost` links with `-Wl,-export_dynamic`; that is what keeps the HAL trampolines (`__hs_*`) and the host-owned `us_tick`/`plc_stop`/`__plc_shm` in the host so they survive a swap. This makes the loader-host a **build-order prerequisite** for the logic module on darwin (it already was on Windows) — `compileLogic` errors clearly if it is missing. The 2-slot ping-pong, atomic rename and `logic_<n>.so` slot names need no change: the name is a slot id in the shared protocol, not a format claim, and `dlopen` loads a bundle by path regardless of extension.
+- ⚠️ **`-lrt` and `-ldl` do not exist on macOS** — asking for them fails the link outright. `dlopen`/`clock_gettime` live in libSystem. `hostSimLinkArgs()` and `compileHost` both special-case darwin.
+- ⚠️ **The Mach-O link uses the SYSTEM linker, not lld** (`hostUseLLD()` returns nothing on darwin). We already depend on the Command Line Tools for the SDK, and ld64.lld lags Apple's ld on frameworks, `-bundle_loader` and newer load commands — nothing to gain, a class of link failures to avoid. The cross-compiles to Linux boards keep `-fuse-ld=lld` unconditionally.
+- ⚠️ **`__APPLE__` must stay in the transpiler's shm guard** (`CTranspilerService.js`, `#if defined(__linux__) || defined(_WIN32) || defined(__APPLE__)`) even though nothing in that block creates the segment on macOS: the hot-swap build needs the `extern __plc_shm` declaration and the `plc_shm_name`/`plc_shm_size` exports the loader-host `dlsym`s. Drop it and the sim runs perfectly while the editor shows no live values and every force-write silently does nothing.
+- **Toolchain**: the macOS LLVM comes from the same upstream release (`LLVM-<ver>-macOS-ARM64.tar.xz`; `setup_toolchain.py` already matched it, no change needed). ⚠️ Unlike every other target there is **no bundled sysroot** — Apple forbids redistributing the SDK — so `bundledHostClangArgs` passes `-isysroot` from `xcrun --show-sdk-path` (`paths.go` `MacOSSDKPath`, `sync.Once`-cached, and it reports the `xcode-select --install` fix rather than letting it surface as "stdio.h not found"). The host triple is pinned to `arm64-apple-macos11`/`x86_64-apple-macos11` to match the `.app`'s `LSMinimumSystemVersion`.
+- ⚠️ **NOT verified on real hardware.** The Windows port could be iterated under wine64; there is no macOS emulator on Linux. Everything above the Go layer is compile- and reasoning-verified only, plus the barrier shim's Linux stress test. The first run on a real Mac is the acceptance test — see `packaging/README.md` "Verifying a build" for what to exercise.
 
 ### Re-attach after a browser reload
 The simulation is a separate host-agent process, so it survives a tab close/reload. `GET /api/host/sim-status` reports both the plain and hot-swap state (`{running, pid, mode}`, `mode` = `"hotswap"`|`"plain"`). On (re)load, an effect (guarded by `simReattachedRef`) restores the running flags; for hot-swap it also restores `hotSwapActiveRef`/`taskSigRef` so a re-attached sim stays reloadable. Live values resume over the existing `simulation-output` SSE.
@@ -711,3 +737,47 @@ Cross-tab copy/paste rides `navigator.clipboard` with an in-process fallback. Ea
 - **Local variables:** same `_copy{n}` scheme.
 - **Global-variable SET** (`CLIP_KIND.GLOBALS`): **merge by name** — a same-named global is skipped (destination's kept), not `_copy`-duplicated. Addresses dropped on paste (hardware-unique). Merging into another project is the point.
 - **Referenced globals bundled with a POU** (`meta.globalsBundle`): merged by name (skip-if-present).
+
+---
+
+## 15. Library builder (Settings → Libraries)
+
+The four buttons in Settings → Libraries. All were 501 stubs after the Tauri removal and are now real, ported from `src-tauri/src/main.rs` (`do_update_libraries` / `do_build_soem` / `do_build_canopen` / `do_update_server`, recoverable at `bdc8c071^`).
+
+| Button | Endpoint | Code | Produces |
+|---|---|---|---|
+| Build Libraries | `update-libraries` | `libraries_kron.go` | `resources/krontek-include/*.h` + `HAL/` and one `lib<stem>.a` per source, per target |
+| Build SOEM | `build-soem` | `libraries_deps.go` | `krontek-include/soem/**` + `libsoem.a` |
+| Build CANopen | `build-canopen` | `libraries_deps.go` | `krontek-include/canopen/**` + `libcanopen.a` |
+| Build Server | `update-server` | `libraries_server.go` | `resources/<triple>/server/plc-agent_linux_{armv7,arm64,amd64}` |
+
+These are **developer** actions: they need `git`, network access, and they rewrite files committed to the repo. `libraries.go` holds the target matrix and the shared helpers (clone, compile, archive, staging swap).
+
+### Target matrix (`libraryTargets`)
+`x86_64/linux`, `x86_64/win32`, `arm/aarch64`, `arm/armv7` — plus `arm64/macos` (or `x86_64/macos`) **only when running on a Mac**.
+- ⚠️ **macOS is host-only.** Every other target cross-compiles anywhere because its sysroot is bundled; Apple's SDK cannot be redistributed, so darwin archives exist only if the build runs on a Mac. The matrix is host-dependent for the first time — `runUpdateLibraries` logs an explicit note on non-Mac hosts so a Linux run cannot read as "macOS covered too". This is the intended way to produce the archives `packaging/build-mac.sh` warns about.
+- ⚠️ **Cortex-M (M0/M4/M7) was REMOVED from the matrix** with the bare-metal boards (§9). `targetResourceKey`/`llvmCompileBaseArgs` never learned `arm-none-eabi`, so adding the targets back means adding both. The stale `resources/arm-none-eabi-m*/` trees are left untouched, not deleted.
+- Cross targets resolve their compiler through `llvmCompileBaseArgs` (bundled sysroot); the macOS host target must go through `bundledHostClangArgs` (`-isysroot` from xcrun) — `resolveToolchain` picks.
+
+### Rules the port deliberately CHANGED from the Tauri original
+- ⚠️ **Headers go to ONE place.** The original copied them into every `resources/<triple>/include/`; those copies were consolidated into `resources/krontek-include/` precisely because drift between them was a recurring bug (§1/§3). `installKrontekHeaders` must never grow back into a per-target loop — `TestRunUpdateLibrariesEndToEnd` asserts no per-target `include/` appears.
+- ⚠️ **Build to staging, install only on success.** The original DELETED every header and `.a` up front and compiled in place, so an aborted run left `resources/` stripped. Survivable when each target had its own header copy; not survivable now that one shared tree feeds every compile in the product.
+- ⚠️ **`installKrontekHeaders` replaces only what the Krontek repos own** — top-level `*.h` plus `HAL/`. Sibling subtrees (`soem/`, `canopen/`) belong to the other buttons and must survive; the original got away with wiping everything only because it rebuilt SOEM in the same pass.
+- ⚠️ **A header scope is cleared ONLY if the build staged content for it** (`stagedScopes`; an empty staged `HAL/` does not count). Nothing writing into `resources/` may delete what the current run cannot put back — `HAL/` in particular is hand-maintained and never staged, since KronHAL is not a repo.
+- ⚠️ **A local `KrontekLibraries/` is NOT written back to.** The original synced the GitHub clone onto it, which silently overwrites the very local edits §1 makes it the source of truth for. The build logs that it is leaving the directory alone.
+- ⚠️ **KronHAL is NOT a repo** and is absent from `KRON_REPOS` (SettingsPage.jsx). The HAL headers live only in `resources/krontek-include/HAL/`, edited there directly (or mirrored from `KrontekLibraries/KronHAL/` — §1). `runUpdateLibraries`'s `isHAL` branch is currently dead code, kept only so the HAL/ layout rule survives if those sources ever return as a fetchable repo.
+
+### Constraints the implementation must respect
+- ⚠️ **A repo that fails to clone is skipped, never a hard stop.** The failure is recorded and the loop moves on, so everything that DID clone still compiles and all problems surface in one run. The run as a whole still fails and installs nothing (the staging/atomicity rule above).
+- ⚠️ **`runWithTimeout` APPENDS to `cmd.Env`, never resets it to `os.Environ()`.** `runUpdateServer` sets `GOOS`/`GOARCH`/`GOARM`/`CGO_ENABLED=0` before calling in; resetting silently produces host-arch, dynamically linked binaries that `deploy_server_to_target` would ship to ARM boards.
+- ⚠️ **SOEM's `ec_options.h` is cmake-generated**, so a plain clone lacks it and every SOEM source fails on the missing include. `writeSoemOptionsHeader` writes SOEM v2.0.0's CMakeLists defaults directly (no cmake dependency). `EC_BUFSIZE` really is `(EC_MAXECATFRAME)` — that macro comes from `ec_type.h`, included later, so the preprocessor resolves it lazily. Do not "fix" it to a literal.
+- ⚠️ **SOEM v2.x builds `osal/<platform>/osal.c` only**; only legacy trees also compile `osal/*.c` from the root, and adding it on v2.x gives duplicate symbols. `patchSoemWin32Osal` swaps `timespec_get()` for `_ftime64_s()` because mingw-w64 on MSVCRT does not expose it even with `-std=c11`.
+- ⚠️ **CANopenNode's upstream layout DRIFTED since the Tauri code.** The `socketCAN/` directory the original compiled has moved to a separate repo (CANopenLinux), and the only `CO_driver_target.h` now lives in `example/`. So the build produces a protocol-stack archive (`CANopen.c` + `301/` + `303/` + `305/`) bound to upstream's **reference** driver header — compilable everywhere, but **not CAN-capable**: a real KronCANopen driver must rebuild the stack against its own `CO_driver_target.h`, since the struct layouts come from it. Upstream `304/`, `309/`, `storage/`, `extra/` are logged as present-but-not-built rather than silently guessed at.
+- **Nothing links `libcanopen.a` today** — `kron_pi.h` only names KronCANopen as a future parallel driver. The build says so in its own log.
+- Compilation is parallel (`compileConcurrency`, capped at 8): the bundled clang is ~242 MB and its cold load dominates each invocation, so a serial 5-target matrix spends most of its wall clock in process startup. Object files carry an index prefix because two source dirs can hold the same basename (SOEM's `osal/osal.c` vs `osal/linux/osal.c`) and a plain stem silently overwrites one.
+- `archive()` removes the target `.a` first: `ar rcs` MERGES into an existing archive, so a stale member would otherwise survive a rebuild.
+
+### Tests
+`libraries_test.go` / `libraries_deps_test.go` — driven against the real bundled clang.
+- ⚠️ The Krontek repos are **private**, so `krontekRepoBase` is a `var` the end-to-end test repoints at a local git fixture. The fixture directory must be named `<repo>.git`: the URL is built as `base+repo+".git"` and git does not strip that suffix for filesystem paths.
+- SOEM/CANopen/server tests do real clones and real cross-compiles; they honour `-short` and skip when github is unreachable.

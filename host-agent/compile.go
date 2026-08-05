@@ -81,9 +81,11 @@ func (s *Server) compileSimulation() (string, string, error) {
 		"-I", filepath.Join(resInclude, "HAL"),
 		"-I", filepath.Join(s.paths.LLVMSysroot("simulation_env"), "include"),
 		"-I", filepath.Join(resInclude, "soem/include"),
-		"-fuse-ld=lld",
 		"-ffunction-sections",
 		"-fdata-sections",
+	)
+	args = append(args, hostUseLLD()...)
+	args = append(args,
 		// -O0 for the SIMULATION build: it is a correctness/logic test, not a
 		// perf target, and -O3 is the dominant compile-time cost on large
 		// projects (motion/EtherCAT pull kron_nc.c etc. in as inline headers, and
@@ -313,10 +315,16 @@ func (s *Server) bundledHostClangArgs() (string, []string, error) {
 	switch runtime.GOOS + "/" + runtime.GOARCH {
 	case "windows/amd64":
 		triple = "x86_64-w64-windows-gnu"
+	// ⚠️ macOS triples carry an explicit deployment version. Without one clang
+	// infers it from the SDK, which produces objects newer than the .app's
+	// declared LSMinimumSystemVersion (11.0, set in packaging/build-mac.sh) and
+	// makes the linker warn about mismatched build versions on every compile.
+	// "arm64", not "aarch64": clang normalises the latter for Apple targets,
+	// but only the former matches how the deployment suffix is spelled.
 	case "darwin/arm64":
-		triple = "aarch64-apple-darwin"
+		triple = "arm64-apple-macos11"
 	case "darwin/amd64":
-		triple = "x86_64-apple-darwin"
+		triple = "x86_64-apple-macos11"
 	case "linux/arm64":
 		triple = "aarch64-linux-gnu"
 	default:
@@ -346,7 +354,32 @@ func (s *Server) bundledHostClangArgs() (string, []string, error) {
 			"-L", s.paths.MinGWLibDir(),
 		)
 	}
+	// ⚠️ macOS host: there is no bundled sysroot (Apple forbids redistributing
+	// the SDK), so libc/framework headers and the link-time stubs come from the
+	// user's Xcode Command Line Tools via -isysroot. Without it the bundled
+	// upstream clang cannot even find stdio.h.
+	if runtime.GOOS == "darwin" {
+		sdk, err := s.paths.MacOSSDKPath()
+		if err != nil {
+			return "", nil, err
+		}
+		args = append(args, "-isysroot", sdk)
+	}
 	return clang, args, nil
+}
+
+// hostUseLLD returns -fuse-ld=lld for the hosts that need it.
+//
+// ⚠️ Deliberately EMPTY on macOS: the Mach-O linker is the one place we defer
+// to the system toolchain. ld64.lld exists but lags Apple's ld on framework
+// resolution, -bundle_loader and the newer load commands, and we already
+// depend on the Command Line Tools for the SDK — so there is nothing to gain
+// and a whole class of link failures to avoid.
+func hostUseLLD() []string {
+	if runtime.GOOS == "darwin" {
+		return nil
+	}
+	return []string{"-fuse-ld=lld"}
 }
 
 // hostResourceTarget is the resources/<triple> key for the machine the agent is
@@ -359,6 +392,13 @@ func hostResourceTarget() string {
 	case "windows":
 		return "x86_64/win32"
 	case "darwin":
+		// ⚠️ Must follow GOARCH, not just GOOS. Every other host we ship is
+		// x86_64, but a Mac is either Intel or Apple Silicon and the Krontek
+		// archives are per-ABI — returning "x86_64/macos" on an M-series Mac
+		// links the wrong-arch .a files and every local sim dies at link time.
+		if runtime.GOARCH == "arm64" {
+			return "arm64/macos"
+		}
 		return "x86_64/macos"
 	default:
 		return "x86_64/linux"
@@ -368,12 +408,20 @@ func hostResourceTarget() string {
 // hostSimLinkArgs returns the platform's link-time extras for a local-sim
 // binary/module (threading + timing runtime).
 func hostSimLinkArgs() []string {
-	if runtime.GOOS == "windows" {
+	switch runtime.GOOS {
+	case "windows":
 		// winpthreads supplies pthreads AND clock_gettime/clock_nanosleep, so
 		// the generated scan loop and the loader-host barrier need no #ifdef.
 		return []string{"-lwinpthread"}
+	case "darwin":
+		// ⚠️ NO -lrt and NO -ldl on macOS: neither library exists (the link
+		// dies with "library not found"). pthreads, dlopen and clock_gettime
+		// all live in libSystem, which is linked by default; -lpthread is
+		// accepted as a harmless no-op alias and kept for symmetry.
+		return []string{"-lpthread"}
+	default:
+		return []string{"-lpthread", "-lrt"}
 	}
-	return []string{"-lpthread", "-lrt"}
 }
 
 func (s *Server) llvmCompileBaseArgs(target string) (string, []string, []string, error) {

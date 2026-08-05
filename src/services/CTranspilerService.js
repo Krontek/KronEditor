@@ -1130,15 +1130,24 @@ ${boardDefines}${runtimePortHelpers}${customIncludes}${ecCfgEarly.motionIncludes
             initial_value: info.defaultValue,
         }));
 
-    // --- 7. SHARED MEMORY SYNC (Linux + Windows) ---
+    // --- 7. SHARED MEMORY SYNC (Linux + Windows + macOS) ---
     variableTable.shmSize = shmOffset;
     if (shmEntries.length > 0) {
-        // ⚠️ Linux AND Windows. The mirror is how the editor reads/forces live
-        // variables, so gating it on __linux__ alone is what made local
-        // simulation Linux-only. The two platforms differ ONLY in how the
-        // shared segment is created; everything below (pull/sync, force flags)
-        // is byte-identical, because the agent addresses it purely by offset.
-        source += `\n#if defined(__linux__) || defined(_WIN32)\n`;
+        // ⚠️ Linux AND Windows AND macOS. The mirror is how the editor
+        // reads/forces live variables, so gating it on __linux__ alone is what
+        // made local simulation Linux-only. The platforms differ ONLY in how
+        // the shared segment is created; everything below (pull/sync, force
+        // flags) is byte-identical, because the agent addresses it purely by
+        // offset.
+        //
+        // ⚠️ __APPLE__ must stay in this guard even though the branch below
+        // creates nothing on macOS: in a hot-swap build the LOADER-HOST owns
+        // the segment and the logic module only needs the `extern __plc_shm`
+        // declaration plus the plc_shm_name/plc_shm_size exports the host
+        // dlsym's. Drop __APPLE__ and those exports vanish, the host's dlsym
+        // returns NULL, and the sim runs perfectly while the editor shows no
+        // live values and every force-write silently does nothing.
+        source += `\n#if defined(__linux__) || defined(_WIN32) || defined(__APPLE__)\n`;
         source += `#define PLC_SHM_SIZE 65536\n`;
         source += `#if defined(_WIN32)\n`;
         // Win32 kernel object name — NOT the POSIX "/plc_runtime": a Windows
@@ -1170,6 +1179,11 @@ ${boardDefines}${runtimePortHelpers}${customIncludes}${ecCfgEarly.motionIncludes
         source += `    __plc_shm = (uint8_t *)MapViewOfFile(h, 0x000F001F /*FILE_MAP_ALL_ACCESS*/, 0, 0, PLC_SHM_SIZE);\n`;
         source += `}\n`;
         source += `#else\n`;
+        // NOTE (macOS): this non-hot-swap branch is dead code there — the plain
+        // sim is refused on darwin (runtime.go) and macOS is never a deploy
+        // target, so nothing ever runs it. It still has to COMPILE, which
+        // shm_open does. The mirror macOS actually uses is the file-backed one
+        // the loader-host creates (hotswaphost/host.c, __APPLE__ branch).
         source += `static void plc_shm_init(void) {\n`;
         source += `    int fd = shm_open(PLC_SHM_NAME, O_CREAT | O_RDWR, 0666);\n`;
         source += `    if (fd < 0) return;\n`;

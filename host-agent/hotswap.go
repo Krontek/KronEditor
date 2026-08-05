@@ -193,7 +193,7 @@ func (s *Server) writeHotSwapVariable(w http.ResponseWriter, req writeVariableRe
 		writeError(w, http.StatusBadRequest, fmt.Sprintf("Cannot encode %q as %s", req.Value, spec.VType))
 		return
 	}
-	m, err := openShmMirror(hotswapShmName, hotswapShmSize, true)
+	m, err := openShmMirror(s.paths.BuildDir(), hotswapShmName, hotswapShmSize, true)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "open shm mirror: "+err.Error())
 		return
@@ -250,12 +250,35 @@ func (s *Server) compileLogic(buildDir string, ver int) (string, string, error) 
 	// fresh inode while the old inode stays mapped.
 	tmpSO := hotswaplib.TempGenerationPath(buildDir, ver)
 	args := append([]string{}, baseArgs...)
+	if runtime.GOOS == "darwin" {
+		// ⚠️ Mach-O has no equivalent of "-shared against an -rdynamic host".
+		// A .dylib is linked in the two-level namespace and must resolve every
+		// undefined symbol at LINK time, so it cannot reach back into the
+		// executable that loads it the way an ELF .so resolves us_tick /
+		// plc_stop / __plc_shm / the __hs_* HAL trampolines against a
+		// -rdynamic loader-host.
+		//
+		// A BUNDLE with -bundle_loader is the exact Mach-O analogue of the
+		// Windows import library: the linker reads the host executable's
+		// symbol table and binds the module's undefined symbols to it, so the
+		// HAL and its device fds stay in the host and survive a swap. dlopen
+		// loads bundles just like dylibs, and the .so slot name is a
+		// ping-pong slot id, not a format claim — nothing else changes.
+		hostBin := filepath.Join(buildDir, hostBinName())
+		if _, e := os.Stat(hostBin); e != nil {
+			return "", "", fmt.Errorf("loader-host binary missing (%s) — build the loader-host first", hostBin)
+		}
+		args = append(args, "-bundle", "-bundle_loader", hostBin)
+	} else {
+		args = append(args, "-shared")
+	}
 	args = append(args,
-		"-shared", "-fPIC", "-DPLC_HOTSWAP", "-DKRON_EC_SIM",
+		"-fPIC", "-DPLC_HOTSWAP", "-DKRON_EC_SIM",
 		"-I", buildDir, "-I", resInclude, "-I", filepath.Join(resInclude, "HAL"),
 		"-I", simInc, "-I", filepath.Join(resInclude, "soem/include"),
-		"-fuse-ld=lld", "-O2", "-o", tmpSO, plcC,
 	)
+	args = append(args, hostUseLLD()...)
+	args = append(args, "-O2", "-o", tmpSO, plcC)
 	args = append(args, CollectStaticArchives(libDir)...)
 	args = append(args, "-lm")
 	if runtime.GOOS == "windows" {
@@ -340,13 +363,21 @@ func (s *Server) compileHost(buildDir string) (string, error) {
 	}
 	args := append([]string{}, baseArgs...)
 	args = append(args, "-O2", hostC)
-	if runtime.GOOS == "windows" {
+	switch runtime.GOOS {
+	case "windows":
 		// --export-all-symbols + --out-implib is mingw's stand-in for -rdynamic:
 		// it makes the host's symbols linkable from the logic DLL.
 		args = append(args,
 			"-Wl,--export-all-symbols",
 			"-Wl,--out-implib,"+filepath.Join(buildDir, hostImportLibName))
-	} else {
+	case "darwin":
+		// Mach-O's -rdynamic: keep every symbol in the executable's export
+		// table so the logic bundle can bind to us_tick / plc_stop /
+		// __plc_shm / the __hs_* HAL trampolines via -bundle_loader. clang
+		// does accept -rdynamic on darwin, but only as an alias for this —
+		// spelling it out keeps the intent readable next to the Windows case.
+		args = append(args, "-Wl,-export_dynamic")
+	default:
 		args = append(args, "-rdynamic")
 	}
 
@@ -366,9 +397,15 @@ func (s *Server) compileHost(buildDir string) (string, error) {
 		args = append(args, CollectStaticArchives(libDir)...)
 		args = append(args, "-lm")
 	}
-	if runtime.GOOS == "windows" {
+	switch runtime.GOOS {
+	case "windows":
 		args = append(args, hostSimLinkArgs()...) // -lwinpthread; LoadLibrary lives in kernel32
-	} else {
+	case "darwin":
+		// ⚠️ NO -ldl and NO -lrt: macOS ships neither library, and asking for
+		// them fails the link outright. dlopen and clock_gettime are in
+		// libSystem, which is always linked.
+		args = append(args, "-lpthread")
+	default:
 		args = append(args, "-lpthread", "-ldl", "-lrt")
 	}
 	args = append(args, "-o", hostBin)
@@ -745,7 +782,7 @@ func (s *Server) handleHotSwapRun(w http.ResponseWriter, r *http.Request) {
 	// Fresh mirror each run. This MUST happen after the already-running
 	// early-return above: the poller opens the mirror by path each tick, so
 	// removing it while a host is live would silently kill the live stream.
-	removeShmMirror(hotswapShmName)
+	removeShmMirror(buildDir, hotswapShmName)
 	// Clear any stale result from a previous run BEFORE spawning, so a
 	// leftover file can never be misread as THIS run's cold-start outcome.
 	_ = hotswaplib.ClearResultFile(swapResultPath(buildDir))
@@ -939,7 +976,7 @@ func (s *Server) hotswapPoller(specs []ShmSpec, stop <-chan struct{}) {
 			return
 		case <-ticker.C:
 		}
-		mirror, err := openShmMirror(hotswapShmName, hotswapShmSize, false)
+		mirror, err := openShmMirror(s.paths.BuildDir(), hotswapShmName, hotswapShmSize, false)
 		if err != nil {
 			continue // mirror not up yet
 		}
