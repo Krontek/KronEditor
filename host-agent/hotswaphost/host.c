@@ -417,7 +417,16 @@ static void *task_thread(void *arg) {
     int idx = (int)(intptr_t)arg;
     struct timespec next; clock_gettime(CLOCK_MONOTONIC, &next);
     while (!plc_stop) {
-        next.tv_nsec += (long)(g_interval[idx] * 1000UL);
+        /* ⚠️ Accumulate the period in 64-bit and split it into whole seconds +
+         * remainder BEFORE touching tv_nsec. `long` (and mingw's tv_nsec) is
+         * 32 BITS on Windows, so the old `next.tv_nsec += (long)(interval_us *
+         * 1000UL)` overflowed for any interval >= ~2.148 s: T#3s produced
+         * -1294967296, pushing the deadline BACKWARD, so plc_sleep_until saw
+         * delta_ns <= 0, never slept, and the task ran flat out. Measured on
+         * Windows: (long)(3000000 * 1000UL) == -1294967296. */
+        long long period_ns = (long long)g_interval[idx] * 1000LL;
+        next.tv_sec  += (time_t)(period_ns / 1000000000LL);
+        next.tv_nsec += (long)(period_ns % 1000000000LL);
         while (next.tv_nsec >= 1000000000L) { next.tv_sec++; next.tv_nsec -= 1000000000L; }
 
         /* Scan-boundary swap: every thread gathers, thread 0 swaps + clears the
@@ -448,28 +457,54 @@ int main(int argc, char **argv) {
     signal(SIGUSR1, on_usr1);
 #endif
 
+    /* ⚠️ EVERY cold-start failure below must write a swap_result before
+     * returning. The Go supervisor learns the outcome ONLY from that file, so a
+     * bare `return 1` here is indistinguishable from a host that never started
+     * at all: the agent waits out its full timeout and then reports the useless
+     * "cold-start outcome unknown (timeout) — host killed", while the real
+     * reason (e.g. "dlopen: Win32 error 126" for a logic module with an
+     * unresolvable DLL import) goes only to a stderr nobody reads. The loader
+     * error is appended to the reason token — readSwapResult joins the trailing
+     * fields, so a multi-word detail is safe. */
+    int cold_gen = parse_gen_from_path(argv[1]);
+    char detail[256];
+
     g_handle = plc_dlopen(argv[1]);
-    if (!g_handle) { fprintf(stderr, "dlopen: %s\n", plc_dlerror()); return 1; }
+    if (!g_handle) {
+        const char *e = plc_dlerror();
+        fprintf(stderr, "dlopen: %s\n", e ? e : "(unknown)");
+        snprintf(detail, sizeof detail, "DLOPEN %s", e ? e : "(unknown)");
+        write_swap_result("FAIL", cold_gen, detail);
+        return 1;
+    }
 
     unsigned long (*ssize)(void) = (unsigned long(*)(void))plc_dlsym(g_handle, "plc_state_size");
     void (*sinit)(void)          = (void(*)(void))plc_dlsym(g_handle, "plc_state_init");
     void (*pinit)(void)          = (void(*)(void))plc_dlsym(g_handle, "plc_init_hs");
-    if (!ssize) { fprintf(stderr, "missing plc_state_size\n"); return 1; }
+    if (!ssize) {
+        fprintf(stderr, "missing plc_state_size\n");
+        write_swap_result("FAIL", cold_gen, "SYMBOL plc_state_size");
+        return 1;
+    }
 
     g_state = calloc(1, ssize());
-    if (!g_state) { fprintf(stderr, "state calloc failed\n"); return 1; }
+    if (!g_state) {
+        fprintf(stderr, "state calloc failed\n");
+        write_swap_result("FAIL", cold_gen, "NOMEM");
+        return 1;
+    }
 
     int rc0 = resolve_and_bind(g_handle);
     if (rc0 != RB_OK) {
         fprintf(stderr, "resolve failed (%s)\n", rb_reason(rc0));
-        write_swap_result("FAIL", parse_gen_from_path(argv[1]), rb_reason(rc0));
+        write_swap_result("FAIL", cold_gen, rb_reason(rc0));
         return 1;
     }
     /* Confirms to the Go supervisor that the FIRST logic module is loaded and
      * bound — handleHotSwapRun polls for this before declaring "started", so
      * a fresh run that can't even bind its initial .so is caught immediately
      * instead of looking like a normal start. */
-    write_swap_result("OK", parse_gen_from_path(argv[1]), "COLDSTART");
+    write_swap_result("OK", cold_gen, "COLDSTART");
 
     /* Open the /dev/shm mirror once (host-owned, survives swaps). The editor /
      * agent reads live variables from here by variables.json offset. */

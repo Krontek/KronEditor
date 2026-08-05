@@ -15,11 +15,17 @@ const parseInterval = (str) => {
 
 const fmtInterval = (value, unit) => `T#${value}${unit}`;
 
-// Value is in nanoseconds now
-const fmtExecNs = (ns) => {
-    if (ns >= 1000000) return `${(ns / 1000000).toFixed(2)}ms`;
-    if (ns >= 1000)    return `${(ns / 1000).toFixed(1)}µs`;
-    return `${ns}ns`;
+// ⚠️ Values here are MICROseconds. Both inputs this formats — the runtime's
+// `__exec_us_<prog>` field and the task interval parsed into `ivUs` — are µs
+// (CLAUDE.md §5 "exec-time is MICROseconds"). It used to be `fmtExecNs` and
+// treated its argument as NANOseconds, so every number on the running task card
+// was displayed 1000x too small: a T#1s task interval rendered as "1.00ms" and
+// a T#1ms one as "1.0µs". Overrun detection was never affected — that compares
+// totalExecUs > ivUs, both already µs — only the display lied.
+const fmtExecUs = (us) => {
+    if (us >= 1000000) return `${(us / 1000000).toFixed(2)}s`;
+    if (us >= 1000)    return `${(us / 1000).toFixed(2)}ms`;
+    return `${Math.round(us)}µs`;
 };
 
 export default function TaskManager({
@@ -178,7 +184,7 @@ export default function TaskManager({
                                 {isRunning && totalExecUs > 0 && (
                                     <span style={{ fontSize: 10, fontVariantNumeric: 'tabular-nums', color: taskOverrun ? '#f44336' : '#4ec9b0', background: taskOverrun ? '#3a1a1a' : '#1a2a2a', border: `1px solid ${taskOverrun ? '#f4433644' : '#4ec9b044'}`, borderRadius: 3, padding: '1px 6px', display: 'flex', alignItems: 'center', gap: 4 }}>
                                         {taskOverrun && <span>⚠</span>}
-                                        {fmtExecNs(totalExecUs)} / {fmtExecNs(ivUs)}
+                                        {fmtExecUs(totalExecUs)} / {fmtExecUs(ivUs)}
                                     </span>
                                 )}
 
@@ -236,7 +242,7 @@ export default function TaskManager({
                                             {/* Live exec time */}
                                             {execUs != null && (
                                                 <span style={{ fontSize: 10, color: taskOverrun ? '#f44336' : '#4ec9b0', fontVariantNumeric: 'tabular-nums' }}>
-                                                    {fmtExecNs(execUs)}
+                                                    {fmtExecUs(execUs)}
                                                 </span>
                                             )}
 

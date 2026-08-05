@@ -550,15 +550,13 @@ export const TOOL_DEFS = [
       name: str('Variable name to remove'),
     }, ['scope', 'name']),
   },
-  {
-    name: 'check_compile',
-    description:
-      'Transpile the CURRENT project to C and run an actual compile (the same compile-check the toolbar\'s "Build" button performs, using the real bundled clang). ' +
-      'Use this when you cannot find the problem by reading the ST/LD source alone, or whenever the user explicitly asks you to check for compile/build errors. ' +
-      'On failure you get the real C compiler diagnostics (file:line:col, the offending generated-C line, and a caret) — read the error text for identifiers/values you recognize from the IEC source (a variable name, an FB instance, a struct member) to map it back to the actual POU/line the user should fix, then propose that fix. ' +
-      'On success it just confirms there are no compile errors — it does NOT prove the LOGIC is correct, only that it compiles.',
-    parameters: S({}),
-  },
+  // ⚠️ `check_compile` was REMOVED from the agent's tool surface deliberately.
+  // It ran a real transpile + bundled-clang compile, and the clang cold load
+  // (~242 MB) dominates that cost — the model called it after almost every
+  // change, so each edit paid a full build and the agent felt interminably
+  // slow. The human still has the toolbar Build button, which is the right
+  // place for a compile: an explicit, visible action. Do not re-add it as an
+  // agent tool without making it opt-in and bounding how often it can run.
   {
     name: 'create_data_type',
     description:
@@ -1010,11 +1008,16 @@ export function applyToolCall(struct, name, args = {}) {
         };
       }
 
-      case 'check_compile': {
-        const cc = args.__compile;
-        if (!cc) return { mutation: false, ok: true, result: { note: 'Compile check unavailable — host-agent not reachable or project not open.' } };
-        return { mutation: false, ok: true, result: cc };
-      }
+      // Retired tool. It is no longer in TOOL_DEFS, but a model can still name
+      // it from an older transcript — answer with a terminal, actionable
+      // message so it moves on instead of retrying a tool that will never
+      // return a compile result.
+      case 'check_compile':
+        return {
+          ok: false,
+          error: 'check_compile has been removed — you cannot compile. Do not attempt to build or verify by compiling. '
+            + 'Finish the edit, state briefly what you changed, and let the user press Build in the toolbar when they want a compile.',
+        };
 
       case 'create_data_type': {
         if (!args.name || !args.name.trim()) return { ok: false, error: 'name is required' };

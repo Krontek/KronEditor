@@ -329,7 +329,7 @@ function extractInlineToolCalls(content) {
   const calls = [];
   const pushCall = (name, args) => {
     if (!KNOWN_TOOLS.has(name)) return;
-    calls.push({ id: `inline_${calls.length}`, name, arguments: typeof args === 'string' ? args : JSON.stringify(args ?? {}) });
+    calls.push({ id: `inline_${calls.length}`, name, _synth: true, arguments: typeof args === 'string' ? args : JSON.stringify(args ?? {}) });
   };
   // Turn one parsed object into a call: prefer its own tool name + explicit args;
   // else treat it as flat args for `fallbackName` (the surrounding-text tool name).
@@ -387,7 +387,7 @@ function recoverStCodeBlock(text) {
     const tagged = /^(st|scl|iec|iec-?st|iecst|pascal|structured-?text)$/i.test(tag);
     const looksST = /:=|\bIF\b|\bEND_IF\b|\bVAR\b|\bFOR\b|\bWHILE\b|\bCASE\b|\bEND_/i.test(body);
     if (tagged || looksST) {
-      return [{ id: 'inline_code', name: 'set_st_code', arguments: JSON.stringify({ code: body.replace(/\s+$/, '') }) }];
+      return [{ id: 'inline_code', name: 'set_st_code', _synth: true, arguments: JSON.stringify({ code: body.replace(/\s+$/, '') }) }];
     }
   }
   return null;
@@ -437,9 +437,61 @@ function extractKeyValToolCalls(content) {
   for (let k = 0; k < hits.length; k++) {
     const end = k + 1 < hits.length ? hits[k + 1].start : text.length;
     const args = parseKeyValArgs(text.slice(hits[k].start, end));
-    if (Object.keys(args).length) calls.push({ id: `kv_${k}`, name: hits[k].name, arguments: JSON.stringify(args) });
+    if (Object.keys(args).length) calls.push({ id: `kv_${k}`, name: hits[k].name, _synth: true, arguments: JSON.stringify(args) });
   }
   return calls.length ? calls : null;
+}
+
+// Whether to mine the model's REPLY TEXT for tool calls it failed to emit
+// structurally. True only for the providers those recovery layers were built
+// for — a local daemon (Ollama) or an unknown OpenAI-compatible gateway, which
+// may front a model with no reliable native tool API. Every first-party
+// provider here (Anthropic, OpenAI, Gemini, DeepSeek) emits real tool calls, so
+// for them a text-only turn means the model is FINISHED and must end the loop.
+function recoverToolCallsFromText(provider) {
+  return provider === 'ollama' || provider === 'custom';
+}
+
+// ⚠️ A tool call we SYNTHESIZED from the model's prose (the `_synth` flag set by
+// extractInlineToolCalls / extractKeyValToolCalls / recoverStCodeBlock) must
+// NEVER be replayed to the provider as a real tool call. The model never made
+// it, so it carries no provider-issued call id and no opaque per-call blob —
+// and Gemini 3 hard-rejects the WHOLE next request with
+//   400 "Function call is missing a thought_signature in functionCall parts …
+//        function call `default_api:set_st_code`, position 7"
+// which kills the run with no way to recover (a thought_signature cannot be
+// fabricated). Observed end-to-end: Gemini finished its work, replied with a
+// prose summary containing an ```iecst block, recoverStCodeBlock turned that
+// summary into a set_st_code, and every following turn 400'd.
+//
+// So the recovered call still EXECUTES locally (that is the point of the
+// recovery), but in the transcript it is demoted to plain text: the assistant
+// message keeps only calls the provider actually emitted, and each synthesized
+// call's `tool` result becomes a user-role line. That also keeps the
+// every-tool_call_id-needs-a-result invariant intact — a dangling tool result is
+// itself a 400 on Anthropic and OpenAI.
+function providerSafeMessages(msgs) {
+  const synthIds = new Set();
+  for (const m of msgs) {
+    for (const c of m.toolCalls || []) if (c._synth && c.id) synthIds.add(c.id);
+  }
+  if (synthIds.size === 0) return msgs;
+  return msgs.map((m) => {
+    if (m.role === 'tool' && synthIds.has(m.toolCallId)) {
+      return { role: 'user', content: `[recovered tool result] ${m.name}: ${m.content}` };
+    }
+    if (m.role !== 'assistant' || !(m.toolCalls || []).length) return m;
+    const real = m.toolCalls.filter((c) => !c._synth);
+    if (real.length === m.toolCalls.length) return m;
+    const noted = m.toolCalls
+      .filter((c) => c._synth)
+      .map((c) => `[recovered from your reply text and executed] ${c.name}(${typeof c.arguments === 'string' ? c.arguments : JSON.stringify(c.arguments ?? {})})`)
+      .join('\n');
+    const content = [m.content, noted].filter((s) => s && String(s).trim()).join('\n');
+    const out = { ...m, content };
+    if (real.length) out.toolCalls = real; else delete out.toolCalls;
+    return out;
+  });
 }
 
 // Tools that act on a single LOCAL POU and therefore need a valid `pou` arg.
@@ -592,7 +644,7 @@ function buildSystemPrompt(libraryData = [], agentMode = 'manual') {
     '- While the program is RUNNING, read_live_variables returns the current values AND a buffered time-series `history` per variable (min/max/last, change count, flags like constant/oscillating/rising/falling, a recent sample series). Read it to diagnose real behaviour (a value stuck, oscillating, drifting, out of range) BEFORE proposing a fix, and refer to the concrete numbers when you explain the problem.',
     '- For TIME-DEPENDENT behaviour use watch_live_variables: it actively WAITS a real window and returns a per-variable summary, and EACH variable can be watched for its own duration (e.g. watch a 5 s timer output for 12 s but a fast pulse for 2 s). read_live_variables is just an instant snapshot; watch_live_variables is for "does it toggle / settle / ramp over time". There is NO fixed cap — pick whatever window the behaviour under diagnosis actually needs (a few seconds for a fast pulse, minutes for a slow ramp/drift/long sequence), but default to the SHORTEST window that answers the question; do not pick a long duration "just in case". The user sees a live elapsed-time counter while you watch and can stop it early, so an overly long pick wastes their time waiting on you, not just yours.',
     '- VERIFY-AFTER-CHANGE LOOP: live monitoring is automatic whenever the program is running (simulation or a connected PLC) — your edits are committed to the project on approval, but to take effect on the RUNNING target they must be DEPLOYED by the user (Build & Send). When the program is running, after your change is in effect call watch_live_variables on the variables your fix targets, compare the observed behaviour against what the user asked for, and report explicitly whether the desired result was achieved (if not, propose another fix). If the live values do NOT yet reflect your change, it has not been deployed — tell the user to Build & Send. Keep watch durations only as long as needed.',
-    '- C-LEVEL DIAGNOSTICS: call check_compile to transpile the project to C and run the REAL bundled clang on it. Use it when (a) you cannot spot the problem by reading the ST/LD source, or (b) the user asks you to check for compile/build errors. On failure the result contains the raw compiler output (file:line:col + offending C line + caret) — scan it for identifiers, FB names, or struct members you recognise from the IEC source to pinpoint which POU/line to fix, then propose and apply the fix. On success it confirms no compile errors exist (NOT that the logic is correct). Do NOT call it as a routine "verification" after every change — it is a diagnostic tool for when source-level reading is insufficient.',
+    '- YOU CANNOT COMPILE, AND MUST NOT TRY. There is no compile/build tool. Never attempt to build, transpile or "verify by compiling", and never claim you compiled something. Get the code right by READING the ST/LD source and the variable declarations; if the user asks about compile errors, tell them to press Build in the toolbar and paste the output, then diagnose it from the text.',
     '',
     libLine ? `Standard library blocks (names only — call list_blocks for pins): ${libLine}` : '',
     'The CURRENT project state (selected board, open POU, POU list, global variables, data types, project-defined blocks) arrives in a <project-context> block at the END of the conversation, refreshed every turn — always trust the latest one.',
@@ -611,7 +663,6 @@ export default function AiAgentPanel({
   hotSwapActive = false,       // a live hot-swap session is running
   onStartHotSwap = null,       // () → build+run a hot-swap session (online change)
   onStopHotSwap = null,        // () → stop the hot-swap session
-  onCheckCompile = null,       // async () → transpile + compile; returns {ok, stage, message?, error?, log?, errors?}
   askRequest = null,           // {text, id} pushed from the output-panel "Ask agent" — auto-sends once
 }) {
   const [config, setConfig] = useState(loadConfig);
@@ -1094,7 +1145,7 @@ export default function AiAgentPanel({
         provider: config.provider, model: config.model, apiKey: config.apiKey, baseUrl: config.baseUrl,
         system: buildSystemPrompt(libraryData, agentModeRef.current),
         context: buildProjectContext(psRef.current, selectedBoard, activeItem),
-        messages: apiMessages,
+        messages: providerSafeMessages(apiMessages),
         tools: TOOL_DEFS,
       }, controller.signal);
     } catch (e) {
@@ -1119,19 +1170,26 @@ export default function AiAgentPanel({
     let assistantText = stripSpecialTokens(assistant.content || '');
     // Fallback: a model that wrote the tool call as text instead of using the
     // structured field. Promote it to a real call and don't show it as prose.
-    if (calls.length === 0) {
+    // ⚠️ Gated to providers that actually need it. These layers exist for weak
+    // LOCAL models that print a call instead of emitting one; a native
+    // tool-calling provider that returns text-only is simply DONE, and treating
+    // its closing summary as a missed call is a misread. Observed: Gemini
+    // finished the job, replied "I have created … ```iecst …```", and
+    // recoverStCodeBlock re-applied that summary as a fresh set_st_code — which
+    // then poisoned the transcript (see providerSafeMessages).
+    if (calls.length === 0 && recoverToolCallsFromText(config.provider)) {
       const inline = extractInlineToolCalls(assistantText);
       if (inline) { calls = inline; assistantText = ''; }
     }
     // Some models emit calls as `tool_name key="value"` plain text (no JSON).
-    if (calls.length === 0) {
+    if (calls.length === 0 && recoverToolCallsFromText(config.provider)) {
       const kv = extractKeyValToolCalls(assistantText);
       if (kv) { calls = kv; assistantText = ''; }
     }
     // Last-ditch fallback: a weak model that, after several turns, stops calling
     // tools and just PRINTS the POU body in a ```st code block. Recover it as a
     // set_st_code on the active POU (the POU-target inference fills the target).
-    if (calls.length === 0) {
+    if (calls.length === 0 && recoverToolCallsFromText(config.provider)) {
       const codeCall = recoverStCodeBlock(assistantText);
       if (codeCall) { calls = codeCall; assistantText = ''; }
     }
@@ -1241,16 +1299,6 @@ export default function AiAgentPanel({
         }
       }
       if (controller.signal.aborted) break;
-      if (tc.name === 'check_compile') {
-        pushView({ role: 'note', text: 'Transpiling and compiling — checking for C compiler errors…' });
-        if (onCheckCompile) {
-          try {
-            args.__compile = await onCheckCompile();
-          } catch (e) {
-            args.__compile = { ok: false, stage: 'compile', error: e?.message || String(e), log: '' };
-          }
-        }
-      }
       // Tools that need the standard block library: list_blocks (catalog) and
       // set_ladder (FB pin resolution for fb-in-rung).
       if (tc.name === 'list_blocks' || tc.name === 'set_ladder') args.__library = libraryData;

@@ -53,3 +53,10 @@ packaging/*.exe
 toolchains-win/
 toolchains/*
 experiments/*
+
+# Compiled host-agent binaries. Reproducible from source (npm run build, or a
+# bare `go build` in host-agent/); a committed ~14 MB blob cannot be reviewed in
+# a PR and bloats history on every rebuild.
+/dist-binary/
+/host-agent/kron-host-agent
+/host-agent/kron-host-agent.exe
