@@ -1,4 +1,5 @@
 import React, { useState, useMemo, useRef } from 'react';
+import { useTranslation } from 'react-i18next';
 import EtherCATIconSrc from '../assets/icons/ethercat.png';
 import { PLC_BLOCKS } from '../utils/plcStandards';
 import { LIBRARY_TREE, ETHERCAT_LIBRARY_TREE, GENERIC_FB_DEFS } from '../utils/libraryTree';
@@ -206,6 +207,7 @@ const COMM_PROTO_BLOCKS = {
 };
 
 const Toolbox = ({ userDefinedBlocks = [], libraryData = [], activeFileType, selectedBoard, buses = [], interfaceConfig = {} }) => {
+  const { t } = useTranslation();
   const hasEtherCAT = buses.some(b => b.type === 'ethercat');
   // expand state: category-level and subcategory-level
   const [expandedCats, setExpandedCats] = useState({});
@@ -214,6 +216,77 @@ const Toolbox = ({ userDefinedBlocks = [], libraryData = [], activeFileType, sel
   // grouped, filtered list so a block can be found by name without knowing
   // which category it lives under.
   const [search, setSearch] = useState('');
+
+  // Helper to translate library category/subcategory titles and block descriptions
+  const translateLibraryText = (text, type = 'title') => {
+    if (!text) return text;
+
+    // Map of English titles to translation keys
+    const titleKeys = {
+      // Main categories
+      'Bit Logic Operations': 'library.bitLogicOperations',
+      'Standard Function Blocks': 'library.standardFunctionBlocks',
+      'Mathematical Functions': 'library.mathematicalFunctions',
+      'Comparison & Selection': 'library.comparisonSelection',
+      'Data Conversion': 'library.dataConversion',
+      'Advanced Control': 'library.advancedControl',
+      'Motion Control': 'library.motionControl',
+      'Communication': 'library.communication',
+      'System & Time': 'library.systemTime',
+      // Subcategories
+      'Contacts': 'library.contacts',
+      'Coils': 'library.coils',
+      'Bistables': 'library.bistables',
+      'Edge Detectors': 'library.edgeDetectors',
+      'Bitwise Operations': 'library.bitwiseOperations',
+      'Timers': 'library.timers',
+      'Counters': 'library.counters',
+      'Basic Math': 'library.basicMath',
+      'Floating Point': 'library.floatingPoint',
+      'Trigonometry': 'library.trigonometry',
+      'Comparison': 'library.comparison',
+      'Selection': 'library.selection',
+      'Scaling': 'library.scaling',
+      'Regulators': 'library.regulators',
+      'Signal Processing': 'library.signalProcessing',
+      'Administrative': 'library.administrative',
+      'Stop / Halt': 'library.stopHalt',
+      'Homing': 'library.homing',
+      'Point-to-Point': 'library.pointToPoint',
+      'Velocity': 'library.velocity',
+      'Superimposed': 'library.superimposed',
+      'Read / Diagnostic': 'library.readDiagnostic',
+      'Generic': 'library.generic',
+      'Protocols': 'library.protocols',
+      'Diagnostics': 'library.diagnostics',
+      'RTC': 'library.rtc',
+      'File': 'library.file',
+      'Bus Diagnostics': 'library.busDiagnostics',
+      'SDO Access': 'library.sdoAccess',
+    };
+
+    const descKeys = {
+      'Normally Open Contact': 'blockDesc.normallyOpenContact',
+      'Normally Closed Contact': 'blockDesc.normallyClosedContact',
+      'Inverted / Rising Edge': 'blockDesc.invertedRisingEdge',
+      'Falling Edge Contact': 'blockDesc.fallingEdgeContact',
+      'Output Coil': 'blockDesc.outputCoil',
+      'Set Coil (latch)': 'blockDesc.setCoilLatch',
+      'Reset Coil (unlatch)': 'blockDesc.resetCoilUnlatch',
+      'Moving Average Filter': 'blockDesc.movingAverageFilter',
+      'Ramp Function Generator': 'blockDesc.rampFunctionGenerator',
+      'Read Active Alarms': 'blockDesc.readActiveAlarms',
+      'Read Hardware ID': 'blockDesc.readHardwareId',
+    };
+
+    if (type === 'desc') {
+      const key = descKeys[text];
+      return key ? t(key) : text;
+    }
+
+    const key = titleKeys[text];
+    return key ? t(key) : text;
+  };
 
   const blockMap = useMemo(() => buildBlockMap(libraryData), [libraryData]);
 
@@ -254,7 +327,7 @@ const Toolbox = ({ userDefinedBlocks = [], libraryData = [], activeFileType, sel
           blockType: item.blockType,
           subType: item.subType,
           label: item.label,
-          desc: item.desc,
+          desc: translateLibraryText(item.desc, 'desc'),
           customData: isCC ? { subType: item.subType } : (item.customData || null),
           color: item.blockType === 'Contact' ? CONTACT_COLOR
             : item.blockType === 'Coil' ? COIL_COLOR
@@ -291,20 +364,20 @@ const Toolbox = ({ userDefinedBlocks = [], libraryData = [], activeFileType, sel
     const out = [];
     const push = (group, item) => { if (item) out.push({ group, ...item }); };
     boardTree.forEach(sub => (sub.items || []).forEach(item => push(
-      `${getBoardFamily(selectedBoard) || 'Board'} › ${sub.title}`,
-      { blockType: item.blockType, subType: item.subType, label: item.label, desc: item.desc, customData: item.customData, color: BOARD_COLOR }
+      `${getBoardFamily(selectedBoard) || 'Board'} › ${translateLibraryText(sub.title)}`,
+      { blockType: item.blockType, subType: item.subType, label: item.label, desc: translateLibraryText(item.desc, 'desc'), customData: item.customData, color: BOARD_COLOR }
     )));
     if (hasEtherCAT) {
-      ETHERCAT_LIBRARY_TREE.forEach(sub => resolveItems(sub).forEach(item => push(`EtherCAT › ${sub.title}`, { ...item, color: EC_COLOR })));
+      ETHERCAT_LIBRARY_TREE.forEach(sub => resolveItems(sub).forEach(item => push(`EtherCAT › ${translateLibraryText(sub.title)}`, { ...item, color: EC_COLOR })));
     }
     LIBRARY_TREE.forEach(cat => (cat.subcategories || []).forEach(sub =>
-      resolveItems(sub).forEach(item => push(`${cat.title} › ${sub.title}`, item))
+      resolveItems(sub).forEach(item => push(`${translateLibraryText(cat.title)} › ${translateLibraryText(sub.title)}`, item))
     ));
     (userDefinedBlocks || []).forEach(b => push('User Defined', {
       blockType: b.name, label: b.name, desc: b.type === 'functionBlocks' ? 'Block' : 'Function', customData: { ...b }, color: UD_COLOR,
     }));
     return out;
-  }, [boardTree, hasEtherCAT, blockMap, userDefinedBlocks, selectedBoard]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [boardTree, hasEtherCAT, blockMap, userDefinedBlocks, selectedBoard, t]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const query = search.trim().toLowerCase();
   const searchResults = useMemo(() => {
@@ -438,7 +511,7 @@ const Toolbox = ({ userDefinedBlocks = [], libraryData = [], activeFileType, sel
                     <span style={{ marginRight: 5, fontSize: 8, opacity: 0.7 }}>
                       {expandedSubs[sub.id] ? '▼' : '▶'}
                     </span>
-                    {sub.title}
+                    {translateLibraryText(sub.title)}
                     <span style={{ marginLeft: 'auto', opacity: 0.45, fontSize: 9 }}>
                       {sub.items.length}
                     </span>
@@ -500,7 +573,7 @@ const Toolbox = ({ userDefinedBlocks = [], libraryData = [], activeFileType, sel
                     <span style={{ marginRight: 5, fontSize: 8, opacity: 0.6 }}>
                       {expandedSubs[sub.id] !== false ? '▼' : '▶'}
                     </span>
-                    {sub.title}
+                    {translateLibraryText(sub.title)}
                   </div>
 
                   {expandedSubs[sub.id] !== false && (
@@ -549,7 +622,7 @@ const Toolbox = ({ userDefinedBlocks = [], libraryData = [], activeFileType, sel
             <span style={{ marginRight: 6, fontSize: 9, opacity: 0.7 }}>
               {expandedCats[cat.id] ? '▼' : '▶'}
             </span>
-            {cat.title}
+            {translateLibraryText(cat.title)}
           </div>
 
           {expandedCats[cat.id] && (
@@ -583,7 +656,7 @@ const Toolbox = ({ userDefinedBlocks = [], libraryData = [], activeFileType, sel
                       <span style={{ marginRight: 5, fontSize: 8, opacity: 0.7 }}>
                         {expandedSubs[sub.id] ? '▼' : '▶'}
                       </span>
-                      {sub.title}
+                      {translateLibraryText(sub.title)}
                       <span style={{ marginLeft: 'auto', opacity: 0.45, fontSize: 9 }}>
                         {items.length}
                       </span>

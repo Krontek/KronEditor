@@ -6,7 +6,9 @@
         "functions": "Functions",
         "programs": "Programs",
         "resources": "Resources",
-        "configuration": "Configuration"
+        "configuration": "Configuration",
+        "taskManager": "Task Manager",
+        "visualization": "Visualization"
     },
     "tables": {
         "name": "Name",
@@ -46,6 +48,7 @@
         "cancel": "Cancel",
         "settings": "Settings",
         "language": "Language",
+        "selectItemToEdit": "Select an item from the Project Tree to edit.",
         "english": "English",
         "turkish": "Turkish",
         "name": "Name",
@@ -71,7 +74,8 @@
         "library": "Library",
         "dragDrop": "Drag & Drop",
         "blockCount": "{{count}} blocks",
-        "howItWorks": "How it works"
+        "howItWorks": "How it works",
+        "standardLibraries": "Standard Libraries"
     },
     "actions": {
         "add": "Add",
@@ -92,7 +96,9 @@
         "selectTarget": "Select Target",
         "build": "Build",
         "loadFromTarget": "Load from Target",
-        "pullConfirm": "The current project will be closed and replaced by the one on the target. Continue?"
+        "pullConfirm": "The current project will be closed and replaced by the one on the target. Continue?",
+        "newTask": "New Task",
+        "deleteTask": "Delete Task"
     },
     "options": {
         "cyclic": "Cyclic",
@@ -126,7 +132,16 @@
         "removeFieldbusConfirm": "Do you want to remove this fieldbus connection?",
         "removeFieldbusTitle": "Remove Fieldbus",
         "deleteSlaveConfirm": "Delete \"{{name}}\"?",
-        "deleteSlaveTitle": "Delete Slave"
+        "deleteSlaveTitle": "Delete Slave",
+        "noTasksYet": "No tasks yet.",
+        "createFirstTask": "Create your first task",
+        "addProgram": "Add Program",
+        "interval": "Interval",
+        "programs": "Programs",
+        "unassignedPrograms": "Unassigned Programs",
+        "noProgramsAssigned": "No programs assigned to this task",
+        "assignProgram": "Assign Program",
+        "allProgramsAssigned": "✓ All programs assigned"
     },
     "resources": {
         "globalVariables": "Global Variables"
@@ -178,7 +193,19 @@
         "sshPort": "SSH Port",
         "deployServer": "Deploy Server",
         "noBoardSelected": "Please select a board first (create or open a project).",
-        "buildServer": "Build Server"
+        "buildServer": "Build Server",
+        "buildLibraries": "Build Libraries",
+        "buildCanopen": "Build CANopen",
+        "hmiHowToUse": "How to Use",
+        "hmiStep1": "Open the",
+        "hmiStep2": "tab from the project tree.",
+        "hmiStep3": "Drag components from the toolbox onto the canvas.",
+        "hmiStep4": "Bind variables using the properties panel on the right.",
+        "hmiStep5": "Click",
+        "hmiStep6": "Serve",
+        "hmiStep7": "in the toolbar to start the web server.",
+        "hmiStep8": "Open",
+        "hmiStep9": "in a browser."
     },
     "blockInfo": {
         "TON": "Timer On-Delay. When IN=TRUE timing starts; Q=TRUE after PT has elapsed. ET shows elapsed time. Resets when IN=FALSE.",
@@ -321,6 +348,59 @@
         "startSimulation": "Start Simulation",
         "undo": "Undo",
         "redo": "Redo"
+    },
+    "library": {
+        "bitLogicOperations": "Bit Logic Operations",
+        "contacts": "Contacts",
+        "coils": "Coils",
+        "bistables": "Bistables",
+        "edgeDetectors": "Edge Detectors",
+        "bitwiseOperations": "Bitwise Operations",
+        "standardFunctionBlocks": "Standard Function Blocks",
+        "timers": "Timers",
+        "counters": "Counters",
+        "mathematicalFunctions": "Mathematical Functions",
+        "basicMath": "Basic Math",
+        "floatingPoint": "Floating Point",
+        "trigonometry": "Trigonometry",
+        "comparisonSelection": "Comparison & Selection",
+        "comparison": "Comparison",
+        "selection": "Selection",
+        "dataConversion": "Data Conversion",
+        "scaling": "Scaling",
+        "advancedControl": "Advanced Control",
+        "regulators": "Regulators",
+        "signalProcessing": "Signal Processing",
+        "motionControl": "Motion Control",
+        "administrative": "Administrative",
+        "stopHalt": "Stop / Halt",
+        "homing": "Homing",
+        "pointToPoint": "Point-to-Point",
+        "velocity": "Velocity",
+        "superimposed": "Superimposed",
+        "readDiagnostic": "Read / Diagnostic",
+        "communication": "Communication",
+        "generic": "Generic",
+        "protocols": "Protocols",
+        "diagnostics": "Diagnostics",
+        "systemTime": "System & Time",
+        "rtc": "RTC",
+        "file": "File",
+        "busDiagnostics": "Bus Diagnostics",
+        "sdoAccess": "SDO Access"
+    },
+    "blockDesc": {
+        "normallyOpenContact": "Normally Open Contact",
+        "normallyClosedContact": "Normally Closed Contact",
+        "invertedRisingEdge": "Inverted / Rising Edge",
+        "fallingEdgeContact": "Falling Edge Contact",
+        "outputCoil": "Output Coil",
+        "setCoilLatch": "Set Coil (latch)",
+        "resetCoilUnlatch": "Reset Coil (unlatch)",
+        "movingAverageFilter": "Moving Average Filter",
+        "rampFunctionGenerator": "Ramp Function Generator",
+        "readActiveAlarms": "Read Active Alarms",
+        "readHardwareId": "Read Hardware ID"
     },
     "blockNotes": {
         "Contact": {

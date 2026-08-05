@@ -726,9 +726,9 @@ const SettingsPage = ({ theme, setTheme, editorSettings, setEditorSettings, sele
                                 ))}
                             </div>
                             {[
-                                { label: 'Build Libraries', handler: handleUpdateLibraries, color: '#007acc' },
-                                { label: 'Build Server',    handler: handleUpdateServer,    color: '#0d47a1' },
-                                { label: 'Build CANopen',   handler: handleBuildCanopen,    color: '#0d47a1' },
+                                { label: t('settingsPage.buildLibraries'), handler: handleUpdateLibraries, color: '#007acc' },
+                                { label: t('settingsPage.buildServer'),    handler: handleUpdateServer,    color: '#0d47a1' },
+                                { label: t('settingsPage.buildCanopen'),   handler: handleBuildCanopen,    color: '#0d47a1' },
                             ].map(({ label, handler, color }) => (
                                 <button key={label} onClick={handler} disabled={isUpdating} style={{
                                     padding: '10px 20px', backgroundColor: isUpdating ? '#444' : color,
@@ -932,13 +932,13 @@ const SettingsPage = ({ theme, setTheme, editorSettings, setEditorSettings, sele
                         </div>
 
                         <div style={{ background: '#252526', border: '1px solid #333', borderRadius: 3, padding: '20px' }}>
-                            <h3 style={{ fontSize: 13, fontWeight: '600', color: '#aaa', marginBottom: 12, letterSpacing: '0.05em', textTransform: 'uppercase' }}>How to Use</h3>
+                            <h3 style={{ fontSize: 13, fontWeight: '600', color: '#aaa', marginBottom: 12, letterSpacing: '0.05em', textTransform: 'uppercase' }}>{t('settingsPage.hmiHowToUse')}</h3>
                             <div style={{ fontSize: 12, color: '#666', lineHeight: 1.8 }}>
-                                <div>1. Open the <span style={{ color: '#c0c0c0' }}>Visualization</span> tab from the project tree.</div>
-                                <div>2. Drag components from the toolbox onto the canvas.</div>
-                                <div>3. Bind variables using the properties panel on the right.</div>
-                                <div>4. Click <span style={{ color: '#4ec9b0' }}>🌐 Serve</span> in the toolbar to start the web server.</div>
-                                <div>5. Open <span style={{ color: '#7eb8f7', fontFamily: 'monospace' }}>http://localhost:{Number(localStorage.getItem('hmiPort') || '7800')}</span> in a browser.</div>
+                                <div>1. {t('settingsPage.hmiStep1')} <span style={{ color: '#c0c0c0' }}>{t('sidebar.visualization')}</span> {t('settingsPage.hmiStep2')}</div>
+                                <div>2. {t('settingsPage.hmiStep3')}</div>
+                                <div>3. {t('settingsPage.hmiStep4')}</div>
+                                <div>4. {t('settingsPage.hmiStep5')} <span style={{ color: '#4ec9b0' }}>🌐 {t('settingsPage.hmiStep6')}</span> {t('settingsPage.hmiStep7')}</div>
+                                <div>5. {t('settingsPage.hmiStep8')} <span style={{ color: '#7eb8f7', fontFamily: 'monospace' }}>http://localhost:{Number(localStorage.getItem('hmiPort') || '7800')}</span> {t('settingsPage.hmiStep9')}</div>
                             </div>
                         </div>
                     </div>

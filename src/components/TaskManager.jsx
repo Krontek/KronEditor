@@ -1,4 +1,5 @@
 import { useState, useRef, useEffect } from 'react';
+import { useTranslation } from 'react-i18next';
 
 const TASK_COLORS = [
     '#00bcd4', '#ff9800', '#9c27b0', '#4caf50',
@@ -32,6 +33,7 @@ export default function TaskManager({
     taskConfig, onTaskConfigChange,
     programs = [], isRunning = false, liveVariables = null,
 }) {
+    const { t } = useTranslation();
     const tasks = taskConfig?.tasks || [];
     const [editingId, setEditingId] = useState(null);
     const [nameInput, setNameInput] = useState('');
@@ -109,7 +111,7 @@ export default function TaskManager({
             <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '14px 20px', background: '#252526', borderBottom: '1px solid #2a2a2a', flexShrink: 0 }}>
                 <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
                     <span style={{ fontSize: 16 }}>⏱</span>
-                    <span style={{ fontSize: 12, fontWeight: 700, color: '#bbb', letterSpacing: '0.08em', textTransform: 'uppercase' }}>Task Manager</span>
+                    <span style={{ fontSize: 12, fontWeight: 700, color: '#bbb', letterSpacing: '0.08em', textTransform: 'uppercase' }}>{t('sidebar.taskManager')}</span>
                 </div>
                 <button
                     onClick={addTask}
@@ -123,7 +125,7 @@ export default function TaskManager({
                     onMouseEnter={e => { if (!isRunning) e.currentTarget.style.background = '#1a8ad4'; }}
                     onMouseLeave={e => { if (!isRunning) e.currentTarget.style.background = '#007acc'; }}
                 >
-                    + New Task
+                    + {t('actions.newTask')}
                 </button>
             </div>
 
@@ -132,9 +134,9 @@ export default function TaskManager({
 
                 {tasks.length === 0 && (
                     <div style={{ textAlign: 'center', padding: '60px 20px', color: '#444', fontSize: 13, fontStyle: 'italic' }}>
-                        No tasks yet.&nbsp;
+                        {t('messages.noTasksYet')}&nbsp;
                         <span style={{ color: '#007acc', cursor: 'pointer', textDecoration: 'underline' }} onClick={addTask}>
-                            Create your first task
+                            {t('messages.createFirstTask')}
                         </span>
                     </div>
                 )}
@@ -190,7 +192,7 @@ export default function TaskManager({
 
                                 {/* Interval */}
                                 <div style={{ display: 'flex', alignItems: 'center', gap: 5 }}>
-                                    <span style={{ fontSize: 10, color: '#666', marginRight: 2, textTransform: 'uppercase', letterSpacing: '0.06em' }}>Interval</span>
+                                    <span style={{ fontSize: 10, color: '#666', marginRight: 2, textTransform: 'uppercase', letterSpacing: '0.06em' }}>{t('messages.interval')}</span>
                                     <input
                                         type="number" min="1"
                                         value={iv.value}
@@ -225,7 +227,7 @@ export default function TaskManager({
                             {/* Program list */}
                             <div style={{ padding: '8px 12px', display: 'flex', flexDirection: 'column', gap: 4, minHeight: 8 }}>
                                 {sorted.length === 0 && (
-                                    <div style={{ fontSize: 11, color: '#444', fontStyle: 'italic', padding: '4px 2px' }}>No programs assigned to this task</div>
+                                    <div style={{ fontSize: 11, color: '#444', fontStyle: 'italic', padding: '4px 2px' }}>{t('messages.noProgramsAssigned')}</div>
                                 )}
                                 {sorted.map((p, i) => {
                                     const pName = p.program.replace(/\s+/g, '_');
@@ -264,7 +266,7 @@ export default function TaskManager({
                                     onMouseEnter={e => { if (!isRunning && available.length > 0) { e.currentTarget.style.borderColor = color; e.currentTarget.style.color = color; } }}
                                     onMouseLeave={e => { e.currentTarget.style.borderColor = '#444'; e.currentTarget.style.color = '#888'; }}
                                 >
-                                    + Assign Program
+                                    + {t('messages.assignProgram')}
                                 </button>
                                 {openDropdown === task.id && (
                                     <div onClick={e => e.stopPropagation()} style={{ position: 'absolute', bottom: '100%', left: 12, background: '#2d2d2d', border: '1px solid #444', borderRadius: 5, zIndex: 200, minWidth: 170, boxShadow: '0 4px 20px rgba(0,0,0,0.5)', overflow: 'hidden' }}>
@@ -288,12 +290,12 @@ export default function TaskManager({
                 {programs.length > 0 && (
                     <div style={{ background: '#1a1a2a', border: '1px solid #2a2a3a', borderRadius: 6, padding: '12px 16px' }}>
                         <div style={{ fontSize: 10, color: '#555', textTransform: 'uppercase', letterSpacing: '0.1em', marginBottom: 10, display: 'flex', alignItems: 'center', gap: 6 }}>
-                            <span>Unassigned Programs</span>
+                            <span>{t('messages.unassignedPrograms')}</span>
                             {unassigned.length > 0 && <span style={{ background: '#f44336', color: '#fff', borderRadius: 9, padding: '0 5px', fontSize: 9, fontWeight: 700 }}>{unassigned.length}</span>}
                         </div>
                         <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
                             {unassigned.length === 0
-                                ? <span style={{ fontSize: 11, color: '#3a5a3a', fontStyle: 'italic' }}>✓ All programs assigned</span>
+                                ? <span style={{ fontSize: 11, color: '#3a5a3a', fontStyle: 'italic' }}>{t('messages.allProgramsAssigned')}</span>
                                 : unassigned.map(p => (
                                     <span key={p.name} style={{ padding: '3px 10px', background: '#2a2a2a', borderRadius: 12, fontSize: 11, color: '#888', border: '1px solid #383838' }}>
                                         {p.name}

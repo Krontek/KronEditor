@@ -6,7 +6,9 @@
         "functions": "Fonksiyonlar",
         "programs": "Programlar",
         "resources": "Kaynaklar",
-        "configuration": "Yapılandırma"
+        "configuration": "Yapılandırma",
+        "taskManager": "Görev Yöneticisi",
+        "visualization": "Görselleştirme"
     },
     "tables": {
         "name": "İsim",
@@ -46,6 +48,7 @@
         "cancel": "İptal",
         "settings": "Ayarlar",
         "language": "Dil",
+        "selectItemToEdit": "Düzenlemek için Proje Ağacından bir öğe seçin.",
         "english": "İngilizce",
         "turkish": "Türkçe",
         "name": "İsim",
@@ -71,7 +74,8 @@
         "library": "Kütüphane",
         "dragDrop": "Sürükleyip Bırak",
         "blockCount": "{{count}} blok",
-        "howItWorks": "Nasıl çalışır"
+        "howItWorks": "Nasıl çalışır",
+        "standardLibraries": "Standart Kütüphaneler"
     },
     "actions": {
         "add": "Ekle",
@@ -92,7 +96,9 @@
         "selectTarget": "Hedef Seç",
         "build": "Derle",
         "loadFromTarget": "Hedeften Yükle",
-        "pullConfirm": "Mevcut proje kapatılıp hedeften gelen proje yüklenecek. Devam edilsin mi?"
+        "pullConfirm": "Mevcut proje kapatılıp hedeften gelen proje yüklenecek. Devam edilsin mi?",
+        "newTask": "Yeni Görev",
+        "deleteTask": "Görevi Sil"
     },
     "options": {
         "cyclic": "Döngüsel",
@@ -126,7 +132,16 @@
         "removeFieldbusConfirm": "Bu fieldbus bağlantısını kaldırmak istiyor musunuz?",
         "removeFieldbusTitle": "Fieldbus Kaldır",
         "deleteSlaveConfirm": "\"{{name}}\" silinsin mi?",
-        "deleteSlaveTitle": "Slave Sil"
+        "deleteSlaveTitle": "Slave Sil",
+        "noTasksYet": "Henüz görev yok.",
+        "createFirstTask": "İlk görevinizi oluşturun",
+        "addProgram": "Program Ekle",
+        "interval": "Aralık",
+        "programs": "Programlar",
+        "unassignedPrograms": "Atanmamış Programlar",
+        "noProgramsAssigned": "Bu göreve atanmış program yok",
+        "assignProgram": "Program Ata",
+        "allProgramsAssigned": "✓ Tüm programlar atandı"
     },
     "resources": {
         "globalVariables": "Global Değişkenler"
@@ -178,7 +193,19 @@
         "sshPort": "SSH Portu",
         "deployServer": "Sunucuyu Gönder",
         "noBoardSelected": "Lütfen önce bir kart seçin (proje oluşturun veya açın).",
-        "buildServer": "Sunucu Derle"
+        "buildServer": "Sunucu Derle",
+        "buildLibraries": "Kütüphaneleri Derle",
+        "buildCanopen": "CANopen Derle",
+        "hmiHowToUse": "Nasıl Kullanılır",
+        "hmiStep1": "Proje ağacından",
+        "hmiStep2": "sekmesini açın.",
+        "hmiStep3": "Araç kutusundan bileşenleri tuvale sürükleyin.",
+        "hmiStep4": "Sağdaki özellikler panelini kullanarak değişkenleri bağlayın.",
+        "hmiStep5": "Web sunucusunu başlatmak için araç çubuğundaki",
+        "hmiStep6": "Yayınla",
+        "hmiStep7": "düğmesine tıklayın.",
+        "hmiStep8": "Bir tarayıcıda",
+        "hmiStep9": "adresini açın."
     },
     "blockInfo": {
         "TON": "Açma Gecikmeli Zamanlayıcı. IN=TRUE olunca zamanlama başlar; PT süresi dolunca Q=TRUE olur. ET geçen süreyi gösterir. IN=FALSE olunca sıfırlanır.",
@@ -321,6 +348,59 @@
         "startSimulation": "Simülasyonu Başlat",
         "undo": "Geri Al",
         "redo": "İleri Al"
+    },
+    "library": {
+        "bitLogicOperations": "Bit Mantık İşlemleri",
+        "contacts": "Kontaklar",
+        "coils": "Bobinler",
+        "bistables": "Bistabil Devreler",
+        "edgeDetectors": "Kenar Algılayıcılar",
+        "bitwiseOperations": "Bit Düzeyinde İşlemler",
+        "standardFunctionBlocks": "Standart Fonksiyon Blokları",
+        "timers": "Zamanlayıcılar",
+        "counters": "Sayıcılar",
+        "mathematicalFunctions": "Matematik Fonksiyonları",
+        "basicMath": "Temel Matematik",
+        "floatingPoint": "Kayan Nokta",
+        "trigonometry": "Trigonometri",
+        "comparisonSelection": "Karşılaştırma ve Seçim",
+        "comparison": "Karşılaştırma",
+        "selection": "Seçim",
+        "dataConversion": "Veri Dönüştürme",
+        "scaling": "Ölçekleme",
+        "advancedControl": "Gelişmiş Kontrol",
+        "regulators": "Regülatörler",
+        "signalProcessing": "Sinyal İşleme",
+        "motionControl": "Hareket Kontrolü",
+        "administrative": "Yönetimsel",
+        "stopHalt": "Durdur / Dur",
+        "homing": "Sıfırlama",
+        "pointToPoint": "Noktadan Noktaya",
+        "velocity": "Hız",
+        "superimposed": "Üst Üste Bindirilmiş",
+        "readDiagnostic": "Okuma / Teşhis",
+        "communication": "İletişim",
+        "generic": "Genel",
+        "protocols": "Protokoller",
+        "diagnostics": "Teşhis",
+        "systemTime": "Sistem ve Zaman",
+        "rtc": "Gerçek Zamanlı Saat",
+        "file": "Dosya",
+        "busDiagnostics": "Veri Yolu Teşhisi",
+        "sdoAccess": "SDO Erişimi"
+    },
+    "blockDesc": {
+        "normallyOpenContact": "Normalde Açık Kontak",
+        "normallyClosedContact": "Normalde Kapalı Kontak",
+        "invertedRisingEdge": "Ters / Yükselen Kenar",
+        "fallingEdgeContact": "Düşen Kenar Kontağı",
+        "outputCoil": "Çıkış Bobini",
+        "setCoilLatch": "Ayarla Bobini (mandal)",
+        "resetCoilUnlatch": "Sıfırla Bobini (mandal aç)",
+        "movingAverageFilter": "Hareketli Ortalama Filtresi",
+        "rampFunctionGenerator": "Rampa Fonksiyon Üreteci",
+        "readActiveAlarms": "Aktif Alarmları Oku",
+        "readHardwareId": "Donanım Kimliğini Oku"
     },
     "blockNotes": {
         "Contact": {
