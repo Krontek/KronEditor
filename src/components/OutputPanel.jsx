@@ -2,6 +2,7 @@ import { useState, useRef, useEffect, useCallback } from 'react';
 import { createPortal } from 'react-dom';
 import ForceWriteModal from './common/ForceWriteModal';
 import { ErrorCodeService } from '../services/ErrorCodeService';
+import { findVarByName } from '../utils/iecNames';
 
 const LOG_COLORS = {
     info:    '#c8c8c8',
@@ -48,13 +49,17 @@ const resolveExpression = (expr, projectStructure) => {
             ...(projectStructure.programs || []),
             ...(projectStructure.functionBlocks || []),
         ];
+        // Matched case-INSENSITIVELY (IEC identifiers are — see utils/iecNames),
+        // and the live key is then built from the DECLARED spelling, never from
+        // what was typed here: the key doubles as the force-write target.
+        const progLower = progName.replace(/\s+/g, '_').toLowerCase();
         const pou = allPOUs.find(p =>
-            p.name.trim().replace(/\s+/g, '_') === progName.replace(/\s+/g, '_') ||
-            p.name.trim() === progName
+            p.name.trim().replace(/\s+/g, '_').toLowerCase() === progLower ||
+            p.name.trim().toLowerCase() === progName.toLowerCase()
         );
-        const varEntry = (pou?.content?.variables || []).find(v => v.name === varName);
-        const safeProg = progName.replace(/\s+/g, '_');
-        const safeVar  = varName.replace(/\s+/g, '_');
+        const varEntry = findVarByName(pou?.content?.variables || [], varName);
+        const safeProg = (pou?.name?.trim() || progName).replace(/\s+/g, '_');
+        const safeVar  = (varEntry?.name || varName).replace(/\s+/g, '_');
         return {
             liveKey: `prog_${safeProg}_${safeVar}`,
             varType: varEntry?.type || null,
@@ -64,10 +69,10 @@ const resolveExpression = (expr, projectStructure) => {
     // Bare name — try GLOBALS first (the picker lists globals by bare name;
     // POU locals always come through in "Prog.var" form). The transpiler keys
     // global debug variables as `prog__<name>` (empty program segment).
-    const globalVar = getGlobalVars(projectStructure).find(v => v.name === trimmed);
+    const globalVar = findVarByName(getGlobalVars(projectStructure), trimmed);
     if (globalVar) {
         return {
-            liveKey: `prog__${trimmed.replace(/\s+/g, '_')}`,
+            liveKey: `prog__${globalVar.name.replace(/\s+/g, '_')}`,
             varType: globalVar.type || null,
         };
     }
@@ -77,10 +82,10 @@ const resolveExpression = (expr, projectStructure) => {
         ...(projectStructure.functionBlocks || []),
     ];
     for (const pou of allPOUs) {
-        const v = (pou.content?.variables || []).find(vr => vr.name === trimmed);
+        const v = findVarByName(pou.content?.variables || [], trimmed);
         if (v) {
             const safeProg = pou.name.trim().replace(/\s+/g, '_');
-            return { liveKey: `prog_${safeProg}_${trimmed.replace(/\s+/g, '_')}`, varType: v.type };
+            return { liveKey: `prog_${safeProg}_${v.name.replace(/\s+/g, '_')}`, varType: v.type };
         }
     }
     return { liveKey: `${trimmed.replace(/\s+/g, '_')}`, varType: null };

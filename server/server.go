@@ -58,15 +58,20 @@ type RuntimeConfig struct {
 	// (served at the root: http://ip:HMIPort/). 0 = HMI not published on a
 	// dedicated port (it remains reachable on the agent port under /hmi/).
 	HMIPort uint16 `json:"hmi_port,omitempty"`
+	// RingRAMPercent sizes the lossless capture ring as a percentage of the
+	// device's *available* RAM (clamped to ringMaxRAMPercent). 0 = use the
+	// default byte size. Applied at runtime (re)start via createRingSegment.
+	RingRAMPercent float64 `json:"ring_ram_percent,omitempty"`
 }
 
 // runtimeConfigUpdate is the partial-update payload accepted by
 // /deploy/config and /api/v1/runtime/config. Pointer fields let callers
 // touch only what they care about without resetting other settings.
 type runtimeConfigUpdate struct {
-	AutoRun          *bool   `json:"auto_run,omitempty"`
-	StreamIntervalMs *uint32 `json:"stream_interval_ms,omitempty"`
-	HMIPort          *uint16 `json:"hmi_port,omitempty"`
+	AutoRun          *bool    `json:"auto_run,omitempty"`
+	StreamIntervalMs *uint32  `json:"stream_interval_ms,omitempty"`
+	HMIPort          *uint16  `json:"hmi_port,omitempty"`
+	RingRAMPercent   *float64 `json:"ring_ram_percent,omitempty"`
 	// Restart is a transient ACTION flag (not persisted): when true, the
 	// runtime is (re)started with the freshly-deployed binary. Build & Send
 	// sets this as its final step so a new push actually takes effect — merely
@@ -137,7 +142,7 @@ func (s *Server) registerRoutes() {
 	RegisterHMIRoutes(s.mux, s.hmi)
 
 	// REST API for addressed variables (external access: Python, SCADA, HMI).
-	api := NewAPIManager(s.ipc, s)
+	api := NewAPIManager(s.ipc, s, s.cfg.ShmName)
 	RegisterAPIRoutes(s.mux, api)
 }
 
@@ -461,6 +466,16 @@ func (s *Server) UpdateRuntimeConfig(u runtimeConfigUpdate) map[string]any {
 	if u.HMIPort != nil {
 		s.rtCfg.HMIPort = *u.HMIPort
 	}
+	if u.RingRAMPercent != nil {
+		p := *u.RingRAMPercent
+		if p < 0 {
+			p = 0
+		}
+		if p > ringMaxRAMPercent {
+			p = ringMaxRAMPercent
+		}
+		s.rtCfg.RingRAMPercent = p
+	}
 	if err := s.saveRuntimeConfig(); err != nil {
 		slog.Warn("Failed to save runtime config", "err", err)
 	}
@@ -530,6 +545,7 @@ func (s *Server) runtimeConfigSnapshotLocked() map[string]any {
 		"auto_run":           s.rtCfg.AutoRun,
 		"stream_interval_ms": uint32(GetAPIStreamInterval() / time.Millisecond),
 		"hmi_port":           s.rtCfg.HMIPort,
+		"ring_ram_percent":   s.rtCfg.RingRAMPercent,
 	}
 }
 
@@ -538,11 +554,35 @@ func (s *Server) runtimeConfigSnapshotLocked() map[string]any {
 // and BEFORE the new one spawns — writing them here would let the dying
 // runtime's final shm sync overwrite them. Implements RuntimeController.
 func (s *Server) StartRuntime() (int, error) {
+	// Size the capture ring from the RAM-% setting and (re)create the segment
+	// BEFORE the runtime spawns, so the runtime adopts KronServer's size (no env
+	// has to survive a sudo reset). Best-effort: a failure here must not block
+	// starting the runtime — the runtime falls back to its own default size.
+	s.rtMu.Lock()
+	pct := s.rtCfg.RingRAMPercent
+	s.rtMu.Unlock()
+	_, avail := readMemInfo()
+	bytes := ringBytesFromPercent(pct, avail)
+	if err := createRingSegment(s.cfg.ShmName, bytes); err != nil {
+		slog.Warn("Failed to pre-size capture ring; runtime will use default", "err", err, "bytes", bytes)
+	}
+
 	if err := s.pm.Start(); err != nil {
 		return 0, err
 	}
 	pid, _ := s.pm.Status()
 	return pid, nil
+}
+
+// resolvedRingBytes returns the byte size the capture ring would get from the
+// current RAM-% setting and live device memory (for /status display).
+func (s *Server) resolvedRingBytes() (bytes, memTotal, memAvail uint64, pct float64) {
+	s.rtMu.Lock()
+	pct = s.rtCfg.RingRAMPercent
+	s.rtMu.Unlock()
+	memTotal, memAvail = readMemInfo()
+	bytes = ringBytesFromPercent(pct, memAvail)
+	return bytes, memTotal, memAvail, pct
 }
 
 // StopRuntime gracefully terminates the PLC runtime. Implements RuntimeController.
@@ -561,15 +601,20 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	autoRun := s.rtCfg.AutoRun
 	hmiPort := s.rtCfg.HMIPort
 	s.rtMu.Unlock()
+	ringBytes, memTotal, memAvail, ringPct := s.resolvedRingBytes()
 	resp := map[string]any{
-		"running":            running,
-		"pid":                pid,
-		"variable_count":     s.ipc.VariableCount(),
-		"shm_name":           s.cfg.ShmName,
-		"deploy_dir":         s.cfg.DeployDir,
-		"auto_run":           autoRun,
-		"stream_interval_ms": uint32(GetAPIStreamInterval() / time.Millisecond),
-		"hmi_port":           hmiPort,
+		"running":             running,
+		"pid":                 pid,
+		"variable_count":      s.ipc.VariableCount(),
+		"shm_name":            s.cfg.ShmName,
+		"deploy_dir":          s.cfg.DeployDir,
+		"auto_run":            autoRun,
+		"stream_interval_ms":  uint32(GetAPIStreamInterval() / time.Millisecond),
+		"hmi_port":            hmiPort,
+		"mem_total_bytes":     memTotal,
+		"mem_available_bytes": memAvail,
+		"ring_ram_percent":    ringPct,
+		"ring_bytes":          ringBytes,
 	}
 	// Last swap/cold-start/crash outcome — the editor's existing 3s /status
 	// poll is the only channel back from the field side for this (no

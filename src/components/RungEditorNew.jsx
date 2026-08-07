@@ -10,6 +10,7 @@ import { registerIECSTLanguage } from '../utils/iecSTLanguage';
 import { findStMarkers } from '../utils/stValidation';
 import { writeClipboard, readClipboard, useKronClipboard, CLIP_KIND } from '../utils/kronClipboard';
 import { setEditorScope, getEditorScope, EDITOR_SCOPE, hasTextSelection } from '../utils/editorScope';
+import { liveGet, liveResolveKey } from '../utils/iecNames';
 
 // IEC ST identifier validation for SCL inline editors.
 // Returns Monaco markers for undeclared identifiers.
@@ -110,7 +111,13 @@ const SCLInlineEditor = ({ code, readOnly, onCodeChange, onBlur, variables = [],
     }
 
     const safeProgName = (parentName || '').trim().replace(/\s+/g, '_');
-    const userVarNames = new Set([...variables.map(v => v.name), ...globalVars.map(v => v.name)]);
+    // Lowercased — ST identifiers are case-insensitive everywhere else in the
+    // pipeline (transpiler + validation), so a `var0` reference to a declared
+    // `Var0` must resolve here too (see utils/liveLookup).
+    const userVarNames = new Set([
+      ...variables.map(v => (v.name || '').toLowerCase()),
+      ...globalVars.map(v => (v.name || '').toLowerCase()),
+    ]);
     const lines = model.getValue().split('\n');
     const decs = [];
 
@@ -120,13 +127,12 @@ const SCLInlineEditor = ({ code, readOnly, onCodeChange, onBlur, variables = [],
       let match;
       while ((match = regex.exec(line)) !== null) {
         const word = match[0];
-        if (!userVarNames.has(word)) continue;
+        if (!userVarNames.has(word.toLowerCase())) continue;
         const progKey = `prog_${safeProgName}_${word}`;
         const globalKey = `prog__${word}`;
-        let val;
-        if (liveVariables[progKey] !== undefined) val = liveVariables[progKey];
-        else if (liveVariables[globalKey] !== undefined) val = liveVariables[globalKey];
-        else continue;
+        let val = liveGet(liveVariables, progKey);
+        if (val === undefined) val = liveGet(liveVariables, globalKey);
+        if (val === undefined) continue;
 
         const isBool = typeof val === 'boolean';
         const displayStr = isBool ? (val ? 'TRUE' : 'FALSE') : String(val);
@@ -630,7 +636,16 @@ const RungEditorNew = ({ variables, setVariables, rungs, setRungs, availableBloc
     const refName = __declare ? (blockUpdates.instanceName || '').trim().replace(/\s+/g, '_') : '';
     const isValidName = /^[A-Za-z_][A-Za-z0-9_]*$/.test(refName);
     if (refName && isValidName) {
-      const declared = newVariables.some(v => v.name === refName) || (globalVars || []).some(v => v.name === refName);
+      // ⚠️ Case-INSENSITIVE, because IEC identifiers are: with an exact compare,
+      // typing `var0` into a contact while `Var0` was already declared created a
+      // SECOND variable. Both then reach the transpiler, which collapses them in
+      // `varMapLower` (last one wins) while emitting two distinct PlcState
+      // fields — so the ladder block and the ST code silently wired to different
+      // storage. A missing badge was the visible half of this; this is the half
+      // that corrupts the program.
+      const refLower = refName.toLowerCase();
+      const sameName = v => (v.name || '').toLowerCase() === refLower;
+      const declared = newVariables.some(sameName) || (globalVars || []).some(sameName);
       if (!declared) {
         let inferredType = null;
         let isInstance = false;
@@ -683,10 +698,13 @@ const RungEditorNew = ({ variables, setVariables, rungs, setRungs, availableBloc
       ).replace(/[🌍🏠⊞⊡⊟]/g, '').trim();
       if (!instanceName) return;
       const safeProgName = (parentName || '').trim().replace(/\s+/g, '_');
-      const progKey = `prog_${safeProgName}_${instanceName}`;
-      const globalKey = `prog__${instanceName}`;
-      const lookupKey = liveVariables[progKey] !== undefined ? progKey : globalKey;
-      const varDef = [...variables, ...globalVars].find(v => v.name === instanceName);
+      // Resolve to the key AS STORED (built from the declared spelling), not the
+      // spelling typed into the block — a force-write addresses the slot by name.
+      const lookupKey = liveResolveKey(liveVariables, `prog_${safeProgName}_${instanceName}`)
+        || liveResolveKey(liveVariables, `prog__${instanceName}`)
+        || `prog_${safeProgName}_${instanceName}`;
+      const instLower = instanceName.toLowerCase();
+      const varDef = [...variables, ...globalVars].find(v => (v.name || '').toLowerCase() === instLower);
       setSimForceModal({
         varName: instanceName,
         varType: varDef?.type || 'BOOL',

@@ -44,6 +44,92 @@ const SettingsPage = ({ theme, setTheme, editorSettings, setEditorSettings, sele
     });
     const [connStatus, setConnStatus] = useState(null); // null | 'checking' | 'connected' | 'failed' | 'disconnected'
 
+    // ── Lossless capture buffer (ring) sizing ────────────────────────────────
+    const [ringInfo, setRingInfo] = useState(null); // { mem_total_bytes, mem_available_bytes, ring_ram_percent, ring_bytes }
+    const [ringPct, setRingPct] = useState('');      // user input, % of available RAM
+    const [ringMsg, setRingMsg] = useState('');
+    const [ringBusy, setRingBusy] = useState(false);
+
+    const fmtBytes = (b) => {
+        if (!b || b <= 0) return '—';
+        const u = ['B', 'KB', 'MB', 'GB', 'TB'];
+        let i = 0, v = b;
+        while (v >= 1024 && i < u.length - 1) { v /= 1024; i++; }
+        return `${v.toFixed(v < 10 && i > 0 ? 1 : 0)} ${u[i]}`;
+    };
+
+    const refreshRingInfo = async () => {
+        if (!plcAddress) return;
+        try {
+            const st = await host.checkServerStatus(plcAddress);
+            if (st && typeof st === 'object') {
+                setRingInfo(st);
+                if (ringPct === '' && st.ring_ram_percent != null) {
+                    setRingPct(st.ring_ram_percent ? String(st.ring_ram_percent) : '');
+                }
+            }
+        } catch { /* not connected — leave info as-is */ }
+    };
+
+    // Refresh capture-buffer info when the connection comes up.
+    useEffect(() => {
+        if (isPlcConnected) refreshRingInfo();
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [isPlcConnected, plcAddress]);
+
+    const applyRingPercent = async () => {
+        const p = parseFloat(ringPct);
+        if (Number.isNaN(p) || p < 0 || p > 25) {
+            setRingMsg(t('settingsPage.capture.range', 'Enter a percentage between 0 and 25.'));
+            return;
+        }
+        setRingBusy(true);
+        setRingMsg('');
+        try {
+            const res = await fetch(`http://${plcAddress}/deploy/config`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ ring_ram_percent: p }),
+            });
+            if (!res.ok) throw new Error(`HTTP ${res.status}`);
+            setRingMsg(t('settingsPage.capture.applied', 'Applied. Takes effect on the next runtime (re)start.'));
+            await refreshRingInfo();
+        } catch (e) {
+            setRingMsg(`${t('settingsPage.capture.failed', 'Failed')}: ${e.message}`);
+        } finally {
+            setRingBusy(false);
+        }
+    };
+
+    // Derived: seconds of history the resolved ring holds, from the project's
+    // addressed-variable production rate (Σ size / period). Purely informational.
+    const ringSeconds = (() => {
+        if (!ringInfo?.ring_bytes || !projectStructure) return null;
+        try {
+            const tasks = projectStructure.taskConfig?.tasks || [];
+            let bytesPerSec = 0;
+            // rough: every addressed scalar var contributes size / its task period
+            const addr = [];
+            (projectStructure.programs || []).forEach((prog) => {
+                (prog.content?.variables || prog.variables || []).forEach((v) => {
+                    if (v.address) addr.push({ prog: prog.name, size: 8 });
+                });
+            });
+            // if we cannot resolve precise sizes, assume 8 bytes (LINT/LREAL worst case)
+            const periodUsOf = (progName) => {
+                const tk = tasks.find((tsk) => (tsk.programs || []).some((pp) => (pp.program || '') === progName));
+                if (!tk) return 100000;
+                const m = String(tk.interval || '').match(/T#(\d+)(us|ms|s)/i);
+                if (!m) return 100000;
+                const n = parseInt(m[1], 10);
+                return m[2].toLowerCase() === 's' ? n * 1e6 : m[2].toLowerCase() === 'ms' ? n * 1e3 : n;
+            };
+            addr.forEach((a) => { bytesPerSec += (a.size / periodUsOf(a.prog)) * 1e6; });
+            if (bytesPerSec <= 0) return null;
+            return ringInfo.ring_bytes / bytesPerSec;
+        } catch { return null; }
+    })();
+
     // ── Host-agent PoC (temporary — remove after migration) ──────────────────
     const [hostBuildStatus, setHostBuildStatus] = useState(null); // null | 'running' | 'ok' | 'fail'
     const [hostBuildLog, setHostBuildLog] = useState('');
@@ -531,6 +617,82 @@ const SettingsPage = ({ theme, setTheme, editorSettings, setEditorSettings, sele
                                 )}
                             </div>
                         </div>
+
+                        <div style={{ height: '1px', background: '#333', margin: '20px 0' }} />
+
+                        {/* Lossless capture buffer (ring) sizing */}
+                        <h3 style={{ borderBottom: '1px solid #444', paddingBottom: '10px' }}>
+                            {t('settingsPage.capture.title', 'Capture Buffer (Lossless)')}
+                        </h3>
+                        <p style={{ color: '#888', fontSize: '12px', marginBottom: '12px', lineHeight: 1.5 }}>
+                            {t('settingsPage.capture.desc',
+                                'Sizes the on-device buffer that lets the REST API stream (/api/v1/stream/ring) capture EVERY scan value of addressed variables with no loss. Expressed as a percentage of the device\'s available RAM (max 25%). Takes effect on the next runtime (re)start.')}
+                        </p>
+                        {ringInfo && (ringInfo.mem_total_bytes || ringInfo.ring_bytes) ? (
+                            <div style={{
+                                display: 'grid', gridTemplateColumns: 'auto 1fr', gap: '4px 16px',
+                                fontSize: '12px', color: '#bbb', marginBottom: '12px',
+                                background: '#1e1e1e', border: '1px solid #333', borderRadius: '4px', padding: '10px',
+                            }}>
+                                <span style={{ color: '#888' }}>{t('settingsPage.capture.ramTotal', 'Device RAM (total)')}</span>
+                                <span>{fmtBytes(ringInfo.mem_total_bytes)}</span>
+                                <span style={{ color: '#888' }}>{t('settingsPage.capture.ramAvail', 'RAM available')}</span>
+                                <span>{fmtBytes(ringInfo.mem_available_bytes)}</span>
+                                <span style={{ color: '#888' }}>{t('settingsPage.capture.current', 'Current buffer')}</span>
+                                <span>
+                                    {fmtBytes(ringInfo.ring_bytes)}
+                                    {ringInfo.ring_ram_percent ? ` (${ringInfo.ring_ram_percent}% of available)` : ` (${t('settingsPage.capture.default', 'default')})`}
+                                    {ringSeconds != null ? ` · ≈ ${ringSeconds >= 1 ? ringSeconds.toFixed(1) + ' s' : (ringSeconds * 1000).toFixed(0) + ' ms'} ${t('settingsPage.capture.history', 'of history')}` : ''}
+                                </span>
+                            </div>
+                        ) : (
+                            <p style={{ color: '#666', fontSize: '12px', marginBottom: '12px' }}>
+                                {t('settingsPage.capture.connectFirst', 'Connect to a device to read its memory and configure the buffer.')}
+                            </p>
+                        )}
+                        <div style={{ display: 'flex', gap: '10px', alignItems: 'center', marginBottom: '8px' }}>
+                            <label style={{ fontSize: '13px', color: '#ccc' }}>
+                                {t('settingsPage.capture.percent', 'Buffer size (% of available RAM)')}
+                            </label>
+                            <input
+                                type="number" min="0" max="25" step="0.5"
+                                value={ringPct}
+                                onChange={(e) => setRingPct(e.target.value)}
+                                placeholder="0"
+                                style={{
+                                    width: '80px', padding: '6px 8px', background: '#2d2d2d', color: '#ddd',
+                                    border: '1px solid #444', borderRadius: '4px', fontSize: '13px',
+                                }}
+                            />
+                            <button
+                                onClick={applyRingPercent}
+                                disabled={ringBusy || !isPlcConnected}
+                                style={{
+                                    padding: '6px 16px', backgroundColor: '#0e639c', color: '#fff',
+                                    border: 'none', borderRadius: '4px', fontSize: '13px',
+                                    cursor: (ringBusy || !isPlcConnected) ? 'not-allowed' : 'pointer',
+                                    opacity: (ringBusy || !isPlcConnected) ? 0.5 : 1,
+                                }}
+                            >
+                                {ringBusy ? t('common.applying', 'Applying…') : t('common.apply', 'Apply')}
+                            </button>
+                            <button
+                                onClick={refreshRingInfo}
+                                disabled={!isPlcConnected}
+                                style={{
+                                    padding: '6px 12px', backgroundColor: '#2d2d2d', color: '#ccc',
+                                    border: '1px solid #444', borderRadius: '4px', fontSize: '13px',
+                                    cursor: !isPlcConnected ? 'not-allowed' : 'pointer', opacity: !isPlcConnected ? 0.5 : 1,
+                                }}
+                            >
+                                ⟳ {t('common.refresh', 'Refresh')}
+                            </button>
+                        </div>
+                        {ringMsg && (
+                            <p style={{ color: ringMsg.startsWith(t('settingsPage.capture.failed', 'Failed')) ? '#f44747' : '#4ec9b0', fontSize: '12px', margin: '4px 0 0' }}>
+                                {ringMsg}
+                            </p>
+                        )}
 
                         <div style={{ height: '1px', background: '#333', margin: '20px 0' }} />
 

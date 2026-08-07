@@ -1225,6 +1225,21 @@ ${boardDefines}${runtimePortHelpers}${customIncludes}${ecCfgEarly.motionIncludes
     if (ecCfg.headerDecl) {
         source += ecCfg.headerDecl; // KRON_EC_Config definition in plc.c
     }
+    // Addressed SCALAR variables for the lossless capture ring. Only scalars with
+    // a real shm slot and a C field symbol (no array/struct member access) — the
+    // common case (%MW0, %ML0…). Order/task grouping happens in generateMainLoop.
+    const addressedRingVars = Object.entries(variableTable.debugDefaults)
+        .filter(([, info]) => info.address && info.offset !== undefined && info.size > 0
+            && info.c_symbol && !/[.\[]/.test(info.c_symbol))
+        .map(([key, info]) => ({
+            name: key,
+            cSymbol: info.c_symbol,
+            size: info.size,
+            offset: info.offset,
+            serverType: IEC_TO_SERVER_TYPE[info.type?.toUpperCase()] ?? 'int32',
+            isGlobal: key.startsWith('prog__'),
+        }));
+
     const mainLoop = generateMainLoop(
         projectStructure, config, boardId, shmEntries.length > 0, execTimeVars,
         deviceArtifacts.initCode + ecCfg.initCode,
@@ -1236,9 +1251,11 @@ ${boardDefines}${runtimePortHelpers}${customIncludes}${ecCfgEarly.motionIncludes
         ecCfg.ecThreadJoinCode  || '',
         !!ecCfg.halContent,         // gpiMutexEnabled: true when IO_Bus thread owns the bus
         shmEntries,
-        plcStateLayoutHash
+        plcStateLayoutHash,
+        addressedRingVars
     );
     source += mainLoop.src;
+    if (mainLoop.ringConfig) variableTable.ring = mainLoop.ringConfig;
     variableTable.tasks = mainLoop.programTasks.map(pt => ({
         program: pt.name,
         interval_us: pt.intervalUs,
@@ -1911,7 +1928,7 @@ ${ncWriteBridge}` : ''}        /* Step 4: Propagate HW-updated staging to the ba
     };
 };
 
-const generateMainLoop = (projectStructure, config, boardId = null, shmEnabled = false, execTimeVars = [], initCode = '', cleanupCode = '', ecPdoReadCode = '', ecPdoWriteCode = '', ecThreadCode = '', ecThreadStartCode = '', ecThreadJoinCode = '', gpiMutexEnabled = false, shmEntries = [], plcStateLayoutHash = '0') => {
+const generateMainLoop = (projectStructure, config, boardId = null, shmEnabled = false, execTimeVars = [], initCode = '', cleanupCode = '', ecPdoReadCode = '', ecPdoWriteCode = '', ecThreadCode = '', ecThreadStartCode = '', ecThreadJoinCode = '', gpiMutexEnabled = false, shmEntries = [], plcStateLayoutHash = '0', addressedRingVars = []) => {
     let mainSrc = `\n// --- DETERMINISTIC SCAN LOOP ---\n`;
 
     // --- 1. Discover task→program groupings (priority: taskConfig > res_config > fallback) ---
@@ -1980,6 +1997,57 @@ const generateMainLoop = (projectStructure, config, boardId = null, shmEnabled =
         ? Math.max(1, Math.min(...programTasks.map(pt => pt.intervalUs)))
         : 1000;
 
+    // --- LOSSLESS CAPTURE RING grouping (addressed variables) ---
+    // Group each addressed variable under the TASK that writes it, so the ring
+    // record for a task carries exactly that task's addressed vars. Program-local
+    // vars map to their program's task; globals (which any task may write) map to
+    // the FASTEST task so they are captured at the highest rate (never
+    // undersampled). See server/RING_FORMAT.md. A variable whose program is
+    // unassigned to any task is skipped (it never runs).
+    const ringFastestTaskIdx = taskGroups.length > 0
+        ? taskGroups.reduce((best, tg, i, arr) => (tg.intervalUs < arr[best].intervalUs ? i : best), 0)
+        : -1;
+    const ringOwnerTaskIdx = (rv) => {
+        if (rv.isGlobal) return ringFastestTaskIdx;
+        let best = -1, bestLen = -1;
+        taskGroups.forEach((tg, ti) => {
+            tg.programs.forEach((P) => {
+                if (rv.cSymbol.startsWith(`prog_${P}_`) && P.length > bestLen) { best = ti; bestLen = P.length; }
+            });
+        });
+        return best;
+    };
+    // ringTasks[ti] present only for tasks that actually carry addressed vars.
+    const ringTasksByIdx = {};
+    (addressedRingVars || []).forEach((rv) => {
+        const ti = ringOwnerTaskIdx(rv);
+        if (ti < 0) return;
+        (ringTasksByIdx[ti] = ringTasksByIdx[ti] || []).push(rv);
+    });
+    // deterministic payload order = ascending shm offset
+    Object.values(ringTasksByIdx).forEach((list) => list.sort((a, b) => a.offset - b.offset));
+    const ringTasks = Object.keys(ringTasksByIdx)
+        .map((k) => parseInt(k, 10))
+        .sort((a, b) => a - b)
+        .map((ti) => {
+            const vars = ringTasksByIdx[ti];
+            const payloadLen = vars.reduce((s, v) => s + v.size, 0);
+            return { taskId: ti, taskName: taskGroups[ti].taskName, periodUs: taskGroups[ti].intervalUs, vars, payloadLen };
+        });
+    const ringEnabled = ringTasks.length > 0;
+    const ringMaxPayload = ringEnabled ? Math.max(...ringTasks.map((t) => t.payloadLen)) : 0;
+    // record_stride = align8(16 header + max task payload)
+    const ringRecordStride = ringEnabled ? Math.ceil((16 + ringMaxPayload) / 8) * 8 : 0;
+    // ringConfig returned for variable_table.json (client decodes payloads with it)
+    const ringConfig = ringEnabled ? {
+        record_stride: ringRecordStride,
+        tasks: ringTasks.map((t) => ({
+            task_id: t.taskId,
+            period_us: t.periodUs,
+            vars: t.vars.map((v) => ({ name: v.name, type: v.serverType, size: v.size })),
+        })),
+    } : null;
+
     // --- 2. Global shared state ---
     // us_tick is defined for ALL platforms.
     // Linux/Apple: updated from clock_gettime inside each task thread → always accurate.
@@ -1992,6 +2060,7 @@ const generateMainLoop = (projectStructure, config, boardId = null, shmEnabled =
     mainSrc += `volatile int plc_stop = 0;\n`;
     mainSrc += `volatile uint64_t us_tick = 0;\n`;
     mainSrc += `#endif\n\n`;
+    if (ringEnabled) mainSrc += `static void plc_ring_init(void);\n`;
     mainSrc += `void PLC_Init(void) {\n`;
     if (boardId) {
         mainSrc += `    HAL_Init();\n`;
@@ -2000,6 +2069,7 @@ const generateMainLoop = (projectStructure, config, boardId = null, shmEnabled =
     if (initCode) {
         mainSrc += initCode;
     }
+    if (ringEnabled) mainSrc += `    plc_ring_init();\n`;
     mainSrc += `}\n\n`;
     mainSrc += `void PLC_Cleanup(void) {\n`;
     if (cleanupCode) {
@@ -2050,6 +2120,97 @@ const generateMainLoop = (projectStructure, config, boardId = null, shmEnabled =
         mainSrc += `\n`;
     }
 
+    // --- LOSSLESS CAPTURE RING codegen (addressed variables) ---
+    // Producer side of server/RING_FORMAT.md. A second /dev/shm segment
+    // (<shm>_ring) holds fixed-stride records; each task appends its addressed
+    // vars on kept scans (scan_g % stride_N). KronServer drains it losslessly and
+    // writes stride_N back. Gated to a plain Linux build: KronServer (the only
+    // consumer) runs on Linux, hot-swap builds don't own this memory, and the
+    // Windows/macOS SIM keeps compiling via the no-op stubs below.
+    if (ringEnabled) {
+        const RS = ringRecordStride;
+        mainSrc += `// ===== Lossless capture ring (addressed variables) =====\n`;
+        mainSrc += `#if defined(__linux__) && !defined(PLC_HOTSWAP)\n`;
+        mainSrc += `#include <sys/mman.h>\n#include <sys/stat.h>\n#include <fcntl.h>\n#include <unistd.h>\n#include <stdlib.h>\n#include <string.h>\n#include <stdint.h>\n`;
+        mainSrc += `#define PLC_RING_NAME "/plc_runtime_ring"\n`;
+        mainSrc += `#define PLC_RING_HEADER 256\n`;
+        mainSrc += `#define PLC_RING_STRIDE ${RS}\n`;
+        mainSrc += `static uint8_t *__plc_ring = NULL;\n`;
+        mainSrc += `static uint64_t __plc_ring_nslots = 0;\n`;
+        ringTasks.forEach((t) => { mainSrc += `static uint64_t __ring_scan_${t.taskName} = 0;\n`; });
+        // init
+        mainSrc += `static void plc_ring_init(void) {\n`;
+        mainSrc += `    int fd = shm_open(PLC_RING_NAME, O_CREAT | O_RDWR, 0660);\n`;
+        mainSrc += `    if (fd < 0) return;\n`;
+        mainSrc += `    struct stat st;\n`;
+        mainSrc += `    if (fstat(fd, &st) != 0) { close(fd); return; }\n`;
+        mainSrc += `    long total = (long)st.st_size;\n`;
+        mainSrc += `    long minimal = PLC_RING_HEADER + PLC_RING_STRIDE;\n`;
+        mainSrc += `    if (total < minimal) {\n`;
+        mainSrc += `        const char *env = getenv("KRON_RING_BYTES");\n`;
+        mainSrc += `        long want = env ? atol(env) : (1L<<20);\n`;
+        mainSrc += `        if (want < minimal) want = 1L<<20;\n`;
+        mainSrc += `        if (ftruncate(fd, want) != 0) { close(fd); return; }\n`;
+        mainSrc += `        total = want;\n`;
+        mainSrc += `    }\n`;
+        mainSrc += `    uint8_t *r = (uint8_t*)mmap(NULL, (size_t)total, PROT_READ|PROT_WRITE, MAP_SHARED, fd, 0);\n`;
+        mainSrc += `    close(fd);\n`;
+        mainSrc += `    if (r == MAP_FAILED) return;\n`;
+        mainSrc += `    uint64_t nslots = (uint64_t)((total - PLC_RING_HEADER) / PLC_RING_STRIDE);\n`;
+        mainSrc += `    if (nslots == 0) { munmap(r, (size_t)total); return; }\n`;
+        // preserve stride_N + epoch across restarts
+        mainSrc += `    uint32_t oldN; memcpy(&oldN, r + 40, 4); if (oldN == 0) oldN = 1;\n`;
+        mainSrc += `    uint64_t oldEpoch; memcpy(&oldEpoch, r + 48, 8);\n`;
+        mainSrc += `    uint32_t u32; uint16_t u16; uint64_t u64;\n`;
+        mainSrc += `    u32 = 0x4B524E47u; memcpy(r+0,&u32,4);\n`;   // magic
+        mainSrc += `    u32 = 1u;          memcpy(r+4,&u32,4);\n`;   // version
+        mainSrc += `    u32 = 256u;        memcpy(r+8,&u32,4);\n`;   // header_bytes
+        mainSrc += `    u32 = (uint32_t)PLC_RING_STRIDE; memcpy(r+12,&u32,4);\n`;
+        mainSrc += `    u32 = (uint32_t)nslots; memcpy(r+16,&u32,4);\n`;
+        mainSrc += `    u32 = (uint32_t)total; memcpy(r+20,&u32,4);\n`;
+        mainSrc += `    u32 = ${ringTasks.length}u; memcpy(r+24,&u32,4);\n`; // ntasks
+        mainSrc += `    u32 = 1u; memcpy(r+28,&u32,4);\n`;            // flags: enabled
+        mainSrc += `    u64 = 0ull; memcpy(r+32,&u64,8);\n`;         // write_seq = 0
+        mainSrc += `    memcpy(r+40,&oldN,4);\n`;                     // stride_N preserved
+        mainSrc += `    u64 = oldEpoch + 1ull; memcpy(r+48,&u64,8);\n`; // epoch bump
+        // task table
+        ringTasks.forEach((t, j) => {
+            mainSrc += `    u32 = ${t.periodUs}u; memcpy(r+${64 + j * 8},&u32,4);\n`;
+            mainSrc += `    u16 = ${t.payloadLen}u; memcpy(r+${64 + j * 8 + 4},&u16,2);\n`;
+            mainSrc += `    u16 = ${t.taskId}u; memcpy(r+${64 + j * 8 + 6},&u16,2);\n`;
+        });
+        // init all slots to empty seq
+        mainSrc += `    for (uint64_t i = 0; i < nslots; i++) { u64 = ~0ull; memcpy(r + 256 + i*PLC_RING_STRIDE, &u64, 8); }\n`;
+        mainSrc += `    __atomic_thread_fence(__ATOMIC_RELEASE);\n`;
+        mainSrc += `    __plc_ring = r; __plc_ring_nslots = nslots;\n`;
+        mainSrc += `}\n`;
+        // append per task
+        ringTasks.forEach((t) => {
+            mainSrc += `static void plc_ring_append_${t.taskName}(void) {\n`;
+            mainSrc += `    if (!__plc_ring) return;\n`;
+            mainSrc += `    uint32_t N = __atomic_load_n((uint32_t*)(__plc_ring + 40), __ATOMIC_RELAXED); if (N == 0) N = 1;\n`;
+            mainSrc += `    if ((__ring_scan_${t.taskName}++ % N) != 0) return;\n`;
+            mainSrc += `    uint64_t s = __atomic_fetch_add((uint64_t*)(__plc_ring + 32), 1ull, __ATOMIC_RELAXED);\n`;
+            mainSrc += `    uint8_t *slot = __plc_ring + 256 + (uint64_t)(s % __plc_ring_nslots) * PLC_RING_STRIDE;\n`;
+            mainSrc += `    uint16_t tid = ${t.taskId}u; memcpy(slot + 8, &tid, 2);\n`;
+            mainSrc += `    uint16_t pl = ${t.payloadLen}u; memcpy(slot + 10, &pl, 2);\n`;
+            mainSrc += `    uint8_t *p = slot + 16;\n`;
+            let po = 0;
+            t.vars.forEach((v) => {
+                mainSrc += `    memcpy(p + ${po}, (const void*)&(S->${v.cSymbol}), ${v.size});\n`;
+                po += v.size;
+            });
+            mainSrc += `    __atomic_store_n((uint64_t*)(slot + 0), s, __ATOMIC_RELEASE);\n`;
+            mainSrc += `}\n`;
+        });
+        mainSrc += `#else\n`;
+        // non-Linux sim / hot-swap: ring not owned here — no-op so the SAME task
+        // body compiles and links everywhere.
+        mainSrc += `static inline void plc_ring_init(void) {}\n`;
+        ringTasks.forEach((t) => { mainSrc += `static inline void plc_ring_append_${t.taskName}(void) {}\n`; });
+        mainSrc += `#endif\n\n`;
+    }
+
     // Per-task scan BODY (SHM pull → programs → SHM sync). Extracted into its own
     // function so the SAME body is run by the in-binary thread loop (normal build)
     // AND by the hot-swap loader-host, which calls plc_task_body_<i> through dlsym
@@ -2071,6 +2232,11 @@ const generateMainLoop = (projectStructure, config, boardId = null, shmEnabled =
             }
         });
         if (shmEnabled) mainSrc += `    plc_shm_sync_${tg.taskName}();\n`;
+        // Capture ring: append this task's addressed vars AFTER shm sync (values
+        // final for the scan). No-op unless this task has addressed vars.
+        if (ringEnabled && ringTasks.find((t) => t.taskId === ti)) {
+            mainSrc += `    plc_ring_append_${taskGroups[ti].taskName}();\n`;
+        }
         mainSrc += `}\n\n`;
     });
 
@@ -2213,7 +2379,7 @@ const generateMainLoop = (projectStructure, config, boardId = null, shmEnabled =
     mainSrc += `#endif /* PLC_HOTSWAP */\n\n`;
 
 
-    return { src: mainSrc, programTasks, baseTickUs };
+    return { src: mainSrc, programTasks, baseTickUs, ringConfig };
 };
 
 // FUNCTION POU helpers — Input-class variables become C parameters in

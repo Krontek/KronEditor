@@ -7,6 +7,7 @@ import RungEditorNew from './RungEditorNew';
 import ResourceEditor from './ResourceEditor';
 import DragDropManager from '../utils/DragDropManager';
 import ForceWriteModal from './common/ForceWriteModal';
+import { liveGet, memberGet, liveEntriesWithPrefix } from '../utils/iecNames';
 
 // IEC scalar (elementary) types — anything else (FB instances like TON/CTU,
 // UDTs, ARRAY[...]) is a COMPOSITE whose live value is a struct/array, shown in
@@ -331,14 +332,16 @@ const EditorPane = ({
         // Context for the live-value hover provider (registered once below).
         window.stLiveCtx = { live: liveVariables, prog: safeProgName };
 
-        // Only look up actual user-defined variables, not keywords
+        // Only look up actual user-defined variables, not keywords. Keyed by
+        // LOWERCASE name — ST identifiers are case-insensitive (§liveLookup), so
+        // a `var0` reference to a declared `Var0` must still get its badge.
         const userVarNames = new Set([
-          ...variables.map(v => v.name),
-          ...globalVars.map(v => v.name)
+          ...variables.map(v => (v.name || '').toLowerCase()),
+          ...globalVars.map(v => (v.name || '').toLowerCase())
         ]);
-        // name → declared type, to classify scalar vs composite (FB/struct/array).
+        // lowercased name → declared type, to classify scalar vs composite (FB/struct/array).
         const varTypeMap = {};
-        [...variables, ...globalVars].forEach(v => { if (v && v.name) varTypeMap[v.name] = v.type; });
+        [...variables, ...globalVars].forEach(v => { if (v && v.name) varTypeMap[v.name.toLowerCase()] = v.type; });
         const isArrayType = (t) => /\barray\b|\[/i.test(String(t || ''));
         const isCompositeType = (t) => {
           const u = String(t || '').toUpperCase().trim();
@@ -371,7 +374,8 @@ const EditorPane = ({
           let match;
           while ((match = regex.exec(line)) !== null) {
             const word = match[0];
-            if (!userVarNames.has(word)) continue;
+            const wordLower = word.toLowerCase();
+            if (!userVarNames.has(wordLower)) continue;
 
             // Look at the next significant char after the identifier.
             const afterIdx = match.index + word.length;
@@ -383,25 +387,27 @@ const EditorPane = ({
             // own, so render nothing.
             if (nextCh === '(') continue;
 
-            const composite = isCompositeType(varTypeMap[word]);
+            const composite = isCompositeType(varTypeMap[wordLower]);
 
             // MEMBER access (e.g. blink.Q) — show the MEMBER's value, never the
             // base. Always `continue` so the base FB/struct is not rendered as a
             // bogus scalar (this is what caused `blink 0 .Q`).
             if (nextCh === '.') {
               const progKeyM = `prog_${safeProgName}_${word}`;
-              const valM = liveVariables[progKeyM] !== undefined ? liveVariables[progKeyM] : liveVariables[`prog__${word}`];
+              const valMProg = liveGet(liveVariables, progKeyM);
+              const valM = valMProg !== undefined ? valMProg : liveGet(liveVariables, `prog__${word}`);
               const mm = line.slice(j + 1).match(/^[a-zA-Z_][a-zA-Z0-9_]*/);
               const member = mm && mm[0];
               let mv;
               if (valM && typeof valM === 'object') {
                 // Local sim: FB decoded to an object {Q, ET, …}.
-                mv = member ? valM[member] : undefined;
+                mv = member ? memberGet(valM, member) : undefined;
               } else if (member) {
                 // Target (KronServer/SHM): FB outputs streamed as FLAT keys
                 // `prog_X_<var>.<pin>` (or global `prog__<var>.<pin>`).
                 const fk = `prog_${safeProgName}_${word}.${member}`;
-                mv = liveVariables[fk] !== undefined ? liveVariables[fk] : liveVariables[`prog__${word}.${member}`];
+                const fkVal = liveGet(liveVariables, fk);
+                mv = fkVal !== undefined ? fkVal : liveGet(liveVariables, `prog__${word}.${member}`);
               }
               if (member && mv !== undefined && typeof mv !== 'object') {
                 const memStartCol = j + 2;                // 1-based col of member's first char
@@ -413,19 +419,14 @@ const EditorPane = ({
             // Try program-scoped key first, then global key
             const progKey = `prog_${safeProgName}_${word}`;
             const globalKey = `prog__${word}`;
-            let val;
-            if (liveVariables[progKey] !== undefined) {
-              val = liveVariables[progKey];
-            } else if (liveVariables[globalKey] !== undefined) {
-              val = liveVariables[globalKey];
-            } else if (!composite) {
-              continue;
-            }
+            let val = liveGet(liveVariables, progKey);
+            if (val === undefined) val = liveGet(liveVariables, globalKey);
+            if (val === undefined && !composite) continue;
 
             // A composite (FB / struct / array) referenced as a whole — show an
             // icon (NOT a scalar value), with full contents on hover.
             if (composite || (val && typeof val === 'object')) {
-              const icon = isArrayType(varTypeMap[word]) ? '▦ array' : '{ } struct';
+              const icon = isArrayType(varTypeMap[wordLower]) ? '▦ array' : '{ } struct';
               pushDec(i + 1, match.index + 1, afterIdx + 1, { text: icon, hl: 'live-var-hl-num', txt: 'live-var-text-struct' });
               continue;
             }
@@ -591,26 +592,22 @@ const EditorPane = ({
         const word = wi.word;
         const live = ctx.live;
         const pk = `prog_${ctx.prog}_${word}`, gk = `prog__${word}`;
-        let val = live[pk] !== undefined ? live[pk] : live[gk];
+        let val = liveGet(live, pk);
+        if (val === undefined) val = liveGet(live, gk);
         // Array spread across indexed keys (prog_X_arr[0], …) → gather into one array.
         if (val === undefined || typeof val !== 'object') {
-          const p1 = `prog_${ctx.prog}_${word}[`, p2 = `prog__${word}[`;
           const elems = [];
-          for (const k of Object.keys(live)) {
-            const rest = k.startsWith(p1) ? k.slice(p1.length) : (k.startsWith(p2) ? k.slice(p2.length) : null);
-            if (rest === null) continue;
+          for (const [rest, v] of liveEntriesWithPrefix(live, [`prog_${ctx.prog}_${word}[`, `prog__${word}[`])) {
             const idx = parseInt(rest, 10);
-            if (!Number.isNaN(idx)) elems[idx] = live[k];
+            if (!Number.isNaN(idx)) elems[idx] = v;
           }
           if (elems.length) val = elems;
         }
         // FB/struct members spread across flat keys (prog_X_blink.Q, …, target SHM).
         if (val === undefined || typeof val !== 'object') {
-          const d1 = `prog_${ctx.prog}_${word}.`, d2 = `prog__${word}.`;
           const obj = {};
-          for (const k of Object.keys(live)) {
-            const rest = k.startsWith(d1) ? k.slice(d1.length) : (k.startsWith(d2) ? k.slice(d2.length) : null);
-            if (rest) obj[rest] = live[k];
+          for (const [rest, v] of liveEntriesWithPrefix(live, [`prog_${ctx.prog}_${word}.`, `prog__${word}.`])) {
+            if (rest) obj[rest] = v;
           }
           if (Object.keys(obj).length) val = obj;
         }

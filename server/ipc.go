@@ -67,9 +67,33 @@ type Variable struct {
 
 // VariableTable is the root structure for the symbol table.
 type VariableTable struct {
-	Variables       []Variable `json:"variables"`
-	APIPasswordHash string     `json:"api_password_hash,omitempty"`
-	APIPasswordSalt string     `json:"api_password_salt,omitempty"`
+	Variables       []Variable  `json:"variables"`
+	APIPasswordHash string      `json:"api_password_hash,omitempty"`
+	APIPasswordSalt string      `json:"api_password_salt,omitempty"`
+	Ring            *RingConfig `json:"ring,omitempty"`
+}
+
+// RingConfig describes the capture-ring payload layout so a stream client can
+// decode raw record bytes into named variables. Emitted by the transpiler; the
+// var order within each task IS the payload byte order. Optional — absent means
+// the project has no addressed variables (ring disabled).
+type RingConfig struct {
+	RecordStride int              `json:"record_stride"`
+	Tasks        []RingTaskLayout `json:"tasks"`
+}
+
+// RingTaskLayout is one task's addressed-variable payload layout.
+type RingTaskLayout struct {
+	TaskID   int       `json:"task_id"`
+	PeriodUs int       `json:"period_us"`
+	Vars     []RingVar `json:"vars"`
+}
+
+// RingVar is one addressed variable's slot inside a task's record payload.
+type RingVar struct {
+	Name string  `json:"name"`
+	Type VarType `json:"type"`
+	Size int     `json:"size"`
 }
 
 // IPC manager
@@ -85,6 +109,7 @@ type IPCManager struct {
 	addressedVars   map[string]Variable // Subset where Address != ""
 	apiPasswordHash string
 	apiPasswordSalt string
+	ringConfig      *RingConfig // payload layout for the capture ring (may be nil)
 }
 
 // NewIPCManager opens (or creates) /dev/shm/<shmName> and memory maps it.
@@ -198,6 +223,7 @@ func (m *IPCManager) LoadVariableTable(path string) error {
 	m.addressedVars = addressed
 	m.apiPasswordHash = table.APIPasswordHash
 	m.apiPasswordSalt = table.APIPasswordSalt
+	m.ringConfig = table.Ring
 	m.mu.Unlock()
 
 	slog.Info("Variable table loaded", "path", path, "count", len(newVars), "addressed", len(addressed))
@@ -558,6 +584,14 @@ func (m *IPCManager) AddressedVarInfo(name string) (Variable, bool) {
 	v, ok := m.addressedVars[name]
 	m.mu.RUnlock()
 	return v, ok
+}
+
+// RingConfig returns the capture-ring payload layout (nil if the project has no
+// addressed variables / no ring).
+func (m *IPCManager) RingConfig() *RingConfig {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.ringConfig
 }
 
 // AppendRawSample appends the current raw little-endian bytes of each variable

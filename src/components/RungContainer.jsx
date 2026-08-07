@@ -2,6 +2,7 @@ import React, { useState, useCallback, useRef, useEffect } from 'react';
 import { useTranslation } from 'react-i18next';
 import ForceWriteModal from './common/ForceWriteModal';
 import { formatTimeUs, normalizeTimeLiteral } from '../utils/plcStandards';
+import { liveGet, liveResolveKey, findVarByName } from '../utils/iecNames';
 import { ErrorCodeService } from '../services/ErrorCodeService';
 import ReactFlow, {
   ReactFlowProvider,
@@ -459,13 +460,15 @@ const BlockNode = ({ id, data, selected }) => {
   // by name). Used to catch a pin wired to an UNDECLARED variable (e.g. an
   // output assigned to a name never added to the table) so it is flagged with
   // a reason instead of silently building into a broken/undefined symbol.
+  // Held LOWERCASED: IEC identifiers are case-insensitive, so `var0` referencing
+  // a declared `Var0` is valid and must not be red-flagged (see utils/iecNames).
   const declaredNames = React.useMemo(() => {
     const s = new Set();
-    [...variables, ...globalVars, ...(hwPortVars || [])].forEach(v => { if (v?.name) s.add(v.name); });
+    [...variables, ...globalVars, ...(hwPortVars || [])].forEach(v => { if (v?.name) s.add(v.name.toLowerCase()); });
     (dataTypes || []).forEach(dt => {
       if (dt.type === 'Enumerated') {
         (dt.content?.members || dt.content?.values || []).forEach(m => {
-          const n = typeof m === 'string' ? m : m?.name; if (n) s.add(n);
+          const n = typeof m === 'string' ? m : m?.name; if (n) s.add(n.toLowerCase());
         });
       }
     });
@@ -481,7 +484,7 @@ const BlockNode = ({ id, data, selected }) => {
     if (!/^[A-Za-z_]/.test(c)) return null;               // numeric/other literal
     if (/^(TRUE|FALSE|NULL)$/i.test(c)) return null;       // keyword literals
     const base = c.split(/[\[.]/)[0];
-    return base && !declaredNames.has(base) ? base : null;
+    return base && !declaredNames.has(base.toLowerCase()) ? base : null;
   }, [declaredNames]);
 
   // LOCAL STATE to prevent cursor jumping due to async prop updates
@@ -537,17 +540,14 @@ const BlockNode = ({ id, data, selected }) => {
     let lookupKey = null;
     if (liveVariables && safeName) {
       const progKey = `prog_${safeProgName}_${safeName}`;
-      if (liveVariables[progKey] !== undefined) {
-        lookupKey = progKey;
-      } else {
-        const globalKey = `prog__${safeName}`;
-        lookupKey = liveVariables[globalKey] !== undefined ? globalKey : progKey;
-      }
+      lookupKey = liveResolveKey(liveVariables, progKey)
+        || liveResolveKey(liveVariables, `prog__${safeName}`)
+        || progKey;
     }
     const isLiveActive = liveVariables && lookupKey && liveVariables[lookupKey] !== undefined;
     const canForce = !!data.onForceWrite && isLiveActive;
     const allVars = [...variables, ...globalVars];
-    const varDef = allVars.find(v => v.name === instanceName);
+    const varDef = findVarByName(allVars, instanceName);
     const varType = varDef?.type || 'BOOL';
     const isTypeMismatch = !!(varDef && varDef.type !== 'BOOL');
 
@@ -580,7 +580,7 @@ const BlockNode = ({ id, data, selected }) => {
         border: selected ? '2px solid #a78bfa' : (
           isTypeMismatch ? '2px solid #ff9800' // ORANGE: variable exists but not BOOL
           : ((data.type === 'Contact' || data.type === 'Coil') && instanceName !== '' &&
-              !allVars.some(v => v.name === instanceName.replace(/[🌍🏠⊞⊡⊟]/g, '').trim().split(/[\[.]/)[0]))
+              !findVarByName(allVars, instanceName.replace(/[🌍🏠⊞⊡⊟]/g, '').trim().split(/[\[.]/)[0]))
             ? '2px solid #f44336' // RED: variable not found
             : '1px solid transparent'
         ),
@@ -634,7 +634,7 @@ const BlockNode = ({ id, data, selected }) => {
               setLocalInstanceName(rawValue);
               const val = rawValue.replace(/[🌍🏠⊞⊡⊟]/g, '').trim();
               // Block assignment if variable exists but is not BOOL type
-              const typedVarDef = allVars.find(v => v.name === val.split(/[\[.]/)[0]);
+              const typedVarDef = findVarByName(allVars, val.split(/[\[.]/)[0]);
               if (typedVarDef && typedVarDef.type !== 'BOOL') return;
               handleUpdate({ instanceName: val });
             }}
@@ -645,7 +645,7 @@ const BlockNode = ({ id, data, selected }) => {
               if (data.readOnly) return;
               const val = (localInstanceName || '').replace(/[🌍🏠⊞⊡⊟]/g, '').trim();
               if (!val) return;
-              const typedVarDef = allVars.find(v => v.name === val.split(/[\[.]/)[0]);
+              const typedVarDef = findVarByName(allVars, val.split(/[\[.]/)[0]);
               if (typedVarDef && typedVarDef.type !== 'BOOL') return;
               handleUpdate({ instanceName: val, __declare: true });
             }}
@@ -829,7 +829,7 @@ const BlockNode = ({ id, data, selected }) => {
       }
       // Variable reference → use its declared type
       const baseName = val.split(/[\[.]/)[0];
-      const varDef = allVars.find(v => v.name === baseName);
+      const varDef = findVarByName(allVars, baseName);
       if (varDef) {
         if (varDef.type === 'REAL' || varDef.type === 'LREAL') { inferredType = 'REAL'; break; }
         if (inferredType === 'ANY_NUM') inferredType = varDef.type;
@@ -958,7 +958,7 @@ const BlockNode = ({ id, data, selected }) => {
 
             const cleanVal = val.replace(/[🌍🏠⊞⊡⊟]/g, '').trim();
             const baseValName = cleanVal.split(/[\[.]/)[0];
-            const valVarDef = [...variables, ...globalVars].find(v => v.name === baseValName);
+            const valVarDef = findVarByName([...variables, ...globalVars], baseValName);
             const allowsWholeArrayRef = !!pin.passByReference;
             const isArrayWithoutIndex = valVarDef && arrayTypeMap[valVarDef.type] && !cleanVal.includes('[');
             const isInvalidWholeArrayUsage = isArrayWithoutIndex && !allowsWholeArrayRef;
@@ -990,11 +990,9 @@ const BlockNode = ({ id, data, selected }) => {
                         empty pin's input — it would cover the field and swallow clicks, making a
                         freshly dropped block impossible to wire while the sim runs. */}
                     {(liveVariables && (data.readOnly ? (!val || valVarDef || hasShadow) : !!(val && (valVarDef || hasShadow)))) && (() => {
-                      const varLiveVal = liveVariables[`prog_${safeProgName}_${baseValName}`] !== undefined
-                        ? liveVariables[`prog_${safeProgName}_${baseValName}`]
-                        : liveVariables[`prog__${baseValName}`] !== undefined
-                          ? liveVariables[`prog__${baseValName}`]
-                          : liveVariables[shadowKey];
+                      let varLiveVal = liveGet(liveVariables, `prog_${safeProgName}_${baseValName}`);
+                      if (varLiveVal === undefined) varLiveVal = liveGet(liveVariables, `prog__${baseValName}`);
+                      if (varLiveVal === undefined) varLiveVal = liveVariables[shadowKey];
                       const hasLive = varLiveVal !== undefined;
                       const liveStr = hasLive
                         ? (typeof varLiveVal === 'boolean' ? (varLiveVal ? '1' : '0') : (pin.type === 'TIME' ? formatTimeUs(varLiveVal) : String(varLiveVal)))
@@ -1012,7 +1010,8 @@ const BlockNode = ({ id, data, selected }) => {
                             if (isVarRefBadge) {
                               const safeVar = cleanedVal.replace(/\s+/g, '_');
                               const pk = `prog_${safeProgName}_${safeVar}`;
-                              forceKey = liveVariables?.[pk] !== undefined ? pk : `prog__${safeVar}`;
+                              forceKey = liveResolveKey(liveVariables, pk)
+                                || liveResolveKey(liveVariables, `prog__${safeVar}`) || pk;
                               forceCurrent = liveVariables?.[forceKey];
                               forceName = cleanedVal;
                             }
@@ -1061,7 +1060,8 @@ const BlockNode = ({ id, data, selected }) => {
                         if (isVarRef) {
                           const safeVar = cleanedVal.replace(/\s+/g, '_');
                           const pk = `prog_${safeProgName}_${safeVar}`;
-                          forceKey = liveVariables?.[pk] !== undefined ? pk : `prog__${safeVar}`;
+                          forceKey = liveResolveKey(liveVariables, pk)
+                            || liveResolveKey(liveVariables, `prog__${safeVar}`) || pk;
                           forceCurrent = liveVariables?.[forceKey];
                           forceName = cleanedVal;
                         }
@@ -1147,7 +1147,7 @@ const BlockNode = ({ id, data, selected }) => {
             const val = data.values?.[pin.name] || '';
             const outCleanVal = val.replace(/[🌍🏠⊞⊡⊟]/g, '').trim();
             const outBaseVarName = outCleanVal.split(/[\[.]/)[0];
-            const outVarDef = [...variables, ...globalVars].find(v => v.name === outBaseVarName);
+            const outVarDef = findVarByName([...variables, ...globalVars], outBaseVarName);
             const outIsArrayWithoutIndex = outVarDef && arrayTypeMap[outVarDef.type] && !outCleanVal.includes('[');
             const undeclaredOut = undeclaredRefBase(val);
             const outInvalid = outIsArrayWithoutIndex || !!undeclaredOut;
@@ -1164,8 +1164,8 @@ const BlockNode = ({ id, data, selected }) => {
               const assignedVar = val.replace(/[🌍🏠⊞⊡⊟]/g, '').trim();
               if (assignedVar && /^[A-Za-z_]/.test(assignedVar)) {
                 const safeVar = assignedVar.replace(/\s+/g, '_');
-                const progKey = `prog_${safeProgName}_${safeVar}`;
-                outLiveVal = lv[progKey] !== undefined ? lv[progKey] : lv[`prog__${safeVar}`];
+                outLiveVal = liveGet(lv, `prog_${safeProgName}_${safeVar}`);
+                if (outLiveVal === undefined) outLiveVal = liveGet(lv, `prog__${safeVar}`);
               }
               if (outLiveVal === undefined && safeInstName) {
                 outLiveVal = lv[`prog_${safeProgName}_out_${safeInstName}_${pin.name}`];
@@ -1561,16 +1561,10 @@ const RungContainer = ({
         if (!varName) return;
         const safeVar = varName.replace(/\s+/g, '_');
         const progKey = `prog_${safeProgName}_${safeVar}`;
-        const globalKey = `prog__${safeVar}`;
-        let liveKey = progKey;
-        let currentVal = false;
-        if (liveVariables[progKey] !== undefined) {
-          liveKey = progKey;
-          currentVal = !!liveVariables[progKey];
-        } else if (liveVariables[globalKey] !== undefined) {
-          liveKey = globalKey;
-          currentVal = !!liveVariables[globalKey];
-        }
+        const liveKey = liveResolveKey(liveVariables, progKey)
+          || liveResolveKey(liveVariables, `prog__${safeVar}`)
+          || progKey;
+        const currentVal = !!liveVariables[liveKey];
         e.preventDefault();
         onForceWrite(liveKey, !currentVal);
       });
@@ -1767,11 +1761,9 @@ const RungContainer = ({
       if (!name) return false;
       const safeName = (name + '').replace(/[🌍🏠⊞⊡⊟]/g, '').trim();
       if (!safeName) return false;
-      const progKey = `prog_${safeProgName}_${safeName}`;
-      const globalKey = `prog__${safeName}`;
-      if (liveVariables[progKey] !== undefined) return !!liveVariables[progKey];
-      if (liveVariables[globalKey] !== undefined) return !!liveVariables[globalKey];
-      return false;
+      let v = liveGet(liveVariables, `prog_${safeProgName}_${safeName}`);
+      if (v === undefined) v = liveGet(liveVariables, `prog__${safeName}`);
+      return v === undefined ? false : !!v;
     };
 
     const blockMap = {};
@@ -1849,8 +1841,8 @@ const RungContainer = ({
             const assignedVar = (vals[pinName] || '').replace(/[🌍🏠⊞⊡⊟]/g, '').trim();
             if (assignedVar && /^[A-Za-z_]/.test(assignedVar)) {
               const safeVar = assignedVar.replace(/\s+/g, '_');
-              const progKey = `prog_${safeProgName}_${safeVar}`;
-              pinVal = liveVariables[progKey] !== undefined ? liveVariables[progKey] : liveVariables[`prog__${safeVar}`];
+              pinVal = liveGet(liveVariables, `prog_${safeProgName}_${safeVar}`);
+              if (pinVal === undefined) pinVal = liveGet(liveVariables, `prog__${safeVar}`);
             }
             // 2. Fallback: shadow variable for unassigned output pins
             if (pinVal === undefined && instName) {

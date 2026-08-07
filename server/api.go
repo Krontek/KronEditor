@@ -27,6 +27,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -45,14 +46,20 @@ type APIManager struct {
 	ipc      *IPCManager
 	rt       RuntimeController
 	sessions *SessionStore
+
+	shmName string // base /dev/shm name; the capture ring is "<shmName>_ring"
+	ringMu  sync.Mutex
+	ring    *RingConsumer   // lazily opened, shared by all stream connections
+	ringCtl *ringController // adaptive decimation controller (owns stride_N)
 }
 
 // NewAPIManager creates a new API manager with its own session store.
-func NewAPIManager(ipc *IPCManager, rt RuntimeController) *APIManager {
+func NewAPIManager(ipc *IPCManager, rt RuntimeController, shmName string) *APIManager {
 	return &APIManager{
 		ipc:      ipc,
 		rt:       rt,
 		sessions: NewSessionStore(),
+		shmName:  shmName,
 	}
 }
 
@@ -64,6 +71,8 @@ func RegisterAPIRoutes(mux *http.ServeMux, am *APIManager) {
 	mux.HandleFunc("POST /api/v1/variables/{name...}", am.requireToken(am.handleWriteOne))
 	mux.HandleFunc("GET /api/v1/stream", am.requireToken(am.handleStream))
 	mux.HandleFunc("GET /api/v1/stream/buffered", am.requireToken(am.handleBufferedStream))
+	mux.HandleFunc("GET /api/v1/stream/ring", am.requireToken(am.handleRingStream))
+	mux.HandleFunc("GET /api/v1/ring/info", am.requireToken(am.handleRingInfo))
 	mux.HandleFunc("POST /api/v1/forces/clear", am.requireToken(am.handleClearForces))
 
 	mux.HandleFunc("GET /api/v1/runtime", am.requireToken(am.handleRuntimeStatus))
