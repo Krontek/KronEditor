@@ -47,8 +47,10 @@ build/simulation
 # everything else in packaging/tmplinux/ or packaging/tmpwin/ (deleted on exit).
 packaging/tmplinux/
 packaging/tmpwin/
+packaging/tmpmac/
 packaging/*.AppImage
 packaging/*.exe
+packaging/*.dmg
 # Persistent windows-host LLVM (downloaded once by build-windows.sh)
 toolchains-win/
 toolchains/*

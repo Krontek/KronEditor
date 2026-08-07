@@ -643,7 +643,7 @@ const ProjectSidebar = ({
                 <TreeNode
                     level={1}
                     icon="⏱"
-                    label="Task Manager"
+                    label={t('sidebar.taskManager')}
                     active={activeId === 'TASK_MANAGER'}
                     onClick={() => onSelectItem?.('TASK_MANAGER', 'TASK_MANAGER')}
                 />
@@ -652,7 +652,7 @@ const ProjectSidebar = ({
                 <TreeNode
                     level={1}
                     icon="📊"
-                    label="Visualization"
+                    label={t('sidebar.visualization')}
                     active={activeId === 'VISUALIZATION'}
                     onClick={() => onSelectItem?.('VISUALIZATION', 'VISUALIZATION')}
                 />

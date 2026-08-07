@@ -6,7 +6,9 @@
         "functions": "Функции",
         "programs": "Программы",
         "resources": "Ресурсы",
-        "configuration": "Конфигурация"
+        "configuration": "Конфигурация",
+        "taskManager": "Менеджер задач",
+        "visualization": "Визуализация"
     },
     "tables": {
         "name": "Имя",
@@ -46,6 +48,7 @@
         "cancel": "Отмена",
         "settings": "Настройки",
         "language": "Язык",
+        "selectItemToEdit": "Выберите элемент из дерева проекта для редактирования.",
         "english": "Английский",
         "turkish": "Турецкий",
         "name": "Имя",
@@ -71,7 +74,8 @@
         "library": "Библиотека",
         "dragDrop": "Перетащить",
         "blockCount": "{{count}} блоков",
-        "howItWorks": "Как это работает"
+        "howItWorks": "Как это работает",
+        "standardLibraries": "Стандартные библиотеки"
     },
     "actions": {
         "add": "Добавить",
@@ -92,7 +96,9 @@
         "selectTarget": "Выбрать цель",
         "build": "Сборка",
         "loadFromTarget": "Загрузить с цели",
-        "pullConfirm": "Текущий проект будет закрыт и заменён проектом с цели. Продолжить?"
+        "pullConfirm": "Текущий проект будет закрыт и заменён проектом с цели. Продолжить?",
+        "newTask": "Новая задача",
+        "deleteTask": "Удалить задачу"
     },
     "options": {
         "cyclic": "Циклический",
@@ -126,7 +132,16 @@
         "removeFieldbusConfirm": "Удалить это подключение fieldbus?",
         "removeFieldbusTitle": "Удалить Fieldbus",
         "deleteSlaveConfirm": "Удалить \"{{name}}\"?",
-        "deleteSlaveTitle": "Удалить Slave"
+        "deleteSlaveTitle": "Удалить Slave",
+        "noTasksYet": "Задач пока нет.",
+        "createFirstTask": "Создайте свою первую задачу",
+        "addProgram": "Добавить программу",
+        "interval": "Интервал",
+        "programs": "Программы",
+        "unassignedPrograms": "Неназначенные программы",
+        "noProgramsAssigned": "Нет программ, назначенных этой задаче",
+        "assignProgram": "Назначить программу",
+        "allProgramsAssigned": "✓ Все программы назначены"
     },
     "resources": {
         "globalVariables": "Глобальные переменные"
@@ -178,7 +193,19 @@
         "sshPort": "Порт SSH",
         "deployServer": "Отправить сервер",
         "noBoardSelected": "Сначала выберите плату (создайте или откройте проект).",
-        "buildServer": "Собрать сервер"
+        "buildServer": "Собрать сервер",
+        "buildLibraries": "Собрать библиотеки",
+        "buildCanopen": "Собрать CANopen",
+        "hmiHowToUse": "Как использовать",
+        "hmiStep1": "Откройте вкладку",
+        "hmiStep2": "из дерева проекта.",
+        "hmiStep3": "Перетащите компоненты из панели инструментов на холст.",
+        "hmiStep4": "Привяжите переменные с помощью панели свойств справа.",
+        "hmiStep5": "Нажмите",
+        "hmiStep6": "Запустить",
+        "hmiStep7": "на панели инструментов, чтобы запустить веб-сервер.",
+        "hmiStep8": "Откройте",
+        "hmiStep9": "в браузере."
     },
     "blockInfo": {
         "TON": "Таймер с задержкой включения. При IN=TRUE начинается отсчёт; Q=TRUE когда ET≥PT. ET показывает прошедшее время. Сбрасывается при IN=FALSE.",
@@ -321,6 +348,59 @@
         "startSimulation": "Запустить симуляцию",
         "undo": "Отменить",
         "redo": "Повторить"
+    },
+    "library": {
+        "bitLogicOperations": "Побитовые логические операции",
+        "contacts": "Контакты",
+        "coils": "Катушки",
+        "bistables": "Бистабильные",
+        "edgeDetectors": "Детекторы фронтов",
+        "bitwiseOperations": "Побитовые операции",
+        "standardFunctionBlocks": "Стандартные функциональные блоки",
+        "timers": "Таймеры",
+        "counters": "Счётчики",
+        "mathematicalFunctions": "Математические функции",
+        "basicMath": "Базовая математика",
+        "floatingPoint": "С плавающей точкой",
+        "trigonometry": "Тригонометрия",
+        "comparisonSelection": "Сравнение и выбор",
+        "comparison": "Сравнение",
+        "selection": "Выбор",
+        "dataConversion": "Преобразование данных",
+        "scaling": "Масштабирование",
+        "advancedControl": "Расширенное управление",
+        "regulators": "Регуляторы",
+        "signalProcessing": "Обработка сигналов",
+        "motionControl": "Управление движением",
+        "administrative": "Административные",
+        "stopHalt": "Стоп / Останов",
+        "homing": "Возврат в исходное положение",
+        "pointToPoint": "Точка в точку",
+        "velocity": "Скорость",
+        "superimposed": "Наложенное",
+        "readDiagnostic": "Чтение / Диагностика",
+        "communication": "Связь",
+        "generic": "Общие",
+        "protocols": "Протоколы",
+        "diagnostics": "Диагностика",
+        "systemTime": "Система и время",
+        "rtc": "Часы реального времени",
+        "file": "Файл",
+        "busDiagnostics": "Диагностика шины",
+        "sdoAccess": "Доступ к SDO"
+    },
+    "blockDesc": {
+        "normallyOpenContact": "Нормально открытый контакт",
+        "normallyClosedContact": "Нормально закрытый контакт",
+        "invertedRisingEdge": "Инвертированный / Передний фронт",
+        "fallingEdgeContact": "Контакт по заднему фронту",
+        "outputCoil": "Выходная катушка",
+        "setCoilLatch": "Установочная катушка (защёлка)",
+        "resetCoilUnlatch": "Сбросная катушка (снятие защёлки)",
+        "movingAverageFilter": "Фильтр скользящего среднего",
+        "rampFunctionGenerator": "Генератор линейной функции",
+        "readActiveAlarms": "Чтение активных аварий",
+        "readHardwareId": "Чтение идентификатора оборудования"
     },
     "blockNotes": {
         "Contact": {

@@ -282,7 +282,7 @@ function App() {
       // Extract library blocks for the Variable Manager drop-down
       const blocks = [];
       data.forEach(cat => {
-        const catName = cat.title || cat.category || 'Standard Libraries';
+        const catName = cat.title || cat.category || t('common.standardLibraries');
         (cat.blocks || []).forEach(b => blocks.push({ name: b.blockType, category: catName }));
         (cat.subcategories || []).forEach(sub => {
           (sub.items || []).forEach(item => blocks.push({ name: item.blockType, category: catName }));
@@ -3041,7 +3041,7 @@ function App() {
                   </ErrorBoundary>
                 ) : (
                   <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: '100%', color: '#666' }}>
-                    Select an item from the Project Tree to edit.
+                    {t('common.selectItemToEdit')}
                   </div>
                 )}
               </div>

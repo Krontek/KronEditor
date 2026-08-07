@@ -148,7 +148,10 @@ def safe_extract_tar(archive: Path, destination: Path) -> None:
     with tarfile.open(archive, "r:*") as tf:
         for member in tf.getmembers():
             member_path = destination / member.name
-            if not _is_within_directory(destination, member_path.resolve()):
+            # Use absolute() instead of resolve() to avoid issues with non-existent paths on macOS
+            member_abs = member_path.absolute()
+            dest_abs = destination.absolute()
+            if not _is_within_directory(dest_abs, member_abs):
                 raise SetupError(f"Unsafe tar path detected: {member.name}")
         try:
             tf.extractall(destination, filter="data")
