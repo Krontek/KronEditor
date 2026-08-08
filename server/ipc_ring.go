@@ -64,9 +64,16 @@ type RingConsumer struct {
 	fd   int
 	mem  []byte
 
+	// Header-derived layout, guarded by mu. It is RE-PARSED when the runtime
+	// restarts (epoch bump) and rewrites the header with a different
+	// record_stride/nslots/tasks — e.g. after a Build & Send that changed the
+	// addressed-variable set. Without this, the agent would keep decoding the
+	// new records with the old stride and every value past the first would be
+	// garbage. parsedEpoch is the epoch the current layout was parsed under.
 	recordStride int
 	nslots       int
 	tasks        []ringTask
+	parsedEpoch  uint64
 }
 
 // OpenRing maps /dev/shm/<shmName>_ring read-write and validates the header.
@@ -98,7 +105,37 @@ func OpenRing(shmName string) (*RingConsumer, error) {
 		rc.Close()
 		return nil, err
 	}
+	rc.parsedEpoch = rc.loadU64(offEpoch)
 	return rc, nil
+}
+
+// syncLocked re-reads the header when the runtime restarted (epoch changed) and
+// possibly re-mmaps if the segment was resized (a new KronServer pre-size). Must
+// be called with rc.mu held; all other rc.mem access is under the same lock, so
+// munmap here can never pull the map from under a concurrent reader.
+func (rc *RingConsumer) syncLocked() {
+	if rc.mem == nil {
+		return
+	}
+	ep := rc.loadU64(offEpoch)
+	if ep == rc.parsedEpoch {
+		return
+	}
+	// segment may have grown/shrunk (runtime adopted a new pre-sized ring)
+	var st syscall.Stat_t
+	if err := syscall.Fstat(rc.fd, &st); err == nil {
+		newSize := int(st.Size)
+		if newSize >= ringHeaderBytes && newSize != len(rc.mem) {
+			if nm, err := syscall.Mmap(rc.fd, 0, newSize,
+				syscall.PROT_READ|syscall.PROT_WRITE, syscall.MAP_SHARED); err == nil {
+				syscall.Munmap(rc.mem)
+				rc.mem = nm
+			}
+		}
+	}
+	if err := rc.parseHeader(); err == nil {
+		rc.parsedEpoch = ep
+	}
 }
 
 func (rc *RingConsumer) u32(off int) uint32 { return binary.LittleEndian.Uint32(rc.mem[off:]) }
@@ -144,24 +181,58 @@ func (rc *RingConsumer) storeU32(off int, v uint32) {
 	atomic.StoreUint32((*uint32)(unsafe.Pointer(&rc.mem[off])), v)
 }
 
-func (rc *RingConsumer) WriteSeq() uint64  { return rc.loadU64(offWriteSeq) }
-func (rc *RingConsumer) Epoch() uint64     { return rc.loadU64(offEpoch) }
-func (rc *RingConsumer) StrideN() uint32   { return rc.loadU32(offStrideN) }
-func (rc *RingConsumer) Nslots() int       { return rc.nslots }
-func (rc *RingConsumer) RecordStride() int { return rc.recordStride }
-func (rc *RingConsumer) Tasks() []ringTask { return rc.tasks }
+// All accessors below lock rc.mu because syncLocked may re-mmap rc.mem when the
+// runtime restarts; every mmap read must be serialized against that.
+func (rc *RingConsumer) WriteSeq() uint64 {
+	rc.mu.Lock()
+	defer rc.mu.Unlock()
+	return rc.loadU64(offWriteSeq)
+}
+func (rc *RingConsumer) Epoch() uint64 {
+	rc.mu.Lock()
+	defer rc.mu.Unlock()
+	return rc.loadU64(offEpoch)
+}
+func (rc *RingConsumer) StrideN() uint32 {
+	rc.mu.Lock()
+	defer rc.mu.Unlock()
+	return rc.loadU32(offStrideN)
+}
+func (rc *RingConsumer) Nslots() int {
+	rc.mu.Lock()
+	defer rc.mu.Unlock()
+	rc.syncLocked()
+	return rc.nslots
+}
+func (rc *RingConsumer) RecordStride() int {
+	rc.mu.Lock()
+	defer rc.mu.Unlock()
+	rc.syncLocked()
+	return rc.recordStride
+}
+func (rc *RingConsumer) Tasks() []ringTask {
+	rc.mu.Lock()
+	defer rc.mu.Unlock()
+	rc.syncLocked()
+	return rc.tasks
+}
 
 // SetStrideN publishes the global decimation stride to the producer.
 func (rc *RingConsumer) SetStrideN(n uint32) {
 	if n == 0 {
 		n = 1
 	}
+	rc.mu.Lock()
 	rc.storeU32(offStrideN, n)
+	rc.mu.Unlock()
 }
 
 // ProducedBytesPerSec is Σ_g(payload_len_g / period_us_g) × 1e6 — the RAW
 // production rate before decimation, from the task table.
 func (rc *RingConsumer) ProducedBytesPerSec() float64 {
+	rc.mu.Lock()
+	defer rc.mu.Unlock()
+	rc.syncLocked()
 	var bps float64
 	for _, t := range rc.tasks {
 		if t.PeriodUs > 0 {
@@ -185,12 +256,22 @@ type RingRecord struct {
 // A record whose slot.seq != expected is treated as "producer mid-write" and
 // stops the drain (retry next tick); this never blocks.
 func (rc *RingConsumer) Drain(readSeq uint64, dst []RingRecord, maxRecords int) (uint64, uint64, []RingRecord) {
-	w := rc.WriteSeq()
+	// Hold the lock for the whole drain: syncLocked may re-mmap rc.mem (runtime
+	// restart / resize), and the record loop reads rc.mem directly. ≤5 clients at
+	// a 5 ms cadence, so the contention is negligible.
+	rc.mu.Lock()
+	defer rc.mu.Unlock()
+	rc.syncLocked()
+	stride := rc.recordStride
+	nslots := uint64(rc.nslots)
+	if stride <= recOffPayload || nslots == 0 {
+		return readSeq, 0, dst
+	}
+	w := rc.loadU64(offWriteSeq)
 	if w <= readSeq {
 		return readSeq, 0, dst
 	}
 	var dropped uint64
-	nslots := uint64(rc.nslots)
 	if w-readSeq > nslots {
 		dropped = (w - readSeq) - nslots
 		readSeq = w - nslots // catch up to the oldest slot still present
@@ -200,7 +281,7 @@ func (rc *RingConsumer) Drain(readSeq uint64, dst []RingRecord, maxRecords int) 
 		if maxRecords > 0 && got >= maxRecords {
 			break
 		}
-		base := ringHeaderBytes + int(s%nslots)*rc.recordStride
+		base := ringHeaderBytes + int(s%nslots)*stride
 		ss := rc.loadU64(base + recOffSeq)
 		if ss != s {
 			// ss < s: not yet written (producer mid-write) → stop and retry.
@@ -213,8 +294,8 @@ func (rc *RingConsumer) Drain(readSeq uint64, dst []RingRecord, maxRecords int) 
 		}
 		taskID := rc.u16(base + recOffTaskID)
 		plen := int(rc.u16(base + recOffPayloadLen))
-		if plen > rc.recordStride-recOffPayload {
-			plen = rc.recordStride - recOffPayload
+		if plen > stride-recOffPayload {
+			plen = stride - recOffPayload
 		}
 		payload := make([]byte, plen)
 		copy(payload, rc.mem[base+recOffPayload:base+recOffPayload+plen])

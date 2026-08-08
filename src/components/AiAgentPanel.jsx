@@ -2,6 +2,7 @@ import { useState, useRef, useEffect, useCallback } from 'react';
 import { host } from '../services/HostClient';
 import { TOOL_DEFS, applyToolCall, buildProjectOverview, findPOU, summarizeLiveSamples, summarizeWatch } from '../services/agentTools';
 import { setEditorScope, EDITOR_SCOPE } from '../utils/editorScope';
+import PasswordInput from './common/PasswordInput';
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -1633,7 +1634,9 @@ export default function AiAgentPanel({
           ) : providerDef.auth !== 'local' && (   /* key + custom take an API key; local takes none */
             <>
               <label style={{ fontSize: 11, color: C.sub }}>API key</label>
-              <input type="password" value={draftCfg.apiKey} onChange={e => setDraftCfg(d => ({ ...d, apiKey: e.target.value }))} placeholder="sk-..."
+              <PasswordInput value={draftCfg.apiKey} onChange={e => setDraftCfg(d => ({ ...d, apiKey: e.target.value }))} placeholder="sk-..."
+                iconColor={C.sub}
+                showTitle="Show API key" hideTitle="Hide API key"
                 style={{ background: C.panel, border: `1px solid ${C.border2}`, color: C.text, fontSize: 12, padding: '4px 6px', fontFamily: 'monospace' }} />
             </>
           )}

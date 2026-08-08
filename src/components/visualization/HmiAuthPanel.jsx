@@ -1,5 +1,6 @@
 import { useState } from 'react';
 import { generateSalt, hashPassword } from '../../services/HmiExportService';
+import PasswordInput from '../common/PasswordInput';
 
 const ROLES = [
     { value: 'admin',      label: 'Admin',       desc: 'Full access + user management',        color: '#f14c4c' },
@@ -13,21 +14,22 @@ const DEFAULT_READ_ROLES  = ALL_ROLES;
 const DEFAULT_WRITE_ROLES = ['admin', 'maintainer', 'operator'];
 
 /* ─── Small helpers ──────────────────────────────────────────── */
-const Input = ({ value, onChange, type = 'text', placeholder, style = {} }) => (
-    <input
-        type={type}
-        value={value ?? ''}
-        placeholder={placeholder}
-        onChange={e => onChange(e.target.value)}
-        style={{
+const Input = ({ value, onChange, type = 'text', placeholder, style = {} }) => {
+    const common = {
+        value: value ?? '',
+        placeholder,
+        onChange: e => onChange(e.target.value),
+        style: {
             background: '#1a1a1a', border: '1px solid #333', color: '#d4d4d4',
             fontSize: 12, padding: '4px 8px', outline: 'none',
             width: '100%', fontFamily: 'inherit', ...style,
-        }}
-        onFocus={e => e.target.style.borderColor = '#007acc'}
-        onBlur={e => e.target.style.borderColor = '#333'}
-    />
-);
+        },
+        onFocus: e => e.target.style.borderColor = '#007acc',
+        onBlur: e => e.target.style.borderColor = '#333',
+    };
+    // Passwords get the shared eye toggle; everything else stays a plain input.
+    return type === 'password' ? <PasswordInput {...common} iconColor="#555" /> : <input type={type} {...common} />;
+};
 
 const RoleTag = ({ role }) => {
     const def = ROLES.find(r => r.value === role);

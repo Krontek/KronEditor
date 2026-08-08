@@ -561,6 +561,9 @@ func (s *Server) StartRuntime() (int, error) {
 	s.rtMu.Lock()
 	pct := s.rtCfg.RingRAMPercent
 	s.rtMu.Unlock()
+	if pct <= 0 {
+		pct = ringDefaultPercent // unset → default to 50% of available RAM
+	}
 	_, avail := readMemInfo()
 	bytes := ringBytesFromPercent(pct, avail)
 	if err := createRingSegment(s.cfg.ShmName, bytes); err != nil {
@@ -580,6 +583,9 @@ func (s *Server) resolvedRingBytes() (bytes, memTotal, memAvail uint64, pct floa
 	s.rtMu.Lock()
 	pct = s.rtCfg.RingRAMPercent
 	s.rtMu.Unlock()
+	if pct <= 0 {
+		pct = ringDefaultPercent // report the EFFECTIVE percent (unset → 50%)
+	}
 	memTotal, memAvail = readMemInfo()
 	bytes = ringBytesFromPercent(pct, memAvail)
 	return bytes, memTotal, memAvail, pct

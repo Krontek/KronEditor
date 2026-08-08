@@ -48,6 +48,13 @@ const (
 	ringFillLow   = 0.10      // backlog fraction under which we may relax
 	ringTickMs    = 100       // control cadence
 	ringDeliverMs = 5         // client push cadence
+	// ⚠️ Cap the bytes drained into ONE frame. Without it, a client attaching to
+	// an already-running high-rate producer drains the WHOLE ring in the first
+	// tick (nslots records × record_stride) — on a 2 GiB ring that is gigabytes of
+	// allocation in one shot and OOM-kills the agent. Excess backlog is left for
+	// the next 5 ms tick (or lapped + counted as dropped if production outruns the
+	// link, which is exactly when the controller raises the stride).
+	ringMaxFrameBytes = 4 << 20 // 4 MiB
 )
 
 type ringClientStat struct {
@@ -214,9 +221,18 @@ func (am *APIManager) handleRingStream(w http.ResponseWriter, r *http.Request) {
 				lastEpoch = e
 				readSeq = 0
 			}
+			// bound the frame: at most ringMaxFrameBytes worth of records this tick
+			stride := rc.RecordStride()
+			if stride < 1 {
+				stride = 1
+			}
+			maxRecs := ringMaxFrameBytes / stride
+			if maxRecs < 1 {
+				maxRecs = 1
+			}
 			var dropped uint64
 			recs = recs[:0]
-			readSeq, dropped, recs = rc.Drain(readSeq, recs, 0)
+			readSeq, dropped, recs = rc.Drain(readSeq, recs, maxRecs)
 			droppedTotal += dropped
 			if len(recs) == 0 {
 				ctl.report(id, dBps, rc.WriteSeq()-readSeq)

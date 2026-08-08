@@ -73,6 +73,32 @@ func (p *ringProducer) append(taskID uint16, payload []byte) uint64 {
 	return s
 }
 
+// relayout mimics a runtime RESTART that changed the addressed-variable set:
+// it rewrites the header with a new record_stride/nslots/task-table, resets
+// write_seq, re-inits the slots, and bumps epoch (published last, like the C
+// producer). The consumer must pick up the new layout on its next drain.
+func (p *ringProducer) relayout(recordStride int, tasks []ringTask) {
+	total := len(p.mem)
+	nslots := (total - ringHeaderBytes) / recordStride
+	binary.LittleEndian.PutUint32(p.mem[offRecordStride:], uint32(recordStride))
+	binary.LittleEndian.PutUint32(p.mem[offNslots:], uint32(nslots))
+	binary.LittleEndian.PutUint32(p.mem[offNtasks:], uint32(len(tasks)))
+	binary.LittleEndian.PutUint64(p.mem[offWriteSeq:], 0)
+	for i, tk := range tasks {
+		off := offTaskTable + i*taskEntryBytes
+		binary.LittleEndian.PutUint32(p.mem[off:], tk.PeriodUs)
+		binary.LittleEndian.PutUint16(p.mem[off+4:], tk.PayloadLen)
+		binary.LittleEndian.PutUint16(p.mem[off+6:], tk.TaskID)
+	}
+	for s := 0; s < nslots; s++ {
+		binary.LittleEndian.PutUint64(p.mem[ringHeaderBytes+s*recordStride+recOffSeq:], ringSeqEmpty)
+	}
+	p.recordStride = recordStride
+	p.nslots = nslots
+	old := binary.LittleEndian.Uint64(p.mem[offEpoch:])
+	atomic.StoreUint64((*uint64)(unsafe.Pointer(&p.mem[offEpoch])), old+1) // publish last
+}
+
 func (p *ringProducer) close() {
 	syscall.Munmap(p.mem)
 	syscall.Close(p.fd)
@@ -177,6 +203,94 @@ func TestRingDrainDetectsLapLoss(t *testing.T) {
 		}
 	}
 	_ = readSeq
+}
+
+// Regression: after a runtime restart that changes the layout (epoch bump), the
+// consumer must RE-PARSE the header instead of decoding new records with the old
+// record_stride. This is the "added variables → only the first one showed up" bug.
+func TestRingReparseOnLayoutChange(t *testing.T) {
+	name := "kron_test_reparse"
+	p := newRingProducer(t, name, 16+8, 4096, []ringTask{{PeriodUs: 100, PayloadLen: 8, TaskID: 0}})
+	defer p.close()
+	rc, err := OpenRing(name)
+	if err != nil {
+		t.Fatalf("OpenRing: %v", err)
+	}
+	defer rc.Close()
+
+	// gen 1: one 8-byte var
+	for i := 0; i < 10; i++ {
+		var b [8]byte
+		binary.LittleEndian.PutUint64(b[:], uint64(100+i))
+		p.append(0, b[:])
+	}
+	readSeq, _, recs := rc.Drain(0, nil, 0)
+	if len(recs) != 10 || rc.RecordStride() != 24 {
+		t.Fatalf("gen1: got %d recs, stride %d", len(recs), rc.RecordStride())
+	}
+
+	// runtime restart with TWO 8-byte vars (stride 32, payload 16)
+	epochBefore := rc.Epoch()
+	p.relayout(16+16, []ringTask{{PeriodUs: 100, PayloadLen: 16, TaskID: 0}})
+	// the stream handler resets its readSeq when the epoch changes:
+	if rc.Epoch() == epochBefore {
+		t.Fatalf("epoch did not change")
+	}
+	readSeq = 0
+	for i := 0; i < 5; i++ {
+		var b [16]byte
+		binary.LittleEndian.PutUint64(b[0:], uint64(200+i))
+		binary.LittleEndian.PutUint64(b[8:], uint64(900+i))
+		p.append(0, b[:])
+	}
+	_, _, recs = rc.Drain(readSeq, nil, 0)
+	// consumer must have re-parsed to the new stride and decode BOTH vars
+	if rc.RecordStride() != 32 {
+		t.Fatalf("consumer did not re-parse stride: got %d want 32", rc.RecordStride())
+	}
+	if len(recs) != 5 {
+		t.Fatalf("gen2: got %d recs, want 5", len(recs))
+	}
+	for i, r := range recs {
+		if len(r.Payload) != 16 {
+			t.Fatalf("rec %d payload len %d want 16", i, len(r.Payload))
+		}
+		v0 := binary.LittleEndian.Uint64(r.Payload[0:])
+		v1 := binary.LittleEndian.Uint64(r.Payload[8:])
+		if v0 != uint64(200+i) || v1 != uint64(900+i) {
+			t.Fatalf("rec %d decoded (%d,%d) want (%d,%d) — second var lost/misaligned", i, v0, v1, 200+i, 900+i)
+		}
+	}
+}
+
+// Drain must honor maxRecords so one frame can't allocate the whole (huge) ring
+// at once — the fix for the OOM when a client attaches to a running producer.
+func TestRingDrainRespectsMaxRecords(t *testing.T) {
+	name := "kron_test_maxrecs"
+	p := newRingProducer(t, name, 24, 4096, []ringTask{{PeriodUs: 100, PayloadLen: 8, TaskID: 0}})
+	defer p.close()
+	rc, err := OpenRing(name)
+	if err != nil {
+		t.Fatalf("OpenRing: %v", err)
+	}
+	defer rc.Close()
+	for i := 0; i < 1000; i++ {
+		var b [8]byte
+		binary.LittleEndian.PutUint64(b[:], uint64(i))
+		p.append(0, b[:])
+	}
+	readSeq, _, recs := rc.Drain(0, nil, 100)
+	if len(recs) != 100 {
+		t.Fatalf("first drain returned %d, want capped at 100", len(recs))
+	}
+	if readSeq != 100 {
+		t.Fatalf("readSeq=%d, want 100 (rest left for next tick)", readSeq)
+	}
+	// the remainder drains on subsequent calls
+	_, _, recs2 := rc.Drain(readSeq, nil, 100)
+	if len(recs2) != 100 || recs2[0].Seq != 100 {
+		t.Fatalf("second drain: got %d recs starting at seq %d", len(recs2), recs2[0].Seq)
+	}
 }
 
 func TestRingSetStrideRoundTrips(t *testing.T) {

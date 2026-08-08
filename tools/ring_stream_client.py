@@ -101,6 +101,11 @@ def main():
     last_stride = 1
     last_report = t0
     per_task_last_val = {}
+    # The very first frame's `dropped` is the ring history that had already lapped
+    # BEFORE we attached (records produced while the runtime ran without us) — that
+    # is not a streaming loss. Only drops BEYOND this baseline mean the consumer
+    # could not keep up after attaching.
+    attach_backlog = None
 
     try:
         while True:
@@ -114,6 +119,8 @@ def main():
                 break
             count, stride_n, dropped = struct.unpack_from("<IIQ", body, 0)
             last_stride, last_dropped = stride_n, dropped
+            if attach_backlog is None:
+                attach_backlog = dropped
             off = 16
             for _ in range(count):
                 seq, task_id, plen = struct.unpack_from("<QHH", body, off)
@@ -134,8 +141,9 @@ def main():
             now = time.time()
             if now - last_report >= 1.0:
                 rate = total_recs / (now - t0)
+                stream_drops = last_dropped - (attach_backlog or 0)
                 print(f"[{now-t0:4.1f}s] records={total_recs} rate={rate:8.0f}/s "
-                      f"stride_N={last_stride} dropped={last_dropped} seq_gaps={gaps}")
+                      f"stride_N={last_stride} streaming_drops={stream_drops} seq_gaps={gaps}")
                 last_report = now
     except KeyboardInterrupt:
         pass
@@ -143,20 +151,23 @@ def main():
         resp.close()
 
     dur = time.time() - t0
+    backlog = attach_backlog or 0
+    stream_drops = last_dropped - backlog
     print("\n=== SUMMARY ===")
-    print(f"duration        {dur:.2f} s")
-    print(f"records         {total_recs}  ({total_recs/max(dur,1e-9):.0f}/s)")
-    print(f"final stride_N  {last_stride}  (1 = every scan captured; >1 = decimated to fit the link)")
-    print(f"dropped (lap)   {last_dropped}")
-    print(f"seq gaps        {gaps}")
-    if gaps == 0 and last_dropped == 0:
+    print(f"duration          {dur:.2f} s")
+    print(f"records           {total_recs}  ({total_recs/max(dur,1e-9):.0f}/s)")
+    print(f"final stride_N    {last_stride}  (1 = every scan captured; >1 = decimated to fit the link)")
+    print(f"attach backlog    {backlog}  (ring history already lapped BEFORE we connected — not a stream loss)")
+    print(f"streaming drops   {stream_drops}  (records lost AFTER attach because we couldn't keep up)")
+    print(f"seq gaps          {gaps}")
+    if gaps == 0 and stream_drops == 0:
         if last_stride == 1:
-            print("✅ LOSSLESS: every scan delivered, no decimation, no drops.")
+            print("✅ LOSSLESS: after attach, every scan delivered — no decimation, no drops, no gaps.")
         else:
-            print(f"✅ NO LOSS in transit: delivered every {last_stride}th scan (link-limited, "
+            print(f"✅ NO LOSS after attach: delivered every {last_stride}th scan (link-limited, "
                   f"uniform decimation), zero drops/gaps.")
     else:
-        print("⚠️ some records were dropped/aliased — link slower than production; "
+        print("⚠️ records lost during streaming — link slower than production even after decimation; "
               "raise the capture buffer % or reduce the captured variable set / rate.")
 
 

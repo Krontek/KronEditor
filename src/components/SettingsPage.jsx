@@ -4,6 +4,7 @@ import { Editor } from '@monaco-editor/react';
 import { transpileToC } from '../services/CTranspilerService';
 import { HostClient, host } from '../services/HostClient';
 import { openFile } from '../services/browserFs';
+import PasswordInput from './common/PasswordInput';
 import { APP_VERSION } from '../version';
 
 // ⚠️ KronHAL is NOT a separate repo any more — the HAL headers (kronhal_rpi.h
@@ -79,8 +80,8 @@ const SettingsPage = ({ theme, setTheme, editorSettings, setEditorSettings, sele
 
     const applyRingPercent = async () => {
         const p = parseFloat(ringPct);
-        if (Number.isNaN(p) || p < 0 || p > 25) {
-            setRingMsg(t('settingsPage.capture.range', 'Enter a percentage between 0 and 25.'));
+        if (Number.isNaN(p) || p < 0 || p > 50) {
+            setRingMsg(t('settingsPage.capture.range', 'Enter a percentage between 0 and 50.'));
             return;
         }
         setRingBusy(true);
@@ -655,7 +656,7 @@ const SettingsPage = ({ theme, setTheme, editorSettings, setEditorSettings, sele
                                 {t('settingsPage.capture.percent', 'Buffer size (% of available RAM)')}
                             </label>
                             <input
-                                type="number" min="0" max="25" step="0.5"
+                                type="number" min="0" max="50" step="0.5"
                                 value={ringPct}
                                 onChange={(e) => setRingPct(e.target.value)}
                                 placeholder="0"
@@ -774,11 +775,12 @@ const SettingsPage = ({ theme, setTheme, editorSettings, setEditorSettings, sele
                                 <label style={{ display: 'block', marginBottom: '6px', color: '#ccc', fontSize: '13px' }}>
                                     {t('settingsPage.sshPassword', 'SSH Password')}
                                 </label>
-                                <input
-                                    type="password"
+                                <PasswordInput
                                     value={sshPass}
                                     onChange={(e) => setSshPass(e.target.value)}
                                     placeholder="••••••"
+                                    showTitle={t('settingsPage.showPassword', 'Show password')}
+                                    hideTitle={t('settingsPage.hidePassword', 'Hide password')}
                                     style={{
                                         width: '100%', padding: '8px', background: '#252526', color: '#fff',
                                         border: '1px solid #444', borderRadius: '4px', boxSizing: 'border-box'
@@ -811,11 +813,12 @@ const SettingsPage = ({ theme, setTheme, editorSettings, setEditorSettings, sele
                             <label style={{ display: 'block', marginBottom: '6px', color: '#ccc', fontSize: '13px' }}>
                                 API Password
                             </label>
-                            <input
-                                type="password"
+                            <PasswordInput
                                 value={apiPassword || ''}
                                 onChange={(e) => { if (setApiPassword) setApiPassword(e.target.value); }}
                                 placeholder="Default: krontek"
+                                showTitle={t('settingsPage.showPassword', 'Show password')}
+                                hideTitle={t('settingsPage.hidePassword', 'Hide password')}
                                 style={{
                                     width: '100%', padding: '8px', background: '#252526', color: '#fff',
                                     border: '1px solid #444', borderRadius: '4px', boxSizing: 'border-box'

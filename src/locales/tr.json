@@ -190,6 +190,8 @@
         "serverDeployDesc": "SSH üzerinden plc-agent'ı hedef karta yükle ve başlat.",
         "sshUsername": "SSH Kullanıcı Adı",
         "sshPassword": "SSH Şifresi",
+        "showPassword": "Şifreyi göster",
+        "hidePassword": "Şifreyi gizle",
         "sshPort": "SSH Portu",
         "deployServer": "Sunucuyu Gönder",
         "noBoardSelected": "Lütfen önce bir kart seçin (proje oluşturun veya açın).",

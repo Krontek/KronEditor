@@ -16,10 +16,13 @@ import (
 )
 
 const (
-	ringDefaultBytes  = 1 << 20   // 1 MiB — standalone fallback when % not set
-	ringMinBytes      = 64 << 10  // 64 KiB floor (a smaller ring is pointless)
-	ringMaxBytes      = 512 << 20 // 512 MiB hard cap regardless of RAM
-	ringMaxRAMPercent = 25.0      // never reserve more than 25% of *available* RAM
+	ringDefaultBytes   = 1 << 20  // 1 MiB — standalone runtime fallback (no KronServer)
+	ringMinBytes       = 64 << 10 // 64 KiB floor (a smaller ring is pointless)
+	ringMaxBytes       = 2 << 30  // 2 GiB hard cap regardless of RAM
+	ringMaxRAMPercent  = 50.0     // never reserve more than 50% of *available* RAM
+	ringDefaultPercent = 50.0     // buffer default when the device config is unset
+	// NOTE: /dev/shm is tmpfs (demand-paged), so a large ring only costs RSS as it
+	// actually fills — sizing 50% by default is cheap until the buffer is used.
 )
 
 // readMemInfo returns MemTotal and MemAvailable in BYTES from /proc/meminfo.

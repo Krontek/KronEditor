@@ -190,6 +190,8 @@
         "serverDeployDesc": "Upload and start plc-agent on the target board via SSH.",
         "sshUsername": "SSH Username",
         "sshPassword": "SSH Password",
+        "showPassword": "Show password",
+        "hidePassword": "Hide password",
         "sshPort": "SSH Port",
         "deployServer": "Deploy Server",
         "noBoardSelected": "Please select a board first (create or open a project).",

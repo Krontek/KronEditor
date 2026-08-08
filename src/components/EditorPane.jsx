@@ -186,12 +186,19 @@ const EditorPane = ({
     }
   };
 
-  const handleUpdateVar = (id, field, value) => {
+  // `fieldOrObj` accepts either a single field name + value, or a patch object
+  // for changes that must land in ONE update — a type change retargets the
+  // address (see VariableManager), and two sequential single-field calls would
+  // let a reader observe the new type beside the old, now-wrong address.
+  // Mirrors ResourceEditor.handleUpdateVar's signature.
+  const handleUpdateVar = (id, fieldOrObj, value) => {
+    const patch = (typeof fieldOrObj === 'string') ? { [fieldOrObj]: value } : fieldOrObj;
+    const field = (typeof fieldOrObj === 'string') ? fieldOrObj : null;
     const oldVar = variables.find(v => v.id === id);
     const oldName = oldVar?.name;
 
     setVariables((prev) =>
-      prev.map((v) => (v.id === id ? { ...v, [field]: value } : v))
+      prev.map((v) => (v.id === id ? { ...v, ...patch } : v))
     );
 
     if (field === 'name' && (fileType === 'LD' || fileType === 'SCL') && oldName && oldName !== value) {

@@ -19,6 +19,7 @@
  */
 
 import { isReservedTranspilerName } from '../utils/reservedNames';
+import { validateIECAddress, retargetIECAddress } from '../utils/iecAddress';
 // Single source of truth for FB power-flow wiring: the transpiler reads the
 // trigger pin (power in) and Q pin (power out) from these tables, so the
 // ladder the agent authors must use exactly the same pins.
@@ -896,6 +897,15 @@ export function applyToolCall(struct, name, args = {}) {
           base = { ...struct, dataTypes: [...(struct.dataTypes || []), resolved.newDataType] };
           extraLines.push({ type: 'add', text: `data type  ${resolved.newDataType.name} = ARRAY[${resolved.newDataType.content.dimensions.map((d) => `${d.min}..${d.max}`).join(',')}] OF ${resolved.newDataType.content.baseType}` });
         }
+        // An address is a WIDTH claim that must agree with the type (%MX bit,
+        // %MW word, …). Nothing downstream re-derives it, so a wrong prefix
+        // reaches the REST/HMI feed intact and misleads whatever reads it —
+        // reject here so the model gets the correction now, not at Build time.
+        if (args.address != null && String(args.address).trim() !== '') {
+          const addr = validateIECAddress(args.address, resolved.type);
+          if (!addr.ok) return { ok: false, error: `address: ${addr.message}` };
+          args = { ...args, address: addr.address };
+        }
         const v = makeVar(scope, { ...args, name: args.name.trim(), type: resolved.type, isInstance: resolved.isInstance });
         if (scope === 'global') {
           const globals = getGlobals(base);
@@ -937,7 +947,6 @@ export function applyToolCall(struct, name, args = {}) {
           changes.name = newName;
         }
         if (args.initialValue != null) changes.initialValue = args.initialValue;
-        if (args.address != null) changes.address = args.address;
         if (args.description != null) changes.description = args.description;
         let base = struct;
         const extraLines = [];
@@ -954,13 +963,38 @@ export function applyToolCall(struct, name, args = {}) {
             extraLines.push({ type: 'add', text: `data type  ${resolved.newDataType.name} = ARRAY[${resolved.newDataType.content.dimensions.map((d) => `${d.min}..${d.max}`).join(',')}] OF ${resolved.newDataType.content.baseType}` });
           }
         }
-        if (Object.keys(changes).length === 0) return { ok: false, error: 'no changes provided' };
+        // ⚠️ The address must agree with the FINAL type, so it is resolved after
+        // the type is (and against the existing variable, which is only known
+        // per scope below). Two cases:
+        //   • an explicit address was passed → validate it against that type;
+        //   • the TYPE changed and the address was left alone → retarget it
+        //     (%MW10 + BOOL → %MX10.0), exactly as the Variable Manager does.
+        // Without the second case a retype silently leaves a stale width that
+        // nothing downstream re-derives — the REST/HMI feed would keep
+        // publishing the old one. The resulting address is visible in the
+        // approval diff, since varLine() renders `AT <address>`.
+        const finalizeAddress = (before) => {
+          const finalType = changes.type != null ? changes.type : before.type;
+          if (args.address != null) {
+            const raw = String(args.address).trim();
+            if (raw === '') return { ok: true, address: '' };
+            const res = validateIECAddress(raw, finalType);
+            return res.ok ? { ok: true, address: res.address } : { ok: false, error: `address: ${res.message}` };
+          }
+          if (changes.type == null || !before.address) return { ok: true };
+          return { ok: true, address: retargetIECAddress(before.address, finalType).address };
+        };
+
+        if (args.address == null && Object.keys(changes).length === 0) return { ok: false, error: 'no changes provided' };
 
         if (scope === 'global') {
           const globals = getGlobals(base);
           const idx = globals.findIndex((g) => (g.name || '').toLowerCase() === String(args.name).toLowerCase());
           if (idx < 0) return { ok: false, error: `global "${args.name}" not found` };
           const before = globals[idx];
+          const addr = finalizeAddress(before);
+          if (!addr.ok) return { ok: false, error: addr.error };
+          if (addr.address !== undefined) changes.address = addr.address;
           const after = { ...before, ...changes };
           const next = withGlobals(base, globals.map((g, i) => (i === idx ? after : g)));
           return {
@@ -974,6 +1008,9 @@ export function applyToolCall(struct, name, args = {}) {
         const idx = vars.findIndex((x) => (x.name || '').toLowerCase() === String(args.name).toLowerCase());
         if (idx < 0) return { ok: false, error: `"${args.pou}" has no variable "${args.name}"` };
         const before = vars[idx];
+        const addrLocal = finalizeAddress(before);
+        if (!addrLocal.ok) return { ok: false, error: addrLocal.error };
+        if (addrLocal.address !== undefined) changes.address = addrLocal.address;
         const after = { ...before, ...changes };
         const next = withPOUContent(base, hit.category, hit.index, { ...hit.item.content, variables: vars.map((x, i) => (i === idx ? after : x)) });
         return {

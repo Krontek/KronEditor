@@ -190,6 +190,8 @@
         "serverDeployDesc": "Загрузить и запустить plc-agent на целевом устройстве через SSH.",
         "sshUsername": "Пользователь SSH",
         "sshPassword": "Пароль SSH",
+        "showPassword": "Показать пароль",
+        "hidePassword": "Скрыть пароль",
         "sshPort": "Порт SSH",
         "deployServer": "Отправить сервер",
         "noBoardSelected": "Сначала выберите плату (создайте или откройте проект).",

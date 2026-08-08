@@ -7,6 +7,7 @@ import { blockConfig } from './RungContainer';
 import { writeClipboard, readClipboard, useKronClipboard, CLIP_KIND } from '../utils/kronClipboard';
 import { setEditorScope, getEditorScope, EDITOR_SCOPE, hasTextSelection } from '../utils/editorScope';
 import { isReservedTranspilerName, isValidIecIdentifier } from '../utils/reservedNames';
+import { formatIECAddress, retargetIECAddress } from '../utils/iecAddress';
 
 const ALL_CLASSES = ['Local', 'Global', 'Input', 'Output', 'InOut', 'Temp'];
 
@@ -27,33 +28,8 @@ const hCell = {
 // borderRight; horizontal via the row's borderBottom.
 const bCell = { padding: '0 2px', borderRight: '1px solid #2c2c2c' };
 
-// IEC 61131-3 memory address formatting
-const IEC_TYPE_PREFIX = {
-  'BOOL': 'X', 'BYTE': 'B', 'SINT': 'B', 'USINT': 'B',
-  'INT': 'W', 'UINT': 'W', 'WORD': 'W',
-  'DINT': 'D', 'UDINT': 'D', 'DWORD': 'D', 'REAL': 'D', 'TIME': 'D',
-  'LINT': 'L', 'ULINT': 'L', 'LWORD': 'L', 'LREAL': 'L',
-};
-
-// Convert a number input to IEC address based on variable type
-// e.g. type=BOOL, num=1 → %MX0.1; type=INT, num=10 → %MW10
-function formatIECAddress(input, varType) {
-  const trimmed = (input || '').trim();
-  if (!trimmed) return '';
-  // If already IEC format, accept as-is
-  if (trimmed.startsWith('%')) return trimmed.toUpperCase();
-  // Try as number
-  const num = parseInt(trimmed, 10);
-  if (isNaN(num) || num < 0) return trimmed;
-  const prefix = IEC_TYPE_PREFIX[(varType || '').toUpperCase()] || 'W';
-  if (prefix === 'X') {
-    // Bit addressing: byte.bit
-    const byte_ = Math.floor(num / 8);
-    const bit = num % 8;
-    return `%MX${byte_}.${bit}`;
-  }
-  return `%M${prefix}${num}`;
-}
+// IEC address formatting/validation lives in utils/iecAddress.js — shared with
+// the transpiler's pre-codegen gate so the UI and the build agree on one rule.
 
 const InsertZoneRow = ({ colSpan, onInsert }) => {
   const [hovered, setHovered] = useState(false);
@@ -231,8 +207,18 @@ const VariableManager = ({
   const [complexPopup, setComplexPopup] = useState(null); // { variable, anchorRect }
   const [ctxMenu, setCtxMenu] = useState(null); // { x, y, variable }
   const ctxMenuRef = useRef(null);
-  const [addrWarning, setAddrWarning] = useState(null); // { msg, x, y }
+  const [addrWarning, setAddrWarning] = useState(null); // { msg, tone: 'error'|'info' }
   const addrWarnTimer = useRef(null);
+
+  // Transient toast for address problems (invalid syntax, prefix/type mismatch,
+  // duplicate) and for the automatic retarget note on a type change. Errors
+  // linger longer than notes because they explain what to type instead.
+  const showAddrNotice = (msg, tone = 'error') => {
+    if (addrWarnTimer.current) clearTimeout(addrWarnTimer.current);
+    setAddrWarning({ msg, tone });
+    addrWarnTimer.current = setTimeout(() => setAddrWarning(null), tone === 'error' ? 6000 : 4000);
+  };
+  useEffect(() => () => { if (addrWarnTimer.current) clearTimeout(addrWarnTimer.current); }, []);
 
   useEffect(() => {
     if (!ctxMenu) return;
@@ -614,7 +600,33 @@ const VariableManager = ({
                           return;
                         }
 
-                        if (onUpdate) onUpdate(v.id, 'type', newType);
+                        if (!onUpdate) return;
+
+                        // ⚠️ The address encodes the variable's WIDTH (%MX bit,
+                        // %MW word, …), so it stops describing the variable the
+                        // moment the type changes. Nothing downstream catches
+                        // that — the runtime reads by offset and treats the
+                        // address as an opaque "expose over REST/HMI" label —
+                        // so a stale %MW on a BOOL would keep being published
+                        // to the SCADA side at the wrong width. Retarget it
+                        // here, keeping the operator-facing number.
+                        const retarget = retargetIECAddress(v.address, newType);
+                        if (!retarget.changed) {
+                          onUpdate(v.id, 'type', newType);
+                          return;
+                        }
+                        // The rewritten address may collide with one already in
+                        // use (%MW10 and %MX10.0 coexist happily; %MW10 → %MD10
+                        // may not). Drop it rather than silently duplicating.
+                        const clash = retarget.address && [...variables, ...globalVars]
+                          .find(other => other.id !== v.id && other.address && other.address === retarget.address);
+                        if (clash) {
+                          onUpdate(v.id, { type: newType, address: '' });
+                          showAddrNotice(`Address removed — ${retarget.address} is already used by "${clash.name}". Assign a new address for "${v.name}".`);
+                          return;
+                        }
+                        onUpdate(v.id, { type: newType, address: retarget.address });
+                        showAddrNotice(retarget.note, 'info');
                       }}
                       derivedTypes={derivedTypes}
                       userDefinedTypes={userDefinedTypes}
@@ -662,14 +674,17 @@ const VariableManager = ({
                       value={v.address || ''}
                       onCommit={(val, e) => {
                         if (disabled || isSimulationMode) return;
-                        const formatted = formatIECAddress(val, v.type);
+                        const res = formatIECAddress(val, v.type);
+                        if (!res.ok) {
+                          showAddrNotice(res.message);
+                          return;
+                        }
+                        const formatted = res.address;
                         if (formatted) {
                           const allVars = [...variables, ...globalVars];
                           const dup = allVars.find(other => other.id !== v.id && other.address && other.address === formatted);
                           if (dup) {
-                            if (addrWarnTimer.current) clearTimeout(addrWarnTimer.current);
-                            setAddrWarning(`"${formatted}" is already used by "${dup.name}"`);
-                            addrWarnTimer.current = setTimeout(() => setAddrWarning(null), 2000);
+                            showAddrNotice(`"${formatted}" is already used by "${dup.name}"`);
                             return;
                           }
                         }
@@ -836,14 +851,16 @@ const VariableManager = ({
         </div>
       )}
 
-      {/* Duplicate address warning popup */}
+      {/* Address notice: validation error / duplicate (red) or automatic
+          retarget note (blue). Wraps — the validation messages name the
+          expected format, so they must not be clipped. */}
       {addrWarning && (
         <div style={{
           position: 'fixed',
           bottom: 32,
           left: '50%',
           transform: 'translateX(-50%)',
-          background: '#b71c1c',
+          background: addrWarning.tone === 'info' ? '#0d47a1' : '#b71c1c',
           color: '#fff',
           padding: '7px 18px',
           borderRadius: 6,
@@ -852,9 +869,10 @@ const VariableManager = ({
           boxShadow: '0 4px 16px rgba(0,0,0,0.6)',
           zIndex: 99999,
           pointerEvents: 'none',
-          whiteSpace: 'nowrap',
+          maxWidth: 'min(620px, 90vw)',
+          lineHeight: 1.45,
         }}>
-          {addrWarning}
+          {addrWarning.msg}
         </div>
       )}
     </div>
