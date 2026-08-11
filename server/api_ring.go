@@ -60,6 +60,7 @@ const (
 type ringClientStat struct {
 	dBps    float64 // measured delivered bytes/s (EWMA), 0 = not measured yet
 	backlog uint64  // write_seq - readSeq at last report
+	readSeq uint64  // this client's drain cursor (for min-across-clients reclaim)
 }
 
 type ringController struct {
@@ -81,6 +82,13 @@ func (c *ringController) register() int {
 	id := c.nextID
 	c.nextID++
 	c.clients[id] = &ringClientStat{}
+	// Resume the producer immediately (don't wait for the first control tick) at
+	// the last-good stride — the runtime is PAUSED (stride_N=0) while no consumer
+	// is connected, so this is what starts capture.
+	if c.n < 1 {
+		c.n = 1
+	}
+	c.rc.SetStrideN(c.n)
 	if !c.running {
 		c.running = true
 		go c.loop()
@@ -88,11 +96,12 @@ func (c *ringController) register() int {
 	return id
 }
 
-func (c *ringController) report(id int, dBps float64, backlog uint64) {
+func (c *ringController) report(id int, dBps float64, backlog, readSeq uint64) {
 	c.mu.Lock()
 	if s := c.clients[id]; s != nil {
 		s.dBps = dBps
 		s.backlog = backlog
+		s.readSeq = readSeq
 	}
 	c.mu.Unlock()
 }
@@ -100,12 +109,19 @@ func (c *ringController) report(id int, dBps float64, backlog uint64) {
 func (c *ringController) unregister(id int) {
 	c.mu.Lock()
 	delete(c.clients, id)
-	if len(c.clients) == 0 {
+	idle := len(c.clients) == 0
+	if idle {
 		c.running = false
-		c.n = 1
-		c.rc.SetStrideN(1) // reset to full rate when nobody is listening
+		// PAUSE the producer: stride_N=0 tells the runtime to stop writing to the
+		// ring entirely while nobody is listening — no wasted scan cycles and the
+		// ring stops filling RAM. register() resumes it on the next connect.
+		// (c.n is kept as the last-good stride so the next client resumes there.)
+		c.rc.SetStrideN(0)
 	}
 	c.mu.Unlock()
+	if idle {
+		c.rc.ReclaimAll() // release the whole ring's pages while idle → RSS ~0
+	}
 }
 
 // loop is the ~100 ms control tick. AIMD-style: grow the stride fast when the
@@ -121,12 +137,16 @@ func (c *ringController) loop() {
 		}
 		minD := math.Inf(1)
 		var maxBacklog uint64
+		minRead := ^uint64(0)
 		for _, s := range c.clients {
 			if s.dBps > 0 && s.dBps < minD {
 				minD = s.dBps
 			}
 			if s.backlog > maxBacklog {
 				maxBacklog = s.backlog
+			}
+			if s.readSeq < minRead {
+				minRead = s.readSeq // free only up to the SLOWEST client's cursor
 			}
 		}
 		n := c.n
@@ -163,6 +183,11 @@ func (c *ringController) loop() {
 		c.n = n
 		c.mu.Unlock()
 		c.rc.SetStrideN(n)
+		// Release the pages of records every client has already drained, so the
+		// ring's resident memory tracks the live backlog (not the whole segment).
+		if minRead != ^uint64(0) {
+			c.rc.Reclaim(minRead)
+		}
 	}
 }
 
@@ -204,7 +229,10 @@ func (am *APIManager) handleRingStream(w http.ResponseWriter, r *http.Request) {
 	defer deliver.Stop()
 
 	ctx := r.Context()
-	var readSeq uint64
+	// Start from the producer's CURRENT position: no pre-connect history (the
+	// producer was paused while idle anyway), and — since valid seqs are ≥ 1 —
+	// never try to read seq 0 out of an uninitialised slot.
+	readSeq := rc.WriteSeq()
 	var droppedTotal uint64
 	lastEpoch := rc.Epoch()
 	var recs []RingRecord
@@ -216,10 +244,12 @@ func (am *APIManager) handleRingStream(w http.ResponseWriter, r *http.Request) {
 		case <-ctx.Done():
 			return
 		case <-deliver.C:
-			// epoch change (runtime restarted) → reset our read cursor
+			// epoch change (runtime restarted) → resync to the new generation's
+			// current write position (write_seq continues monotonically across
+			// restarts, so starting from "now" skips the old run's records).
 			if e := rc.Epoch(); e != lastEpoch {
 				lastEpoch = e
-				readSeq = 0
+				readSeq = rc.WriteSeq()
 			}
 			// bound the frame: at most ringMaxFrameBytes worth of records this tick
 			stride := rc.RecordStride()
@@ -235,7 +265,7 @@ func (am *APIManager) handleRingStream(w http.ResponseWriter, r *http.Request) {
 			readSeq, dropped, recs = rc.Drain(readSeq, recs, maxRecs)
 			droppedTotal += dropped
 			if len(recs) == 0 {
-				ctl.report(id, dBps, rc.WriteSeq()-readSeq)
+				ctl.report(id, dBps, rc.WriteSeq()-readSeq, readSeq)
 				continue
 			}
 
@@ -268,7 +298,7 @@ func (am *APIManager) handleRingStream(w http.ResponseWriter, r *http.Request) {
 					dBps = 0.7*dBps + 0.3*inst // EWMA
 				}
 			}
-			ctl.report(id, dBps, rc.WriteSeq()-readSeq)
+			ctl.report(id, dBps, rc.WriteSeq()-readSeq, readSeq)
 		}
 	}
 }

@@ -68,6 +68,13 @@ const hotswapShmSize = 65536
 // generous headroom over the sub-100ms cost typically observed.
 const swapResultTimeout = 5 * time.Second
 
+// hotSwapStopGrace is how long Stop waits after SIGTERM for the loader-host to
+// unwind on its own (scan threads exit on their next boundary, then the retain
+// flusher writes a final snapshot) before falling back to SIGKILL. Kept short:
+// a Stop must stay snappy, and everything but the last <=1s of retained values
+// is already on disk from the periodic flush.
+const hotSwapStopGrace = 1500 * time.Millisecond
+
 // windowsStaticRuntimeFlag links the mingw runtime (winpthreads above all)
 // STATICALLY into the local-sim loader-host and logic module.
 //
@@ -145,7 +152,19 @@ func (h *HotSwapState) Stop() {
 		}
 	}
 	if cmd != nil && cmd.Process != nil {
-		_ = cmd.Process.Signal(syscall.SIGTERM)
+		// SIGTERM first, then a short grace: the loader-host handles it by
+		// unwinding its scan threads and flushing RETAINED variables one last
+		// time (hotswaphost/host.c). Kill is still the fallback — a SIGKILL'd
+		// host just falls back on the periodic flush, and on Windows (where
+		// Signal fails outright) nothing is lost by killing immediately.
+		termed := cmd.Process.Signal(syscall.SIGTERM) == nil
+		if termed && done != nil {
+			select {
+			case <-done:
+				return // exited gracefully; nothing left to kill
+			case <-time.After(hotSwapStopGrace):
+			}
+		}
 		_ = cmd.Process.Kill()
 		if done != nil {
 			select {

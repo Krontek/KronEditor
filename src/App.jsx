@@ -3014,8 +3014,17 @@ function App() {
                           initialContent={activeItem.content}
                           onContentChange={handleContentChange}
                           allowedClasses={
+                            // ⚠️ 'Retain' is offered to PROGRAM locals only (and
+                            // to globals, in ResourceEditor). A variable declared
+                            // inside a function block or function is not a
+                            // PlcState field — it is an FB struct member or a C
+                            // local — so the transpiler cannot persist it, and
+                            // offering the class there would be a silent no-op.
+                            // Retaining a whole FB INSTANCE (its counter/timer
+                            // state included) is done on the instance variable in
+                            // the program that declares it.
                             activeItem.category === 'programs'
-                              ? ['Local', 'Temp']
+                              ? ['Local', 'Temp', 'Retain']
                               : ['Input', 'Output', 'InOut', 'Local', 'Temp']
                           }
                           context={activeItem.category}

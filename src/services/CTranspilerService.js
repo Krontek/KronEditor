@@ -649,6 +649,11 @@ ${boardDefines}${runtimePortHelpers}${customIncludes}${ecCfgEarly.motionIncludes
     // hot-swapped (dlopen) while the state in S (shared memory) persists.
     const stateFields = [];   // e.g. "int16_t prog_Main_cnt;"
     const stateInits = [];    // e.g. "S->prog_Main_cnt = 0;"
+    // Retentive variables: PlcState fields snapshotted to retain.dat and restored
+    // at PLC_Init (see generateRetainSupport). {key} is the STABLE identity the
+    // file is matched on — the C field name is free to change (it encodes the
+    // owning program), the key is not.
+    const retainEntries = [];
     const usedHalBlocks = new Set(); // HAL block types used → trampolined to the host in hot-swap mode
     // The struct itself is emitted AFTER all type defs (UDTs, FB structs) and
     // signatures but BEFORE the function/program bodies — see the marker below.
@@ -808,11 +813,16 @@ ${boardDefines}${runtimePortHelpers}${customIncludes}${ecCfgEarly.motionIncludes
             const initVal = isUserType ? '' : formatVarInitial(v.initialValue, v.type);
             stateFields.push(`${mapType(v.type)} ${v.name};`);
             if (initVal) stateInits.push(`S->${v.name}${initVal};`);
-            variableTable.globalVars[v.name] = { type: v.type, initialValue: gInitVal };
+            const gRetain = isRetainVar(v);
+            // Globals are keyed by bare name — the same identity the ST/LD code
+            // uses, so renaming a PROGRAM never orphans a retained global.
+            if (gRetain) retainEntries.push({ key: v.name, field: v.name });
+            variableTable.globalVars[v.name] = { type: v.type, initialValue: gInitVal, ...(gRetain ? { retain: true } : {}) };
             // Debug: top-level entry (scalar types get a SHM slot)
             const gShmSlot = !isUserType ? tryAssignShm(v.type, v.name) : {};
             variableTable.debugDefaults[`prog__${v.name}`] = {
-                type: v.type, c_symbol: v.name, defaultValue: gInitVal, address: v.address || '', ...gShmSlot
+                type: v.type, c_symbol: v.name, defaultValue: gInitVal, address: v.address || '', ...gShmSlot,
+                ...(gRetain ? { retain: true } : {})
             };
             // Debug: expand array elements and struct members for monitoring
             const dtDef = dataTypeDefs[v.type];
@@ -984,13 +994,19 @@ ${boardDefines}${runtimePortHelpers}${customIncludes}${ecCfgEarly.motionIncludes
 
                 const cSym = isFB ? `prog_${progName}_inst_${vName}` : `prog_${progName}_${vName}`;
                 const initVal = resolveInitialValue(v.initialValue, vType);
+                // A retained FB INSTANCE persists the whole struct (a CTU keeps
+                // its CV, a TONR its accumulated ET) — the entry is one blob of
+                // sizeof(that struct), so nothing here is type-specific.
+                const vRetain = isRetainVar(v);
+                if (vRetain) retainEntries.push({ key: `${progName}.${vName}`, field: cSym });
                 variableTable.programs[progName].variables[vName] = {
-                    type: vType, c_symbol: cSym, initialValue: initVal
+                    type: vType, c_symbol: cSym, initialValue: initVal, ...(vRetain ? { retain: true } : {})
                 };
                 // Debug: top-level entry (non-FB scalars get a SHM slot)
                 const vShmSlot = !isFB ? tryAssignShm(vType, cSym) : {};
                 variableTable.debugDefaults[`prog_${progName}_${vName}`] = {
-                    type: vType, c_symbol: cSym, defaultValue: initVal, address: v.address || '', ...vShmSlot
+                    type: vType, c_symbol: cSym, defaultValue: initVal, address: v.address || '', ...vShmSlot,
+                    ...(vRetain ? { retain: true } : {})
                 };
                 // FB instance OUTPUT pins (Q, ET, CV, …): expose each scalar pin
                 // as its own SHM-slotted variable so the TARGET (KronServer reads
@@ -1273,6 +1289,11 @@ ${boardDefines}${runtimePortHelpers}${customIncludes}${ecCfgEarly.motionIncludes
             isGlobal: key.startsWith('prog__'),
         }));
 
+    // Retain support must precede the scan loop: PLC_Init/PLC_Cleanup and the
+    // flusher thread below call plc_retain_load/save, and C needs them declared
+    // first. It only references PlcState + S, both from plc.h.
+    source += generateRetainSupport(retainEntries);
+
     const mainLoop = generateMainLoop(
         projectStructure, config, boardId, shmEntries.length > 0, execTimeVars,
         deviceArtifacts.initCode + ecCfg.initCode,
@@ -1285,7 +1306,8 @@ ${boardDefines}${runtimePortHelpers}${customIncludes}${ecCfgEarly.motionIncludes
         !!ecCfg.halContent,         // gpiMutexEnabled: true when IO_Bus thread owns the bus
         shmEntries,
         plcStateLayoutHash,
-        addressedRingVars
+        addressedRingVars,
+        retainEntries.length > 0
     );
     source += mainLoop.src;
     if (mainLoop.ringConfig) variableTable.ring = mainLoop.ringConfig;
@@ -1961,7 +1983,185 @@ ${ncWriteBridge}` : ''}        /* Step 4: Propagate HW-updated staging to the ba
     };
 };
 
-const generateMainLoop = (projectStructure, config, boardId = null, shmEnabled = false, execTimeVars = [], initCode = '', cleanupCode = '', ecPdoReadCode = '', ecPdoWriteCode = '', ecThreadCode = '', ecThreadStartCode = '', ecThreadJoinCode = '', gpiMutexEnabled = false, shmEntries = [], plcStateLayoutHash = '0', addressedRingVars = []) => {
+// ── RETENTIVE (RETAIN) VARIABLES ─────────────────────────────────────────────
+// A variable declared with class `Retain` keeps its LAST value across a runtime
+// restart (IEC 61131-3 warm restart). Every retainable value already lives in
+// exactly one place — PlcState — so persistence is a name-keyed snapshot of a
+// subset of its fields to a file (`retain.dat`) in the runtime's cwd: the deploy
+// dir on a target (process.go sets cmd.Dir), the build dir for the local sim
+// (hotswap.go does the same).
+//
+// ⚠️ The file is SELF-DESCRIBING and matched BY NAME, not by struct layout.
+// A rebuild that adds/removes/retypes variables must not discard the values of
+// everything else, and a raw `memcpy(&PlcState)` blob would do exactly that (it
+// would also silently restore garbage into the wrong fields once a field moved).
+// Records whose name is unknown are skipped; a name whose size no longer matches
+// is skipped; a retained variable with no record simply keeps its initial value.
+//
+// ⚠️ The snapshot is taken ASYNCHRONOUSLY (a flusher thread, not the scan), so a
+// >word-sized value (LINT/LREAL on a 32-bit board) can in principle be sampled
+// mid-update. Scan-synchronised capture would need per-task partitioning like
+// the capture ring's producer (§16) — a known v1 gap, not an oversight.
+//
+// Layout: "KRTN" u16 version u16 count, then count × { u16 nameLen, name,
+// u16 size, value bytes }. Scalars are explicit little-endian; the payload is
+// raw native bytes (only ever read back by the same runtime on the same box).
+const RETAIN_INTERVAL_MS = 1000;
+// The declaration side is the variable's CLASS (IEC's `VAR_GLOBAL RETAIN` /
+// `VAR RETAIN`), matched case-insensitively like every other identifier here.
+export const isRetainVar = (v) => String(v?.class || '').toLowerCase() === 'retain';
+const generateRetainSupport = (retainEntries) => {
+    if (!retainEntries.length) return '';
+    let s = `\n// --- RETENTIVE (RETAIN) VARIABLES ---\n`;
+    s += `// Values persisted to ./${'retain.dat'} and restored at PLC_Init. See CLAUDE.md §17.\n`;
+    s += `#include <stdio.h>\n#include <stddef.h>\n`;
+    s += `#if defined(_WIN32)\n`;
+    // ⚠️ ISO rename() fails on Windows when the destination exists (same trap as
+    // host.c's swap_result), so the atomic replace must go through MoveFileEx.
+    s += `int MoveFileExA(const char *src, const char *dst, unsigned long flags);\n`;
+    s += `#define PLC_RETAIN_REPLACE 0x1UL /* MOVEFILE_REPLACE_EXISTING */\n`;
+    s += `#endif\n`;
+    s += `#define PLC_RETAIN_FILE "retain.dat"\n`;
+    s += `#define PLC_RETAIN_TMP  "retain.dat.tmp"\n`;
+    s += `#define PLC_RETAIN_VERSION 1u\n`;
+    s += `#define PLC_RETAIN_MAX_FILE (16u << 20) /* sanity bound: refuse an absurd/corrupt file outright (the whole file is read into memory) */\n`;
+    s += `typedef struct { const char *name; unsigned int off; unsigned int sz; } plc_retain_ent;\n`;
+    s += `static const plc_retain_ent __retain_tab[] = {\n`;
+    retainEntries.forEach(({ key, field }) => {
+        s += `    { "${key}", (unsigned int)offsetof(PlcState, ${field}), (unsigned int)sizeof(((PlcState *)0)->${field}) },\n`;
+    });
+    s += `};\n`;
+    s += `#define PLC_RETAIN_COUNT ((int)(sizeof(__retain_tab) / sizeof(__retain_tab[0])))\n\n`;
+    s += `static unsigned char *__retain_img = NULL;   /* image packed on each save */\n`;
+    s += `static unsigned char *__retain_prev = NULL;  /* last image actually written */\n`;
+    s += `static unsigned int   __retain_len = 0;\n`;
+    s += `static void __retain_put16(unsigned char *b, unsigned int v) { b[0] = (unsigned char)(v & 0xFF); b[1] = (unsigned char)((v >> 8) & 0xFF); }\n`;
+    s += `static unsigned int __retain_get16(const unsigned char *b) { return (unsigned int)b[0] | ((unsigned int)b[1] << 8); }\n`;
+    // ⚠️ The VALUE length is 32-bit on purpose. A retained ARRAY[0..20000] OF
+    // DINT is 80 KB — a u16 length would wrap silently and restore a fraction
+    // of the array over the rest of PlcState. Names stay u16 (identifiers).
+    s += `static void __retain_put32(unsigned char *b, unsigned int v) { for (int k = 0; k < 4; k++) b[k] = (unsigned char)((v >> (8 * k)) & 0xFF); }\n`;
+    s += `static unsigned int __retain_get32(const unsigned char *b) {\n`;
+    s += `    unsigned int v = 0; for (int k = 0; k < 4; k++) v |= (unsigned int)b[k] << (8 * k); return v;\n}\n\n`;
+    s += `static unsigned int __retain_image_len(void) {\n`;
+    s += `    unsigned int n = 8; /* magic(4) + version(2) + count(2) */\n`;
+    s += `    for (int i = 0; i < PLC_RETAIN_COUNT; i++) n += 6 + (unsigned int)strlen(__retain_tab[i].name) + __retain_tab[i].sz;\n`;
+    s += `    return n;\n}\n\n`;
+    s += `static void __retain_pack(unsigned char *b) {\n`;
+    s += `    memcpy(b, "KRTN", 4);\n`;
+    s += `    __retain_put16(b + 4, PLC_RETAIN_VERSION);\n`;
+    s += `    __retain_put16(b + 6, (unsigned int)PLC_RETAIN_COUNT);\n`;
+    s += `    unsigned char *p = b + 8;\n`;
+    s += `    for (int i = 0; i < PLC_RETAIN_COUNT; i++) {\n`;
+    s += `        unsigned int nl = (unsigned int)strlen(__retain_tab[i].name);\n`;
+    s += `        __retain_put16(p, nl); p += 2;\n`;
+    s += `        memcpy(p, __retain_tab[i].name, nl); p += nl;\n`;
+    s += `        __retain_put32(p, __retain_tab[i].sz); p += 4;\n`;
+    s += `        memcpy(p, (const unsigned char *)S + __retain_tab[i].off, __retain_tab[i].sz);\n`;
+    s += `        p += __retain_tab[i].sz;\n`;
+    s += `    }\n}\n\n`;
+    // Non-static: in a hot-swap build the loader-host dlsym's plc_retain_save to
+    // drive the periodic flush (the logic module owns no threads of its own).
+    s += `/* Restores retained values over the initial ones. Called at the END of\n`;
+    s += ` * PLC_Init — i.e. after plc_state_init() has seeded every initial value,\n`;
+    s += ` * so a retained variable overrides its initial and an unretained (or\n`;
+    s += ` * brand-new) one keeps it. */\n`;
+    s += `void plc_retain_load(void) {\n`;
+    s += `    FILE *f = fopen(PLC_RETAIN_FILE, "rb");\n`;
+    s += `    if (!f) return;              /* first ever run — initial values stand */\n`;
+    s += `    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return; }\n`;
+    s += `    long len = ftell(f);\n`;
+    s += `    if (len < 8 || len > (long)PLC_RETAIN_MAX_FILE || fseek(f, 0, SEEK_SET) != 0) { fclose(f); return; }\n`;
+    s += `    unsigned char *b = (unsigned char *)malloc((size_t)len);\n`;
+    s += `    if (!b) { fclose(f); return; }\n`;
+    s += `    size_t got = fread(b, 1, (size_t)len, f);\n`;
+    s += `    fclose(f);\n`;
+    s += `    if (got != (size_t)len || memcmp(b, "KRTN", 4) != 0 || __retain_get16(b + 4) != PLC_RETAIN_VERSION) { free(b); return; }\n`;
+    s += `    unsigned int cnt = __retain_get16(b + 6), restored = 0;\n`;
+    s += `    const unsigned char *p = b + 8, *end = b + len;\n`;
+    s += `    for (unsigned int r = 0; r < cnt; r++) {\n`;
+    s += `        if ((size_t)(end - p) < 2) break;\n`;
+    s += `        unsigned int nl = __retain_get16(p); p += 2;\n`;
+    s += `        if ((size_t)(end - p) < (size_t)nl + 4) break;\n`;
+    s += `        const char *nm = (const char *)p; p += nl;\n`;
+    s += `        unsigned int sz = __retain_get32(p); p += 4;\n`;
+    s += `        if ((size_t)(end - p) < (size_t)sz) break;\n`;
+    s += `        for (int i = 0; i < PLC_RETAIN_COUNT; i++) {\n`;
+    s += `            /* The stored name is NOT NUL-terminated — compare length-bounded. */\n`;
+    s += `            if (__retain_tab[i].sz == sz && strlen(__retain_tab[i].name) == nl\n`;
+    s += `                && memcmp(__retain_tab[i].name, nm, nl) == 0) {\n`;
+    s += `                memcpy((unsigned char *)S + __retain_tab[i].off, p, sz);\n`;
+    s += `                restored++;\n`;
+    s += `                break;\n`;
+    s += `            }\n`;
+    s += `        }\n`;
+    s += `        p += sz;\n`;
+    s += `    }\n`;
+    s += `    free(b);\n`;
+    s += `    fprintf(stderr, "[plc] retain: restored %u/%d variable(s) from %s\\n", restored, PLC_RETAIN_COUNT, PLC_RETAIN_FILE);\n`;
+    s += `    fflush(stderr);\n`;
+    s += `}\n\n`;
+    s += `/* Packs the retained fields and writes them atomically (tmp + rename) IF\n`;
+    s += ` * they differ from the last image written — an idle machine performs zero\n`;
+    s += ` * disk writes, which is what keeps this off an SD card's wear budget.\n`;
+    s += ` * Returns 1 when a write happened. Safe to call from any thread; never\n`;
+    s += ` * called from a scan. */\n`;
+    s += `int plc_retain_save(void) {\n`;
+    s += `    if (!__retain_img) {\n`;
+    s += `        __retain_len = __retain_image_len();\n`;
+    s += `        __retain_img = (unsigned char *)malloc(__retain_len);\n`;
+    s += `        if (!__retain_img) return 0;\n`;
+    s += `    }\n`;
+    s += `    __retain_pack(__retain_img);\n`;
+    s += `    if (__retain_prev && memcmp(__retain_prev, __retain_img, __retain_len) == 0) return 0;\n`;
+    s += `    FILE *f = fopen(PLC_RETAIN_TMP, "wb");\n`;
+    s += `    if (!f) return 0;\n`;
+    s += `    size_t w = fwrite(__retain_img, 1, __retain_len, f);\n`;
+    s += `    fflush(f);\n`;
+    s += `#if defined(__linux__) || defined(__APPLE__)\n`;
+    s += `    /* The rename is only atomic with respect to data that actually reached\n`;
+    s += `     * the disk — without this, a power cut can leave an empty new file. */\n`;
+    s += `    fsync(fileno(f));\n`;
+    s += `#endif\n`;
+    s += `    fclose(f);\n`;
+    s += `    if (w != (size_t)__retain_len) { remove(PLC_RETAIN_TMP); return 0; }\n`;
+    s += `#if defined(_WIN32)\n`;
+    s += `    if (!MoveFileExA(PLC_RETAIN_TMP, PLC_RETAIN_FILE, PLC_RETAIN_REPLACE)) return 0;\n`;
+    s += `#else\n`;
+    s += `    if (rename(PLC_RETAIN_TMP, PLC_RETAIN_FILE) != 0) return 0;\n`;
+    s += `#endif\n`;
+    s += `    if (!__retain_prev) __retain_prev = (unsigned char *)malloc(__retain_len);\n`;
+    s += `    if (__retain_prev) memcpy(__retain_prev, __retain_img, __retain_len);\n`;
+    s += `    return 1;\n`;
+    s += `}\n\n`;
+    // The flusher thread belongs to the SINGLE-BINARY build only: under
+    // PLC_HOTSWAP the logic module is dlclose'd on every swap, so a thread
+    // running in it would be pulled out from under itself — the loader-host owns
+    // the cadence there (hotswaphost/host.c retain_thread).
+    s += `#if defined(__linux__) && !defined(PLC_HOTSWAP)\n`;
+    s += `#define PLC_RETAIN_INTERVAL_MS ${RETAIN_INTERVAL_MS}\n`;
+    // plc_stop is DEFINED further down (generateMainLoop emits it with the scan
+    // loop), so this block — which is emitted before it — needs the extern.
+    s += `extern volatile int plc_stop;\n`;
+    s += `static void *plc_retain_thread(void *arg) {\n`;
+    s += `    (void)arg;\n`;
+    s += `    int ticks = 0;\n`;
+    s += `    while (!plc_stop) {\n`;
+    s += `        /* 100 ms granularity so a stop is honoured promptly regardless of\n`;
+    s += `         * how long the flush interval is. */\n`;
+    s += `        struct timespec ts = { .tv_sec = 0, .tv_nsec = 100 * 1000 * 1000 };\n`;
+    s += `        nanosleep(&ts, NULL);\n`;
+    s += `        if (++ticks < (PLC_RETAIN_INTERVAL_MS / 100)) continue;\n`;
+    s += `        ticks = 0;\n`;
+    s += `        plc_retain_save();\n`;
+    s += `    }\n`;
+    s += `    return NULL;\n`;
+    s += `}\n`;
+    s += `#endif\n`;
+    return s;
+};
+
+const generateMainLoop = (projectStructure, config, boardId = null, shmEnabled = false, execTimeVars = [], initCode = '', cleanupCode = '', ecPdoReadCode = '', ecPdoWriteCode = '', ecThreadCode = '', ecThreadStartCode = '', ecThreadJoinCode = '', gpiMutexEnabled = false, shmEntries = [], plcStateLayoutHash = '0', addressedRingVars = [], retainEnabled = false) => {
     let mainSrc = `\n// --- DETERMINISTIC SCAN LOOP ---\n`;
 
     // --- 1. Discover task→program groupings (priority: taskConfig > res_config > fallback) ---
@@ -2103,8 +2303,14 @@ const generateMainLoop = (projectStructure, config, boardId = null, shmEnabled =
         mainSrc += initCode;
     }
     if (ringEnabled) mainSrc += `    plc_ring_init();\n`;
+    // ⚠️ LAST in PLC_Init, on purpose: plc_state_init() (injected at the top of
+    // this function) has just written every initial value, so the retained ones
+    // must be restored over it — the reverse order would make retain a no-op.
+    if (retainEnabled) mainSrc += `    plc_retain_load();\n`;
     mainSrc += `}\n\n`;
     mainSrc += `void PLC_Cleanup(void) {\n`;
+    // Final flush before the HAL/EtherCAT teardown below can disturb anything.
+    if (retainEnabled) mainSrc += `    plc_retain_save();\n`;
     if (cleanupCode) {
         mainSrc += cleanupCode;
     }
@@ -2192,7 +2398,6 @@ const generateMainLoop = (projectStructure, config, boardId = null, shmEnabled =
         mainSrc += `    uint64_t nslots = (uint64_t)((total - PLC_RING_HEADER) / PLC_RING_STRIDE);\n`;
         mainSrc += `    if (nslots == 0) { munmap(r, (size_t)total); return; }\n`;
         // preserve stride_N + epoch across restarts
-        mainSrc += `    uint32_t oldN; memcpy(&oldN, r + 40, 4); if (oldN == 0) oldN = 1;\n`;
         mainSrc += `    uint64_t oldEpoch; memcpy(&oldEpoch, r + 48, 8);\n`;
         mainSrc += `    uint32_t u32; uint16_t u16; uint64_t u64;\n`;
         mainSrc += `    u32 = 0x4B524E47u; memcpy(r+0,&u32,4);\n`;   // magic
@@ -2203,8 +2408,13 @@ const generateMainLoop = (projectStructure, config, boardId = null, shmEnabled =
         mainSrc += `    u32 = (uint32_t)total; memcpy(r+20,&u32,4);\n`;
         mainSrc += `    u32 = ${ringTasks.length}u; memcpy(r+24,&u32,4);\n`; // ntasks
         mainSrc += `    u32 = 1u; memcpy(r+28,&u32,4);\n`;            // flags: enabled
-        mainSrc += `    u64 = 0ull; memcpy(r+32,&u64,8);\n`;         // write_seq = 0
-        mainSrc += `    memcpy(r+40,&oldN,4);\n`;                     // stride_N preserved
+        // write_seq CONTINUES monotonically across (re)starts and starts at 1,
+        // never 0. This makes every valid record sequence >= 1, so an unwritten /
+        // punched slot (which reads back as 0, a tmpfs hole) can NEVER be mistaken
+        // for a real record — which is why the slots need no 0xFFFF initialization
+        // (that init used to touch every page → the whole segment resident at boot).
+        mainSrc += `    { uint64_t oldW = 0; memcpy(&oldW, r+32, 8); if (oldW < 1) oldW = 1; memcpy(r+32, &oldW, 8); }\n`;
+        mainSrc += `    u32 = 0u; memcpy(r+40,&u32,4);\n`;           // stride_N = 0 → PAUSED until a consumer connects
         // epoch is published LAST (release store, below) so a consumer that sees
         // the new epoch is guaranteed to see the fully-written header + task table
         // task table
@@ -2213,8 +2423,12 @@ const generateMainLoop = (projectStructure, config, boardId = null, shmEnabled =
             mainSrc += `    u16 = ${t.payloadLen}u; memcpy(r+${64 + j * 8 + 4},&u16,2);\n`;
             mainSrc += `    u16 = ${t.taskId}u; memcpy(r+${64 + j * 8 + 6},&u16,2);\n`;
         });
-        // init all slots to empty seq
-        mainSrc += `    for (uint64_t i = 0; i < nslots; i++) { u64 = ~0ull; memcpy(r + 256 + i*PLC_RING_STRIDE, &u64, 8); }\n`;
+        // NOTE: slots are deliberately NOT initialized — see the write_seq comment
+        // above. Leaving them as tmpfs holes (RSS 0) is what lets the ring's
+        // resident memory track the live backlog; the consumer punches consumed
+        // slots back into holes (fallocate) so the segment never stays fully
+        // resident. A hole reads 0, which is < every valid seq (≥1), so it is
+        // never mistaken for data.
         // Publish epoch LAST with a release store: on a restart that changed the
         // header layout, a consumer acquire-loading the new epoch is then
         // guaranteed to see the fresh record_stride/nslots/task-table too (ARM is
@@ -2226,7 +2440,8 @@ const generateMainLoop = (projectStructure, config, boardId = null, shmEnabled =
         ringTasks.forEach((t) => {
             mainSrc += `static void plc_ring_append_${t.taskName}(void) {\n`;
             mainSrc += `    if (!__plc_ring) return;\n`;
-            mainSrc += `    uint32_t N = __atomic_load_n((uint32_t*)(__plc_ring + 40), __ATOMIC_RELAXED); if (N == 0) N = 1;\n`;
+            mainSrc += `    uint32_t N = __atomic_load_n((uint32_t*)(__plc_ring + 40), __ATOMIC_RELAXED);\n`;
+            mainSrc += `    if (N == 0) return; /* paused: no consumer connected → don't burn scan cycles / RAM */\n`;
             mainSrc += `    if ((__ring_scan_${t.taskName}++ % N) != 0) return;\n`;
             mainSrc += `    uint64_t s = __atomic_fetch_add((uint64_t*)(__plc_ring + 32), 1ull, __ATOMIC_RELAXED);\n`;
             mainSrc += `    uint8_t *slot = __plc_ring + 256 + (uint64_t)(s % __plc_ring_nslots) * PLC_RING_STRIDE;\n`;
@@ -2312,20 +2527,38 @@ const generateMainLoop = (projectStructure, config, boardId = null, shmEnabled =
 
     // Linux main(): spawn all task threads (normal build only).
     mainSrc += `#ifndef PLC_HOTSWAP\n`;
+    if (retainEnabled) {
+        // ⚠️ Installed ONLY for a project that has retained variables. Without a
+        // handler SIGTERM terminates the process outright, so KronServer's Stop
+        // (SIGTERM → 5 s → SIGKILL, server/process.go) would skip PLC_Cleanup and
+        // lose everything written since the last periodic flush. Gating it on
+        // retain keeps the stop semantics of every other project unchanged.
+        mainSrc += `#include <signal.h>\n`;
+        mainSrc += `static void plc_on_term(int sig) { (void)sig; plc_stop = 1; }\n`;
+    }
     mainSrc += `int main() {\n`;
     mainSrc += `    { struct sched_param __sp = { .sched_priority = sched_get_priority_max(SCHED_FIFO) };\n`;
     mainSrc += `      sched_setscheduler(0, SCHED_FIFO, &__sp); }\n`;
+    if (retainEnabled) {
+        mainSrc += `    signal(SIGTERM, plc_on_term);\n`;
+        mainSrc += `    signal(SIGINT,  plc_on_term);\n`;
+    }
     mainSrc += `    PLC_Init();\n`;
     if (shmEnabled) {
         mainSrc += `    plc_shm_init();\n`;
     }
     if (ecThreadStartCode) mainSrc += ecThreadStartCode;
     if (taskGroups.length > 0) {
+        // The flusher is tied to the task threads' lifetime: with no tasks
+        // nothing ever sets plc_stop, so an unconditional thread here would make
+        // main() hang forever on its join.
+        if (retainEnabled) mainSrc += `    pthread_t __retain_thread;\n    pthread_create(&__retain_thread, NULL, plc_retain_thread, NULL);\n`;
         mainSrc += `    pthread_t __plc_threads[${taskGroups.length}];\n`;
         taskGroups.forEach((tg, i) => {
             mainSrc += `    pthread_create(&__plc_threads[${i}], NULL, plc_task_${tg.taskName}, NULL);\n`;
         });
         mainSrc += `    for (int i = 0; i < ${taskGroups.length}; i++) pthread_join(__plc_threads[i], NULL);\n`;
+        if (retainEnabled) mainSrc += `    pthread_join(__retain_thread, NULL);\n`;
     }
     if (ecThreadJoinCode) mainSrc += ecThreadJoinCode;
     mainSrc += `    PLC_Cleanup();\n`;
@@ -2352,6 +2585,7 @@ const generateMainLoop = (projectStructure, config, boardId = null, shmEnabled =
     mainSrc += `    PLC_Init();\n`;
     if (shmEnabled) mainSrc += `    plc_shm_init();\n`;
     mainSrc += `    uint64_t __prev_us = 0;\n`;
+    if (retainEnabled) mainSrc += `    uint64_t __retain_last_us = 0;\n`;
     mainSrc += `    while (!plc_stop) {\n`;
     mainSrc += `        __update_us_tick();\n`;
     if (ecPdoReadCode) mainSrc += ecPdoReadCode;
@@ -2363,6 +2597,13 @@ const generateMainLoop = (projectStructure, config, boardId = null, shmEnabled =
         mainSrc += `        if (us_tick / ${tg.intervalUs} != __prev_us / ${tg.intervalUs}) { plc_task_body_${ti}(); }\n`;
     });
     mainSrc += `        __prev_us = us_tick;\n`;
+    if (retainEnabled) {
+        // Windows has no flusher thread here: this main() IS a cooperative timer
+        // wheel, so the periodic save rides it directly (plc.c includes
+        // <pthread.h> only under __linux__). The save is a no-op unless a
+        // retained value actually changed.
+        mainSrc += `        if (us_tick - __retain_last_us >= ${RETAIN_INTERVAL_MS * 1000}ULL) { __retain_last_us = us_tick; plc_retain_save(); }\n`;
+    }
     if (ecPdoWriteCode) mainSrc += ecPdoWriteCode;
     mainSrc += `        Sleep(${Math.max(1, Math.floor(baseTickUs / 1000))});\n`;
     mainSrc += `    }\n`;
@@ -2650,6 +2891,9 @@ const FB_TRIGGER_PIN = {
     'MC_ReadActualPosition': 'Enable', 'MC_ReadActualVelocity': 'Enable',
     'MC_ReadActualTorque': 'Enable', 'MC_ReadStatus': 'Enable',
     'MC_ReadMotionState': 'Enable', 'MC_ReadAxisInfo': 'Enable', 'MC_ReadAxisError': 'Enable',
+    // System / RTC (kronsystem.h) — EN-triggered but a REAL instance FB,
+    // hence the SYSTEM_FB_TYPES entry that keeps it out of isInlineMathType.
+    'Read_System_Time': 'EN',
 };
 
 // Primary boolean output pin for downstream power flow
@@ -2694,6 +2938,8 @@ const FB_Q_OUTPUT = {
     'MC_ReadActualPosition': 'Valid', 'MC_ReadActualVelocity': 'Valid',
     'MC_ReadActualTorque': 'Valid', 'MC_ReadStatus': 'Valid',
     'MC_ReadMotionState': 'Valid', 'MC_ReadAxisInfo': 'Valid', 'MC_ReadAxisError': 'Valid',
+    // System / RTC
+    'Read_System_Time': 'ENO',
 };
 
 // Exported for agentTools.js (the PLC Agent's set_ladder): the agent authors
@@ -2709,6 +2955,10 @@ const GENERATED_FB_OUTPUT_TYPES = {};
 const getOutputPinType = (blockType, pinName, customData) => {
     if (['Q', 'Q1', 'QU', 'QD', 'ENO'].includes(pinName)) return 'BOOL';
     if ((blockType === 'UART_Receive' || blockType === 'USB_Receive') && pinName === 'ReceivedLength') return 'UINT';
+    // Read_System_Time.TIME is a DINT (ms since local midnight), NOT the IEC
+    // TIME duration type the pin name suggests — must not fall through to the
+    // `pinName === 'ET'`-style rules or the default BOOL.
+    if (blockType === 'Read_System_Time' && pinName === 'TIME') return 'DINT';
     if (GENERATED_FB_OUTPUT_TYPES[blockType]?.[pinName]) return GENERATED_FB_OUTPUT_TYPES[blockType][pinName];
     if (pinName === 'ET') return 'TIME';
     if (pinName === 'CV') return 'INT';
@@ -2939,6 +3189,8 @@ const FB_OUTPUTS = {
     'MC_ReadMotionState': ['Valid', 'Busy', 'Error', 'ErrorID', 'ConstantVelocity', 'Accelerating', 'Decelerating', 'DirectionPositive', 'DirectionNegative'],
     'MC_ReadAxisInfo': ['Valid', 'Busy', 'Error', 'ErrorID'],
     'MC_ReadAxisError': ['Valid', 'Busy', 'Error', 'ErrorID', 'AxisErrorID'],
+    // System / RTC (kronsystem.h)
+    'Read_System_Time': ['ENO', 'TIME'],
 };
 // All conversion blocks (X_TO_Y) share ['ENO', 'OUT'] — built dynamically below
 // Programmatically populate all 72 X_TO_Y conversion entries across lookup tables
@@ -3004,9 +3256,23 @@ const HAL_BLOCK_TYPES = new Set();
 // no SHM slot) or the macro expansion produces invalid C.
 const EC_PDO_VAR_NAMES = new Set();
 
+// Statically-known blocks that use EN as their power-flow pin but are REAL
+// instance FBs backed by a struct + _Call (kronsystem.h) — the same exemption
+// HAL_BLOCK_TYPES gives the dynamically-registered HAL blocks, except these are
+// always present so they live in a permanent set. Without the exemption they
+// would be treated as stateless inline math: no PlcState field, no instance, no
+// shadow vars, and the LD path would fall into the inline branch that has no
+// KRON_FN/BITWISE/MATH_FB entry for them.
+// ⚠️ Every member needs a struct + `<Type>_Call(<Type>*)` reachable from a
+// kron*.h in resources/krontek-include/ — otherwise the generated C references
+// a type and a function that do not exist and the build fails at compile time.
+const SYSTEM_FB_TYPES = new Set(['Read_System_Time']);
+export { SYSTEM_FB_TYPES };
+
 // Returns true for EN-trigger stateless blocks that should be inlined.
 // HAL blocks (GPIO_Read, PWM0, etc.) are excluded even though their trigger is EN.
-const isInlineMathType = (type) => FB_TRIGGER_PIN[type] === 'EN' && !HAL_BLOCK_TYPES.has(type);
+const isInlineMathType = (type) =>
+    FB_TRIGGER_PIN[type] === 'EN' && !HAL_BLOCK_TYPES.has(type) && !SYSTEM_FB_TYPES.has(type);
 
 // Ordered input pin names for each standard FB type (index matches in_0, in_1, ...)
 const FB_INPUTS = {
@@ -3083,6 +3349,8 @@ const FB_INPUTS = {
     'MC_ReadMotionState': ['Enable'],
     'MC_ReadAxisInfo': ['Enable'],
     'MC_ReadAxisError': ['Enable'],
+    // System / RTC (kronsystem.h)
+    'Read_System_Time': ['EN'],
 };
 
 // EtherCAT diagnostic FBs that require KRON_EC_Config* (&__ec_cfg) as 2nd parameter.

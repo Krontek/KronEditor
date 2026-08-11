@@ -501,16 +501,25 @@ const VariableManager = ({
   const dataTypes = [...(projectStructure?.dataTypes || []), AXIS_REF_BUILTIN];
   const isComplexType = (typeName) => dataTypes.some(dt => dt.name === typeName && (dt.type === 'Array' || dt.type === 'Structure'));
 
-  const showClass = allowedClasses.some(c => c === 'Input' || c === 'Output' || c === 'InOut');
+  // ⚠️ 'Retain' MUST be in this list. The column used to appear only for POUs
+  // that have pin classes (Input/Output/InOut), so the Retain option offered to
+  // globals and program locals had no way of ever being selected — the whole
+  // retentive-variable feature was unreachable config.
+  const showClass = allowedClasses.some(c => c === 'Input' || c === 'Output' || c === 'InOut' || c === 'Retain');
   const colCount = 6 + (liveVariables ? 1 : 0) + (showClass ? 1 : 0);
 
   const CLASS_COLORS = {
-    Input:  { bg: '#0e4f7a', border: '#1177bb', text: '#6dbfff' },
-    Output: { bg: '#6b3a1f', border: '#b86030', text: '#ffb07a' },
-    InOut:  { bg: '#4a2060', border: '#8e2fad', text: '#ce8ff0' },
-    Local:  { bg: '#2a2a2a', border: '#555',    text: '#aaa'    },
-    Temp:   { bg: '#2a2a2a', border: '#555',    text: '#aaa'    },
-    Global: { bg: '#1a3a1a', border: '#3a7a3a', text: '#88cc88' },
+    Input:    { bg: '#0e4f7a', border: '#1177bb', text: '#6dbfff' },
+    Output:   { bg: '#6b3a1f', border: '#b86030', text: '#ffb07a' },
+    InOut:    { bg: '#4a2060', border: '#8e2fad', text: '#ce8ff0' },
+    Local:    { bg: '#2a2a2a', border: '#555',    text: '#aaa'    },
+    Temp:     { bg: '#2a2a2a', border: '#555',    text: '#aaa'    },
+    Global:   { bg: '#1a3a1a', border: '#3a7a3a', text: '#88cc88' },
+    Var:      { bg: '#2a2a2a', border: '#555',    text: '#aaa'    },
+    Constant: { bg: '#2a2a2a', border: '#555',    text: '#aaa'    },
+    // Retentive — deliberately the loudest chip in the table: it is the one
+    // class that changes what happens across a restart.
+    Retain:   { bg: '#5a4300', border: '#c79300', text: '#ffd76a' },
   };
 
   // ── Render ────────────────────────────────────────────────────────────────
@@ -559,7 +568,14 @@ const VariableManager = ({
                     <EditableCell value={v.name} onCommit={(val) => !isSimulationMode && !disabled && validateAndSaveName(v.id, val)} />
                   </td>
                   {showClass && (() => {
-                    const cls = v.class || allowedClasses[0] || 'Local';
+                    // ⚠️ Fall back when the stored class isn't offered in THIS
+                    // scope, not just when it is missing: the globals table
+                    // offers Var/Constant/Retain, but an agent-created global
+                    // carries class 'Global'. A <select> whose value matches no
+                    // option renders BLANK — which only became visible now that
+                    // the column is shown for globals at all. Display-only; the
+                    // stored value is rewritten the moment the user picks one.
+                    const cls = allowedClasses.includes(v.class) ? v.class : (allowedClasses[0] || 'Local');
                     const cc = CLASS_COLORS[cls] || CLASS_COLORS.Local;
                     return (
                       <td style={bCell}>

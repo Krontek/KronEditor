@@ -456,6 +456,7 @@
         "NE": "IN1 ≠ IN2 olduğu sürece Q = TRUE.",
         "LE": "IN1 <= IN2 olduğu sürece Q = TRUE.",
         "LT": "IN1 < IN2 olduğu sürece Q = TRUE.",
+        "Read_System_Time": "Gerçek zaman saati (RTC) okuma. EN TRUE iken TIME her tarama döngüsünde YEREL GECE YARISINDAN itibaren geçen milisaniye ile güncellenir (0…86 399 999 — IEC günün saati değeri); değer işletim sisteminin sistem saatinden alınır. EN FALSE iken son değer korunur ve ENO FALSE olur. Bu bir saattir, kronometre değil: gece yarısında ve her NTP veya yaz saati düzeltmesinde değer geriye atlar; geçen süreyi ölçmek için TON/TONR kullanın. Hedef kartta okunan değer, kartın RTC/NTP ayarı kadar doğrudur.",
         "enNote": "Yürütme Kontrolü AÇIK: blok gövdesi yalnız EN TRUE iken çalışır; ENO EN'i aynalar, sonraki bloklar ona zincirlenebilir."
     }
 }

@@ -472,6 +472,32 @@ function recoverToolCallsFromText(provider) {
 // every-tool_call_id-needs-a-result invariant intact — a dangling tool result is
 // itself a 400 on Anthropic and OpenAI.
 function providerSafeMessages(msgs) {
+  // ── Pass 1: repairs that must run on EVERY request, for every provider ─────
+  // Applied at SEND time on purpose: it repairs a history that is already
+  // damaged, so a conversation poisoned by an older build keeps working instead
+  // of having to be reset.
+  //  (a) DROP a dead assistant turn — no text AND no tool calls. Anthropic
+  //      rejects the empty text block it serializes to with
+  //      400 "messages: text content blocks must be non-empty", and because the
+  //      dead turn stays in history the 400 repeats on every LATER message: one
+  //      empty model reply bricks the whole conversation. Nothing references it
+  //      (a turn with no tool calls has no tool results), so dropping is safe.
+  //  (b) STRIP the `__`-prefixed enrichment the panel injects into tool args.
+  const cleaned = [];
+  for (const m of msgs) {
+    if (m.role === 'assistant') {
+      const calls = m.toolCalls || [];
+      if (!String(m.content || '').trim() && calls.length === 0) continue;
+      if (calls.length) {
+        cleaned.push({ ...m, toolCalls: calls.map((c) => ({ ...c, arguments: cleanToolArgs(c.arguments) })) });
+        continue;
+      }
+    }
+    cleaned.push(m);
+  }
+  msgs = cleaned;
+
+  // ── Pass 2: demote synthesized (text-mined) tool calls ────────────────────
   const synthIds = new Set();
   for (const m of msgs) {
     for (const c of m.toolCalls || []) if (c._synth && c.id) synthIds.add(c.id);
@@ -504,10 +530,31 @@ function needsLocalPou(name, args) {
 }
 
 // Parse a tool call's arguments (string or object) defensively.
+// ⚠️ Always return a COPY, never the stored object. The turn loop ENRICHES the
+// parsed args in place (`args.__library = …`, `__live`, `__watch`, `__board`),
+// and by then `tc.arguments` is already an object living inside convoRef's
+// assistant message — so returning the same reference wrote the enrichment into
+// the conversation history. Observed: two `list_blocks` calls in one turn each
+// glued a ~47 KB block catalog into history (40 KB → 137 KB in ONE turn), which
+// was then re-sent to the provider on every later request.
 function parseArgs(raw) {
   if (raw == null) return {};
-  if (typeof raw === 'object') return raw;
+  if (typeof raw === 'object') return { ...raw };
   try { return JSON.parse(raw); } catch { return { __parseError: true }; }
+}
+
+// Strip the panel's internal `__`-prefixed enrichment out of a tool call's
+// arguments before it goes back to the provider. Belt-and-braces with the copy
+// in parseArgs: this one also cleans history that was ALREADY poisoned by the
+// aliasing bug, so an existing conversation recovers instead of re-sending tens
+// of KB of block catalog on every turn.
+function cleanToolArgs(raw) {
+  if (!raw || typeof raw !== 'object') return raw;
+  const keys = Object.keys(raw);
+  if (!keys.some((k) => k.startsWith('__'))) return raw;
+  const out = {};
+  for (const k of keys) if (!k.startsWith('__')) out[k] = raw[k];
+  return out;
 }
 
 // Build the `tool` message we feed back to the model for one executed step.
@@ -796,6 +843,9 @@ export default function AiAgentPanel({
   // (read-only turns that chain into the next runTurn with no fetch in flight).
   const turnControllerRef = useRef(null);
   const stopRequestedRef = useRef(false);
+  // Guards the single retry of a DEAD turn (model returned no text and no tool
+  // calls) so a persistently empty model can't spin the loop forever.
+  const emptyTurnRetryRef = useRef(false);
 
   // What the agent is doing right now, and when this run started. A dot
   // animation alone can't be told apart from a hung request — the label + a
@@ -815,6 +865,7 @@ export default function AiAgentPanel({
   const stopAgent = () => {
     stopRequestedRef.current = true;
     runGenRef.current++;               // orphan the running loop for good
+    emptyTurnRetryRef.current = false; // a stopped run must not spend the next run's retry
     turnControllerRef.current?.abort(); // and unblock it if a request is in flight
     // Clear the UI immediately rather than waiting for the loop to notice: if it
     // is parked between turns there is nothing to abort, and "working…" would
@@ -1203,6 +1254,30 @@ export default function AiAgentPanel({
       const a = parseArgs(c.arguments);
       return { ...c, arguments: a && a.__parseError ? {} : a };
     });
+    // ⚠️ A turn with NEITHER text NOR tool calls is a DEAD turn, not a final
+    // answer, and it must never reach the transcript. Two things went wrong when
+    // it did: the run ended at the `calls.length === 0` return below with the
+    // pushView skipped (empty text) — so the agent simply went quiet mid-task,
+    // with nothing on screen to say why — and the empty turn stayed in history,
+    // which Anthropic then rejected with 400 "text content blocks must be
+    // non-empty" on EVERY later message, bricking the conversation. Observed
+    // right after a `list_blocks` turn had inflated the history to 137 KB.
+    // Retry once on the SAME history (the dead turn is not kept, and pass 1 of
+    // providerSafeMessages has since shrunk the payload), then say so out loud.
+    if (!assistantText.trim() && calls.length === 0) {
+      if (!emptyTurnRetryRef.current) {
+        emptyTurnRetryRef.current = true;
+        runTurn(apiMessages, turn, gen);
+        return;
+      }
+      emptyTurnRetryRef.current = false;
+      setRunning(false);
+      setActivity('');
+      pushView({ role: 'note', text: 'The model returned an empty response twice — nothing was changed. Send your message again to retry.' });
+      return;
+    }
+    emptyTurnRetryRef.current = false;
+
     const assistantMsg = { role: 'assistant', content: assistantText, toolCalls: calls };
     convoRef.current = [...apiMessages, assistantMsg];
     if (assistantText && assistantText.trim()) pushView({ role: 'assistant', text: assistantText });

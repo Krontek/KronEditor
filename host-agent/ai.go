@@ -11,7 +11,9 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -111,6 +113,29 @@ type aiChatReq struct {
 	Temperature *float64    `json:"temperature"`
 }
 
+// defaultMaxTokens is the per-turn OUTPUT budget when the caller does not set
+// one (the frontend never does, so in practice this is THE value).
+//
+// ⚠️ It was 4096, which silently broke the agent's central operation. Two
+// things share this budget and neither fits in 4096:
+//   - A reasoning model bills its THINKING against max_tokens and returns it as
+//     a `thinking` content block. Measured on claude-opus-5 (the packaged
+//     sign-in default): one agent turn spent the entire 4096 thinking and came
+//     back as content=[thinking] with no text and no tool_use — i.e. the DEAD
+//     TURN the frontend has to defend against (§8), except nothing was wrong
+//     with the history. The user saw the agent go quiet mid-task.
+//   - A tool call that rewrites a POU carries the whole program in its
+//     arguments; a real esc_control ST body is ~19 KB ≈ 6k tokens on its own.
+//
+// Worse than a cut-off sentence: the API returns a tool call truncated
+// mid-arguments as a PARTIALLY PARSED input object with the unfinished keys
+// simply absent (verified — a `set_st_code` cut mid-`code` arrives as
+// {"pou":"esc_control"}). Such a call reaches applyToolCall looking well-formed,
+// so a half-generated `rungs` array would pass the non-empty check and REPLACE
+// the POU's ladder with the fragment. See the stop_reason guards below, which
+// are what actually make that safe; this constant only stops it being routine.
+const defaultMaxTokens = 32000
+
 func (s *Server) handleAIChat(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeError(w, http.StatusMethodNotAllowed, "POST required")
@@ -126,7 +151,7 @@ func (s *Server) handleAIChat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if req.MaxTokens <= 0 {
-		req.MaxTokens = 4096
+		req.MaxTokens = defaultMaxTokens
 	}
 
 	// Tool-calling can take a while on a big local model; give it room.
@@ -352,6 +377,58 @@ func joinURL(base, suffix string) string {
 	return strings.TrimRight(base, "/") + suffix
 }
 
+// maxTokensLimitRe pulls a provider's own output cap out of its rejection:
+// "max_tokens: 32000 > 8192, which is the maximum allowed number of output
+// tokens for <model>".
+var maxTokensLimitRe = regexp.MustCompile(`max_tokens:\s*\d+\s*>\s*(\d+)`)
+
+// parseMaxTokensLimit reports the cap a provider named when refusing our
+// max_tokens, so the caller can clamp and retry.
+func parseMaxTokensLimit(err error) (int, bool) {
+	if err == nil {
+		return 0, false
+	}
+	m := maxTokensLimitRe.FindStringSubmatch(err.Error())
+	if m == nil {
+		return 0, false
+	}
+	lim, e := strconv.Atoi(m[1])
+	if e != nil || lim <= 0 {
+		return 0, false
+	}
+	return lim, true
+}
+
+// errTruncatedTurn turns "the model ran out of output budget" into a hard,
+// explained failure.
+//
+// ⚠️ A truncated turn must NEVER be handed back as though it were the model's
+// answer. What comes back is not merely a cut-off sentence:
+//   - Content can be EMPTY. A reasoning model spends the budget on `thinking`
+//     blocks and returns no text and no tool_use at all — indistinguishable
+//     downstream from "the model chose to say nothing", which the frontend
+//     reports as a dead turn (or silently shows an empty bubble).
+//   - A tool call is returned PARTIALLY PARSED: the arguments that had not
+//     finished generating are simply absent from `input`, so the call arrives
+//     structurally valid and would be EXECUTED. A `set_ladder` cut halfway
+//     through its rungs array still passes the non-empty check and would
+//     replace a whole POU with the fragment.
+//
+// Failing here means nothing is applied and the panel says why, which is the
+// only safe reading of a response the provider itself flagged as incomplete.
+func errTruncatedTurn(truncated bool, budget int) error {
+	if !truncated {
+		return nil
+	}
+	limit := "the model's output limit"
+	if budget > 0 {
+		limit = fmt.Sprintf("the %d-token output limit", budget)
+	}
+	return fmt.Errorf("the model's reply was cut off at %s, so it was discarded — nothing was applied. "+
+		"Reasoning models spend this budget on thinking before they answer, and a whole-POU rewrite is large. "+
+		"Retry, or ask for the change in smaller pieces (one POU or one rung at a time)", limit)
+}
+
 // ── Anthropic (/v1/messages) ─────────────────────────────────────────────────
 
 // oauthToken != "" switches to subscription OAuth mode: Bearer auth + the
@@ -400,8 +477,16 @@ func callAnthropic(ctx context.Context, req aiChatReq, oauthToken string) (aiMes
 					"input": json.RawMessage(orEmptyObj(tc.Arguments)),
 				})
 			}
+			// ⚠️ A turn with neither text nor tool calls must be DROPPED, never
+			// serialized as an empty text block. Anthropic rejects the whole
+			// request with 400 "messages: text content blocks must be non-empty",
+			// and since the dead turn lives on in the caller's history that 400
+			// then repeats for every LATER message — one empty model reply
+			// bricks the conversation rather than just failing a single turn.
+			// Consecutive same-role messages are merged by push(), so removing
+			// an empty assistant turn cannot break role alternation.
 			if len(blocks) == 0 {
-				blocks = []block{{"type": "text", "text": ""}}
+				continue
 			}
 			push("assistant", blocks)
 		default: // user
@@ -416,7 +501,14 @@ func callAnthropic(ctx context.Context, req aiChatReq, oauthToken string) (aiMes
 					},
 				})
 			}
-			blocks = append(blocks, block{"type": "text", "text": m.Content})
+			// Same rule as above: an empty text block is a 400. An image-only
+			// message is legitimate and still goes through.
+			if strings.TrimSpace(m.Content) != "" {
+				blocks = append(blocks, block{"type": "text", "text": m.Content})
+			}
+			if len(blocks) == 0 {
+				continue
+			}
 			push("user", blocks)
 		}
 	}
@@ -496,7 +588,8 @@ func callAnthropic(ctx context.Context, req aiChatReq, oauthToken string) (aiMes
 			Name  string          `json:"name"`
 			Input json.RawMessage `json:"input"`
 		} `json:"content"`
-		Usage struct {
+		StopReason string `json:"stop_reason"`
+		Usage      struct {
 			InputTokens              int `json:"input_tokens"`
 			OutputTokens             int `json:"output_tokens"`
 			CacheCreationInputTokens int `json:"cache_creation_input_tokens"`
@@ -513,7 +606,19 @@ func callAnthropic(ctx context.Context, req aiChatReq, oauthToken string) (aiMes
 	} else {
 		headers["x-api-key"] = req.APIKey
 	}
-	if err := httpJSON(ctx, joinURL(base, "/v1/messages"), headers, payload, &out); err != nil {
+	endpoint := joinURL(base, "/v1/messages")
+	err := httpJSON(ctx, endpoint, headers, payload, &out)
+	// A model whose own output cap is below defaultMaxTokens rejects the request
+	// outright and names its limit ("max_tokens: 32000 > 8192, which is the
+	// maximum allowed..."). Clamp to what it reported and retry once, so raising
+	// the default cannot make an older/smaller model unusable. The model list is
+	// a LIVE catalogue (§8) — we cannot hold a per-model cap table that stays
+	// true, and the provider is telling us the answer.
+	if lim, ok := parseMaxTokensLimit(err); ok && lim < req.MaxTokens {
+		payload["max_tokens"] = lim
+		err = httpJSON(ctx, endpoint, headers, payload, &out)
+	}
+	if err != nil {
 		return aiMessage{}, err
 	}
 	if out.Error.Message != "" {
@@ -522,8 +627,12 @@ func callAnthropic(ctx context.Context, req aiChatReq, oauthToken string) (aiMes
 	// Cache effectiveness at a glance: after the first turn of a loop,
 	// cache_read should carry most of the prompt and input stay small. A
 	// persistent cache_read=0 means a silent prefix invalidator crept in.
-	log.Printf("[ai] anthropic usage: input=%d cache_read=%d cache_write=%d output=%d",
-		out.Usage.InputTokens, out.Usage.CacheReadInputTokens, out.Usage.CacheCreationInputTokens, out.Usage.OutputTokens)
+	log.Printf("[ai] anthropic usage: input=%d cache_read=%d cache_write=%d output=%d stop=%s",
+		out.Usage.InputTokens, out.Usage.CacheReadInputTokens, out.Usage.CacheCreationInputTokens, out.Usage.OutputTokens, out.StopReason)
+
+	if err := errTruncatedTurn(out.StopReason == "max_tokens", req.MaxTokens); err != nil {
+		return aiMessage{}, err
+	}
 
 	var msg aiMessage
 	var text strings.Builder
@@ -609,6 +718,7 @@ func callOpenAI(ctx context.Context, req aiChatReq, defaultBase string) (aiMessa
 					ExtraContent json.RawMessage `json:"extra_content"`
 				} `json:"tool_calls"`
 			} `json:"message"`
+			FinishReason string `json:"finish_reason"`
 		} `json:"choices"`
 		Error struct {
 			Message string `json:"message"`
@@ -626,6 +736,13 @@ func callOpenAI(ctx context.Context, req aiChatReq, defaultBase string) (aiMessa
 	}
 	if len(out.Choices) == 0 {
 		return aiMessage{}, fmt.Errorf("openai: empty response")
+	}
+	// Same hazard as Anthropic's stop_reason, different spelling: "length" means
+	// the turn was cut mid-generation and any tool call in it may be missing
+	// arguments. This path never sends max_tokens, so it is the provider's or
+	// the model's own cap that was hit.
+	if err := errTruncatedTurn(out.Choices[0].FinishReason == "length", 0); err != nil {
+		return aiMessage{}, err
 	}
 	ch := out.Choices[0].Message
 	msg := aiMessage{Content: ch.Content}

@@ -35,7 +35,7 @@ exactly — change all three together (same rule as the `/dev/shm` mirror paths)
 | 24 | u32 | ntasks        | producer | number of tasks that emit records (≤ 24) |
 | 28 | u32 | flags         | producer | bit0 = ring enabled |
 | 32 | u64 | write_seq     | producer (atomic fetch_add) | next record sequence; monotonic |
-| 40 | u32 | stride_N      | **consumer** (atomic store) | global decimation stride, init `1` |
+| 40 | u32 | stride_N      | **consumer** (atomic store) | `0` = PAUSED (producer writes nothing), `N ≥ 1` = keep every Nth scan. Init `0`. |
 | 44 | u32 | reserved      | — | 0 |
 | 48 | u64 | epoch         | producer | bumped at each runtime (re)start → consumer resets |
 | 56 | u64 | reserved      | — | 0 |
@@ -55,7 +55,7 @@ Records begin at offset `256`.
 
 | off | type | name | meaning |
 |----|------|------|---------|
-| 0  | u64 | seq         | the `write_seq` value under which this slot was written; `0xFFFFFFFFFFFFFFFF` = empty (init) |
+| 0  | u64 | seq         | the `write_seq` value under which this slot was written (always `≥ 1`); a slot that reads back `0` is empty/punched (a tmpfs hole), never a real record |
 | 8  | u16 | task_id     | which task wrote it |
 | 10 | u16 | payload_len | valid bytes in payload |
 | 12 | u32 | reserved    | 0 |
@@ -63,14 +63,33 @@ Records begin at offset `256`.
 
 ## Producer algorithm (per task thread, C)
 
-At init (once): map segment; if `magic` already set keep `epoch`, else zero header;
-write magic/version/header_bytes/record_stride/nslots/total_bytes/ntasks/flags and
-the task_table; set `write_seq = 0`; `epoch += 1`; init every slot's `seq` to
-`0xFFFF...`; leave `stride_N` untouched if already set else `1`.
+At init (once): map segment; write magic/version/header_bytes/record_stride/
+nslots/total_bytes/ntasks/flags and the task_table; `epoch += 1`; set
+`stride_N = 0` — the runtime **boots paused** and the consumer resumes it on
+connect.
+
+⚠️ **`write_seq` CONTINUES monotonically and starts at 1, never 0** (`write_seq =
+max(old_write_seq, 1)`), and **slots are NOT initialized.** This is load-bearing
+for memory: the old design wrote `0xFFFF` into every slot at init, which touched
+every page → the whole (possibly multi-GiB) segment resident at boot. Instead,
+because every valid record seq is `≥ 1`, an unwritten *or* punched-out slot —
+which reads back as **0** (a tmpfs hole) — can never be mistaken for a real
+record, so no init is needed and the segment's resident memory starts at ~0 and
+only grows as data is actually written. A `record_stride`/`nslots` change across a
+restart is safe too: `write_seq` never rewinds, so new records always outrank the
+stale contents of any slot.
+
+⚠️ **`stride_N == 0` means PAUSED, and the producer MUST return without writing.**
+It is a valid, load-bearing value, not "unset": while no client is streaming the
+consumer parks the ring at `0` so the scan loop burns no cycles on `ring_append`
+and the segment stops filling RAM. Coercing `0 → 1` (the obvious "invalid value"
+guard) silently defeats that and the ring fills continuously with data nobody
+reads — do not add it back, on either side.
 
 Per scan of task `g` (after `plc_shm_sync`, so values are final):
 ```c
-uint32_t N = atomic_load(&hdr->stride_N, relaxed); if (N == 0) N = 1;
+uint32_t N = atomic_load(&hdr->stride_N, relaxed);
+if (N == 0) return;                 /* PAUSED — no consumer connected */
 if ((scan_g++ % N) != 0) { /* skip */ }
 else {
     uint64_t s   = atomic_fetch_add(&hdr->write_seq, 1, relaxed);
@@ -87,7 +106,10 @@ Wait-free: one relaxed add + one release store, never blocks on the consumer.
 
 ## Consumer algorithm (KronServer, Go)
 
-Keep `readSeq` and `lastEpoch`. On epoch change → `readSeq = 0`, reset drop stats.
+Keep `readSeq` and `lastEpoch`. Start `readSeq = write_seq` at connect (no
+pre-connect history — the producer was paused while idle anyway), and reset it to
+the current `write_seq` on epoch change (a restart continues `write_seq`, so this
+skips the previous run's records without ever reading seq 0 from an empty slot).
 ```
 w = atomic_load(write_seq, acquire)
 if w - readSeq > nslots:            // lapped: oldest records overwritten
@@ -113,7 +135,35 @@ for s := readSeq; s < w; s++ {
 - Store `N` into `stride_N` atomically. Single global N = proportional ("same
   ratio") decimation: every task keeps exactly `1/N` of its samples, uniformly
   strided on its own scan counter.
+- **Pause/resume:** the FIRST client to register writes the last-good `N` (≥ 1)
+  immediately, without waiting for a control tick; the LAST one to disconnect
+  writes `0`. So the producer only ever runs while somebody is reading. The
+  trade-off is deliberate: there is no pre-connect history, and a client sees
+  data building from the moment it attaches.
 
 `Nmax` = a cap so a pathological link can't drive N to absurd values; the
 `dropped` counter (from lapping) is the honest signal that even N=Nmax can't keep
 up. Both are surfaced to the client per frame.
+
+## Reclaim — resident memory tracks the live backlog (KronServer)
+
+The segment is sized to a **cap** (RAM-%, default 50% of available RAM), NOT a
+working size. Because a circular ring's write cursor visits every slot within one
+lap, a naive design would pin the full segment resident forever. Instead the
+consumer **punches out** the pages of records every client has already drained, so
+the ring's resident memory tracks the *live backlog*:
+
+- Each stream connection reports its `readSeq` to the controller; the controller
+  computes `minReadSeq` across all clients and, each ~100 ms tick, frees the
+  consumed pages via `fallocate(FALLOC_FL_PUNCH_HOLE)` on `<shm>_ring`.
+- ⚠️ **Only slots that are BOTH already-read (`seq < minReadSeq`) AND not yet
+  overwritten (`seq > write_seq - nslots`) are punched**, so the wait-free
+  producer is never raced: it re-faults a punched page (RSS 0 → allocated) only
+  when it laps back to write there. Punch ranges are rounded INWARD to page
+  boundaries so a page shared with a still-live slot is left intact.
+- On PAUSE (last client disconnects) the whole records area is punched → **idle
+  RSS ~0**.
+- Net: consumer keeps up → RSS ≈ 0; consumer falls behind → RSS grows toward the
+  cap; sustained overrate → decimation holds it there; idle → RSS 0. tmpfs frees
+  the pages immediately (`madvise(DONTNEED)` does NOT free a shared tmpfs page —
+  `fallocate` punch-hole is the correct tool).

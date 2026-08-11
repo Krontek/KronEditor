@@ -34,6 +34,10 @@ Releases/
 !/resources/krontek-include/
 /resources/krontek-include/*
 !/resources/krontek-include/HAL/
+# EXCEPTION: kronsystem.h is written and maintained HERE (header-only blocks that
+# need no libkron*.a rebuild) — not pulled from the Krontek libraries repo, so a
+# fresh clone must get it or every project using its blocks fails to compile.
+!/resources/krontek-include/kronsystem.h
 
 # Backend Artifacts
 bin/

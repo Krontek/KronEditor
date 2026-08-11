@@ -23,7 +23,7 @@ import { validateIECAddress, retargetIECAddress } from '../utils/iecAddress';
 // Single source of truth for FB power-flow wiring: the transpiler reads the
 // trigger pin (power in) and Q pin (power out) from these tables, so the
 // ladder the agent authors must use exactly the same pins.
-import { FB_TRIGGER_PIN, FB_Q_OUTPUT, FB_OUTPUTS } from './CTranspilerService';
+import { FB_TRIGGER_PIN, FB_Q_OUTPUT, FB_OUTPUTS, SYSTEM_FB_TYPES } from './CTranspilerService';
 import { GENERIC_FB_DEFS } from '../utils/libraryTree';
 
 const POU_CATEGORIES = ['programs', 'functionBlocks', 'functions'];
@@ -118,9 +118,11 @@ function buildArrayDataType(name, baseType, dimensions) {
 // system prompt's own instruction — "add_variable with type = the FB type name" —
 // was rejected for every standard FB, and the agent had to detour through
 // set_ladder just to get a TON instance declared.
+// SYSTEM_FB_TYPES (Read_System_Time…) are the exception: EN-triggered but real
+// struct+_Call instances, so they stay in the catalogue.
 const STANDARD_FB_TYPES = new Map(
   Object.keys(FB_OUTPUTS)
-    .filter((type) => FB_TRIGGER_PIN[type] !== 'EN')
+    .filter((type) => FB_TRIGGER_PIN[type] !== 'EN' || SYSTEM_FB_TYPES.has(type))
     .map((type) => [type.toUpperCase(), type])
 );
 
@@ -239,7 +241,10 @@ function makeVar(scope, { name, type, initialValue = '', address = '', descripti
   return {
     id: newVarId(),
     name,
-    class: cls || (scope === 'global' ? 'Global' : 'Local'),
+    // ⚠️ 'Var', not 'Global': the globals table's classes are Var/Constant/
+    // Retain (ResourceEditor), so an agent-created global used to carry a class
+    // that scope does not offer at all.
+    class: cls || (scope === 'global' ? 'Var' : 'Local'),
     type: type || 'BOOL',
     initialValue: initialValue ?? '',
     description: description ?? '',
@@ -1598,7 +1603,7 @@ function compileLadderRung(r, idx, ctx = {}) {
     if (!fb.instance || !isValidIecName(fb.instance)) throw new Error(`rung ${idx + 1}: fb.instance must be a valid IEC identifier (the instance variable name, e.g. "timer0")`);
     // Inline math/move/compare check FIRST — it is type-table-based and must
     // fire even when the block library isn't loaded/passed.
-    if (FB_TRIGGER_PIN[fb.type] === 'EN') throw new Error(`rung ${idx + 1}: "${fb.type}" is an inline math/move/compare operation — express it in an ST rung (set_st_code) instead of ladder`);
+    if (FB_TRIGGER_PIN[fb.type] === 'EN' && !SYSTEM_FB_TYPES.has(fb.type)) throw new Error(`rung ${idx + 1}: "${fb.type}" is an inline math/move/compare operation — express it in an ST rung (set_st_code) instead of ladder`);
     fbDef = resolveFbBlockDef(ctx.struct, ctx.library, fb.type);
     if (!fbDef) throw new Error(`rung ${idx + 1}: unknown block type "${fb.type}" — call list_blocks to see available types`);
     if ((fbDef.inputs || []).some((p) => p.type === 'AXIS_REF')) throw new Error(`rung ${idx + 1}: "${fb.type}" is a motion FB (needs an Axis) — author motion in an ST rung (set_st_code)`);

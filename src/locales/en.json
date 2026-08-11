@@ -456,6 +456,7 @@
         "NE": "Q = TRUE while IN1 ≠ IN2.",
         "LE": "Q = TRUE while IN1 <= IN2.",
         "LT": "Q = TRUE while IN1 < IN2.",
+        "Read_System_Time": "Real-time-clock read. While EN is TRUE, TIME is refreshed every scan with the milliseconds since LOCAL MIDNIGHT (0…86 399 999 — the IEC time-of-day reading), taken from the OS wall clock. While EN is FALSE the last value is held and ENO is FALSE. It is a clock, not a stopwatch: the value jumps backwards at midnight and on any NTP or DST correction, so use a TON/TONR timer to measure elapsed time. On a target board the reading is only as good as the board's RTC/NTP setup.",
         "enNote": "Execution Control is ON: the block body runs only while EN is TRUE; ENO mirrors EN so following blocks can chain on it."
     }
 }

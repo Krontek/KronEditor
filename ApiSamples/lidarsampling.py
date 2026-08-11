@@ -2,15 +2,15 @@
 lidarsampling.py — KronServer Lidar Sampling Viewer (API sample)
 ================================================================
 Streams a single-beam lidar reading from the PLC and plots the most
-recent samples in polar coordinates. The "Frequency" entry pushes a
-new cadence to /api/v1/runtime/config so you can watch the visible
-sample rate change live without reconnecting the SSE stream.
+recent samples in polar coordinates. The header shows the lidar's
+actual data-acquisition rate in Hz, derived from the per-sample
+counter (%MD22) — so it reflects the true sensor rate, not the SSE
+snapshot rate.
 
 This script is intentionally a complement to Onemotorcontrol.py:
   - Onemotorcontrol.py demonstrates writes (force-write, runtime
     start/stop, AutoRun toggle).
-  - lidarsampling.py demonstrates reads, the live SSE stream, and
-    server-side cadence control.
+  - lidarsampling.py demonstrates reads and the live SSE stream.
 
 Project requirements — declare these as GLOBAL variables in KronEditor
 with the addresses below (the ST driver `lidar.st` writes to them):
@@ -134,14 +134,6 @@ class KronClient:
     def runtime_status(self):
         return self.get("/api/v1/runtime")
 
-    def runtime_config(self, stream_interval_ms=None, auto_run=None):
-        body = {}
-        if stream_interval_ms is not None:
-            body["stream_interval_ms"] = int(stream_interval_ms)
-        if auto_run is not None:
-            body["auto_run"] = bool(auto_run)
-        return self.post("/api/v1/runtime/config", body)
-
     def stream_iter(self):
         url  = self.base_url + "/api/v1/stream"
         hdrs = {"Authorization": f"Bearer {self.token}"} if self.token else {}
@@ -228,7 +220,7 @@ class LidarApp(tk.Tk):
                             highlightbackground=BORDER, **kw)
 
         lbl("Host:").pack(side=tk.LEFT)
-        self.ent_host = ent(15); self.ent_host.insert(0, "192.168.1.129")
+        self.ent_host = ent(15); self.ent_host.insert(0, "192.168.0.135")
         self.ent_host.pack(side=tk.LEFT, padx=(3, 10))
 
         lbl("Port:").pack(side=tk.LEFT)
@@ -254,29 +246,15 @@ class LidarApp(tk.Tk):
         bar = tk.Frame(self, bg=BG3, padx=10, pady=8)
         bar.pack(fill=tk.X)
 
-        # Frequency control — pushes /api/v1/runtime/config on Apply.
-        # Server clamps to 5..60000 ms; the response carries the actual
-        # value applied, which we mirror back into the entry.
-        tk.Label(bar, text="Frequency:", bg=BG3, fg=TEXT,
+        # Live lidar data-acquisition rate (true Hz). Derived from the
+        # per-sample counter (%MD22) — its rate of change is the real sensor
+        # rate, independent of how fast the SSE stream polls.
+        tk.Label(bar, text="Lidar rate:", bg=BG3, fg=TEXT,
                  font=("Consolas", 10, "bold")).pack(side=tk.LEFT)
-        self.ent_freq = tk.Entry(bar, width=6, bg=BG2, fg=TEXT,
-                                 insertbackground=TEXT, relief=tk.FLAT,
-                                 font=("Consolas", 10), highlightthickness=1,
-                                 highlightbackground=BORDER, justify=tk.RIGHT,
-                                 state=tk.DISABLED)
-        self.ent_freq.pack(side=tk.LEFT, padx=(4, 2))
-        tk.Label(bar, text="ms", bg=BG3, fg=TEXT_DIM,
-                 font=("Consolas", 9)).pack(side=tk.LEFT)
-        self.btn_apply = tk.Button(bar, text="Apply", bg=ACCENT, fg="#fff",
-                                   relief=tk.FLAT, font=("Consolas", 9, "bold"),
-                                   padx=8, pady=2, cursor="hand2",
-                                   state=tk.DISABLED, command=self._apply_freq)
-        self.btn_apply.pack(side=tk.LEFT, padx=(6, 4))
-        self.ent_freq.bind("<Return>", lambda _: self._apply_freq())
-
-        self.lbl_server = tk.Label(bar, text="server: —", bg=BG3, fg=TEXT_DIM,
-                                   font=("Consolas", 9))
-        self.lbl_server.pack(side=tk.LEFT, padx=(8, 18))
+        self.lbl_lidar_hz = tk.Label(bar, text="—", bg=BG3, fg=TEXT_DIM,
+                                     font=("Consolas", 13, "bold"), width=16,
+                                     anchor="w")
+        self.lbl_lidar_hz.pack(side=tk.LEFT, padx=(6, 18))
 
         # Plot range — local, does not talk to the server.
         tk.Label(bar, text="Range:", bg=BG3, fg=TEXT,
@@ -342,23 +320,13 @@ class LidarApp(tk.Tk):
                     self._names[addr.upper()] = self.client.resolve(addr)
                 except KeyError:
                     self._names[addr.upper()] = None
-            try:
-                st = self.client.runtime_status()
-                ms = int(st.get("stream_interval_ms", 50))
-            except Exception:
-                ms = 50
-            self.after(0, self._on_connected, ms)
+            self.after(0, self._on_connected)
         except Exception as e:
             self.after(0, self._on_connect_fail, str(e))
 
-    def _on_connected(self, server_ms):
+    def _on_connected(self):
         self.btn_conn.config(state=tk.NORMAL, text="Reconnect")
         self.lbl_conn.config(text="● Connected", fg=GREEN)
-        self.ent_freq.config(state=tk.NORMAL)
-        self.ent_freq.delete(0, tk.END)
-        self.ent_freq.insert(0, str(server_ms))
-        self.lbl_server.config(text=f"server: {server_ms} ms", fg=TEXT)
-        self.btn_apply.config(state=tk.NORMAL)
         self._start_stream()
         self._log("Streaming…")
 
@@ -367,34 +335,7 @@ class LidarApp(tk.Tk):
         self.lbl_conn.config(text="● Error", fg=YELLOW)
         messagebox.showerror("Connection Failed", err)
 
-    # ── Frequency / range / clear ─────────────────────────────────────────────
-
-    def _apply_freq(self):
-        try:
-            ms = int(self.ent_freq.get().strip())
-        except ValueError:
-            self._log("Frequency must be an integer (ms)")
-            return
-        self.btn_apply.config(state=tk.DISABLED)
-        threading.Thread(target=self._do_apply_freq,
-                         args=(ms,), daemon=True).start()
-
-    def _do_apply_freq(self, ms):
-        try:
-            cfg = self.client.runtime_config(stream_interval_ms=ms)
-            applied = int(cfg.get("stream_interval_ms", ms))
-            self.after(0, self._set_freq_ui, applied, applied != ms)
-        except Exception as e:
-            self.after(0, self._log, f"Frequency error: {e}")
-        finally:
-            self.after(0, lambda: self.btn_apply.config(state=tk.NORMAL))
-
-    def _set_freq_ui(self, ms, was_clamped):
-        self.lbl_server.config(text=f"server: {ms} ms")
-        if was_clamped:
-            self.ent_freq.delete(0, tk.END)
-            self.ent_freq.insert(0, str(ms))
-            self._log(f"Frequency clamped to {ms} ms by server (range 5..60000)")
+    # ── Range / clear ─────────────────────────────────────────────────────────
 
     def _apply_range(self):
         try:
@@ -586,23 +527,34 @@ class LidarApp(tk.Tk):
             pc      = self._pkt_count
             pc_t0   = self._pkt_count_t0
 
-        # Stream snapshots per second (what the SSE delivers). The actual
-        # lidar sample rate is much higher and only visible through
-        # pkt_count delta if the PLC exposes it.
-        text = (f"angle={a:7.2f}°  dist={d:6.3f} m  quality={q:3d}  "
-                f"snap={rate:5.1f} Hz  ")
-
+        # Actual lidar data-acquisition rate = rate of change of the per-sample
+        # counter (%MD22). This is the TRUE sensor rate — it stays correct even
+        # though the SSE stream only polls the counter a few times per second,
+        # because the counter accumulates every sample between polls.
+        lidar_hz = None
         if pc is not None and pc_t0 is not None:
             pc0, t0 = pc_t0
             dt = now - t0
             if dt > 1.0:
                 lidar_hz = (pc - pc0) / dt
-                text += f"lidar={lidar_hz:6.0f} Hz  pkts={pc:>7d}  "
-            else:
-                text += f"pkts={pc:>7d}  "
+
+        # Prominent header readout of the lidar rate.
+        if lidar_hz is not None:
+            self.lbl_lidar_hz.config(text=f"{lidar_hz:,.0f} Hz", fg=GREEN)
+        elif pc is not None:
+            self.lbl_lidar_hz.config(text="measuring…", fg=YELLOW)
+        else:
+            # No per-sample counter (%MD22) → the true rate can't be derived;
+            # fall back to the SSE snapshot rate and say so.
+            self.lbl_lidar_hz.config(text=f"{rate:.0f} Hz (snapshots)", fg=TEXT_DIM)
+
+        # Footer detail line.
+        text = (f"angle={a:7.2f}°  dist={d:6.3f} m  quality={q:3d}  "
+                f"snap={rate:5.1f} Hz  ")
+        if pc is not None:
+            text += f"pkts={pc:>7d}  "
         else:
             text += f"samples={total}  "
-
         if ds is not None:
             label = STATE_LABELS.get(ds, "?")
             text += f"state={ds}({label})"

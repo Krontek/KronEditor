@@ -49,19 +49,32 @@ func readRingFrame(r io.Reader) (*ringFrame, error) {
 }
 
 // end-to-end: synthetic producer fills the ring, the real HTTP handler streams
-// it, and the client must reassemble EVERY record in order with zero drops.
+// it, and the client must reassemble records CONTIGUOUSLY (no seq gaps) with zero
+// drops. The client starts from write_seq at connect (no pre-connect history), so
+// the producer writes CONTINUOUSLY after the client attaches.
 func TestRingStreamEndToEndNoLoss(t *testing.T) {
 	name := "kron_test_e2e"
 	recordStride := 16 + 8
 	p := newRingProducer(t, name, recordStride, 4096, []ringTask{{PeriodUs: 100, PayloadLen: 8, TaskID: 0}})
 	defer p.close()
 
-	const total = 800
-	for i := 0; i < total; i++ {
-		var b [8]byte
-		binary.LittleEndian.PutUint64(b[:], uint64(i))
-		p.append(0, b[:])
-	}
+	// producer goroutine: writes a monotonically increasing counter, paced so it
+	// never laps the 4096-slot ring before the 5 ms consumer reads it.
+	stop := make(chan struct{})
+	go func() {
+		for i := uint64(1); ; i++ {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			var b [8]byte
+			binary.LittleEndian.PutUint64(b[:], i)
+			p.append(0, b[:])
+			time.Sleep(20 * time.Microsecond)
+		}
+	}()
+	defer close(stop)
 
 	am := &APIManager{shmName: name}
 	srv := httptest.NewServer(http.HandlerFunc(am.handleRingStream))
@@ -76,34 +89,60 @@ func TestRingStreamEndToEndNoLoss(t *testing.T) {
 		t.Fatalf("status %d", resp.StatusCode)
 	}
 
-	got := make([]uint64, 0, total)
-	var lastDropped uint64
+	const want = 500
+	var got, lastDropped uint64
+	var prev uint64
+	first := true
 	deadline := time.Now().Add(5 * time.Second)
-	for len(got) < total && time.Now().Before(deadline) {
+	for got < want && time.Now().Before(deadline) {
 		f, err := readRingFrame(resp.Body)
 		if err != nil {
-			t.Fatalf("read frame after %d recs: %v", len(got), err)
+			t.Fatalf("read frame after %d recs: %v", got, err)
 		}
 		lastDropped = f.dropped
 		for _, rec := range f.recs {
-			v := binary.LittleEndian.Uint64(rec.payload)
-			if v != rec.seq {
-				t.Fatalf("payload %d != seq %d", v, rec.seq)
+			if !first && rec.seq != prev+1 {
+				t.Fatalf("seq gap: %d -> %d (a value was lost)", prev, rec.seq)
 			}
-			got = append(got, rec.seq)
+			first, prev = false, rec.seq
+			got++
 		}
 	}
-	if len(got) != total {
-		t.Fatalf("received %d/%d records", len(got), total)
+	if got < want {
+		t.Fatalf("received %d/%d records", got, want)
 	}
 	if lastDropped != 0 {
-		t.Fatalf("expected 0 drops, got %d", lastDropped)
+		t.Fatalf("expected 0 streaming drops, got %d", lastDropped)
 	}
-	for i, s := range got {
-		if s != uint64(i) {
-			t.Fatalf("record %d out of order: seq=%d (a value was lost)", i, s)
-		}
+}
+
+// the producer must be PAUSED (stride_N=0) when no client is connected and
+// RESUMED (>=1) as soon as one registers.
+func TestRingControllerPausesWhenIdle(t *testing.T) {
+	name := "kron_test_pause"
+	p := newRingProducer(t, name, 24, 128, []ringTask{{PeriodUs: 100, PayloadLen: 8, TaskID: 0}})
+	defer p.close()
+	rc, err := OpenRing(name)
+	if err != nil {
+		t.Fatalf("OpenRing: %v", err)
 	}
+	defer rc.Close()
+	ctl := newRingController(rc)
+
+	id := ctl.register()
+	if rc.StrideN() < 1 {
+		t.Fatalf("after register stride_N=%d, want >=1 (resumed)", rc.StrideN())
+	}
+	ctl.unregister(id)
+	if rc.StrideN() != 0 {
+		t.Fatalf("after last unregister stride_N=%d, want 0 (paused)", rc.StrideN())
+	}
+	// a second client resumes it again
+	id2 := ctl.register()
+	if rc.StrideN() < 1 {
+		t.Fatalf("after re-register stride_N=%d, want >=1 (resumed)", rc.StrideN())
+	}
+	ctl.unregister(id2)
 }
 
 // the controller must raise the stride when a client's link cannot keep up,
@@ -126,7 +165,7 @@ func TestRingControllerRaisesStrideUnderBacklog(t *testing.T) {
 	// nslots=128, ringFillHigh=0.5 → backlog 100 (>64) must grow the stride.
 	startN := rc.StrideN()
 	for i := 0; i < 8; i++ {
-		ctl.report(id, 1000 /*slow 1KB/s link*/, 100 /*backlog*/)
+		ctl.report(id, 1000 /*slow 1KB/s link*/, 100 /*backlog*/, 0 /*readSeq*/)
 		time.Sleep(ringTickMs * time.Millisecond * 2)
 		if rc.StrideN() > startN {
 			return // controller reacted

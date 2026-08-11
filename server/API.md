@@ -158,6 +158,25 @@ Uploaded via `POST /deploy/variable-table`. Defines the symbol table for SHM acc
 | `address` | string | No | IEC address (e.g. `%MW0`). **Non-empty = exposed via REST API** |
 | `initial_value` | any | No | Value written to SHM before runtime starts |
 
+### Capture Ring Layout (`ring`)
+
+When the project has addressed scalar variables, the transpiler also emits an optional top-level `ring` object describing the capture-ring record layout. Clients of `GET /api/v1/stream/ring` use it to decode raw record payloads (see [High-Rate Lossless Capture](#high-rate-lossless-capture-capture-ring)). It is served back verbatim by `GET /api/v1/ring/info` under `layout`.
+
+```json
+"ring": {
+  "record_stride": 96,
+  "tasks": [
+    { "task_id": 0, "period_us": 100,
+      "vars": [
+        { "name": "prog_Program0_var1", "type": "int64", "size": 8 },
+        { "name": "prog_Program0_var2", "type": "int64", "size": 8 }
+      ] }
+  ]
+}
+```
+
+The `vars` order **is** the byte order inside each record's payload for that task.
+
 ### Addressed vs Non-Addressed Variables
 
 - **Addressed** (`address` field is non-empty): Exposed via the REST API (`/api/v1/variables`). These are variables the user explicitly marked for external access in KronEditor.
@@ -347,6 +366,168 @@ const es = new EventSource(`/api/v1/stream?token=${token}`);
 
 ---
 
+## High-Rate Lossless Capture (Capture Ring)
+
+`/api/v1/stream` (SSE) and the single-value polls return only the **latest** value at each tick, so a variable that changes faster than the cadence (e.g. a 100 µs / 10 kHz task) has its intermediate scans aliased away. The **capture ring** delivers **every scan** of the addressed variables, with explicit loss accounting.
+
+**How it works.** The PLC runtime itself appends each kept scan's addressed-variable values into a second shared-memory segment (`/dev/shm/<shm-name>_ring`) — the real-time scan loop is the producer, so there is no server-side sampling to alias. KronServer drains it in sequence order and pushes it as a compact binary feed every 5 ms. When production outruns the delivery link, the server **uniformly decimates** (keeps every Nth scan, the *same ratio* across all tasks) so the ring never overflows; genuine loss (ring overwrite) is counted and reported, never silent.
+
+**Paused when idle.** While **no** client is streaming, the producer is **paused** (`stride_N = 0` — the runtime writes nothing to the ring, so it burns no scan cycles and stops filling RAM). It resumes automatically on the first `GET /api/v1/stream/ring` connect. Consequently a freshly-connected client sees data building **from the moment it connects**, not history from before — there is a brief (sub-second) warm-up, and the first frame's `dropped_total` is typically 0.
+
+> ⚠️ **Two things must be current on the device, deployed separately:**
+> 1. A **ring-enabled runtime** (`runtime.bin` from a Build & Send) — the producer. Symptom if missing: `/api/v1/ring/info` returns `{"available": false}` while `/dev/shm/<shm>_ring` is absent.
+> 2. A **ring-capable KronServer** (`plc-agent`) — the endpoints below. Symptom if the agent is an older build: `/api/v1/ring/info` and `/api/v1/stream/ring` return **404**.
+>
+> Only **addressed scalar** variables are captured (arrays/structs/strings excluded). Globals are sampled at the fastest task's rate.
+
+---
+
+### `GET /api/v1/ring/info`
+
+Returns the live ring header plus the payload layout a client needs to decode `stream/ring` frames.
+
+**Request:**
+```http
+GET /api/v1/ring/info
+Authorization: Bearer <token>
+```
+
+**Response (200):**
+```json
+{
+  "available": true,
+  "record_stride": 24,
+  "nslots": 43680,
+  "stride_n": 1,
+  "write_seq": 1234567,
+  "produced_bytes_per_sec": 800000,
+  "header_tasks": [
+    { "task_id": 0, "period_us": 100, "payload_len": 8 }
+  ],
+  "layout": {
+    "record_stride": 24,
+    "tasks": [
+      { "task_id": 0, "period_us": 100,
+        "vars": [ { "name": "prog_Program0_var1", "type": "int64", "size": 8 } ] }
+    ]
+  }
+}
+```
+
+| Field | Description |
+|-------|-------------|
+| `available` | `false` (+ `reason`) if the ring segment is absent/uninitialised (runtime not started, or no addressed vars) |
+| `record_stride` | Bytes per record slot in the ring (from the live header) |
+| `nslots` | Number of record slots (ring capacity) |
+| `stride_n` | Current decimation stride — `0` = **paused** (no consumer connected → producer not writing), `1` = every scan, `N` = every Nth scan |
+| `write_seq` | Monotonic count of records the producer has written so far |
+| `produced_bytes_per_sec` | Raw production rate before decimation (Σ payload_len / period_us) |
+| `header_tasks` | Per-task period + payload length, from the ring header |
+| `layout.tasks[].vars` | **Ordered** list of variables in each task's record payload — decode payload bytes in this order using each var's `type`/`size` |
+
+> The `layout` comes from the deployed `variable_table.json` (`ring` section) and is the key to decoding: within a record for `task_id`, the payload is the concatenation of that task's `vars` in listed order.
+
+---
+
+### `GET /api/v1/stream/ring`
+
+Binary stream. One frame every 5 ms that carries **all records captured since the previous frame** (so a single frame may contain many scans). Little-endian throughout.
+
+**Request:**
+```http
+GET /api/v1/stream/ring
+Authorization: Bearer <token>
+```
+
+**Frame format:**
+```
+u32  frame_len        bytes following this field
+u32  record_count
+u32  stride_N         current decimation (1 = every scan)
+u64  dropped_total    cumulative ring-overwrite losses since stream start
+record_count × record:
+    u64  seq          global monotonic sequence number
+    u16  task_id      which task wrote it (index into layout.tasks)
+    u16  payload_len  valid payload bytes
+    u8   payload[payload_len]   task's addressed vars, in layout order
+```
+
+**Decoding a record:** look up `task_id` in `layout.tasks`; walk that task's `vars` in order, slicing `size` bytes each from `payload` and decoding by `type` (little-endian). `seq` is globally contiguous across all tasks — a gap in `seq` between consecutive delivered records means records were lost.
+
+**Loss accounting (important):**
+- `dropped_total` is cumulative ring-overwrite loss. The **first frame's** `dropped_total` is the "attach backlog" — records produced *before* the client connected that had already lapped out of the ring; this is **not** a streaming loss. Only increases in `dropped_total` *after* the first frame mean the consumer could not keep up.
+- `seq` gaps in the delivered stream indicate true loss (should be zero unless the link is saturated even after decimation).
+- `stride_N > 1` means the server is decimating to fit the link — you are getting every Nth scan, uniformly spaced, losslessly. Effective sample period ≈ `task period_us × stride_N`.
+
+**Reference client:** `tools/ring_stream_client.py` (reassembles by seq, reports attach-backlog vs streaming drops) and the tkinter viewer `ApiSamples/ml0_ring_viewer.py`.
+
+**Usage (Python):**
+```python
+import json, struct, urllib.request
+
+base = "http://plc:7070"
+tok = json.load(urllib.request.urlopen(urllib.request.Request(
+    base + "/api/v1/auth",
+    data=json.dumps({"password": "secret"}).encode(),
+    headers={"Content-Type": "application/json"})))["token"]
+
+info = json.load(urllib.request.urlopen(urllib.request.Request(
+    base + "/api/v1/ring/info", headers={"Authorization": "Bearer " + tok})))
+# build a per-task decoder: task_id -> [(name, struct_fmt, size), ...]
+FMT = {"bool":"?","int8":"b","uint8":"B","int16":"h","uint16":"H","int32":"i",
+       "uint32":"I","int64":"q","uint64":"Q","float32":"f","float64":"d"}
+tasks = {t["task_id"]: [(v["name"], FMT[v["type"]], v["size"]) for v in t["vars"]]
+         for t in info["layout"]["tasks"]}
+
+resp = urllib.request.urlopen(urllib.request.Request(
+    base + "/api/v1/stream/ring", headers={"Authorization": "Bearer " + tok}))
+
+def read_exact(n):
+    b = b""
+    while len(b) < n:
+        c = resp.read(n - len(b))
+        if not c: return b
+        b += c
+    return b
+
+expect = None
+while True:
+    body = read_exact(struct.unpack("<I", read_exact(4))[0])
+    count, stride_n, dropped = struct.unpack_from("<IIQ", body, 0)
+    off = 16
+    for _ in range(count):
+        seq, task_id, plen = struct.unpack_from("<QHH", body, off)
+        payload = body[off+12:off+12+plen]; off += 12 + plen
+        if expect is not None and seq != expect:
+            print("LOSS: seq gap", expect, "->", seq)
+        expect = seq + 1
+        p, values = 0, {}
+        for name, fmt, size in tasks[task_id]:
+            values[name] = struct.unpack_from("<" + fmt, payload, p)[0]; p += size
+        # values = {var_name: value} for this scan
+```
+
+---
+
+### Capture buffer sizing (`ring_ram_percent`)
+
+The ring segment is sized as a percentage of the device's **available** RAM. It is `/dev/shm` (tmpfs, demand-paged), so a large ring only costs RSS as it actually fills.
+
+- Set via `POST /deploy/config` or `POST /api/v1/runtime/config` with `{"ring_ram_percent": <0–50>}`. **Takes effect on the next runtime (re)start.**
+- `0` (unset) = the default **50%** of available RAM.
+- Clamped to `[64 KiB, min(2 GiB, 50% of available)]`.
+- Current sizing and device memory are reported by `GET /status` (`mem_total_bytes`, `mem_available_bytes`, `ring_ram_percent`, `ring_bytes`).
+
+> Sizing the ring only buys **burst headroom** — if production exceeds the delivery link *sustainably*, no buffer size prevents loss; the server decimates (`stride_N`) instead. Pick the ring big enough to absorb consumer stalls (GC pauses, link hiccups), not to "store minutes of data".
+
+---
+
+### Compared to `/api/v1/stream/buffered`
+
+An older `GET /api/v1/stream/buffered?vars=a,b&interval_us=N` endpoint also exists. It **server-samples** at `interval_us` (a Go ticker, ~1–1.5 kHz ceiling on an SBC) and packs samples into 5 ms frames. It is simpler but **aliases** values faster than it can sample, and has no loss accounting. Prefer `/api/v1/stream/ring` when you need every scan; use `buffered` only for modest rates where a fixed sample interval is acceptable.
+
+---
+
 ### `POST /api/v1/forces/clear`
 
 Clear all force flags on addressed variables. After clearing, the PLC runtime resumes overwriting these variables with its computed values during `plc_shm_sync`.
@@ -450,6 +631,7 @@ Content-Type: application/json
 |-------|------|----------|--------|
 | `auto_run` | bool | yes | Whether the runtime is started automatically next time the agent boots |
 | `stream_interval_ms` | uint | yes | New `/api/v1/stream` cadence; clamped to **5–60000**. Applies to in-flight SSE clients on the next tick |
+| `ring_ram_percent` | number | yes | Capture-ring size as % of available RAM (0–50; 0 = default 50%). Applies on the next runtime (re)start |
 
 **Response (200):** the resulting (post-clamp) snapshot.
 ```json
@@ -533,6 +715,7 @@ Content-Type: application/json
 |-------|------|----------|--------|
 | `auto_run` | bool | yes | Whether the runtime is started automatically when the agent boots |
 | `stream_interval_ms` | uint | yes | `/api/v1/stream` cadence in ms; clamped to **5–60000** |
+| `ring_ram_percent` | number | yes | Capture-ring size as % of available RAM (0–50; 0 = default 50%); applies on the next runtime (re)start |
 
 **Response (200):** the resulting (post-clamp) snapshot.
 ```json
@@ -561,7 +744,11 @@ GET /status
   "shm_name": "plc_runtime",
   "deploy_dir": "/opt/plc",
   "auto_run": false,
-  "stream_interval_ms": 50
+  "stream_interval_ms": 50,
+  "mem_total_bytes": 7978577920,
+  "mem_available_bytes": 7593451520,
+  "ring_ram_percent": 50,
+  "ring_bytes": 2134614016
 }
 ```
 
@@ -574,6 +761,10 @@ GET /status
 | `deploy_dir` | string | Deploy directory path |
 | `auto_run` | bool | Whether AutoRun is enabled |
 | `stream_interval_ms` | int | Effective `/api/v1/stream` cadence in ms |
+| `mem_total_bytes` | int | Device total RAM (from `/proc/meminfo`) |
+| `mem_available_bytes` | int | Device available RAM |
+| `ring_ram_percent` | number | Effective capture-ring size as % of available RAM (default 50) |
+| `ring_bytes` | int | Resolved capture-ring byte size the next runtime start will use |
 
 > `/status` is unauthenticated and primarily intended for liveness checks from the editor and load balancers. For authenticated programmatic access prefer `GET /api/v1/runtime`.
 
@@ -684,7 +875,8 @@ Persisted across restarts. Written by `POST /deploy/config` and `POST /api/v1/ru
 ```json
 {
   "auto_run": true,
-  "stream_interval_ms": 100
+  "stream_interval_ms": 100,
+  "ring_ram_percent": 50
 }
 ```
 
@@ -692,6 +884,7 @@ Persisted across restarts. Written by `POST /deploy/config` and `POST /api/v1/ru
 |-------|------|---------|--------|
 | `auto_run` | bool | `false` | Start `runtime.bin` automatically when the agent boots |
 | `stream_interval_ms` | uint | `50` | `/api/v1/stream` cadence (clamped 5–60000); editor streams ignore it |
+| `ring_ram_percent` | number | `0` (→50%) | Capture-ring size as % of available RAM; applied when the runtime (re)starts |
 
 ---
 
@@ -711,7 +904,9 @@ Persisted across restarts. Written by `POST /deploy/config` and `POST /api/v1/ru
 
 4. Monitor variables:
    ConnectRPC StreamVars()      ← editor uses this (all variables, fixed 50 ms)
-   GET /api/v1/stream           ← external clients (addressed only, tunable cadence)
+   GET /api/v1/stream           ← external clients (addressed only, tunable cadence, latest value)
+   GET /api/v1/ring/info        ← discover capture-ring layout (for high-rate capture)
+   GET /api/v1/stream/ring      ← external clients: EVERY scan of addressed vars, lossless
 
 5. Force-write a variable:
    ConnectRPC WriteVar()        ← from editor

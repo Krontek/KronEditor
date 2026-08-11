@@ -74,7 +74,21 @@ type RingConsumer struct {
 	nslots       int
 	tasks        []ringTask
 	parsedEpoch  uint64
+
+	// freedSeq is the sequence up to which consumed record pages have been
+	// punched out of the tmpfs segment (Reclaim). It advances as ALL clients
+	// drain, so the ring's resident memory tracks the live backlog instead of
+	// pinning the whole segment — a fixed circular ring otherwise touches every
+	// page within one lap and stays fully resident forever.
+	freedSeq uint64
 }
+
+// fallocate modes (Linux) — punch a hole to release tmpfs pages without
+// changing the file size.
+const (
+	fallocPunchHole = 0x02
+	fallocKeepSize  = 0x01
+)
 
 // OpenRing maps /dev/shm/<shmName>_ring read-write and validates the header.
 // Returns an error (not a panic) when the segment is absent or not yet
@@ -135,7 +149,74 @@ func (rc *RingConsumer) syncLocked() {
 	}
 	if err := rc.parseHeader(); err == nil {
 		rc.parsedEpoch = ep
+		rc.freedSeq = 0 // new generation: write_seq restarted at 0
 	}
+}
+
+// Reclaim releases (punches holes in) the tmpfs pages of records already consumed
+// by ALL clients (seq < minReadSeq), so the ring's resident memory tracks the
+// live backlog. Safe against the wait-free producer: it only frees slots whose
+// current content is both already-read (seq < minReadSeq) AND not yet overwritten
+// (seq > write_seq - nslots); the producer re-faults a punched page when it laps
+// back to write there. Call off the real-time path (~100 ms controller tick).
+func (rc *RingConsumer) Reclaim(minReadSeq uint64) {
+	rc.mu.Lock()
+	defer rc.mu.Unlock()
+	if rc.mem == nil || rc.nslots == 0 || rc.recordStride <= 0 {
+		return
+	}
+	nslots := uint64(rc.nslots)
+	w := rc.loadU64(offWriteSeq)
+	lo := rc.freedSeq
+	// never punch a slot the producer may have already overwritten with fresh data
+	if w >= nslots {
+		if minSafe := w - nslots + 1; lo < minSafe {
+			lo = minSafe
+		}
+	}
+	hi := minReadSeq
+	if hi <= lo {
+		return
+	}
+	count := hi - lo
+	if count > nslots {
+		count = nslots
+	}
+	startSlot := int(lo % nslots)
+	stride := rc.recordStride
+	if startSlot+int(count) <= rc.nslots {
+		rc.punchRange(ringHeaderBytes+startSlot*stride, int(count)*stride)
+	} else { // wraps once
+		first := rc.nslots - startSlot
+		rc.punchRange(ringHeaderBytes+startSlot*stride, first*stride)
+		rc.punchRange(ringHeaderBytes, (int(count)-first)*stride)
+	}
+	rc.freedSeq = hi
+}
+
+// punchRange frees the tmpfs pages FULLY covered by [off, off+length), rounding
+// INWARD to page boundaries so a page shared with a still-live slot is untouched.
+func (rc *RingConsumer) punchRange(off, length int) {
+	const page = 4096
+	start := (off + page - 1) &^ (page - 1) // round up
+	end := (off + length) &^ (page - 1)     // round down
+	if end <= start {
+		return
+	}
+	_ = syscall.Fallocate(rc.fd, fallocPunchHole|fallocKeepSize, int64(start), int64(end-start))
+}
+
+// ReclaimAll frees the entire records area — used on PAUSE, when the producer is
+// stopped and nobody is reading, so the ring's RSS drops to ~0 while idle.
+func (rc *RingConsumer) ReclaimAll() {
+	rc.mu.Lock()
+	defer rc.mu.Unlock()
+	if rc.mem == nil || rc.nslots == 0 || rc.recordStride <= 0 {
+		return
+	}
+	_ = syscall.Fallocate(rc.fd, fallocPunchHole|fallocKeepSize,
+		int64(ringHeaderBytes), int64(rc.nslots*rc.recordStride))
+	rc.freedSeq = rc.loadU64(offWriteSeq)
 }
 
 func (rc *RingConsumer) u32(off int) uint32 { return binary.LittleEndian.Uint32(rc.mem[off:]) }
@@ -218,10 +299,9 @@ func (rc *RingConsumer) Tasks() []ringTask {
 }
 
 // SetStrideN publishes the global decimation stride to the producer.
+// n == 0 is a valid value meaning PAUSED (the producer stops writing to the ring
+// entirely — used when no consumer is connected); n >= 1 is the decimation stride.
 func (rc *RingConsumer) SetStrideN(n uint32) {
-	if n == 0 {
-		n = 1
-	}
 	rc.mu.Lock()
 	rc.storeU32(offStrideN, n)
 	rc.mu.Unlock()

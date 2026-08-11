@@ -243,6 +243,21 @@ static int                g_layout_hash_set = 0;
 static volatile int      g_swap_req = 0;
 static pthread_barrier_t g_barrier;
 
+/* ── Retentive variables ──────────────────────────────────────────────────
+ * The logic module owns the retain file format and the packing (it is the side
+ * that knows PlcState); the host owns the CADENCE, because a thread running
+ * inside the module would be dlclose'd out from under itself on every swap.
+ * plc_retain_save is OPTIONAL — a project with no retained variable exports it
+ * not at all, and the pointer simply stays NULL.
+ *
+ * ⚠️ g_retain_mu is what makes that safe: the flusher may be executing module
+ * code at the exact moment thread 0 swaps, so do_swap holds the same mutex
+ * across dlclose + re-resolve. The task threads are parked on the barrier for
+ * that whole window anyway, so the extra lock costs nothing in the scan. */
+#define RETAIN_INTERVAL_MS 1000
+static int             (*g_retain_save)(void) = NULL;
+static pthread_mutex_t   g_retain_mu = PTHREAD_MUTEX_INITIALIZER;
+
 #if defined(_WIN32)
 /* Windows has no SIGUSR1. The agent signals a named auto-reset Event; this
  * thread turns that into the same g_swap_req flag the Linux handler sets, so
@@ -258,6 +273,9 @@ static void *swap_event_thread(void *arg) {
 }
 #else
 static void on_usr1(int s) { (void)s; g_swap_req = 1; }
+/* Graceful stop, so the scan threads unwind and the retain flush below runs.
+ * The agent gives us a short grace period before SIGKILL (hotswap.go Stop). */
+static void on_term(int s) { (void)s; plc_stop = 1; }
 #endif
 
 static uint64_t mono_us(void) {
@@ -338,6 +356,9 @@ static int resolve_and_bind(void *h) {
     }
     g_ntask = n;
     bind(g_state);   /* adopt the SAME arena — preserves all state across swaps */
+    /* Optional (NULL when the project retains nothing). Re-resolved on every
+     * bind: the pointer must never outlive the module it came from. */
+    g_retain_save = (int(*)(void))plc_dlsym(h, "plc_retain_save");
     if (!g_layout_hash_set) { g_layout_hash = lhash(); g_layout_hash_set = 1; }
     return RB_OK;
 }
@@ -351,7 +372,7 @@ static const char *rb_reason(int rc) {
 }
 
 /* Performed by task thread 0 only, with all threads parked on the barrier. */
-static void do_swap(void) {
+static void do_swap_locked(void) {
     char path[512] = {0};
     /* stdio rather than open()/read(): the request is one short line, and this
      * is the only file read in the loader — keeping it portable avoids an
@@ -389,6 +410,36 @@ static void do_swap(void) {
     printf("[host] >>> HOT-SWAPPED to %s\n", path);
     fflush(stdout);
     write_swap_result("OK", gen, NULL);
+}
+
+/* The retain flusher runs OUTSIDE the barrier, so it can be inside the old
+ * module's plc_retain_save the instant thread 0 dlclose's it. Serialising the
+ * two here is cheaper and far more obvious than teaching the flusher to park. */
+static void do_swap(void) {
+    pthread_mutex_lock(&g_retain_mu);
+    do_swap_locked();
+    pthread_mutex_unlock(&g_retain_mu);
+}
+
+/* Periodic retain flush. plc_retain_save itself writes nothing when no retained
+ * value changed, so an idle machine touches the disk exactly zero times. */
+static void *retain_thread(void *arg) {
+    (void)arg;
+    int ticks = 0;
+    while (!plc_stop) {
+#if defined(_WIN32)
+        Sleep(100);
+#else
+        struct timespec s = { .tv_sec = 0, .tv_nsec = 100 * 1000 * 1000 };
+        nanosleep(&s, NULL);
+#endif
+        if (++ticks < (RETAIN_INTERVAL_MS / 100)) continue;   /* 100 ms granularity → prompt stop */
+        ticks = 0;
+        pthread_mutex_lock(&g_retain_mu);
+        if (g_retain_save) g_retain_save();
+        pthread_mutex_unlock(&g_retain_mu);
+    }
+    return NULL;
 }
 
 /* Demo/debug only (env HS_MONITOR=1): periodically dump the first bytes of the
@@ -455,6 +506,8 @@ int main(int argc, char **argv) {
     { pthread_t t; pthread_create(&t, NULL, swap_event_thread, NULL); pthread_detach(t); }
 #else
     signal(SIGUSR1, on_usr1);
+    signal(SIGTERM, on_term);
+    signal(SIGINT,  on_term);
 #endif
 
     /* ⚠️ EVERY cold-start failure below must write a swap_result before
@@ -559,7 +612,19 @@ int main(int argc, char **argv) {
     pthread_t mon;
     if (getenv("HS_MONITOR")) pthread_create(&mon, NULL, monitor_thread, NULL);
     pthread_t th[MAXT];
+    /* Tied to the task threads' lifetime: with no tasks nothing ever sets
+     * plc_stop, so an unconditional flusher would hang the join below forever. */
+    pthread_t rt; int rt_started = 0;
+    if (g_ntask > 0) { pthread_create(&rt, NULL, retain_thread, NULL); rt_started = 1; }
     for (int i = 0; i < g_ntask; i++) pthread_create(&th[i], NULL, task_thread, (void *)(intptr_t)i);
     for (int i = 0; i < g_ntask; i++) pthread_join(th[i], NULL);
+    if (rt_started) pthread_join(rt, NULL);
+
+    /* Final flush on a graceful stop — captures whatever changed since the last
+     * periodic write. On a SIGKILL (or a power cut) this never runs, which is
+     * exactly why the periodic flush above exists. */
+    pthread_mutex_lock(&g_retain_mu);
+    if (g_retain_save) g_retain_save();
+    pthread_mutex_unlock(&g_retain_mu);
     return 0;
 }

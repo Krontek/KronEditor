@@ -293,6 +293,56 @@ func TestRingDrainRespectsMaxRecords(t *testing.T) {
 	}
 }
 
+// Reclaim must actually RELEASE the tmpfs pages of consumed records (punch hole)
+// so the ring's resident memory tracks the live backlog instead of pinning the
+// whole segment. Proven via the file's allocated block count (st_blocks).
+func TestRingReclaimFreesPages(t *testing.T) {
+	name := "kron_test_reclaim"
+	nslots := 8192
+	p := newRingProducer(t, name, 24, nslots, []ringTask{{PeriodUs: 100, PayloadLen: 8, TaskID: 0}})
+	defer p.close()
+	rc, err := OpenRing(name)
+	if err != nil {
+		t.Fatalf("OpenRing: %v", err)
+	}
+	defer rc.Close()
+
+	blocks := func() int64 {
+		var st syscall.Stat_t
+		if err := syscall.Stat(p.path, &st); err != nil {
+			t.Fatalf("stat: %v", err)
+		}
+		return st.Blocks // 512-byte units
+	}
+
+	for i := 0; i < nslots; i++ { // fill every slot → allocates pages
+		var b [8]byte
+		binary.LittleEndian.PutUint64(b[:], uint64(i))
+		p.append(0, b[:])
+	}
+	full := blocks()
+
+	// all clients have drained up to seq 8000 → those pages can be freed
+	rc.Reclaim(8000)
+	after := blocks()
+	if after >= full {
+		t.Fatalf("Reclaim did not free pages: full=%d after=%d (blocks should drop)", full, after)
+	}
+	freedKiB := (full - after) * 512 / 1024
+	t.Logf("blocks: full=%d after-reclaim=%d (freed ~%d KiB)", full, after, freedKiB)
+	if freedKiB < 100 { // ~7999 slots × 24 B ≈ 187 KiB should be freed
+		t.Fatalf("freed only ~%d KiB, expected the bulk of the ring", freedKiB)
+	}
+
+	// ReclaimAll (pause) frees essentially everything
+	rc.ReclaimAll()
+	idle := blocks()
+	if idle >= after {
+		t.Fatalf("ReclaimAll did not drop blocks further: after=%d idle=%d", after, idle)
+	}
+	t.Logf("after ReclaimAll (idle): blocks=%d", idle)
+}
+
 func TestRingSetStrideRoundTrips(t *testing.T) {
 	name := "kron_test_stride"
 	p := newRingProducer(t, name, 24, 128, []ringTask{{PeriodUs: 100, PayloadLen: 8, TaskID: 0}})
