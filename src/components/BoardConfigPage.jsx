@@ -4,6 +4,7 @@ import { getBoardById } from '../utils/boardDefinitions';
 import {
   getBoardFamilyDefine,
   getPinPorts,
+  getPortOptions,
 } from '../utils/devicePortMapping';
 
 // ===== PIN LEGEND =====
@@ -401,6 +402,15 @@ const UsbPortsVisual = ({ board, interfaceConfig, onInterfaceConfigChange }) => 
 
   const usbConfig = interfaceConfig?.USB || {};
 
+  // Default device path per channel, straight from devicePortMapping — the same table
+  // the transpiler emits KRON_USB<n> from. Deriving the placeholder from the port id
+  // instead produced "/dev/ttyUSB_3" (id is "USB_3", so replace('USB','') left "_3")
+  // and, worse, implied every channel is a /dev/ttyUSB* — USB_2/USB_3 default to
+  // /dev/ttyACM0 and /dev/ttyACM1, so the hint contradicted what the port really opens.
+  const usbDefaultPaths = Object.fromEntries(
+    getPortOptions(getBoardFamilyDefine(board.id), 'USB').map((p) => [p.id, p.path])
+  );
+
   const togglePort = (portId) => {
     if (!onInterfaceConfigChange) return;
     const current = usbConfig[portId] || { enabled: false, baudRate: 115200, devicePath: '' };
@@ -509,7 +519,7 @@ const UsbPortsVisual = ({ board, interfaceConfig, onInterfaceConfigChange }) => 
                   type="text"
                   value={cfg.devicePath || ''}
                   onChange={(e) => updatePort(port.id, { devicePath: e.target.value })}
-                  placeholder={`/dev/ttyUSB${port.id.replace('USB', '')}`}
+                  placeholder={usbDefaultPaths[port.id] || ''}
                   style={InputBaseStyle}
                   spellCheck={false}
                 />

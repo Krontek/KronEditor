@@ -132,8 +132,16 @@ Before this tool the prompt told the model to write its questions as prose with 
 | `delete_pou` | Explicit-request only (prompt rule). |
 | `set_st_code` | Replaces the POU's ST: on a unified/SCL POU the body goes into a single `lang:'ST'` rung. Takes ONLY plain statements (no PROGRAM/VAR wrappers, no METHOD — enforced by prompt + recovery strip). |
 | `set_ladder` | Replaces ALL rungs with compiled ladder from the DSL — full spec in §6. |
-| `add_variable` / `update_variable` / `remove_variable` | Local (needs `pou`) or global scope. Types funnel through `resolveVarType`: a scalar IEC type, an existing data-type/FB name, or a one-shot inline `ARRAY[m..n] OF T` that is auto-recovered into a real named data type. Anything else is rejected with instructions to call `create_data_type`. Reserved names (e.g. `S`, the PlcState pointer) are rejected. |
+| `add_variable` / `update_variable` / `remove_variable` | Local (needs `pou`) or global scope. Types funnel through `resolveVarType`: a scalar IEC type, an existing data-type/FB name, or a one-shot inline `ARRAY[m..n] OF T` that is auto-recovered into a real named data type. Anything else is rejected with instructions to call `create_data_type`. Reserved names (e.g. `S`, the PlcState pointer) are rejected. **`retain: true`** marks the variable RETENTIVE (CLAUDE.md §17) — see below. |
 | `create_data_type` | Builds the exact `dataTypes` shape the human editors produce (`{name, type:'Array'|'Structure'|'Enumerated', content}`). |
+
+### `retain` — the one variable field with restart semantics
+A boolean, not a free `class` string: retain is the only class the agent has any business steering, and a string would let a model set `Input` on a program local. It maps to `class: 'Retain'`, which is exactly what the human editors write.
+- ⚠️ **Refused outside a global / PROGRAM local** (`resolveRetainClass`). Inside a function block or function a variable is an FB struct member or a C local — not a `PlcState` field — so the transpiler cannot persist it and accepting it would silently do nothing. The error routes to the real fix: retain the **instance** in the declaring program (a `CTU` instance persists whole, `CV` included).
+- ⚠️ That single guard is also what protects an FB's **pin classes**: because retain is refused outside programs, `retain: false` can never rewrite an `Input`/`Output`/`InOut` variable's class to `Local` and silently drop a pin from the block's interface.
+- ⚠️ `retain: false` only undoes an actual `Retain` — it never rewrites some other class, so a `Temp`/`Constant` marking survives it.
+- `varLine` prefixes the diff with **`RETAIN `** (as an IEC `VAR` block does). The diff is the human's only review surface for an agent edit, so a change in restart behaviour has to be visible there.
+- `get_project_overview`, `read_pou` and the referenced-globals list all **report** `retain`, so the model can see which values already survive a restart before proposing another.
 
 ---
 

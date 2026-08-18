@@ -239,7 +239,32 @@ const buildRuntimePortHelpers = (boardId, interfaceConfig = {}) => {
         }
     });
 
-    let helpers = `#define KRON_RUNTIME_PORT_HELPERS 1\n${uartPathDefines}${i2cPathDefines}\n`;
+    // USB device path overrides — same mechanism as UART: `#define KRON_USB<n> "<path>"`
+    // before kronhal.h, honored by the HALs' _usb_devs[] table (all three declare the
+    // slots behind `#ifndef KRON_USB<n>`). Without this the configured Device Path was
+    // read into usbPorts[] and then silently DROPPED: the channel always opened its
+    // compiled-in default, so a board whose dongle enumerated anywhere else was
+    // unreachable from a PLC program no matter what the user typed. The defaults also
+    // cover no /dev/ttyUSB3 slot at all (Jetson/RPi USB3 = /dev/ttyACM1), so that path
+    // was not selectable by ANY channel — open() failed with ERR_ID=2 and the block
+    // reported "no data" forever, which reads as a wiring fault rather than config.
+    // ⚠️ Gated on `enabled`, unlike UART/I2C: the Device Path input is only RENDERED for
+    // an enabled USB port, so a disabled port's path is invisible config the user cannot
+    // see or edit — letting it steer codegen means a stale leftover silently redirects a
+    // channel. Real projects carry exactly that (a port tried, given a path, then turned
+    // off), which would have pointed USB0 at the USB3 dongle. Unlike UART there is no
+    // KRON_USB_PortEnabled gate in the HAL, so this define is the only guard.
+    let usbPathDefines = '';
+    usbPorts.forEach((entry) => {
+        if (entry.enabled && entry.devicePath && entry.channel >= 0 && entry.channel <= 4) {
+            const escaped = entry.devicePath.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+            usbPathDefines += `#ifndef KRON_USB${entry.channel}\n`;
+            usbPathDefines += `#define KRON_USB${entry.channel} "${escaped}"\n`;
+            usbPathDefines += `#endif\n`;
+        }
+    });
+
+    let helpers = `#define KRON_RUNTIME_PORT_HELPERS 1\n${uartPathDefines}${i2cPathDefines}${usbPathDefines}\n`;
     helpers += `static inline bool KRON_I2C_PortEnabled(uint8_t port) {\n`;
     helpers += renderSwitch(
         i2cPorts.map((entry) => ({ caseValue: entry.bus, enabled: entry.enabled })),

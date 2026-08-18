@@ -189,6 +189,33 @@ function pouTargetError(struct, raw) {
 // Globals a POU actually mentions — scanned over its ST code and every ladder
 // block's variable/pin values. Returned by read_pou so the model can see the
 // declaration of a name it meets in the logic instead of assuming it's missing.
+// ── Retentive (RETAIN) variables (CLAUDE.md §17) ────────────────────────────
+// The declaration side is the variable's CLASS, matched case-insensitively like
+// every other identifier in this codebase.
+const isRetainClass = (v) => String(v?.class || '').toLowerCase() === 'retain';
+
+// Retain is only meaningful where the variable is a PlcState field: a global or
+// a PROGRAM local. Inside a function block or function it is an FB struct member
+// or a C local, which the transpiler has no way to persist — so accepting it
+// there would silently do nothing, the one outcome tool errors exist to prevent.
+function retainScopeError(category, pouName) {
+  return `retain is not available on a ${singular(category)}'s variable — only globals and PROGRAM locals are runtime state the transpiler can persist. `
+    + `To keep an instance's state (a counter's CV, a timer's elapsed time) across a restart, mark the INSTANCE variable `
+    + `(e.g. "myCounter : CTU") Retain in the program that declares it${pouName ? `, not inside "${pouName}"` : ''} — the whole instance persists.`;
+}
+
+// Resolves the `retain` argument against the variable's scope. Returns
+// { ok, class? } — `class` absent means "leave the stored class alone", which is
+// what keeps `retain: false` from clobbering a Temp/Constant marking.
+function resolveRetainClass(wantRetain, isGlobal, category, pouName, before) {
+  if (wantRetain == null) return { ok: true };
+  if (!isGlobal && category !== 'programs') return { ok: false, error: retainScopeError(category, pouName) };
+  if (wantRetain === true) return { ok: true, class: 'Retain' };
+  // retain:false only undoes an actual Retain — never rewrites another class.
+  if (before && !isRetainClass(before)) return { ok: true };
+  return { ok: true, class: isGlobal ? 'Var' : 'Local' };
+}
+
 function referencedGlobals(struct, pou) {
   const globals = getGlobals(struct);
   if (!globals.length) return undefined;
@@ -206,7 +233,7 @@ function referencedGlobals(struct, pou) {
   // Word-boundary match so `Motor` doesn't hit inside `MotorRun`.
   const used = globals.filter((g) => g.name && new RegExp(`\\b${g.name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`).test(hay));
   return used.length
-    ? used.map((g) => ({ name: g.name, type: g.type, address: g.address || undefined, scope: 'GLOBAL' }))
+    ? used.map((g) => ({ name: g.name, type: g.type, address: g.address || undefined, retain: isRetainClass(g) || undefined, scope: 'GLOBAL' }))
     : undefined;
 }
 
@@ -297,7 +324,9 @@ export function buildProjectOverview(struct, board) {
   return {
     board: board || null,
     pous,
-    globalVariables: getGlobals(struct).map((v) => ({ name: v.name, type: v.type, address: v.address || undefined })),
+    // `retain` is reported (not just settable) so the model can SEE which values
+    // already survive a restart before proposing to add another one.
+    globalVariables: getGlobals(struct).map((v) => ({ name: v.name, type: v.type, address: v.address || undefined, retain: isRetainClass(v) || undefined })),
     dataTypes: (struct.dataTypes || []).map((d) => ({ name: d.name, kind: d.type })),
   };
 }
@@ -531,6 +560,7 @@ export const TOOL_DEFS = [
       initialValue: str('Initial value (optional)'),
       address: str('IEC address like %MW0, %MX0.1 (optional)'),
       description: str('Comment (optional)'),
+      retain: { type: 'boolean', description: 'RETENTIVE: keep the last value across a runtime restart/power cycle instead of returning to the initial value (IEC RETAIN). Use for production counters, totalizers, recipe/setpoint values, machine step state. Only for globals and PROGRAM locals; on an FB instance variable (e.g. "myCount : CTU") the whole instance persists, counter value included.' },
     }, ['scope', 'name', 'type']),
   },
   {
@@ -545,6 +575,7 @@ export const TOOL_DEFS = [
       initialValue: str('New initial value (optional)'),
       address: str('New IEC address (optional)'),
       description: str('New comment (optional)'),
+      retain: { type: 'boolean', description: 'Turn RETENTIVE on/off — true keeps the last value across a restart, false goes back to starting from the initial value. Only for globals and PROGRAM locals.' },
     }, ['scope', 'name']),
   },
   {
@@ -660,7 +691,8 @@ export function applyToolCall(struct, name, args = {}) {
             // model can actually read the existing program, not just block names.
             ladder: (c.rungs && (hit.item.type === 'LD' || hit.item.type === 'SCL')) ? renderRungs(c.rungs) : undefined,
             variables: (c.variables || []).map((v) => ({
-              name: v.name, type: v.type, class: v.class, initialValue: v.initialValue, address: v.address, description: v.description,
+              name: v.name, type: v.type, class: v.class, retain: isRetainClass(v) || undefined,
+              initialValue: v.initialValue, address: v.address, description: v.description,
             })),
             // ⚠️ Globals this POU actually references. Without them the model
             // reads logic like `MotorRun := (Start OR MotorRun) AND NOT Stop`
@@ -913,6 +945,9 @@ export function applyToolCall(struct, name, args = {}) {
         }
         const v = makeVar(scope, { ...args, name: args.name.trim(), type: resolved.type, isInstance: resolved.isInstance });
         if (scope === 'global') {
+          const gRetain = resolveRetainClass(args.retain, true, null, null, null);
+          if (!gRetain.ok) return { ok: false, error: gRetain.error };
+          if (gRetain.class) v.class = gRetain.class;
           const globals = getGlobals(base);
           if (globals.some((g) => (g.name || '').toLowerCase() === v.name.toLowerCase()))
             return { ok: false, error: `global "${v.name}" already exists` };
@@ -924,6 +959,11 @@ export function applyToolCall(struct, name, args = {}) {
         }
         const hit = findPOU(base, args.pou);
         if (!hit) return { ok: false, error: pouTargetError(base, args.pou) };
+        // Retain is resolved only now: it depends on the POU's CATEGORY, which
+        // is not known until the target POU is found.
+        const lRetain = resolveRetainClass(args.retain, false, hit.category, hit.item.name, null);
+        if (!lRetain.ok) return { ok: false, error: lRetain.error };
+        if (lRetain.class) v.class = lRetain.class;
         const vars = hit.item.content?.variables || [];
         if (vars.some((x) => (x.name || '').toLowerCase() === v.name.toLowerCase()))
           return { ok: false, error: `"${args.pou}" already has a variable named "${v.name}". Use update_variable to change it, or pick a different name.` };
@@ -990,7 +1030,7 @@ export function applyToolCall(struct, name, args = {}) {
           return { ok: true, address: retargetIECAddress(before.address, finalType).address };
         };
 
-        if (args.address == null && Object.keys(changes).length === 0) return { ok: false, error: 'no changes provided' };
+        if (args.address == null && args.retain == null && Object.keys(changes).length === 0) return { ok: false, error: 'no changes provided' };
 
         if (scope === 'global') {
           const globals = getGlobals(base);
@@ -1000,6 +1040,9 @@ export function applyToolCall(struct, name, args = {}) {
           const addr = finalizeAddress(before);
           if (!addr.ok) return { ok: false, error: addr.error };
           if (addr.address !== undefined) changes.address = addr.address;
+          const gRetain = resolveRetainClass(args.retain, true, null, null, before);
+          if (!gRetain.ok) return { ok: false, error: gRetain.error };
+          if (gRetain.class) changes.class = gRetain.class;
           const after = { ...before, ...changes };
           const next = withGlobals(base, globals.map((g, i) => (i === idx ? after : g)));
           return {
@@ -1016,6 +1059,13 @@ export function applyToolCall(struct, name, args = {}) {
         const addrLocal = finalizeAddress(before);
         if (!addrLocal.ok) return { ok: false, error: addrLocal.error };
         if (addrLocal.address !== undefined) changes.address = addrLocal.address;
+        // ⚠️ This is also what protects an FB's PIN classes: retain is refused
+        // outright outside a program, so `retain:false` can never rewrite an
+        // Input/Output/InOut variable's class to 'Local' and silently drop a
+        // pin from the block's interface.
+        const lRetain = resolveRetainClass(args.retain, false, hit.category, hit.item.name, before);
+        if (!lRetain.ok) return { ok: false, error: lRetain.error };
+        if (lRetain.class) changes.class = lRetain.class;
         const after = { ...before, ...changes };
         const next = withPOUContent(base, hit.category, hit.index, { ...hit.item.content, variables: vars.map((x, i) => (i === idx ? after : x)) });
         return {
@@ -1148,7 +1198,10 @@ export function applyToolCall(struct, name, args = {}) {
 // ── formatting helpers ───────────────────────────────────────────────────────
 
 function varLine(v) {
-  let s = `${v.name} : ${v.type}`;
+  // RETAIN leads the line (as it does in an IEC VAR block) so the human
+  // approving the proposal cannot miss that a variable's restart behaviour is
+  // what changed — the diff is the only review surface for an agent edit.
+  let s = `${isRetainClass(v) ? 'RETAIN ' : ''}${v.name} : ${v.type}`;
   if (v.initialValue !== '' && v.initialValue != null) s += ` := ${v.initialValue}`;
   if (v.address) s += `  AT ${v.address}`;
   if (v.description) s += `  // ${v.description}`;
