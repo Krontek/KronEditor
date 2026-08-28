@@ -585,7 +585,9 @@ function App() {
               // remoteVarKeysRef (it is only populated by Build & Send in the
               // same browser session; after a reload it is empty and live
               // values would stay '---' forever).
-              if (!plcClientRef.current.isStreaming) {
+              // isStreamHealthy (not isStreaming): a stream left over from a
+              // powered-off target reconnects forever without delivering data.
+              if (!plcClientRef.current.isStreamHealthy) {
                 stopStreamRef.current = plcClientRef.current.streamVars(
                   (vars) => { Object.assign(liveVarsRef.current, vars); liveVarsDirtyRef.current = true; },
                   (err) => addLog('error', `Stream error: ${err.message}`),
@@ -600,11 +602,27 @@ function App() {
         })
         .catch(() => {
           if (seq !== reqSeq) return; // a newer request already resolved — this one is stale
-          // Don't mark disconnected while a stream is active (server is clearly alive)
-          if (plcClientRef.current?.isStreaming) return;
+          // A stream that is still DELIVERING data proves the server is alive, so
+          // a jittery status poll shouldn't blink the indicator.
+          // ⚠️ Must be isStreamHealthy, NOT isStreaming: EventSource retries a
+          // dead host forever with readyState stuck at CONNECTING (never CLOSED),
+          // so isStreaming stayed true after the target was powered off and the
+          // toolbar kept showing Connected/Running with frozen live values.
+          if (plcClientRef.current?.isStreamHealthy) return;
           consecutiveFailures += 1;
           if (consecutiveFailures >= FAILURE_THRESHOLD) {
             setIsPlcConnected(false);
+            // The target is gone: drop the dead stream/client so the next
+            // successful poll re-attaches from scratch (the attach branch above
+            // is gated on !isRunningRef.current).
+            if (stopStreamRef.current) { stopStreamRef.current(); stopStreamRef.current = null; }
+            if (plcClientRef.current) { plcClientRef.current.close(); plcClientRef.current = null; }
+            // Only the remote run is invalidated — a local sim keeps its own state.
+            if (!isSimulationModeRef.current) {
+              if (isRunningRef.current) setIsRunning(false);
+              liveVarsRef.current = {};
+              setLiveVariables({});
+            }
           }
         });
     };

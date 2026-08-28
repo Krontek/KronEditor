@@ -17,6 +17,10 @@
 
 const SERVICE = 'plc.v1.PLCService';
 
+// A live stream pushes a full snapshot every 50 ms, so nothing arriving for this
+// long means the peer is gone even though EventSource is still "connecting".
+const STREAM_STALE_MS = 5000;
+
 export class PLCClient {
   /**
    * @param {string} address — host:port, e.g. "192.168.1.100:7070"
@@ -24,6 +28,7 @@ export class PLCClient {
   constructor(address) {
     this._base = `http://${address}`;
     this._es = null; // active EventSource
+    this._lastEventAt = 0; // Date.now() of the last byte actually received
   }
 
   // ---------------------------------------------------------------------------
@@ -74,8 +79,12 @@ export class PLCClient {
 
     const es = new EventSource(`${this._base}/stream/vars`);
     this._es = es;
+    this._lastEventAt = Date.now();
+
+    es.onopen = () => { this._lastEventAt = Date.now(); };
 
     es.onmessage = (event) => {
+      this._lastEventAt = Date.now();
       try {
         const vars = JSON.parse(event.data);
         onUpdate(vars);
@@ -111,6 +120,24 @@ export class PLCClient {
   /** True while an SSE connection is open or reconnecting. */
   get isStreaming() {
     return this._es !== null && this._es.readyState !== EventSource.CLOSED;
+  }
+
+  /**
+   * True only while the stream is actually DELIVERING data.
+   *
+   * ⚠️ Never use `isStreaming` as proof that the peer is alive: EventSource
+   * retries a dead host forever and its readyState stays CONNECTING (never
+   * CLOSED), so `isStreaming` remains true indefinitely after the target is
+   * powered off. Liveness must be judged by the last received event.
+   */
+  get isStreamHealthy() {
+    if (!this.isStreaming) return false;
+    return Date.now() - this._lastEventAt < STREAM_STALE_MS;
+  }
+
+  /** ms since the last event was received (Infinity if never / no stream). */
+  get msSinceLastEvent() {
+    return this._lastEventAt ? Date.now() - this._lastEventAt : Infinity;
   }
 
   // ---------------------------------------------------------------------------
