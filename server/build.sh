@@ -52,9 +52,17 @@ REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 copy_to_resources() {
     local src="$1" triple="$2"
     local dst_dir="${REPO_ROOT}/resources/${triple}/server"
-    if [ -d "$dst_dir" ]; then
-        cp -f "$src" "$dst_dir/" && echo "      -> resources/${triple}/server/$(basename "$src")"
-    fi
+    # ⚠️ Must mkdir -p, not just skip when missing: on a machine that hasn't
+    # run "Build Server" from the UI yet (which does create it, via Go
+    # os.MkdirAll — see libraries_server.go), resources/<triple>/server/
+    # doesn't exist at all, so the old `if [ -d "$dst_dir" ]` guard silently
+    # did NOTHING — the Go cross-compile succeeded, dist/ got fresh binaries,
+    # but the sync into resources/ (what deploy_server_to_target actually
+    # reads) never happened, and nothing here said so. The only symptom was
+    # "Deploy Server to Target" refusing with "Server binary not found ...
+    # Build the server first" — right after a successful build.
+    mkdir -p "$dst_dir"
+    cp -f "$src" "$dst_dir/" && echo "      -> resources/${triple}/server/$(basename "$src")"
 }
 copy_to_resources dist/plc-agent_linux_armv7 arm-linux-gnueabihf
 copy_to_resources dist/plc-agent_linux_arm64 aarch64-linux-gnu

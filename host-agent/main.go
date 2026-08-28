@@ -130,6 +130,8 @@ func main() {
 	mux.HandleFunc("/api/host/build-canopen", srvState.handleBuildCanopen)
 	mux.HandleFunc("/api/host/ec-request-state", srvState.handleEcRequestState)
 	mux.HandleFunc("/api/host/list-network-interfaces", srvState.handleListNetworkInterfaces)
+	mux.HandleFunc("/api/host/scan-network", srvState.handleScanNetwork)
+	mux.HandleFunc("/api/host/scan-network/cancel", srvState.handleCancelScanNetwork)
 
 	// Generic event stream (build progress, library updates, ethercat state)
 	mux.HandleFunc("/api/host/events", srvState.events.handleSSE)

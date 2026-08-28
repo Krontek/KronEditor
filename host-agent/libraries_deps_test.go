@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -108,10 +109,26 @@ func TestRunBuildSoemEndToEnd(t *testing.T) {
 		}
 	}
 
-	// libsoem.a for every Linux/Windows target; macOS is deliberately absent.
-	for _, triple := range []string{
+	// libsoem.a for every Linux/Windows target, always.
+	triples := []string{
 		"x86_64-linux-gnu", "x86_64-w64-mingw32", "aarch64-linux-gnu", "arm-linux-gnueabihf",
-	} {
+	}
+	// Plus the host's own darwin triple when this test runs ON a Mac — macOS
+	// is HOST-ONLY (§15/CLAUDE.md, same rule as every other library target)
+	// because its unofficial contrib/ port still needs the real SOEM headers
+	// staged from a real clone, and archiving needs the bundled toolchain's
+	// -isysroot resolved via a real `xcrun`. It is not "deliberately absent"
+	// any more: verified against the real v2.0.0 tree, SOEM DOES vendor a
+	// libpcap-based macOS oshw/osal pair (contrib/oshw/macosx +
+	// contrib/osal/macosx) — see runBuildSoem's "macos" case.
+	if runtime.GOOS == "darwin" {
+		if runtime.GOARCH == "arm64" {
+			triples = append(triples, "aarch64-apple-darwin")
+		} else {
+			triples = append(triples, "x86_64-apple-darwin")
+		}
+	}
+	for _, triple := range triples {
 		st, err := os.Stat(filepath.Join(resources, triple, "lib", "libsoem.a"))
 		if err != nil {
 			t.Errorf("%s: libsoem.a missing: %v", triple, err)

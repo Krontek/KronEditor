@@ -48,6 +48,23 @@ import EtherCATIconSrc from './assets/icons/ethercat.png';
 const EtherCATTabIcon = <img src={EtherCATIconSrc} height="13" style={{ objectFit: 'contain', verticalAlign: 'middle' }} alt="EtherCAT" />;
 import './App.css';
 
+// A plain `fetch()` to a remote PLC has NO timeout — if the device's network
+// stack briefly stalls (common right after it finishes writing a large
+// runtime.bin to flash/eMMC) the promise just sits pending forever with no
+// error, no log line, nothing to diagnose. Build & Send's direct-to-device
+// calls (project-file, hmi-layout, config) go through this instead so a stall
+// surfaces as a clear timeout error rather than an indefinite "Sending..." hang.
+const fetchWithTimeout = (url, options = {}, timeoutMs = 20000) => {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  return fetch(url, { ...options, signal: controller.signal }).finally(() => clearTimeout(timer)).catch((err) => {
+    if (err?.name === 'AbortError') {
+      throw new Error(`request to ${url} timed out after ${timeoutMs / 1000}s (device unreachable or stalled)`);
+    }
+    throw err;
+  });
+};
+
 // ── Unified rung-based POU model ─────────────────────────────────────────────
 // Every program / function block / function is ONE kind of thing: a list of
 // RUNGS, where each rung is authored in either Ladder (LD) or Structured Text
@@ -532,9 +549,25 @@ function App() {
     // Single-packet jitter / agent under load shouldn't blink the indicator.
     let consecutiveFailures = 0;
     const FAILURE_THRESHOLD = 2;
+    // ⚠️ The host-agent's outbound check to the target device can take up to
+    // 5s to time out (deploy.go handleCheckServerStatus), but this poll fires
+    // every 3s regardless of whether the previous call has resolved yet — so
+    // right after connecting (cold TCP/ARP, slowest round-trips) it's normal
+    // to have 2+ requests in flight at once, and their responses can arrive
+    // OUT OF ORDER. Without a sequence guard, a slow/failed response from an
+    // OLDER request could resolve after a newer SUCCESS and increment
+    // consecutiveFailures anyway — two such stale failures (even straddling
+    // real successes in between) hit FAILURE_THRESHOLD and flip the toolbar
+    // to "Disconnected" right after it just showed "Connected", then the next
+    // healthy poll flips it back — a flap with no real connectivity problem.
+    // Same class of bug as `modelReqRef` in AiAgentPanel.jsx: only the result
+    // of the MOST RECENTLY ISSUED request may update state.
+    let reqSeq = 0;
     const checkStatus = () => {
+      const seq = ++reqSeq;
       host.checkServerStatus(plcAddress)
         .then((jsonStr) => {
+          if (seq !== reqSeq) return; // a newer request already resolved — this one is stale
           consecutiveFailures = 0;
           setIsPlcConnected(true);
           try {
@@ -566,6 +599,7 @@ function App() {
           } catch (_) { /* ignore parse errors */ }
         })
         .catch(() => {
+          if (seq !== reqSeq) return; // a newer request already resolved — this one is stale
           // Don't mark disconnected while a stream is active (server is clearly alive)
           if (plcClientRef.current?.isStreaming) return;
           consecutiveFailures += 1;
@@ -1696,11 +1730,22 @@ function App() {
       // ("Pull from Target"). A failure here fails the whole Build & Send.
       addLog('info', 'Sending project file...');
       const projectXml = exportProjectToXml(projectStructure, selectedBoard, { plcAddress, sshUser, sshPort, apiPassword, autoRun }, buses, busConfigs, watchTable, hmiLayout);
-      const projResp = await fetch(`http://${plcAddress}/deploy/project-file`, {
+      const postProjectFile = () => fetchWithTimeout(`http://${plcAddress}/deploy/project-file`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/xml' },
         body: projectXml,
       });
+      // One retry: the device's network/HTTP stack can briefly stall right
+      // after it finishes writing the (larger) runtime.bin from the step
+      // above, so a single transient failure here isn't worth failing the
+      // whole Build & Send over.
+      let projResp;
+      try {
+        projResp = await postProjectFile();
+      } catch (firstErr) {
+        addLog('warning', `Sending project file failed (${firstErr.message || firstErr}) — retrying once...`);
+        projResp = await postProjectFile();
+      }
       if (!projResp.ok) {
         throw new Error(`project file deploy failed: ${projResp.status} ${projResp.statusText}`);
       }

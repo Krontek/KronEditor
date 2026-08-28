@@ -5,6 +5,7 @@ import { transpileToC } from '../services/CTranspilerService';
 import { HostClient, host } from '../services/HostClient';
 import { openFile } from '../services/browserFs';
 import PasswordInput from './common/PasswordInput';
+import DeviceScanModal from './DeviceScanModal';
 import { APP_VERSION } from '../version';
 
 // ⚠️ KronHAL is NOT a separate repo any more — the HAL headers (kronhal_rpi.h
@@ -44,6 +45,85 @@ const SettingsPage = ({ theme, setTheme, editorSettings, setEditorSettings, sele
         return parts[1] || '7070';
     });
     const [connStatus, setConnStatus] = useState(null); // null | 'checking' | 'connected' | 'failed' | 'disconnected'
+
+    // ── Network device search (pick an interface, scan its subnet) ──────────
+    const [netIfaces, setNetIfaces] = useState([]); // [{name, ipv4, cidr}]
+    const [scanIface, setScanIface] = useState('');
+    const [scanModalOpen, setScanModalOpen] = useState(false);
+    const [scanning, setScanning] = useState(false);
+    const [scanProgress, setScanProgress] = useState({ scanned: 0, total: 0 });
+    const [scanResults, setScanResults] = useState([]);
+    const scanStopRef = useRef(null);
+
+    useEffect(() => {
+        host.listNetworkInterfaceDetails().then((list) => {
+            setNetIfaces(list);
+            setScanIface((prev) => prev || (list[0]?.name ?? ''));
+        }).catch((err) => {
+            // Host agent unreachable (or briefly restarting) — Search stays
+            // disabled. Logged (not silent) so "No interfaces found" is
+            // diagnosable instead of looking like a missing feature; reopening
+            // this tab re-runs the probe since SettingsPage remounts per open.
+            console.error('[SettingsPage] listNetworkInterfaceDetails failed:', err);
+        });
+    }, []);
+
+    const handleSearchDevices = () => {
+        if (!scanIface || scanning) return;
+        setScanResults([]);
+        setScanProgress({ scanned: 0, total: 0 });
+        setScanning(true);
+        setScanModalOpen(true);
+        const stop = host.streamEvents((msg) => {
+            if (msg?.topic === 'network-scan-progress') {
+                setScanProgress({ scanned: msg.data.scanned, total: msg.data.total });
+                if (msg.data.found) {
+                    setScanResults((prev) => [...prev, msg.data.found]);
+                }
+            } else if (msg?.topic === 'network-scan-done') {
+                setScanning(false);
+                stop();
+                scanStopRef.current = null;
+            }
+        });
+        scanStopRef.current = stop;
+        host.scanNetwork({ interfaceName: scanIface, port: parseInt(connPort, 10) || 7070 })
+            .then((res) => setScanProgress((prev) => ({ ...prev, total: res.total || prev.total })))
+            .catch((err) => {
+                setScanning(false);
+                stop();
+                scanStopRef.current = null;
+                setScanModalOpen(false);
+                alert('Scan failed: ' + (err.message || err));
+            });
+    };
+
+    const handleCloseScanModal = () => {
+        if (scanStopRef.current) { scanStopRef.current(); scanStopRef.current = null; }
+        // Stop the backend's remaining probes too, not just our SSE listener —
+        // otherwise up to scanConcurrency in-flight requests keep going out at
+        // the target port for a few more seconds after the popup is gone,
+        // which is exactly what was making a just-established connection's
+        // status poll miss a beat and flap the toolbar indicator.
+        host.cancelNetworkScan().catch(() => {});
+        setScanning(false);
+        setScanModalOpen(false);
+    };
+
+    const handleSelectScanResult = (h) => {
+        setConnIp(h.ip);
+        setConnPort(String(h.port));
+        handleCloseScanModal();
+    };
+
+    // Unmounting mid-scan (e.g. leaving the Settings page): stop listening so
+    // a stray SSE update never fires into an unmounted component, and cancel
+    // the backend job itself (host-agent netscan.go) so it doesn't keep
+    // probing the target port after nothing is watching it any more.
+    useEffect(() => () => {
+        if (scanStopRef.current) scanStopRef.current();
+        host.cancelNetworkScan().catch(() => {});
+    }, []);
 
     // ── Lossless capture buffer (ring) sizing ────────────────────────────────
     const [ringInfo, setRingInfo] = useState(null); // { mem_total_bytes, mem_available_bytes, ring_ram_percent, ring_bytes }
@@ -535,6 +615,48 @@ const SettingsPage = ({ theme, setTheme, editorSettings, setEditorSettings, sele
                         <h3 style={{ borderBottom: '1px solid #444', paddingBottom: '10px', marginTop: 0 }}>
                             {t('settingsPage.connectionSettings', 'Connection Settings')}
                         </h3>
+
+                        {/* Search: pick the local interface to scan, then find a device on it */}
+                        <div style={{ marginBottom: '16px' }}>
+                            <div style={{ display: 'flex', gap: '10px', alignItems: 'flex-end' }}>
+                                <div style={{ flex: 3 }}>
+                                    <label style={{ display: 'block', marginBottom: '6px', color: '#ccc', fontSize: '13px' }}>
+                                        {t('settingsPage.networkInterface', 'Network Interface')}
+                                    </label>
+                                    <select
+                                        value={scanIface}
+                                        onChange={(e) => setScanIface(e.target.value)}
+                                        disabled={netIfaces.length === 0}
+                                        style={{
+                                            width: '100%', padding: '8px', background: '#252526', color: '#fff',
+                                            border: '1px solid #444', borderRadius: '4px', boxSizing: 'border-box'
+                                        }}
+                                    >
+                                        {netIfaces.length === 0 && (
+                                            <option value="">{t('settingsPage.noInterfaces', 'No interfaces found')}</option>
+                                        )}
+                                        {netIfaces.map((ifc) => (
+                                            <option key={ifc.name} value={ifc.name}>{ifc.name} ({ifc.cidr})</option>
+                                        ))}
+                                    </select>
+                                </div>
+                                <div style={{ flex: 1 }}>
+                                    <button
+                                        onClick={handleSearchDevices}
+                                        disabled={!scanIface || scanning}
+                                        style={{
+                                            width: '100%', padding: '8px 18px', backgroundColor: '#2d2d2d', color: '#ccc',
+                                            border: '1px solid #444', borderRadius: '4px',
+                                            cursor: (!scanIface || scanning) ? 'not-allowed' : 'pointer',
+                                            opacity: (!scanIface || scanning) ? 0.5 : 1,
+                                            fontSize: '13px'
+                                        }}
+                                    >
+                                        🔍 {scanning ? t('settingsPage.searching', 'Searching...') : t('settingsPage.search', 'Search')}
+                                    </button>
+                                </div>
+                            </div>
+                        </div>
 
                         {/* IP & Port */}
                         <div style={{ marginBottom: '20px' }}>
@@ -1146,6 +1268,15 @@ const SettingsPage = ({ theme, setTheme, editorSettings, setEditorSettings, sele
             <div style={{ flex: 1, padding: '40px', overflowY: 'auto' }}>
                 {renderContent()}
             </div>
+
+            <DeviceScanModal
+                isOpen={scanModalOpen}
+                scanning={scanning}
+                progress={scanProgress}
+                results={scanResults}
+                onSelect={handleSelectScanResult}
+                onClose={handleCloseScanModal}
+            />
         </div>
     );
 };

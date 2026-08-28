@@ -385,6 +385,25 @@ export class HostClient {
     const j = await _get(this._p('/api/host/list-network-interfaces'));
     return j.interfaces || [];
   }
+  // { name, ipv4, cidr }[] — only interfaces that currently hold an IPv4
+  // address (used to pick a subnet for scanNetwork below).
+  async listNetworkInterfaceDetails() {
+    const j = await _get(this._p('/api/host/list-network-interfaces'));
+    return j.details || [];
+  }
+  // Kicks off an async subnet scan for a KronServer on `port` (default 7070)
+  // reachable from `interfaceName`. Returns immediately with { total }; results
+  // stream on streamEvents() topics 'network-scan-progress'/'network-scan-done'.
+  async scanNetwork({ interfaceName, port }) {
+    return _post(this._p('/api/host/scan-network'), { interface: interfaceName, port });
+  }
+  // Stops the in-flight scan's remaining probes immediately (idle no-op if
+  // none is running). Call this whenever the UI stops caring about the scan
+  // — closing the popup, picking a result, unmounting — so it doesn't keep
+  // hammering the target port in the background (see netscan.go).
+  async cancelNetworkScan() {
+    return _post(this._p('/api/host/scan-network/cancel'), {});
+  }
 }
 
 // Shared singleton — most callers just want `host` from this module.

@@ -37,6 +37,44 @@ const ST_ALWAYS_ALLOWED = new Set([
 // Accept any TYPE_TO_TYPE pair without listing all 90+ combinations.
 const ST_CONVERSION_REGEX = /^(?:BOOL|BYTE|WORD|DWORD|LWORD|SINT|USINT|INT|UINT|DINT|UDINT|LINT|ULINT|REAL|LREAL)_TO_(?:BOOL|BYTE|WORD|DWORD|LWORD|SINT|USINT|INT|UINT|DINT|UDINT|LINT|ULINT|REAL|LREAL)$/i;
 
+// Replace `// line comments` and 'single-quoted string literals' with spaces,
+// length-preserving so Monaco column offsets stay valid. A variable NAME that
+// merely appears inside a comment or a string literal must NOT get a live
+// debug-value badge (mirrors EditorPane.jsx's blankCommentsAndStrings — keep
+// both in sync). Block comments are stripped from the whole text before this
+// runs (see maskCommentsAndStrings below).
+function blankCommentsAndStrings(line) {
+  const out = line.split('');
+  let inStr = false;
+  for (let k = 0; k < out.length; k++) {
+    if (inStr) {
+      if (out[k] === "'") inStr = false;
+      out[k] = ' ';
+    } else if (out[k] === "'") {
+      inStr = true;
+      out[k] = ' ';
+    } else if (out[k] === '/' && out[k + 1] === '/') {
+      for (let m = k; m < out.length; m++) out[m] = ' ';
+      break;
+    }
+  }
+  return out.join('');
+}
+
+// Mask an ENTIRE document's comments/strings with same-length spaces (row AND
+// column offsets stay valid) — pure regex, no Monaco dependency, mirrors
+// EditorPane.jsx's maskCommentsAndStrings (keep both in sync). Strips BOTH
+// block-comment styles this language's tokenizer accepts (IEC `(* … *)` and
+// C-style `/* … */` — see iecSTLanguage.js), each of which can span any
+// number of lines, then blanks per-line `//` comments and '...' string
+// literals.
+function maskCommentsAndStrings(text) {
+  const stripped = text
+    .replace(/\(\*[\s\S]*?\*\)/g, m => m.replace(/[^\n]/g, ' '))
+    .replace(/\/\*[\s\S]*?\*\//g, m => m.replace(/[^\n]/g, ' '));
+  return stripped.split('\n').map(blankCommentsAndStrings);
+}
+
 function validateSCLCode(code, variables, globalVars, monaco, model, hwPortVars = []) {
   const allowedLower = new Set(ST_ALWAYS_ALLOWED);
   const varTypes = new Map();
@@ -118,7 +156,10 @@ const SCLInlineEditor = ({ code, readOnly, onCodeChange, onBlur, variables = [],
       ...variables.map(v => (v.name || '').toLowerCase()),
       ...globalVars.map(v => (v.name || '').toLowerCase()),
     ]);
-    const lines = model.getValue().split('\n');
+    // Mask both block-comment styles + line comments + strings so a variable
+    // name written inside any of them never gets a live debug-value badge
+    // (matches EditorPane.jsx's ST editor).
+    const lines = maskCommentsAndStrings(model.getValue());
     const decs = [];
 
     for (let lineIdx = 0; lineIdx < lines.length; lineIdx++) {

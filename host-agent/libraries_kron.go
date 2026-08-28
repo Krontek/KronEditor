@@ -306,9 +306,21 @@ func soemBuildInputs(libName, platform, soemRoot string) (flags []string, includ
 			filepath.Join(base, "osal/linux"),
 			filepath.Join(base, "oshw/linux"),
 		}
+	case "macos":
+		// runBuildSoem (libraries_deps.go) now stages SOEM's unofficial
+		// contrib/oshw/macosx + contrib/osal/macosx port (libpcap-based) too,
+		// preserving the tree's relative layout — so once "Build SOEM" has
+		// run, `base` genuinely contains a contrib/ subtree here, not just on
+		// linux/win32. No -D flags: nothing in SOEM's core src/ or the macosx
+		// contrib files tests a platform macro (verified against the real
+		// v2.0.0 tree); pcap headers/lib come from the system SDK.
+		return nil, []string{
+			filepath.Join(base, "include"),
+			filepath.Join(base, "osal"),
+			filepath.Join(base, "contrib/osal/macosx"),
+			filepath.Join(base, "contrib/oshw/macosx"),
+		}
 	default:
-		// macOS has no SOEM OSHW port in the vendored tree — stub only, which
-		// is correct: a Mac is a development host, never an EtherCAT master.
 		return []string{"-DKRON_EC_SIM"}, nil
 	}
 }

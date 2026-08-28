@@ -46,6 +46,17 @@ func (s *Server) runBuildSoem() error {
 	}
 	s.libLog("[SOEM] ec_options.h written (SOEM %s CMakeLists defaults)", soemTag)
 
+	// ⚠️ The vendored contrib/osal/macosx/osal.c predates SOEM's current OSAL
+	// contract and does not just need a small patch — see writeSoemMacosxOsal
+	// for the full account of what is wrong with it. Replace it outright with
+	// a correct implementation before macosSrc (below) ever globs for it.
+	if err := writeSoemMacosxOsal(soemDir); err != nil {
+		return fmt.Errorf("[SOEM] macosx osal.c: %w", err)
+	}
+	if err := patchSoemMacosxOsalDefs(filepath.Join(soemDir, "contrib", "osal", "macosx", "osal_defs.h")); err != nil {
+		s.libLog("[SOEM] WARN: macosx osal_defs patch skipped: %v", err)
+	}
+
 	// SOEM tree layout. v2.x keeps the core in src/; older trees used soem/.
 	srcDir := filepath.Join(soemDir, "src")
 	legacyLayout := false
@@ -86,12 +97,22 @@ func (s *Server) runBuildSoem() error {
 		filterSources(findFilesWithExt(filepath.Join(soemDir, "oshw", "win32"), "c")),
 		osalRoot,
 		filterSources(findFilesWithExt(filepath.Join(osalDir, "win32"), "c")))
+	// macOS has no OFFICIAL SOEM port (no cmake/macosx.cmake — see the ⚠️ note
+	// on the "macos" switch case below), but the real SOEM tree DOES vendor an
+	// unofficial one under contrib/, structurally identical to the win32/wpcap
+	// pair above: a libpcap-based nicdrv+oshw pair plus its own osal. Verified
+	// against the live v2.0.0 tree (no cmake/macosx.cmake exists; contrib/
+	// oshw/macosx and contrib/osal/macosx do).
+	macosSrc := concat(core,
+		filterSources(findFilesWithExt(filepath.Join(soemDir, "contrib", "oshw", "macosx"), "c")),
+		osalRoot,
+		filterSources(findFilesWithExt(filepath.Join(soemDir, "contrib", "osal", "macosx"), "c")))
 
 	if err := patchSoemWin32Osal(filepath.Join(osalDir, "win32", "osal.c")); err != nil {
 		s.libLog("[SOEM] WARN: win32 osal patch skipped: %v", err)
 	}
 
-	s.libLog("[SOEM] sources: core=%d linux=%d win32=%d", len(core), len(linuxSrc), len(win32Src))
+	s.libLog("[SOEM] sources: core=%d linux=%d win32=%d macos=%d", len(core), len(linuxSrc), len(win32Src), len(macosSrc))
 
 	// Stage the whole header tree, structure preserved — kronethercatmaster
 	// includes them as <soem/soem.h>, "osal.h", "nicdrv.h" from these dirs.
@@ -126,12 +147,36 @@ func (s *Server) runBuildSoem() error {
 				filepath.Join(soemDir, "oshw", "win32"),
 				filepath.Join(soemDir, "oshw", "win32", "wpcap", "Include")}
 			flags = []string{"-DWIN32", "-D_WIN32"}
+		case "macos":
+			// ⚠️ Unofficial port (contrib/, no cmake/macosx.cmake — verified
+			// against the real v2.0.0 tree): a libpcap-based nicdrv+oshw pair,
+			// the exact structural analogue of the win32/wpcap case above.
+			// Unlike win32 (which vendors its own WinPcap headers under
+			// oshw/win32/wpcap/Include), macOS pcap headers/lib come from the
+			// system SDK (<pcap/pcap.h>, usr/lib/libpcap.tbd) that
+			// bundledHostClangArgs already points -isysroot at — no extra -I
+			// needed here, and no extra -L/-lpcap needed to ARCHIVE (that is
+			// a final-link concern for whoever links this .a into a binary).
+			sources = macosSrc
+			includes = []string{
+				repoInc, osalDir,
+				filepath.Join(soemDir, "contrib", "osal", "macosx"),
+				filepath.Join(soemDir, "contrib", "oshw", "macosx"),
+			}
+			// No -D flags: clang predefines __APPLE__/__MACH__ itself, and
+			// (verified) nothing in SOEM's core src/ or the macosx contrib
+			// files tests LINUX/WIN32 — those two flags above are consumed
+			// only by the vendored WinPcap headers on the win32 side.
+			//
+			// ⚠️ macosSrc only compiles because writeSoemMacosxOsal (below)
+			// already replaced the vendored osal.c and
+			// patchSoemMacosxOsalDefs already completed osal_defs.h — the
+			// contrib/ port as cloned does NOT compile against SOEM v2.0.0's
+			// current OSAL contract (verified by trying it first: 20+ errors,
+			// then missing osal_mutex_*/osal_monotonic_sleep at link time).
+			// See those two functions for the full account.
 		default:
-			// ⚠️ SOEM vendors no macOS OSHW/OSAL port, so there is nothing to
-			// build. That is not a gap: a Mac is a development host and never
-			// an EtherCAT master — kronethercatmaster is compiled stub-only
-			// there (see soemBuildInputs).
-			s.libLog("[SOEM][%s] skipped — SOEM has no port for this platform (EtherCAT runs on the PLC, not the host)", t.Tag)
+			s.libLog("[SOEM][%s] skipped — unrecognized platform %q", t.Tag, t.Platform)
 			continue
 		}
 
@@ -268,6 +313,229 @@ func patchSoemWin32Osal(path string) error {
 		out.WriteString("\n")
 	}
 	return os.WriteFile(path, []byte(out.String()), 0o644)
+}
+
+// patchSoemMacosxOsalDefs completes SOEM's unofficial contrib/osal/macosx
+// osal_defs.h.
+//
+// ⚠️ Discovered by actually attempting this build (not by reading the source):
+// the contrib/ macOS port predates SOEM v2.0.0's shared osal.h / ec_type.h /
+// ec_main.h, which reference two macros every OTHER platform's osal_defs.h
+// defines — linux: `struct timespec` / `pthread_mutex_t`; win32: `struct
+// timespec` / `CRITICAL_SECTION` — but the macosx one never learned:
+// `ec_timet` and `osal_mutext` (sic — that exact spelling is upstream's, not
+// a typo introduced here). Without this patch EVERY core SOEM source fails to
+// compile on macOS with "unknown type name 'ec_timet'"/"'osal_mutext'".
+// macOS is POSIX like Linux for both purposes, so the same definitions apply.
+func patchSoemMacosxOsalDefs(path string) error {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	content := string(b)
+	if strings.Contains(content, "ec_timet") {
+		return nil // upstream caught up, or already patched — nothing to do
+	}
+	const addition = "\n#include <time.h>\n" +
+		"#define ec_timet            struct timespec\n" +
+		"#define osal_mutext         pthread_mutex_t\n"
+	idx := strings.LastIndex(content, "#endif")
+	if idx < 0 {
+		return fmt.Errorf("osal_defs.h has no closing #endif to patch before")
+	}
+	patched := content[:idx] + addition + content[idx:]
+	return os.WriteFile(path, []byte(patched), 0o644)
+}
+
+// writeSoemMacosxOsal replaces contrib/osal/macosx/osal.c outright rather than
+// patching it.
+//
+// ⚠️ Discovered by actually attempting this build, not by reading the source:
+// the vendored file predates THREE real API changes SOEM's shared osal.h now
+// requires, verified against the real v2.0.0 tree:
+//  1. ec_timet used to be a bespoke `{sec, usec}` struct; it is now `#define
+//     ec_timet struct timespec` (`.tv_sec`/`.tv_nsec`) everywhere, including
+//     core/shared src/ec_dc.c — so this is not optional, every platform's
+//     osal.c must agree on the CURRENT layout.
+//  2. osal_get_monotonic_time / osal_monotonic_sleep are declared in osal.h
+//     and called from shared code, but never implemented by the old file —
+//     a link-time failure that a compile-only check would miss entirely.
+//  3. osal_mutex_create/_destroy/_lock/_unlock (used by shared code) are
+//     likewise declared but never implemented by the old file.
+// This is written as a small adaptation of osal/linux/osal.c (same POSIX
+// primitives, same osal_timespec* helper macros from the shared osal.h)
+// rather than a patch, with exactly one real platform difference:
+// clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, …) does not exist on
+// Darwin at all (verified — it is a Linux/glibc-only POSIX extension; the
+// loader-host's hotswap_host.c hit the same gap and used mach_wait_until
+// for its high-resolution case, see CLAUDE.md §6 "macOS simulation"). SOEM's
+// own sleep is not hard-real-time critical enough to need mach_wait_until,
+// so the portable fallback is used instead: convert the absolute monotonic
+// deadline to a relative duration against "now" and hand that to nanosleep.
+// PTHREAD_PRIO_INHERIT (used by osal_mutex_create) was verified to work on
+// this machine's Xcode Command Line Tools clang rather than assumed.
+func writeSoemMacosxOsal(soemDir string) error {
+	const content = `/*
+ * macOS osal.c for the KronEditor SOEM build — see writeSoemMacosxOsal in
+ * host-agent/libraries_deps.go for why this replaces the vendored
+ * contrib/osal/macosx/osal.c instead of patching it.
+ */
+#include <osal.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+
+void osal_get_monotonic_time(ec_timet *ts)
+{
+   clock_gettime(CLOCK_MONOTONIC, ts);
+}
+
+ec_timet osal_current_time(void)
+{
+   struct timespec ts;
+   clock_gettime(CLOCK_REALTIME, &ts);
+   return ts;
+}
+
+void osal_time_diff(ec_timet *start, ec_timet *end, ec_timet *diff)
+{
+   osal_timespecsub(end, start, diff);
+}
+
+void osal_timer_start(osal_timert *self, uint32 timeout_usec)
+{
+   struct timespec start_time;
+   struct timespec timeout;
+
+   osal_get_monotonic_time(&start_time);
+   osal_timespec_from_usec(timeout_usec, &timeout);
+   osal_timespecadd(&start_time, &timeout, &self->stop_time);
+}
+
+boolean osal_timer_is_expired(osal_timert *self)
+{
+   struct timespec current_time;
+   int is_not_yet_expired;
+
+   osal_get_monotonic_time(&current_time);
+   is_not_yet_expired = osal_timespeccmp(&current_time, &self->stop_time, <);
+
+   return is_not_yet_expired == FALSE;
+}
+
+int osal_usleep(uint32 usec)
+{
+   struct timespec ts;
+   osal_timespec_from_usec(usec, &ts);
+   return nanosleep(&ts, NULL);
+}
+
+/* macOS has no clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, ...) — convert
+ * the absolute monotonic deadline to a relative duration against "now" and
+ * sleep that instead. A deadline already in the past sleeps for zero time
+ * rather than underflowing into a huge unsigned duration. */
+int osal_monotonic_sleep(ec_timet *ts)
+{
+   struct timespec now, remain;
+
+   osal_get_monotonic_time(&now);
+   if (osal_timespeccmp(ts, &now, <))
+   {
+      return 0;
+   }
+   osal_timespecsub(ts, &now, &remain);
+   return nanosleep(&remain, NULL) == 0 ? 0 : -1;
+}
+
+void *osal_malloc(size_t size)
+{
+   return malloc(size);
+}
+
+void osal_free(void *ptr)
+{
+   free(ptr);
+}
+
+int osal_thread_create(void *thandle, int stacksize, void *func, void *param)
+{
+   int ret;
+   pthread_attr_t attr;
+   pthread_t *threadp;
+
+   threadp = thandle;
+   pthread_attr_init(&attr);
+   pthread_attr_setstacksize(&attr, stacksize);
+   ret = pthread_create(threadp, &attr, func, param);
+   if (ret < 0)
+   {
+      return 0;
+   }
+   return 1;
+}
+
+int osal_thread_create_rt(void *thandle, int stacksize, void *func, void *param)
+{
+   int ret;
+   pthread_attr_t attr;
+   struct sched_param schparam;
+   pthread_t *threadp;
+
+   threadp = thandle;
+   pthread_attr_init(&attr);
+   pthread_attr_setstacksize(&attr, stacksize);
+   ret = pthread_create(threadp, &attr, func, param);
+   pthread_attr_destroy(&attr);
+   if (ret < 0)
+   {
+      return 0;
+   }
+   memset(&schparam, 0, sizeof(schparam));
+   schparam.sched_priority = 40;
+   ret = pthread_setschedparam(*threadp, SCHED_FIFO, &schparam);
+   if (ret < 0)
+   {
+      return 0;
+   }
+
+   return 1;
+}
+
+void *osal_mutex_create(void)
+{
+   pthread_mutexattr_t mutexattr;
+   osal_mutext *mutex;
+   mutex = (osal_mutext *)osal_malloc(sizeof(osal_mutext));
+   if (mutex)
+   {
+      pthread_mutexattr_init(&mutexattr);
+      pthread_mutexattr_setprotocol(&mutexattr, PTHREAD_PRIO_INHERIT);
+      pthread_mutex_init(mutex, &mutexattr);
+   }
+   return (void *)mutex;
+}
+
+void osal_mutex_destroy(void *mutex)
+{
+   pthread_mutex_destroy((osal_mutext *)mutex);
+   osal_free(mutex);
+}
+
+void osal_mutex_lock(void *mutex)
+{
+   pthread_mutex_lock((osal_mutext *)mutex);
+}
+
+void osal_mutex_unlock(void *mutex)
+{
+   pthread_mutex_unlock((osal_mutext *)mutex);
+}
+`
+	path := filepath.Join(soemDir, "contrib", "osal", "macosx", "osal.c")
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	return os.WriteFile(path, []byte(content), 0o644)
 }
 
 // ── CANopen ─────────────────────────────────────────────────────────────────

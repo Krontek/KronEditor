@@ -435,9 +435,21 @@ func TestSoemBuildInputs(t *testing.T) {
 	if len(incs) != 5 {
 		t.Errorf("win32 include dirs = %d, want 5 (wpcap included)", len(incs))
 	}
-	// macOS is a development host, never an EtherCAT master.
-	if flags, _ := soemBuildInputs("kronethercatmaster", "macos", root); flags[0] != "-DKRON_EC_SIM" {
-		t.Errorf("macos flags = %v, want -DKRON_EC_SIM", flags)
+	// macOS: real SOEM headers installed → real include dirs (the unofficial
+	// contrib/oshw|osal/macosx port, verified to exist against the live
+	// v2.0.0 tree — see runBuildSoem's "macos" case), no -D flags needed.
+	flags, incs = soemBuildInputs("kronethercatmaster", "macos", root)
+	if len(flags) != 0 {
+		t.Errorf("macos flags = %v, want none", flags)
+	}
+	if len(incs) != 4 {
+		t.Errorf("macos include dirs = %d, want 4", len(incs))
+	}
+	// Headers missing (fresh root) → macOS falls back to the stub too, same
+	// as every other platform.
+	if flags, incs := soemBuildInputs("kronethercatmaster", "macos", t.TempDir()); len(incs) != 0 ||
+		len(flags) != 1 || flags[0] != "-DKRON_EC_SIM" {
+		t.Errorf("macos with no SOEM headers should fall back to the stub build, got %v %v", flags, incs)
 	}
 }
 

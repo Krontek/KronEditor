@@ -3557,12 +3557,34 @@ const transpileSTLogics = (code, stdFunctions = {}, parentName = '', category = 
     const rawLines = normalized.split(/\r?\n|\\n/).map(l => l.replace(/\/\/.*$/, ''));
     const lines = [];
     let pending = '';
+    // A physical line that STARTS with a binary operator also continues the
+    // previous statement, e.g.:
+    //   angle_raw := a * 128
+    //              + b / 2;
+    //   ready := motor_ok
+    //          AND NOT fault;
+    // No valid ST statement begins with a binary operator, so once CASE
+    // labels (bare `n:` / `name:`) are excluded this is unambiguous. The
+    // trailing-operator check above only catches the operator at the END of
+    // the PREVIOUS line — it cannot see one leading the NEXT line, which is
+    // an equally common way to break a long expression and was silently
+    // mis-transpiled into two statements (the tail became a discarded,
+    // unused-value expression and its term never reached the assignment).
+    const LEADING_OP_RE = /^(?:AND|OR|XOR|NOT|MOD|BAND|BOR|BXOR)\b|^(?:<=|>=|<>|[+\-*/<>=])/i;
+    const looksLikeLabel = s => /:(?!=)/.test(s);
+    const endsOpenBlock = s => /\b(?:THEN|DO|OF|ELSE)$/i.test(s);
     for (const raw of rawLines) {
         const trimRaw = raw.trim();
         if (!trimRaw) {
             if (pending) { /* skip blank continuation lines */ }
             else lines.push(raw);
             continue;
+        }
+        if (!pending && lines.length && LEADING_OP_RE.test(trimRaw) && !looksLikeLabel(trimRaw)) {
+            const prev = lines[lines.length - 1].trim();
+            if (prev && !prev.endsWith(';') && !endsOpenBlock(prev) && !looksLikeLabel(prev)) {
+                pending = lines.pop().trim();
+            }
         }
         const combined = pending ? pending + ' ' + trimRaw : raw;
         const combinedTrim = combined.trim();

@@ -42,6 +42,22 @@ function blankCommentsAndStrings(line) {
   return out.join('');
 }
 
+// Mask an ENTIRE document's comments/strings with same-length spaces (row AND
+// column offsets stay valid) — pure regex, no Monaco dependency, so it is
+// directly unit-testable and cannot silently no-op if a tokenizer lookup
+// misses. Strips BOTH block-comment styles this language's tokenizer accepts
+// (IEC `(* … *)` and C-style `/* … */` — see iecSTLanguage.js), each of which
+// can span any number of lines, then blanks per-line `//` comments and
+// '...' string literals via blankCommentsAndStrings. A variable NAME
+// mentioned only in prose (inside either comment style) must never get a
+// live-value badge.
+function maskCommentsAndStrings(text) {
+  const stripped = text
+    .replace(/\(\*[\s\S]*?\*\)/g, m => m.replace(/[^\n]/g, ' '))
+    .replace(/\/\*[\s\S]*?\*\//g, m => m.replace(/[^\n]/g, ' '));
+  return stripped.split('\n').map(blankCommentsAndStrings);
+}
+
 // Render a live FB/struct/array value as Markdown for the Monaco hover tooltip.
 function formatLiveHoverMd(name, val) {
   const fmt = (v) => (typeof v === 'boolean' ? (v ? 'TRUE' : 'FALSE') : String(v));
@@ -267,11 +283,12 @@ const EditorPane = ({
     const validate = () => {
       const text = model.getValue();
       const markers = [];
-      // Blank (* block comments *) with SAME-LENGTH spaces (newlines kept) so
-      // both row AND column offsets stay valid for the decoration scan — an
-      // inline `(* … *)` must not shift the badge columns of the code after it.
-      const stripped = text.replace(/\(\*[\s\S]*?\*\)/g, match => match.replace(/[^\n]/g, ' '));
-      const lines = stripped.split('\n');
+      // Mask both block-comment styles + line comments + strings so both row
+      // AND column offsets stay valid for the decoration scan below — an
+      // inline comment must not shift the badge columns of the code after
+      // it, and a variable NAME mentioned only in prose must never get a
+      // live badge.
+      const lines = maskCommentsAndStrings(text);
 
       // Case-insensitive set: IEC 61131-3 identifiers are case-insensitive
       const allowedLower = new Set([
@@ -337,7 +354,10 @@ const EditorPane = ({
         const decs = [];
         const safeProgName = (parentName || "").trim().replace(/\s+/g, '_');
         // Context for the live-value hover provider (registered once below).
-        window.stLiveCtx = { live: liveVariables, prog: safeProgName };
+        // `maskedLines` (comment/string-blanked) is reused there so hover
+        // applies the exact same comment/string exclusion as the inline
+        // badges instead of re-deriving it from a raw line.
+        window.stLiveCtx = { live: liveVariables, prog: safeProgName, maskedLines: lines };
 
         // Only look up actual user-defined variables, not keywords. Keyed by
         // LOWERCASE name — ST identifiers are case-insensitive (§liveLookup), so
@@ -373,10 +393,9 @@ const EditorPane = ({
           });
         };
 
-        lines.forEach((rawLine, i) => {
-          // Blank `// comments` and 'string literals' (length-preserving) so a
-          // variable name written inside a comment/string never gets a badge.
-          const line = blankCommentsAndStrings(rawLine);
+        lines.forEach((line, i) => {
+          // `lines` is already tokenizer-masked (comments/strings blanked
+          // above), so `line` here is code-only.
           const regex = /\b[a-zA-Z_][a-zA-Z0-9_]*\b/g;
           let match;
           while ((match = regex.exec(line)) !== null) {
@@ -591,10 +610,17 @@ const EditorPane = ({
         if (!ctx || !ctx.live) return null;
         const wi = model.getWordAtPosition(position);
         if (!wi) return null;
-        // Skip words sitting inside a // comment or a 'string literal' — they are
-        // not live variables even if the text matches a variable name.
+        // Skip words sitting inside a comment (block or line) or a string
+        // literal — they are not live variables even if the text matches a
+        // variable name. Uses the same mask as the inline badges
+        // (§maskCommentsAndStrings) so block comments — `(* … *)` or
+        // `/* … */`, spanning any number of lines — are excluded here too,
+        // not just single-line `//` comments.
         const lineText = model.getLineContent(position.lineNumber);
-        if (blankCommentsAndStrings(lineText)[wi.startColumn - 1] === ' '
+        const maskedLine = ctx.maskedLines && ctx.maskedLines[position.lineNumber - 1];
+        if (maskedLine !== undefined) {
+          if (maskedLine[wi.startColumn - 1] === ' ' && lineText[wi.startColumn - 1] !== ' ') return null;
+        } else if (blankCommentsAndStrings(lineText)[wi.startColumn - 1] === ' '
             && lineText[wi.startColumn - 1] !== ' ') return null;
         const word = wi.word;
         const live = ctx.live;
