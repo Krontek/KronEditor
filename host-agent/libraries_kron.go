@@ -336,6 +336,10 @@ func soemBuildInputs(libName, platform, soemRoot string) (flags []string, includ
 // into every resources/<triple>/include/; those copies were consolidated
 // precisely because drift between them was a recurring bug, so this must not
 // grow back into a per-target loop.
+// locallyOwnedHeaders are top-level headers that live in the repo rather than
+// in a cloned Krontek library, so installKrontekHeaders must never clear them.
+var locallyOwnedHeaders = map[string]bool{"kronsystem.h": true}
+
 func (s *Server) installKrontekHeaders(stageInclude string) error {
 	dst, err := s.paths.ResourceTargetIncludeDir("x86_64/linux")
 	if err != nil {
@@ -358,6 +362,12 @@ func (s *Server) installKrontekHeaders(stageInclude string) error {
 	//
 	// Within a scope the replacement is still complete, so a header deleted
 	// upstream stops shadowing the new tree.
+	// ⚠️ ...and the same trap exists one scope over, for a single file rather
+	// than a directory: kronsystem.h is authored in-repo (CLAUDE.md §14), not
+	// cloned from any Krontek repo, so nothing ever stages it and the
+	// top-level wipe deleted it on every successful run — taking all 25
+	// SYSTEM/TIMERS blocks with it. Like the HAL headers, it only survived
+	// because git tracks it.
 	stagedTop, stagedHAL := stagedScopes(stageInclude)
 
 	if stagedTop {
@@ -366,9 +376,10 @@ func (s *Server) installKrontekHeaders(stageInclude string) error {
 			return err
 		}
 		for _, e := range entries {
-			if !e.IsDir() && filepath.Ext(e.Name()) == ".h" {
-				_ = os.Remove(filepath.Join(dst, e.Name()))
+			if e.IsDir() || filepath.Ext(e.Name()) != ".h" || locallyOwnedHeaders[e.Name()] {
+				continue
 			}
+			_ = os.Remove(filepath.Join(dst, e.Name()))
 		}
 	}
 	if stagedHAL {
