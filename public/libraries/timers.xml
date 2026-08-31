@@ -42,5 +42,44 @@
         <Variable name="ET" type="TIME" />
       </Outputs>
     </Block>
+
+    <!-- ── Signal generation and conditioning ───────────────────────────────
+         Implemented as `static inline` in resources/krontek-include/
+         kronsystem.h, not in a prebuilt libkron*.a. -->
+
+    <Block type="Blink" description="Free-running square wave while ENABLE is true" class="FunctionBlock">
+      <Inputs>
+        <Variable name="ENABLE" type="BOOL" default="FALSE" />
+        <Variable name="T_LOW"  type="TIME" default="T#500ms" />
+        <Variable name="T_HIGH" type="TIME" default="T#500ms" />
+      </Inputs>
+      <Outputs>
+        <Variable name="OUT" type="BOOL" />
+      </Outputs>
+    </Block>
+
+    <Block type="Debounce" description="OUT follows IN once IN has held steady for PT" class="FunctionBlock">
+      <Inputs>
+        <Variable name="IN" type="BOOL" default="FALSE" />
+        <Variable name="PT" type="TIME" default="T#20ms" />
+      </Inputs>
+      <Outputs>
+        <Variable name="OUT" type="BOOL" />
+      </Outputs>
+    </Block>
+
+    <Block type="Gen_Signal" description="Test waveform: 0=sine 1=square 2=triangle 3=sawtooth" class="FunctionBlock">
+      <Inputs>
+        <Variable name="EN"        type="BOOL"  default="FALSE" />
+        <Variable name="MODE"      type="USINT" default="0" />
+        <Variable name="PERIOD"    type="TIME"  default="T#1s" />
+        <Variable name="AMPLITUDE" type="REAL"  default="1.0" />
+        <Variable name="OFFSET"    type="REAL"  default="0.0" />
+      </Inputs>
+      <Outputs>
+        <Variable name="ENO" type="BOOL" />
+        <Variable name="OUT" type="REAL" />
+      </Outputs>
+    </Block>
   </Category>
 </Library>

@@ -215,7 +215,7 @@ func (s *Server) handleAIChat(w http.ResponseWriter, r *http.Request) {
 	case "custom":
 		msg, err = callOpenAI(ctx, req, "") // baseUrl required; OpenAI-compatible
 	case "ollama", "":
-		msg, err = callOllama(ctx, req)
+		msg, err = s.callOllama(ctx, req)
 	default:
 		writeError(w, http.StatusBadRequest, "unknown provider: "+req.Provider)
 		return
@@ -834,10 +834,10 @@ func buildOpenAIMessages(req aiChatReq, argsAsString bool) []map[string]any {
 
 // ── Ollama (/api/chat) ───────────────────────────────────────────────────────
 
-func callOllama(ctx context.Context, req aiChatReq) (aiMessage, error) {
+func (s *Server) callOllama(ctx context.Context, req aiChatReq) (aiMessage, error) {
 	base := normalizeOllamaBase(req.BaseURL)
 
-	msg, err := ollamaChatOnce(ctx, base, req)
+	msg, err := s.ollamaChatOnce(ctx, base, req)
 	// Some Ollama models (e.g. codellama) have no native tool API — passing
 	// `tools` makes the daemon answer HTTP 400 "<model> does not support tools".
 	// Fall back to PROMPT-BASED tool calling: drop the tools field, describe the
@@ -846,7 +846,7 @@ func callOllama(ctx context.Context, req aiChatReq) (aiMessage, error) {
 	if err != nil && len(req.Tools) > 0 && isUnsupportedToolsErr(err) {
 		req.System = strings.TrimRight(req.System, "\n") + "\n\n" + toolPrompt(req.Tools)
 		req.Tools = nil
-		return ollamaChatOnce(ctx, base, req)
+		return s.ollamaChatOnce(ctx, base, req)
 	}
 	return msg, err
 }
@@ -872,7 +872,7 @@ func toolPrompt(tools []aiTool) string {
 	return b.String()
 }
 
-func ollamaChatOnce(ctx context.Context, base string, req aiChatReq) (aiMessage, error) {
+func (s *Server) ollamaChatOnce(ctx context.Context, base string, req aiChatReq) (aiMessage, error) {
 	msgs := buildOpenAIMessages(req, false) // object-form arguments, no tool_call_id
 
 	tools := make([]map[string]any, 0, len(req.Tools))
@@ -887,11 +887,11 @@ func ollamaChatOnce(ctx context.Context, base string, req aiChatReq) (aiMessage,
 		})
 	}
 
-	// Give the agent a context window large enough for the (compact) system
-	// prompt + tool schemas + a few turns, so Ollama doesn't truncate and drop
-	// the project map. 8192 is a good balance on a 6 GB GPU once weights are
-	// loaded (KV cache stays modest); Ollama clamps to the model's max.
-	options := map[string]any{"num_ctx": 8192}
+	// Sized from the model's own metadata and the host's VRAM rather than a
+	// flat constant — see ollamaNumCtx in ollama.go for why, and note that
+	// leaving num_ctx unset is NOT an option: Ollama defaults to 4096 and
+	// silently drops the oldest messages, taking the project map with them.
+	options := map[string]any{"num_ctx": s.ollamaNumCtx(ctx, base, req.Model)}
 	if req.Temperature != nil {
 		options["temperature"] = *req.Temperature
 	}

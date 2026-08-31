@@ -173,3 +173,83 @@ func TestRingControllerRaisesStrideUnderBacklog(t *testing.T) {
 	}
 	t.Fatalf("controller did not raise stride under sustained backlog (stride still %d)", rc.StrideN())
 }
+
+// TestRingControllerRecoversFromAStrideBurst pins the fix for the field failure:
+// the stride grows by DOUBLING, so shrinking by 1 per 100 ms tick left a device
+// pinned in the thousands effectively forever (2048 -> 1 took 2047 ticks, and any
+// blip on the way re-doubled it). Recovery must be multiplicative too.
+//
+// Asserts the DECAY RATE over a few ticks rather than waiting out a full
+// recovery: 10%/tick reaches ~1088 after six ticks, while the old -1/tick would
+// still be at 2042. Those are far enough apart to be unambiguous, and the test
+// stays sub-second.
+func TestRingControllerRecoversFromAStrideBurst(t *testing.T) {
+	name := "kron_test_recover"
+	p := newRingProducer(t, name, 24, 4096, []ringTask{{PeriodUs: 100, PayloadLen: 8, TaskID: 0}})
+	defer p.close()
+	rc, err := OpenRing(name)
+	if err != nil {
+		t.Fatalf("OpenRing: %v", err)
+	}
+	defer rc.Close()
+
+	ctl := newRingController(rc)
+	id := ctl.register()
+	defer ctl.unregister(id)
+
+	// Put BOTH the controller and the ring header where the field device was.
+	// (Setting only ctl.n leaves the header at register()'s stride and the test
+	// passes without exercising anything.)
+	const burst = 2048
+	ctl.mu.Lock()
+	ctl.n = burst
+	ctl.mu.Unlock()
+	rc.SetStrideN(burst)
+
+	// Healthy link, empty backlog: exactly the conditions for relaxing.
+	const ticks = 6
+	deadline := time.Now().Add(ticks * ringTickMs * time.Millisecond)
+	for time.Now().Before(deadline) {
+		ctl.report(id, 50e6 /*fast link*/, 0 /*no backlog*/, 0)
+		time.Sleep(ringTickMs * time.Millisecond / 4)
+	}
+
+	got := rc.StrideN()
+	if got >= burst {
+		t.Fatalf("stride did not fall at all: %d", got)
+	}
+	// Additive (-1/tick) would leave ~2042; multiplicative (10%/tick) reaches
+	// ~1088. The threshold sits between them with room for tick jitter — tying
+	// it to the exact decay curve would make the test flaky, not stricter.
+	if got > burst*3/4 {
+		t.Fatalf("stride only reached %d after %d ticks — decrease looks additive, "+
+			"not multiplicative (additive would give ~%d)", got, ticks, burst-ticks)
+	}
+}
+
+// TestRingWireBytesPerSecMatchesTheControllersUnit guards the unit mismatch:
+// D is measured over whole frames, so P must include the 12-byte per-record
+// stream header. Payload-only understated production 2.5x for an 8-byte var.
+func TestRingWireBytesPerSecMatchesTheControllersUnit(t *testing.T) {
+	name := "kron_test_wirerate"
+	p := newRingProducer(t, name, 24, 64, []ringTask{{PeriodUs: 10, PayloadLen: 8, TaskID: 0}})
+	defer p.close()
+	rc, err := OpenRing(name)
+	if err != nil {
+		t.Fatalf("OpenRing: %v", err)
+	}
+	defer rc.Close()
+
+	payloadOnly := rc.ProducedBytesPerSec() // 8 B / 10 us  = 800 KB/s
+	wire := rc.WireBytesPerSec()            // 20 B / 10 us = 2.0 MB/s
+	if want := (8.0 + 12.0) / 10 * 1e6; wire != want {
+		t.Fatalf("WireBytesPerSec = %v, want %v", wire, want)
+	}
+	if wire <= payloadOnly {
+		t.Fatalf("wire rate %v must exceed payload-only %v", wire, payloadOnly)
+	}
+	// the informational /ring/info field must keep its documented meaning
+	if want := 8.0 / 10 * 1e6; payloadOnly != want {
+		t.Fatalf("ProducedBytesPerSec changed meaning: %v, want %v", payloadOnly, want)
+	}
+}

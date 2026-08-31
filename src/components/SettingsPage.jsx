@@ -182,33 +182,17 @@ const SettingsPage = ({ theme, setTheme, editorSettings, setEditorSettings, sele
         }
     };
 
-    // Derived: seconds of history the resolved ring holds, from the project's
-    // addressed-variable production rate (Σ size / period). Purely informational.
+    // Derived: how long a link stall the resolved ring absorbs before it laps.
+    // The server reports the project's real ring byte-rate on /status, so this is
+    // a division rather than an estimate.
+    //
+    // ⚠️ It used to be guessed client-side as (8 bytes x addressed var count) /
+    // task period, which ignored the 16-byte record header and so read ~3x too
+    // optimistic for a single 8-byte variable. Never re-derive the rate here.
     const ringSeconds = (() => {
-        if (!ringInfo?.ring_bytes || !projectStructure) return null;
-        try {
-            const tasks = projectStructure.taskConfig?.tasks || [];
-            let bytesPerSec = 0;
-            // rough: every addressed scalar var contributes size / its task period
-            const addr = [];
-            (projectStructure.programs || []).forEach((prog) => {
-                (prog.content?.variables || prog.variables || []).forEach((v) => {
-                    if (v.address) addr.push({ prog: prog.name, size: 8 });
-                });
-            });
-            // if we cannot resolve precise sizes, assume 8 bytes (LINT/LREAL worst case)
-            const periodUsOf = (progName) => {
-                const tk = tasks.find((tsk) => (tsk.programs || []).some((pp) => (pp.program || '') === progName));
-                if (!tk) return 100000;
-                const m = String(tk.interval || '').match(/T#(\d+)(us|ms|s)/i);
-                if (!m) return 100000;
-                const n = parseInt(m[1], 10);
-                return m[2].toLowerCase() === 's' ? n * 1e6 : m[2].toLowerCase() === 'ms' ? n * 1e3 : n;
-            };
-            addr.forEach((a) => { bytesPerSec += (a.size / periodUsOf(a.prog)) * 1e6; });
-            if (bytesPerSec <= 0) return null;
-            return ringInfo.ring_bytes / bytesPerSec;
-        } catch { return null; }
+        const rate = ringInfo?.ring_produced_bytes_per_sec;
+        if (!ringInfo?.ring_bytes || !rate || rate <= 0) return null;
+        return ringInfo.ring_bytes / rate;
     })();
 
     // ── Host-agent PoC (temporary — remove after migration) ──────────────────
@@ -749,7 +733,7 @@ const SettingsPage = ({ theme, setTheme, editorSettings, setEditorSettings, sele
                         </h3>
                         <p style={{ color: '#888', fontSize: '12px', marginBottom: '12px', lineHeight: 1.5 }}>
                             {t('settingsPage.capture.desc',
-                                'Sizes the on-device buffer that lets the REST API stream (/api/v1/stream/ring) capture EVERY scan value of addressed variables with no loss. Expressed as a percentage of the device\'s available RAM (max 25%). Takes effect on the next runtime (re)start.')}
+                                'On-device buffer that lets the REST API stream (/api/v1/stream/ring) capture EVERY scan value of addressed variables with no loss. The buffer is sized automatically from the project\'s capture rate (about 10 s of production); this percentage is only the CEILING it may not exceed (max 50% of available RAM). Raising it does not make the buffer bigger unless the project needs it. Takes effect on the next runtime (re)start.')}
                         </p>
                         {ringInfo && (ringInfo.mem_total_bytes || ringInfo.ring_bytes) ? (
                             <div style={{
@@ -765,7 +749,7 @@ const SettingsPage = ({ theme, setTheme, editorSettings, setEditorSettings, sele
                                 <span>
                                     {fmtBytes(ringInfo.ring_bytes)}
                                     {ringInfo.ring_ram_percent ? ` (${ringInfo.ring_ram_percent}% of available)` : ` (${t('settingsPage.capture.default', 'default')})`}
-                                    {ringSeconds != null ? ` · ≈ ${ringSeconds >= 1 ? ringSeconds.toFixed(1) + ' s' : (ringSeconds * 1000).toFixed(0) + ' ms'} ${t('settingsPage.capture.history', 'of history')}` : ''}
+                                    {ringSeconds != null ? ` · ≈ ${ringSeconds >= 1 ? ringSeconds.toFixed(1) + ' s' : (ringSeconds * 1000).toFixed(0) + ' ms'} ${t('settingsPage.capture.stall', 'of link-stall tolerance')}` : ''}
                                 </span>
                             </div>
                         ) : (
@@ -775,7 +759,7 @@ const SettingsPage = ({ theme, setTheme, editorSettings, setEditorSettings, sele
                         )}
                         <div style={{ display: 'flex', gap: '10px', alignItems: 'center', marginBottom: '8px' }}>
                             <label style={{ fontSize: '13px', color: '#ccc' }}>
-                                {t('settingsPage.capture.percent', 'Buffer size (% of available RAM)')}
+                                {t('settingsPage.capture.percent', 'Maximum buffer (% of available RAM)')}
                             </label>
                             <input
                                 type="number" min="0" max="50" step="0.5"

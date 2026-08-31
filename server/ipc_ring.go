@@ -47,6 +47,12 @@ const (
 	recOffPayload    = 16
 
 	ringSeqEmpty = ^uint64(0) // 0xFFFF...  slot never written
+
+	// wireRecordHeaderBytes is the per-record header the stream handler emits:
+	// u64 seq + u16 task_id + u16 payload_len. Deliberately NOT recOffPayload —
+	// the ring slot header (16 B, stride-aligned) and the wire header (12 B) are
+	// different layouts that only happen to be close in size.
+	wireRecordHeaderBytes = 12
 )
 
 // ringTask mirrors one task_table entry.
@@ -317,6 +323,29 @@ func (rc *RingConsumer) ProducedBytesPerSec() float64 {
 	for _, t := range rc.tasks {
 		if t.PeriodUs > 0 {
 			bps += float64(t.PayloadLen) / float64(t.PeriodUs) * 1e6
+		}
+	}
+	return bps
+}
+
+// WireBytesPerSec is the rate the ring's records would occupy ON THE WIRE:
+// the 12-byte per-record stream header (seq + task_id + payload_len) plus the
+// payload, summed over the tasks.
+//
+// ⚠️ This — not ProducedBytesPerSec — is what the decimation controller must
+// compare against `D`, its measurement of delivered bytes/s, because D counts
+// whole frames. Feeding it the payload-only rate understated production by
+// (12+payload)/payload — 2.5x for a single 8-byte variable — so the analytic
+// floor ceil(P/(alpha*D)) came out that much too low, the stride under-decimated,
+// the backlog grew and the fill watermark then doubled the stride instead.
+func (rc *RingConsumer) WireBytesPerSec() float64 {
+	rc.mu.Lock()
+	defer rc.mu.Unlock()
+	rc.syncLocked()
+	var bps float64
+	for _, t := range rc.tasks {
+		if t.PeriodUs > 0 {
+			bps += float64(int(t.PayloadLen)+wireRecordHeaderBytes) / float64(t.PeriodUs) * 1e6
 		}
 	}
 	return bps

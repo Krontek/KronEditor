@@ -1,7 +1,14 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <Library>
+  <!-- SYSTEM category. Every block here is implemented as `static inline` in
+       resources/krontek-include/kronsystem.h, NOT in a prebuilt libkron*.a.
+       Pin names and types must match FB_INPUTS / FB_INPUT_TYPES / FB_OUTPUTS /
+       SYSTEM_FB_OUTPUT_TYPES in CTranspilerService.js exactly. -->
   <Category name="SYSTEM">
-    <Block type="Read_System_Time" description="Read current system time (ms)" class="FunctionBlock">
+
+    <!-- ── Real-time clock / calendar ───────────────────────────────────── -->
+
+    <Block type="Read_System_Time" description="Read local time of day (ms since midnight)" class="FunctionBlock">
       <Inputs>
         <Variable name="EN" type="BOOL" default="FALSE" />
       </Inputs>
@@ -10,6 +17,294 @@
         <Variable name="TIME" type="DINT" />
       </Outputs>
     </Block>
+
+    <Block type="Read_System_Date" description="Read local calendar date (Weekday 1=Mon..7=Sun)" class="FunctionBlock">
+      <Inputs>
+        <Variable name="EN" type="BOOL" default="FALSE" />
+      </Inputs>
+      <Outputs>
+        <Variable name="ENO"       type="BOOL" />
+        <Variable name="Year"      type="INT" />
+        <Variable name="Month"     type="USINT" />
+        <Variable name="Day"       type="USINT" />
+        <Variable name="Weekday"   type="USINT" />
+        <Variable name="DayOfYear" type="UINT" />
+      </Outputs>
+    </Block>
+
+    <Block type="Read_Epoch_Time" description="Absolute UTC timestamp (Unix seconds + ms + UTC offset)" class="FunctionBlock">
+      <Inputs>
+        <Variable name="EN" type="BOOL" default="FALSE" />
+      </Inputs>
+      <Outputs>
+        <Variable name="ENO"        type="BOOL" />
+        <Variable name="SEC"        type="UDINT" />
+        <Variable name="MS"         type="UINT" />
+        <Variable name="UTC_Offset" type="INT" />
+      </Outputs>
+    </Block>
+
+    <Block type="Epoch_To_Date" description="Split an epoch-ms timestamp into calendar fields" class="FunctionBlock">
+      <Inputs>
+        <Variable name="EN"       type="BOOL" default="FALSE" />
+        <Variable name="EPOCH_MS" type="LINT" default="0" />
+        <Variable name="LOCAL"    type="BOOL" default="TRUE" />
+      </Inputs>
+      <Outputs>
+        <Variable name="ENO"         type="BOOL" />
+        <Variable name="Year"        type="INT" />
+        <Variable name="Month"       type="USINT" />
+        <Variable name="Day"         type="USINT" />
+        <Variable name="Hour"        type="USINT" />
+        <Variable name="Minute"      type="USINT" />
+        <Variable name="Second"      type="USINT" />
+        <Variable name="Millisecond" type="UINT" />
+        <Variable name="Weekday"     type="USINT" />
+      </Outputs>
+    </Block>
+
+    <!-- ── Clock-driven scheduling ──────────────────────────────────────── -->
+
+    <Block type="Time_Switch" description="Weekly time switch (DAYS bit0=Mon..bit6=Sun, 127=every day)" class="FunctionBlock">
+      <Inputs>
+        <Variable name="EN"    type="BOOL"  default="FALSE" />
+        <Variable name="ON_H"  type="USINT" default="0" />
+        <Variable name="ON_M"  type="USINT" default="0" />
+        <Variable name="OFF_H" type="USINT" default="0" />
+        <Variable name="OFF_M" type="USINT" default="0" />
+        <Variable name="DAYS"  type="BYTE"  default="127" />
+      </Inputs>
+      <Outputs>
+        <Variable name="ENO" type="BOOL" />
+        <Variable name="Q"   type="BOOL" />
+      </Outputs>
+    </Block>
+
+    <Block type="Daily_Trigger" description="One-scan pulse when the local clock crosses H:M:S" class="FunctionBlock">
+      <Inputs>
+        <Variable name="EN" type="BOOL"  default="FALSE" />
+        <Variable name="H"  type="USINT" default="0" />
+        <Variable name="M"  type="USINT" default="0" />
+        <Variable name="S"  type="USINT" default="0" />
+      </Inputs>
+      <Outputs>
+        <Variable name="ENO" type="BOOL" />
+        <Variable name="Q"   type="BOOL" />
+      </Outputs>
+    </Block>
+
+    <Block type="Astro_Clock" description="Sunrise/sunset for a position (minutes since local midnight)" class="FunctionBlock">
+      <Inputs>
+        <Variable name="EN"  type="BOOL" default="FALSE" />
+        <Variable name="LAT" type="REAL" default="0.0" />
+        <Variable name="LON" type="REAL" default="0.0" />
+      </Inputs>
+      <Outputs>
+        <Variable name="ENO"         type="BOOL" />
+        <Variable name="SUNRISE_MIN" type="UINT" />
+        <Variable name="SUNSET_MIN"  type="UINT" />
+        <Variable name="IS_DAY"      type="BOOL" />
+        <Variable name="VALID"       type="BOOL" />
+      </Outputs>
+    </Block>
+
+    <!-- ── Runtime diagnostics ──────────────────────────────────────────── -->
+
+    <Block type="Read_Uptime" description="Time since the runtime started" class="FunctionBlock">
+      <Inputs>
+        <Variable name="EN" type="BOOL" default="FALSE" />
+      </Inputs>
+      <Outputs>
+        <Variable name="ENO"       type="BOOL" />
+        <Variable name="DAYS"      type="UINT" />
+        <Variable name="HOURS"     type="USINT" />
+        <Variable name="MINUTES"   type="USINT" />
+        <Variable name="SECONDS"   type="USINT" />
+        <Variable name="TOTAL_SEC" type="UDINT" />
+      </Outputs>
+    </Block>
+
+    <Block type="Cycle_Time_Monitor" description="Measures this task's actual scan period (microseconds)" class="FunctionBlock">
+      <Inputs>
+        <Variable name="EN"    type="BOOL" default="FALSE" />
+        <Variable name="RESET" type="BOOL" default="FALSE" />
+      </Inputs>
+      <Outputs>
+        <Variable name="ENO"       type="BOOL" />
+        <Variable name="LAST_US"   type="UDINT" />
+        <Variable name="MIN_US"    type="UDINT" />
+        <Variable name="MAX_US"    type="UDINT" />
+        <Variable name="AVG_US"    type="UDINT" />
+        <Variable name="JITTER_US" type="UDINT" />
+        <Variable name="SAMPLES"   type="UDINT" />
+      </Outputs>
+    </Block>
+
+    <Block type="Hour_Meter" description="Accumulates run time while IN is true (declare Retain to keep it)" class="FunctionBlock">
+      <Inputs>
+        <Variable name="IN"    type="BOOL" default="FALSE" />
+        <Variable name="RESET" type="BOOL" default="FALSE" />
+      </Inputs>
+      <Outputs>
+        <Variable name="Q"       type="BOOL" />
+        <Variable name="HOURS"   type="UDINT" />
+        <Variable name="SECONDS" type="UDINT" />
+      </Outputs>
+    </Block>
+
+    <Block type="Watchdog" description="EXPIRED when KICK sees no rising edge within PT" class="FunctionBlock">
+      <Inputs>
+        <Variable name="KICK" type="BOOL" default="FALSE" />
+        <Variable name="PT"   type="TIME" default="T#1s" />
+      </Inputs>
+      <Outputs>
+        <Variable name="EXPIRED" type="BOOL" />
+        <Variable name="ET"      type="TIME" />
+      </Outputs>
+    </Block>
+
+    <!-- ── Host health (Linux target; ERR_ID=1 elsewhere) ───────────────── -->
+
+    <Block type="Read_CPU_Temperature" description="Hottest thermal zone in Celsius (Linux only)" class="FunctionBlock">
+      <Inputs>
+        <Variable name="EN" type="BOOL" default="FALSE" />
+      </Inputs>
+      <Outputs>
+        <Variable name="ENO"    type="BOOL" />
+        <Variable name="TEMP"   type="REAL" />
+        <Variable name="ERR_ID" type="USINT" />
+      </Outputs>
+    </Block>
+
+    <Block type="Read_System_Load" description="Load average and available memory (Linux only)" class="FunctionBlock">
+      <Inputs>
+        <Variable name="EN" type="BOOL" default="FALSE" />
+      </Inputs>
+      <Outputs>
+        <Variable name="ENO"          type="BOOL" />
+        <Variable name="LOAD_1M"      type="REAL" />
+        <Variable name="MEM_FREE_MB"  type="UDINT" />
+        <Variable name="MEM_TOTAL_MB" type="UDINT" />
+        <Variable name="ERR_ID"       type="USINT" />
+      </Outputs>
+    </Block>
+
+    <Block type="Read_Disk_Free" description="Free space on the runtime's working filesystem (POSIX only)" class="FunctionBlock">
+      <Inputs>
+        <Variable name="EN" type="BOOL" default="FALSE" />
+      </Inputs>
+      <Outputs>
+        <Variable name="ENO"      type="BOOL" />
+        <Variable name="FREE_MB"  type="UDINT" />
+        <Variable name="TOTAL_MB" type="UDINT" />
+        <Variable name="ERR_ID"   type="USINT" />
+      </Outputs>
+    </Block>
+
+    <!-- ── TIME arithmetic and conversion ───────────────────────────────────
+         Named without the X_TO_Y pattern on purpose: the transpiler rewrites
+         that spelling to KRON_<src>_TO_<dst>, which only resolves in the
+         prebuilt archive and has no TIME entry. -->
+
+    <Block type="T_To_Ms" description="TIME to whole milliseconds" class="FunctionBlock">
+      <Inputs>
+        <Variable name="EN" type="BOOL" default="FALSE" />
+        <Variable name="IN" type="TIME" default="T#0ms" />
+      </Inputs>
+      <Outputs>
+        <Variable name="ENO" type="BOOL" />
+        <Variable name="OUT" type="DINT" />
+      </Outputs>
+    </Block>
+
+    <Block type="Ms_To_T" description="Whole milliseconds to TIME" class="FunctionBlock">
+      <Inputs>
+        <Variable name="EN" type="BOOL" default="FALSE" />
+        <Variable name="IN" type="DINT" default="0" />
+      </Inputs>
+      <Outputs>
+        <Variable name="ENO" type="BOOL" />
+        <Variable name="OUT" type="TIME" />
+      </Outputs>
+    </Block>
+
+    <Block type="T_To_Sec" description="TIME to fractional seconds" class="FunctionBlock">
+      <Inputs>
+        <Variable name="EN" type="BOOL" default="FALSE" />
+        <Variable name="IN" type="TIME" default="T#0ms" />
+      </Inputs>
+      <Outputs>
+        <Variable name="ENO" type="BOOL" />
+        <Variable name="OUT" type="REAL" />
+      </Outputs>
+    </Block>
+
+    <Block type="Sec_To_T" description="Fractional seconds to TIME" class="FunctionBlock">
+      <Inputs>
+        <Variable name="EN" type="BOOL" default="FALSE" />
+        <Variable name="IN" type="REAL" default="0.0" />
+      </Inputs>
+      <Outputs>
+        <Variable name="ENO" type="BOOL" />
+        <Variable name="OUT" type="TIME" />
+      </Outputs>
+    </Block>
+
+    <Block type="Add_T" description="Sum of two durations (saturating)" class="FunctionBlock">
+      <Inputs>
+        <Variable name="EN"  type="BOOL" default="FALSE" />
+        <Variable name="IN1" type="TIME" default="T#0ms" />
+        <Variable name="IN2" type="TIME" default="T#0ms" />
+      </Inputs>
+      <Outputs>
+        <Variable name="ENO" type="BOOL" />
+        <Variable name="OUT" type="TIME" />
+      </Outputs>
+    </Block>
+
+    <Block type="Sub_T" description="Difference of two durations (clamped at zero)" class="FunctionBlock">
+      <Inputs>
+        <Variable name="EN"  type="BOOL" default="FALSE" />
+        <Variable name="IN1" type="TIME" default="T#0ms" />
+        <Variable name="IN2" type="TIME" default="T#0ms" />
+      </Inputs>
+      <Outputs>
+        <Variable name="ENO" type="BOOL" />
+        <Variable name="OUT" type="TIME" />
+      </Outputs>
+    </Block>
+
+    <Block type="Mul_T" description="Scale a duration by a factor" class="FunctionBlock">
+      <Inputs>
+        <Variable name="EN" type="BOOL" default="FALSE" />
+        <Variable name="IN" type="TIME" default="T#0ms" />
+        <Variable name="N"  type="REAL" default="1.0" />
+      </Inputs>
+      <Outputs>
+        <Variable name="ENO" type="BOOL" />
+        <Variable name="OUT" type="TIME" />
+      </Outputs>
+    </Block>
+
+    <Block type="Div_T" description="Divide a duration by a factor (0 yields 0)" class="FunctionBlock">
+      <Inputs>
+        <Variable name="EN" type="BOOL" default="FALSE" />
+        <Variable name="IN" type="TIME" default="T#0ms" />
+        <Variable name="N"  type="REAL" default="1.0" />
+      </Inputs>
+      <Outputs>
+        <Variable name="ENO" type="BOOL" />
+        <Variable name="OUT" type="TIME" />
+      </Outputs>
+    </Block>
+
+    <!-- ⚠️ PHANTOM: declared here but with no C implementation anywhere, so a
+         project using it transpiles and then fails at compile time with
+         "unknown type name 'Log_Data'". It cannot be implemented as a printf
+         either: the host agent discards the local simulation's stdout, and
+         KronServer writes the target's to a log file it exposes no endpoint
+         for. Publish diagnostics as VARIABLES instead — those already reach
+         the HMI, REST, SSE and the capture ring. -->
     <Block type="Log_Data" description="Log variable value to console" class="FunctionBlock">
       <Inputs>
         <Variable name="EN"    type="BOOL" default="FALSE" />

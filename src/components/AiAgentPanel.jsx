@@ -109,8 +109,8 @@ const PROVIDERS = [
   // check DeepSeek's docs for its current function-calling support before use.
   { id: 'deepseek', label: 'DeepSeek', auth: 'key', models: ['deepseek-chat', 'deepseek-reasoner'] },
   // Ollama's live list is what's INSTALLED, so its fallback must be pullable
-  // tags from OLLAMA_CATALOG below — bare names like "qwen2.5-coder" aren't.
-  { id: 'ollama', label: 'Ollama', auth: 'local', models: ['qwen2.5-coder:7b', 'qwen2.5-coder:14b', 'deepseek-coder-v2:16b', 'llama3.1:8b'] },
+  // tags from OLLAMA_CATALOG below — bare names like "qwen3-coder" aren't.
+  { id: 'ollama', label: 'Ollama', auth: 'local', models: ['qwen3-coder:30b', 'qwen3.8:27b', 'qwen3:14b', 'qwen3:8b'] },
   { id: 'custom', label: 'Custom endpoint', auth: 'custom', models: [] },
 ];
 
@@ -150,13 +150,26 @@ const defaultModelFor = (providerId) => PROVIDERS.find((p) => p.id === providerI
 
 // Curated catalog of local (Ollama) models the user can pull with one click.
 // `id` must match the exact Ollama tag so installed-state detection works.
+//
+// ⚠️ **Every entry MUST carry Ollama's `tools` capability.** The agent is a
+// tool-calling loop, so a model without a native tool API falls back to
+// text-mining recovery (§8) and produces plausible-looking nonsense rather
+// than an honest failure. That is why the old `codellama:7b` entry is gone
+// instead of merely being labelled — check the badge on
+// https://ollama.com/search?c=tools before adding a model here.
+//
+// Ordered small → large. Sizes are the q4_K_M default tag's DOWNLOAD size;
+// running comfortably wants roughly that much VRAM (or system RAM on CPU).
 const OLLAMA_CATALOG = [
-  { id: 'qwen2.5-coder:1.5b', label: 'Qwen2.5 Coder 1.5B', size: '~1.0 GB', desc: 'Fast, lightweight coding assistant' },
-  { id: 'qwen2.5-coder:7b', label: 'Qwen2.5 Coder 7B', size: '~4.7 GB', desc: 'Strong, balanced coding model', recommended: true },
-  { id: 'qwen2.5-coder:14b', label: 'Qwen2.5 Coder 14B', size: '~9.0 GB', desc: 'Higher quality, needs more RAM' },
-  { id: 'deepseek-coder-v2:16b', label: 'DeepSeek Coder V2 16B', size: '~8.9 GB', desc: 'Strong code generation' },
-  { id: 'codellama:7b', label: 'Code Llama 7B', size: '~3.8 GB', desc: "Meta's code model — no native tool API (uses a prompt fallback; less reliable for the agent)" },
-  { id: 'llama3.1:8b', label: 'Llama 3.1 8B', size: '~4.7 GB', desc: 'General-purpose reasoning' },
+  { id: 'granite4.1:3b', label: 'Granite 4.1 3B', size: '~2.1 GB', desc: "IBM, Apache-2.0. The smallest model here that tool-calls reliably — for low-RAM machines; expect single-step edits only" },
+  { id: 'qwen3:8b', label: 'Qwen3 8B', size: '~5.2 GB', desc: 'General-purpose with native tool calling — the practical floor for multi-step edits' },
+  { id: 'qwen3:14b', label: 'Qwen3 14B', size: '~9.3 GB', desc: 'Clearly better plan-then-edit reliability; the best fit for a 12 GB GPU' },
+  // MoE with only ~3B active params: it downloads like a 30B but runs at
+  // roughly 3B speed, so it is the best quality-per-second pick on any machine
+  // with the RAM to hold it — hence `recommended` over the smaller dense tags.
+  { id: 'qwen3-coder:30b', label: 'Qwen3 Coder 30B (MoE)', size: '~19 GB', desc: 'Trained for agentic coding; 3B active params, so it stays fast even on CPU. 256K context', recommended: true },
+  { id: 'qwen3.8:27b', label: 'Qwen3.8 27B', size: '~18 GB', desc: "Qwen's current flagship: strongest long-horizon agentic work and environment-feedback handling. 256K context, wants ~24 GB VRAM" },
+  { id: 'muse-glimmer:30b', label: 'Muse Glimmer 30B', size: '~18 GB', desc: "Meta's local-agent model — explicitly tuned for tool use and failure recovery, which is what this panel's loop does" },
 ];
 
 const formatBytes = (n) => {
@@ -612,7 +625,18 @@ function focusTarget(steps) {
 // the big prefix (tools + rules + block catalog + history) stay byte-identical
 // across agent-loop turns: with it inlined, every project edit invalidated the
 // whole cache and each turn re-billed everything at full input price.
-function buildProjectContext(projectStructure, board, activeItem) {
+//
+// ⚠️ It also carries the RUN STATE, and that line is load-bearing. Nothing else
+// in the request tells the model whether a program is running: the tool schemas
+// only describe how to ASK. Without it a model that does not spontaneously call
+// read_live_variables answers "no program seems to be running" from its own
+// priors — a confident, wholly invented claim about the machine, produced while
+// a real target was streaming values. Measured on qwen3-coder:30b against the
+// conversation that exposed this: 0/4 turns called a live tool without the
+// line, 4/4 with it. Values themselves stay OUT (they change every 500 ms and
+// would defeat every provider's prompt cache) — this is a pointer to the tools,
+// not a substitute for them.
+function buildProjectContext(projectStructure, board, activeItem, liveVariables) {
   const overview = buildProjectOverview(projectStructure, board);
   const active = activeItem ? `${activeItem.name} (${activeItem.type})` : 'none';
   const pous = overview.pous.map((p) => `${p.name}[${p.language}${p.returnType ? ' ' + p.returnType : ''}]`).join(', ') || '(none)';
@@ -622,12 +646,21 @@ function buildProjectContext(projectStructure, board, activeItem) {
     ...(projectStructure?.functionBlocks || []).map((p) => p.name),
     ...(projectStructure?.functions || []).map((p) => p.name),
   ].join(', ');
+  // null = not running at all; {} = running but no sample has arrived yet, which
+  // is a real and short-lived state right after Run and must not read as stopped.
+  const liveCount = liveVariables ? Object.keys(liveVariables).length : 0;
+  const runLine = !liveVariables
+    ? 'Runtime: STOPPED. No live values exist; read_live_variables will confirm this. Do not speculate about current values.'
+    : liveCount === 0
+      ? 'Runtime: RUNNING, but no samples have arrived yet. Call read_live_variables to check, or watch_live_variables to wait for data.'
+      : `Runtime: RUNNING — ${liveCount} live variables are streaming RIGHT NOW. You CAN observe this machine: call read_live_variables for a snapshot, or watch_live_variables to see behaviour over time. Never tell the user that nothing is running, or that you cannot see live data, while this line says RUNNING.`;
   return [
     `Board: ${board || 'none'}. Currently open POU: ${active}.`,
     `POUs (${overview.pous.length}): ${pous}.`,
     `Global variables: ${globals}.`,
     dts ? `Data types: ${dts}.` : '',
     projBlocks ? `Project-defined blocks (call list_blocks for their pins): ${projBlocks}` : '',
+    runLine,
   ].filter(Boolean).join('\n');
 }
 
@@ -900,7 +933,14 @@ export default function AiAgentPanel({
   // (live values tick every few hundred ms).
   const liveBufRef = useRef([]);
   const LIVE_BUF_MAX = 600; // cap (~minutes at the SSE cadence); auto-trimmed
+  // ⚠️ Also mirrored into a REF. `runTurn` is a useCallback that RECURSES between
+  // turns, so an agent run started before the user pressed Run keeps the
+  // liveVariables it closed over for its whole life — the run-state line below
+  // would then report "stopped" for every later turn of a run that is now
+  // watching a live machine. The ref is always current.
+  const liveRef = useRef(liveVariables);
   useEffect(() => {
+    liveRef.current = liveVariables;
     if (!liveVariables || Object.keys(liveVariables).length === 0) return;
     const buf = liveBufRef.current;
     buf.push({ t: Date.now(), v: liveVariables });
@@ -1197,7 +1237,7 @@ export default function AiAgentPanel({
       assistant = await host.aiChat({
         provider: config.provider, model: config.model, apiKey: config.apiKey, baseUrl: config.baseUrl,
         system: buildSystemPrompt(libraryData, agentModeRef.current),
-        context: buildProjectContext(psRef.current, selectedBoard, activeItem),
+        context: buildProjectContext(psRef.current, selectedBoard, activeItem, liveRef.current),
         messages: providerSafeMessages(apiMessages),
         tools: TOOL_DEFS,
       }, controller.signal);
@@ -1327,13 +1367,19 @@ export default function AiAgentPanel({
       const args = parseArgs(tc.arguments);
       if (args.__parseError) { steps.push({ tc, args: {}, res: { ok: false, error: 'arguments were not valid JSON' } }); continue; }
       if (tc.name === 'get_project_overview') args.__board = selectedBoard;
-      if (tc.name === 'read_live_variables') args.__live = { current: liveVariables, history: summarizeLiveSamples(liveBufRef.current) };
+      // ⚠️ liveRef/liveBufRef, NOT the `liveVariables` closed over by this
+      // callback: runTurn recurses across every turn of a run, so the prop it
+      // captured is frozen at the moment the run STARTED. A diagnostic run that
+      // spans a minute would keep reporting that first snapshot as "current" —
+      // and a run begun before Run was pressed would report "not running"
+      // forever, which is precisely the complaint that led here.
+      if (tc.name === 'read_live_variables') args.__live = { current: liveRef.current, history: summarizeLiveSamples(liveBufRef.current) };
       if (tc.name === 'watch_live_variables') {
         // Active observation: actually WAIT real time so fresh samples land in
         // liveBufRef (the SSE effect keeps filling it during this await), then
         // summarize each variable over its own trailing window. The loop is
         // async, so awaiting here pauses only this turn — not the whole app.
-        const running = liveVariables && Object.keys(liveVariables).length > 0;
+        const running = liveRef.current && Object.keys(liveRef.current).length > 0;
         if (!running) {
           args.__watch = { running: false };
         } else {
@@ -1424,7 +1470,11 @@ export default function AiAgentPanel({
     setMessages((m) => [...m, { id: viewId, role: 'proposal', steps, status: 'pending' }]);
     setPending({ steps, dryStruct: working, viewId, turn });
     setRunning(false);
-  }, [config, selectedBoard, activeItem, liveVariables]);
+    // liveVariables is deliberately NOT a dep: everything live is read through
+    // liveRef/liveBufRef above. As a dep it rebuilt this callback ~2x/second for
+    // the whole time a program ran, and bought nothing — a run in flight kept
+    // its own closure regardless.
+  }, [config, selectedBoard, activeItem]);
 
   // Commit a turn's composed result into the live project and push it online if
   // a hot-swap session is active. Shared by AUTO mode and manual approval.

@@ -549,27 +549,11 @@ func (s *Server) runtimeConfigSnapshotLocked() map[string]any {
 	}
 }
 
-// StartRuntime mirrors the ConnectRPC Start. Initial values are written by
-// pm's pre-start hook (see main.go) AFTER any previous process has stopped
-// and BEFORE the new one spawns — writing them here would let the dying
-// runtime's final shm sync overwrite them. Implements RuntimeController.
+// StartRuntime mirrors the ConnectRPC Start. Initial values AND the capture-ring
+// segment are both established by pm's pre-start hook (see main.go) AFTER any
+// previous process has stopped and BEFORE the new one spawns. Implements
+// RuntimeController.
 func (s *Server) StartRuntime() (int, error) {
-	// Size the capture ring from the RAM-% setting and (re)create the segment
-	// BEFORE the runtime spawns, so the runtime adopts KronServer's size (no env
-	// has to survive a sudo reset). Best-effort: a failure here must not block
-	// starting the runtime — the runtime falls back to its own default size.
-	s.rtMu.Lock()
-	pct := s.rtCfg.RingRAMPercent
-	s.rtMu.Unlock()
-	if pct <= 0 {
-		pct = ringDefaultPercent // unset → default to 50% of available RAM
-	}
-	_, avail := readMemInfo()
-	bytes := ringBytesFromPercent(pct, avail)
-	if err := createRingSegment(s.cfg.ShmName, bytes); err != nil {
-		slog.Warn("Failed to pre-size capture ring; runtime will use default", "err", err, "bytes", bytes)
-	}
-
 	if err := s.pm.Start(); err != nil {
 		return 0, err
 	}
@@ -577,9 +561,38 @@ func (s *Server) StartRuntime() (int, error) {
 	return pid, nil
 }
 
-// resolvedRingBytes returns the byte size the capture ring would get from the
-// current RAM-% setting and live device memory (for /status display).
-func (s *Server) resolvedRingBytes() (bytes, memTotal, memAvail uint64, pct float64) {
+// SizeRingSegment (re)creates /dev/shm/<shm>_ring at the resolved size so the
+// runtime ADOPTS it instead of falling back to its own 1 MiB default (the
+// runtime only ftruncates when the segment is smaller than one record), and no
+// env var has to survive a `sudo` reset.
+//
+// ⚠️ This MUST run from pm's pre-start hook, never from StartRuntime alone.
+// StartRuntime is only one of FOUR ways a runtime is spawned — the ConnectRPC
+// Start (service.go, i.e. the editor's Run button), AutoRun at agent startup
+// (main.go) and the crash-restart watchdog (process.go) all call pm.Start()
+// directly. Sizing here from StartRuntime left the editor's own Run button
+// producing a 1 MiB ring: 0.43 s of slack at 100 kHz, which trips the
+// decimation controller's grow-fast branch within half a second of the first
+// client connecting and pins the stride in the thousands. /status happily
+// reported the configured size the whole time, because it was computed and
+// never applied. pm.preStartHook is the one choke point all four paths share.
+//
+// Best-effort: a failure must not block starting the runtime.
+func (s *Server) SizeRingSegment() {
+	bytes, _, _, _, _ := s.resolvedRingBytes()
+	if err := createRingSegment(s.cfg.ShmName, bytes); err != nil {
+		slog.Warn("Failed to pre-size capture ring; runtime will use its default",
+			"err", err, "bytes", bytes)
+		return
+	}
+	slog.Info("Capture ring sized", "bytes", bytes)
+}
+
+// resolvedRingBytes returns the byte size the capture ring gets from the
+// deployed project's production rate, bounded by the RAM-% ceiling and live
+// device memory. Also what /status reports — so the number on screen is the
+// number actually applied at the next start.
+func (s *Server) resolvedRingBytes() (bytes, memTotal, memAvail uint64, pct, produced float64) {
 	s.rtMu.Lock()
 	pct = s.rtCfg.RingRAMPercent
 	s.rtMu.Unlock()
@@ -587,8 +600,9 @@ func (s *Server) resolvedRingBytes() (bytes, memTotal, memAvail uint64, pct floa
 		pct = ringDefaultPercent // report the EFFECTIVE percent (unset → 50%)
 	}
 	memTotal, memAvail = readMemInfo()
-	bytes = ringBytesFromPercent(pct, memAvail)
-	return bytes, memTotal, memAvail, pct
+	produced = ringProducedBytesPerSec(s.ipc.RingConfig())
+	bytes = ringBytesFor(pct, memAvail, produced)
+	return bytes, memTotal, memAvail, pct, produced
 }
 
 // StopRuntime gracefully terminates the PLC runtime. Implements RuntimeController.
@@ -607,7 +621,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	autoRun := s.rtCfg.AutoRun
 	hmiPort := s.rtCfg.HMIPort
 	s.rtMu.Unlock()
-	ringBytes, memTotal, memAvail, ringPct := s.resolvedRingBytes()
+	ringBytes, memTotal, memAvail, ringPct, ringProduced := s.resolvedRingBytes()
 	resp := map[string]any{
 		"running":             running,
 		"pid":                 pid,
@@ -621,6 +635,11 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		"mem_available_bytes": memAvail,
 		"ring_ram_percent":    ringPct,
 		"ring_bytes":          ringBytes,
+		// Ring bytes/s the deployed project writes. Lets the editor show the
+		// buffer's real stall tolerance (ring_bytes / this) instead of guessing
+		// it from the variable list — a guess that ignored the record header and
+		// came out 3x optimistic for a single 8-byte variable.
+		"ring_produced_bytes_per_sec": ringProduced,
 	}
 	// Last swap/cold-start/crash outcome — the editor's existing 3s /status
 	// poll is the only channel back from the field side for this (no

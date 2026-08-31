@@ -2916,9 +2916,20 @@ const FB_TRIGGER_PIN = {
     'MC_ReadActualPosition': 'Enable', 'MC_ReadActualVelocity': 'Enable',
     'MC_ReadActualTorque': 'Enable', 'MC_ReadStatus': 'Enable',
     'MC_ReadMotionState': 'Enable', 'MC_ReadAxisInfo': 'Enable', 'MC_ReadAxisError': 'Enable',
-    // System / RTC (kronsystem.h) — EN-triggered but a REAL instance FB,
-    // hence the SYSTEM_FB_TYPES entry that keeps it out of isInlineMathType.
-    'Read_System_Time': 'EN',
+    // System / RTC / scheduling / diagnostics (kronsystem.h). The EN-triggered
+    // ones are REAL instance FBs, hence their SYSTEM_FB_TYPES entries, which
+    // keep them out of isInlineMathType.
+    'Read_System_Time': 'EN', 'Read_System_Date': 'EN', 'Read_Epoch_Time': 'EN',
+    'Epoch_To_Date': 'EN',
+    'Time_Switch': 'EN', 'Daily_Trigger': 'EN', 'Astro_Clock': 'EN',
+    'Read_Uptime': 'EN', 'Cycle_Time_Monitor': 'EN',
+    'Read_CPU_Temperature': 'EN', 'Read_System_Load': 'EN', 'Read_Disk_Free': 'EN',
+    'T_To_Ms': 'EN', 'Ms_To_T': 'EN', 'T_To_Sec': 'EN', 'Sec_To_T': 'EN',
+    'Add_T': 'EN', 'Sub_T': 'EN', 'Mul_T': 'EN', 'Div_T': 'EN',
+    'Gen_Signal': 'EN',
+    // Power flow enters these on their own signal pin, so no EN and no
+    // SYSTEM_FB_TYPES entry is needed (isInlineMathType is already false).
+    'Hour_Meter': 'IN', 'Watchdog': 'KICK', 'Blink': 'ENABLE', 'Debounce': 'IN',
 };
 
 // Primary boolean output pin for downstream power flow
@@ -2963,8 +2974,16 @@ const FB_Q_OUTPUT = {
     'MC_ReadActualPosition': 'Valid', 'MC_ReadActualVelocity': 'Valid',
     'MC_ReadActualTorque': 'Valid', 'MC_ReadStatus': 'Valid',
     'MC_ReadMotionState': 'Valid', 'MC_ReadAxisInfo': 'Valid', 'MC_ReadAxisError': 'Valid',
-    // System / RTC
-    'Read_System_Time': 'ENO',
+    // System / RTC / scheduling / diagnostics
+    'Read_System_Time': 'ENO', 'Read_System_Date': 'ENO', 'Read_Epoch_Time': 'ENO',
+    'Epoch_To_Date': 'ENO',
+    'Time_Switch': 'Q', 'Daily_Trigger': 'Q', 'Astro_Clock': 'IS_DAY',
+    'Read_Uptime': 'ENO', 'Cycle_Time_Monitor': 'ENO', 'Hour_Meter': 'Q',
+    'Watchdog': 'EXPIRED',
+    'Read_CPU_Temperature': 'ENO', 'Read_System_Load': 'ENO', 'Read_Disk_Free': 'ENO',
+    'T_To_Ms': 'ENO', 'Ms_To_T': 'ENO', 'T_To_Sec': 'ENO', 'Sec_To_T': 'ENO',
+    'Add_T': 'ENO', 'Sub_T': 'ENO', 'Mul_T': 'ENO', 'Div_T': 'ENO',
+    'Blink': 'OUT', 'Debounce': 'OUT', 'Gen_Signal': 'ENO',
 };
 
 // Exported for agentTools.js (the PLC Agent's set_ladder): the agent authors
@@ -2975,15 +2994,48 @@ export { FB_TRIGGER_PIN, FB_Q_OUTPUT };
 
 const GENERATED_FB_OUTPUT_TYPES = {};
 
+// Output pin types for the kronsystem.h blocks. These MUST be declared rather
+// than inferred: the generic rules in getOutputPinType key off pin NAMES, and
+// every one of these blocks has pins those rules would get wrong —
+// Read_System_Time.TIME is a DINT (ms since local midnight), not the IEC TIME
+// duration its name suggests; Gen_Signal.OUT is a REAL where the `OUT` rule
+// yields DINT; and everything not otherwise matched silently defaults to BOOL.
+const SYSTEM_FB_OUTPUT_TYPES = {
+    'Read_System_Time':     { 'TIME': 'DINT' },
+    'Read_System_Date':     { 'Year': 'INT', 'Month': 'USINT', 'Day': 'USINT', 'Weekday': 'USINT', 'DayOfYear': 'UINT' },
+    'Read_Epoch_Time':      { 'SEC': 'UDINT', 'MS': 'UINT', 'UTC_Offset': 'INT' },
+    'Epoch_To_Date':        { 'Year': 'INT', 'Month': 'USINT', 'Day': 'USINT', 'Hour': 'USINT',
+                              'Minute': 'USINT', 'Second': 'USINT', 'Millisecond': 'UINT', 'Weekday': 'USINT' },
+    'Astro_Clock':          { 'SUNRISE_MIN': 'UINT', 'SUNSET_MIN': 'UINT', 'IS_DAY': 'BOOL', 'VALID': 'BOOL' },
+    'Read_Uptime':          { 'DAYS': 'UINT', 'HOURS': 'USINT', 'MINUTES': 'USINT', 'SECONDS': 'USINT', 'TOTAL_SEC': 'UDINT' },
+    'Cycle_Time_Monitor':   { 'LAST_US': 'UDINT', 'MIN_US': 'UDINT', 'MAX_US': 'UDINT',
+                              'AVG_US': 'UDINT', 'JITTER_US': 'UDINT', 'SAMPLES': 'UDINT' },
+    // Hour_Meter counts a total, so SECONDS is a UDINT here and a 0..59
+    // component (USINT) on Read_Uptime — the table is per block for that reason.
+    'Hour_Meter':           { 'HOURS': 'UDINT', 'SECONDS': 'UDINT' },
+    'Watchdog':             { 'EXPIRED': 'BOOL', 'ET': 'TIME' },
+    'Read_CPU_Temperature': { 'TEMP': 'REAL', 'ERR_ID': 'USINT' },
+    'Read_System_Load':     { 'LOAD_1M': 'REAL', 'MEM_FREE_MB': 'UDINT', 'MEM_TOTAL_MB': 'UDINT', 'ERR_ID': 'USINT' },
+    'Read_Disk_Free':       { 'FREE_MB': 'UDINT', 'TOTAL_MB': 'UDINT', 'ERR_ID': 'USINT' },
+    'T_To_Ms':              { 'OUT': 'DINT' },
+    'Ms_To_T':              { 'OUT': 'TIME' },
+    'T_To_Sec':             { 'OUT': 'REAL' },
+    'Sec_To_T':             { 'OUT': 'TIME' },
+    'Add_T':                { 'OUT': 'TIME' },
+    'Sub_T':                { 'OUT': 'TIME' },
+    'Mul_T':                { 'OUT': 'TIME' },
+    'Div_T':                { 'OUT': 'TIME' },
+    'Blink':                { 'OUT': 'BOOL' },
+    'Debounce':             { 'OUT': 'BOOL' },
+    'Gen_Signal':           { 'OUT': 'REAL' },
+};
+
 // Returns the IEC type of an output pin for a given block type
 // customData is optional — used for user-defined FB output pin types
 const getOutputPinType = (blockType, pinName, customData) => {
     if (['Q', 'Q1', 'QU', 'QD', 'ENO'].includes(pinName)) return 'BOOL';
     if ((blockType === 'UART_Receive' || blockType === 'USB_Receive') && pinName === 'ReceivedLength') return 'UINT';
-    // Read_System_Time.TIME is a DINT (ms since local midnight), NOT the IEC
-    // TIME duration type the pin name suggests — must not fall through to the
-    // `pinName === 'ET'`-style rules or the default BOOL.
-    if (blockType === 'Read_System_Time' && pinName === 'TIME') return 'DINT';
+    if (SYSTEM_FB_OUTPUT_TYPES[blockType]?.[pinName]) return SYSTEM_FB_OUTPUT_TYPES[blockType][pinName];
     if (GENERATED_FB_OUTPUT_TYPES[blockType]?.[pinName]) return GENERATED_FB_OUTPUT_TYPES[blockType][pinName];
     if (pinName === 'ET') return 'TIME';
     if (pinName === 'CV') return 'INT';
@@ -3214,8 +3266,26 @@ const FB_OUTPUTS = {
     'MC_ReadMotionState': ['Valid', 'Busy', 'Error', 'ErrorID', 'ConstantVelocity', 'Accelerating', 'Decelerating', 'DirectionPositive', 'DirectionNegative'],
     'MC_ReadAxisInfo': ['Valid', 'Busy', 'Error', 'ErrorID'],
     'MC_ReadAxisError': ['Valid', 'Busy', 'Error', 'ErrorID', 'AxisErrorID'],
-    // System / RTC (kronsystem.h)
+    // System / RTC / scheduling / diagnostics (kronsystem.h)
     'Read_System_Time': ['ENO', 'TIME'],
+    'Read_System_Date': ['ENO', 'Year', 'Month', 'Day', 'Weekday', 'DayOfYear'],
+    'Read_Epoch_Time': ['ENO', 'SEC', 'MS', 'UTC_Offset'],
+    'Epoch_To_Date': ['ENO', 'Year', 'Month', 'Day', 'Hour', 'Minute', 'Second', 'Millisecond', 'Weekday'],
+    'Time_Switch': ['ENO', 'Q'],
+    'Daily_Trigger': ['ENO', 'Q'],
+    'Astro_Clock': ['ENO', 'SUNRISE_MIN', 'SUNSET_MIN', 'IS_DAY', 'VALID'],
+    'Read_Uptime': ['ENO', 'DAYS', 'HOURS', 'MINUTES', 'SECONDS', 'TOTAL_SEC'],
+    'Cycle_Time_Monitor': ['ENO', 'LAST_US', 'MIN_US', 'MAX_US', 'AVG_US', 'JITTER_US', 'SAMPLES'],
+    'Hour_Meter': ['Q', 'HOURS', 'SECONDS'],
+    'Watchdog': ['EXPIRED', 'ET'],
+    'Read_CPU_Temperature': ['ENO', 'TEMP', 'ERR_ID'],
+    'Read_System_Load': ['ENO', 'LOAD_1M', 'MEM_FREE_MB', 'MEM_TOTAL_MB', 'ERR_ID'],
+    'Read_Disk_Free': ['ENO', 'FREE_MB', 'TOTAL_MB', 'ERR_ID'],
+    'T_To_Ms': ['ENO', 'OUT'], 'Ms_To_T': ['ENO', 'OUT'],
+    'T_To_Sec': ['ENO', 'OUT'], 'Sec_To_T': ['ENO', 'OUT'],
+    'Add_T': ['ENO', 'OUT'], 'Sub_T': ['ENO', 'OUT'],
+    'Mul_T': ['ENO', 'OUT'], 'Div_T': ['ENO', 'OUT'],
+    'Blink': ['OUT'], 'Debounce': ['OUT'], 'Gen_Signal': ['ENO', 'OUT'],
 };
 // All conversion blocks (X_TO_Y) share ['ENO', 'OUT'] — built dynamically below
 // Programmatically populate all 72 X_TO_Y conversion entries across lookup tables
@@ -3291,7 +3361,25 @@ const EC_PDO_VAR_NAMES = new Set();
 // ⚠️ Every member needs a struct + `<Type>_Call(<Type>*)` reachable from a
 // kron*.h in resources/krontek-include/ — otherwise the generated C references
 // a type and a function that do not exist and the build fails at compile time.
-const SYSTEM_FB_TYPES = new Set(['Read_System_Time']);
+const SYSTEM_FB_TYPES = new Set([
+    // RTC / calendar
+    'Read_System_Time', 'Read_System_Date', 'Read_Epoch_Time', 'Epoch_To_Date',
+    // Clock-driven scheduling
+    'Time_Switch', 'Daily_Trigger', 'Astro_Clock',
+    // Runtime diagnostics
+    'Read_Uptime', 'Cycle_Time_Monitor',
+    // Host health
+    'Read_CPU_Temperature', 'Read_System_Load', 'Read_Disk_Free',
+    // TIME arithmetic. These are stateless, but they cannot take the inline
+    // path: that branch dispatches through KRON_FN / BITWISE_OP / MATH_FB_BLOCKS
+    // and a name in none of those tables has nowhere to be emitted. They are
+    // also why the block names avoid the X_TO_Y spelling — transformExpr
+    // rewrites that to KRON_<src>_TO_<dst>, which only resolves in the archive.
+    'T_To_Ms', 'Ms_To_T', 'T_To_Sec', 'Sec_To_T',
+    'Add_T', 'Sub_T', 'Mul_T', 'Div_T',
+    // Signal generation (Blink/Debounce need no entry — their trigger is not EN)
+    'Gen_Signal',
+]);
 export { SYSTEM_FB_TYPES };
 
 // Returns true for EN-trigger stateless blocks that should be inlined.
@@ -3374,8 +3462,28 @@ const FB_INPUTS = {
     'MC_ReadMotionState': ['Enable'],
     'MC_ReadAxisInfo': ['Enable'],
     'MC_ReadAxisError': ['Enable'],
-    // System / RTC (kronsystem.h)
+    // System / RTC / scheduling / diagnostics (kronsystem.h)
     'Read_System_Time': ['EN'],
+    'Read_System_Date': ['EN'],
+    'Read_Epoch_Time': ['EN'],
+    'Epoch_To_Date': ['EN', 'EPOCH_MS', 'LOCAL'],
+    'Time_Switch': ['EN', 'ON_H', 'ON_M', 'OFF_H', 'OFF_M', 'DAYS'],
+    'Daily_Trigger': ['EN', 'H', 'M', 'S'],
+    'Astro_Clock': ['EN', 'LAT', 'LON'],
+    'Read_Uptime': ['EN'],
+    'Cycle_Time_Monitor': ['EN', 'RESET'],
+    'Hour_Meter': ['IN', 'RESET'],
+    'Watchdog': ['KICK', 'PT'],
+    'Read_CPU_Temperature': ['EN'],
+    'Read_System_Load': ['EN'],
+    'Read_Disk_Free': ['EN'],
+    'T_To_Ms': ['EN', 'IN'], 'Ms_To_T': ['EN', 'IN'],
+    'T_To_Sec': ['EN', 'IN'], 'Sec_To_T': ['EN', 'IN'],
+    'Add_T': ['EN', 'IN1', 'IN2'], 'Sub_T': ['EN', 'IN1', 'IN2'],
+    'Mul_T': ['EN', 'IN', 'N'], 'Div_T': ['EN', 'IN', 'N'],
+    'Blink': ['ENABLE', 'T_LOW', 'T_HIGH'],
+    'Debounce': ['IN', 'PT'],
+    'Gen_Signal': ['EN', 'MODE', 'PERIOD', 'AMPLITUDE', 'OFFSET'],
 };
 
 // EtherCAT diagnostic FBs that require KRON_EC_Config* (&__ec_cfg) as 2nd parameter.
@@ -3487,6 +3595,25 @@ const FB_INPUT_TYPES = {
     'SHR':   { 'IN': 'DWORD', 'N': 'USINT' },
     'ROL':   { 'IN': 'DWORD', 'N': 'USINT' },
     'ROR':   { 'IN': 'DWORD', 'N': 'USINT' },
+    // System / RTC / scheduling / diagnostics (kronsystem.h)
+    'Epoch_To_Date':      { 'EPOCH_MS': 'LINT', 'LOCAL': 'BOOL' },
+    'Time_Switch':        { 'ON_H': 'USINT', 'ON_M': 'USINT', 'OFF_H': 'USINT', 'OFF_M': 'USINT', 'DAYS': 'BYTE' },
+    'Daily_Trigger':      { 'H': 'USINT', 'M': 'USINT', 'S': 'USINT' },
+    'Astro_Clock':        { 'LAT': 'REAL', 'LON': 'REAL' },
+    'Cycle_Time_Monitor': { 'RESET': 'BOOL' },
+    'Hour_Meter':         { 'RESET': 'BOOL' },
+    'Watchdog':           { 'PT': 'TIME' },
+    'T_To_Ms':            { 'IN': 'TIME' },
+    'Ms_To_T':            { 'IN': 'DINT' },
+    'T_To_Sec':           { 'IN': 'TIME' },
+    'Sec_To_T':           { 'IN': 'REAL' },
+    'Add_T':              { 'IN1': 'TIME', 'IN2': 'TIME' },
+    'Sub_T':              { 'IN1': 'TIME', 'IN2': 'TIME' },
+    'Mul_T':              { 'IN': 'TIME', 'N': 'REAL' },
+    'Div_T':              { 'IN': 'TIME', 'N': 'REAL' },
+    'Blink':              { 'T_LOW': 'TIME', 'T_HIGH': 'TIME' },
+    'Debounce':           { 'PT': 'TIME' },
+    'Gen_Signal':         { 'MODE': 'USINT', 'PERIOD': 'TIME', 'AMPLITUDE': 'REAL', 'OFFSET': 'REAL' },
 };
 // Motion control: all MC_* FBs take Axis: AXIS_REF
 [...MOTION_FB_AXIS_PARAM].forEach(k => { FB_INPUT_TYPES[k] = { 'Axis': 'AXIS_REF' }; });

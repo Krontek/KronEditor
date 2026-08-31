@@ -58,10 +58,18 @@ func main() {
 	srv := NewServer(cfg, ipc, pm, hmi)
 	// Wire the crash-restart watchdog so it knows when AutoRun is on.
 	pm.SetAutoRunGetter(srv.AutoRunEnabled)
-	// Initial values are written inside pm.Start(), AFTER any previous
-	// process has fully stopped and BEFORE the new one spawns — never
-	// beforehand, where the dying runtime's shm sync would overwrite them.
-	pm.SetPreStartHook(ipc.WriteInitialValues)
+	// Everything that must be established between "old runtime stopped" and
+	// "new runtime spawned" hangs off this ONE hook, because it is the only
+	// point all four start paths share (StartRuntime, the ConnectRPC Start, the
+	// AutoRun start below, and the crash-restart watchdog):
+	//   • initial values — written here and not earlier, where the dying
+	//     runtime's final shm sync would overwrite them;
+	//   • the capture-ring segment — sized here and not in StartRuntime, which
+	//     three of the four paths bypass (see Server.SizeRingSegment).
+	pm.SetPreStartHook(func() {
+		ipc.WriteInitialValues()
+		srv.SizeRingSegment()
+	})
 
 	// Reap any runtime left behind by a previous agent crash. Must run
 	// BEFORE the HTTP server starts accepting: a Start RPC arriving in the

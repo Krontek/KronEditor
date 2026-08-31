@@ -67,8 +67,8 @@ type OllamaState struct {
 	// GPU totals parsed from the managed daemon's own startup logs — a fallback
 	// for when nvidia-smi is absent or broken (e.g. driver/NVML mismatch) yet
 	// Ollama itself still detects the GPU.
-	gpuName       string
-	gpuVramTotal  int64
+	gpuName      string
+	gpuVramTotal int64
 }
 
 func NewOllamaState() *OllamaState {
@@ -993,3 +993,203 @@ func (e *httpStatusErr) Error() string {
 type missingBinErr struct{ path string }
 
 func (e *missingBinErr) Error() string { return "ollama binary not found after extract: " + e.path }
+
+// ── context-window sizing for the agent's chat calls ─────────────────────────
+//
+// Ollama defaults num_ctx to 4096 and silently DROPS the oldest messages once
+// a turn exceeds it — so a long agent run quietly loses the project map and
+// the model starts inventing POU names instead of failing. `ollamaChatOnce`
+// therefore always sets num_ctx explicitly.
+//
+// ⚠️ One constant cannot fit the catalogue. The old flat 8192 wasted a 30B
+// with a 256K window, while that same 8192 of KV cache stacked on a 14B's
+// weights already overflows a 12 GB card — and Ollama's response to not
+// fitting is to spill layers to CPU, which is SLOW rather than broken, so
+// nobody ever notices it happened. Size it from the model + the hardware:
+//
+//	/api/show  → the architecture's own max context, plus the shapes that fix
+//	             the KV cache's cost per token (block_count, head_count_kv,
+//	             key/value_length)
+//	/api/tags  → the weights' on-disk size, which is what they occupy in VRAM
+//	detectGPU  → total VRAM, best-effort (nvidia-smi; absent on AMD/Apple/CPU)
+//
+// num_ctx is then the largest window whose KV cache fits the headroom left
+// after weights + a scratch reserve, clamped to the model's own maximum and
+// to [ollamaMinCtx, ollamaMaxCtx].
+const (
+	// Below this the system prompt + tool schemas alone crowd out the
+	// conversation, which is the failure this whole mechanism exists to avoid.
+	ollamaMinCtx = 8192
+	// Past this the KV cache costs more than the extra history buys: the agent
+	// re-sends a compact project map every turn, it does not need 256K.
+	ollamaMaxCtx = 65536
+	// Compute/scratch buffers Ollama needs on top of weights + KV cache, plus
+	// room for the desktop's own framebuffer. Deliberately generous — spilling
+	// to CPU costs far more than a slightly smaller window.
+	ollamaVramReserve = 1 << 30 // 1 GiB
+	// Used when no VRAM figure is available (AMD, Apple Silicon, CPU-only).
+	// Twice the old flat constant, still small enough that a CPU-only host does
+	// not pay minutes of prompt processing per turn.
+	ollamaFallbackCtx = 16384
+	// Ollama's default KV cache type is f16 — 2 bytes per element, K and V.
+	ollamaKVBytesPerElem = 2
+)
+
+// ollamaShowResp is the subset of POST /api/show this file needs. `model_info`
+// keys are architecture-prefixed ("qwen3.attention.head_count_kv"), so they are
+// read out of a generic map rather than a struct.
+type ollamaShowResp struct {
+	ModelInfo map[string]json.RawMessage `json:"model_info"`
+}
+
+// numCtxCache memoizes the resolved window per "<base>|<model>". /api/show plus
+// /api/tags cost two round-trips and their answer cannot change without a
+// re-pull, but a chat turn happens every few seconds.
+var (
+	numCtxMu    sync.Mutex
+	numCtxCache = map[string]int{}
+)
+
+// modelInfoInt reads an integer out of the arch-prefixed model_info map. `arch`
+// comes from general.architecture; `suffix` is the part after it.
+func modelInfoInt(info map[string]json.RawMessage, arch, suffix string) int64 {
+	raw, ok := info[arch+"."+suffix]
+	if !ok {
+		return 0
+	}
+	var n int64
+	if json.Unmarshal(raw, &n) != nil {
+		return 0
+	}
+	return n
+}
+
+// ollamaWeightBytes returns the model's on-disk size from /api/tags, which is
+// what its weights occupy once resident. 0 when the tag is not found.
+func ollamaWeightBytes(ctx context.Context, base, model string) int64 {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, base+"/api/tags", nil)
+	if err != nil {
+		return 0
+	}
+	resp, err := (&http.Client{Timeout: 5 * time.Second}).Do(req)
+	if err != nil {
+		return 0
+	}
+	defer resp.Body.Close()
+	var tags ollamaTagsResp
+	if json.NewDecoder(resp.Body).Decode(&tags) != nil {
+		return 0
+	}
+	// Ollama reports "qwen3:8b" for a tag the caller may have written bare as
+	// "qwen3" (meaning :latest), so accept that spelling too.
+	for _, m := range tags.Models {
+		if m.Name == model || m.Name == model+":latest" {
+			return m.Size
+		}
+	}
+	return 0
+}
+
+// ollamaNumCtx resolves the context window to request for `model`. It never
+// fails: every probe is best-effort and falls back to a safe constant, because
+// a chat turn must not depend on nvidia-smi being installed.
+func (s *Server) ollamaNumCtx(ctx context.Context, base, model string) int {
+	key := base + "|" + model
+	numCtxMu.Lock()
+	if n, ok := numCtxCache[key]; ok {
+		numCtxMu.Unlock()
+		return n
+	}
+	numCtxMu.Unlock()
+
+	n := s.resolveOllamaNumCtx(ctx, base, model)
+
+	numCtxMu.Lock()
+	numCtxCache[key] = n
+	numCtxMu.Unlock()
+	return n
+}
+
+func (s *Server) resolveOllamaNumCtx(ctx context.Context, base, model string) int {
+	showCtx, cancel := context.WithTimeout(ctx, 8*time.Second)
+	defer cancel()
+
+	var show ollamaShowResp
+	if err := httpJSON(showCtx, base+"/api/show", nil, map[string]any{"model": model}, &show); err != nil {
+		return ollamaFallbackCtx
+	}
+
+	var arch string
+	if raw, ok := show.ModelInfo["general.architecture"]; ok {
+		_ = json.Unmarshal(raw, &arch)
+	}
+	if arch == "" {
+		return ollamaFallbackCtx
+	}
+
+	shape := modelShape{
+		MaxCtx:  modelInfoInt(show.ModelInfo, arch, "context_length"),
+		Blocks:  modelInfoInt(show.ModelInfo, arch, "block_count"),
+		KVHeads: modelInfoInt(show.ModelInfo, arch, "attention.head_count_kv"),
+		HeadDim: modelInfoInt(show.ModelInfo, arch, "attention.key_length"),
+	}
+	if shape.HeadDim == 0 {
+		// Pre-GQA metadata omits key_length; derive it the way llama.cpp does.
+		if heads := modelInfoInt(show.ModelInfo, arch, "attention.head_count"); heads > 0 {
+			shape.HeadDim = modelInfoInt(show.ModelInfo, arch, "embedding_length") / heads
+		}
+	}
+
+	var vram int64
+	if gpu := s.detectGPU(); gpu != nil {
+		vram = gpu.VramTotal
+	}
+	return pickNumCtx(shape, vram, ollamaWeightBytes(ctx, base, model))
+}
+
+// modelShape is the /api/show metadata that fixes KV-cache cost per token.
+type modelShape struct {
+	MaxCtx  int64 // the architecture's own context ceiling
+	Blocks  int64 // transformer layers
+	KVHeads int64 // KV heads (GQA: fewer than attention heads)
+	HeadDim int64 // per-head key/value width
+}
+
+// pickNumCtx is the whole decision, kept pure so it is testable without a
+// daemon or a GPU. `vramTotal` and `weightBytes` may be 0 when undetectable.
+func pickNumCtx(m modelShape, vramTotal, weightBytes int64) int {
+	modelMax := m.MaxCtx
+	if modelMax <= 0 {
+		modelMax = ollamaMaxCtx
+	}
+	ceiling := min(int(modelMax), ollamaMaxCtx)
+	if ceiling < ollamaMinCtx {
+		// A model whose own window is below our floor: take what it has rather
+		// than asking for more and getting a 400.
+		return ceiling
+	}
+
+	if m.Blocks <= 0 || m.KVHeads <= 0 || m.HeadDim <= 0 || vramTotal <= 0 {
+		return min(ollamaFallbackCtx, ceiling)
+	}
+
+	// KV cache per token = K and V, for every layer, for every KV head.
+	kvPerToken := 2 * m.Blocks * m.KVHeads * m.HeadDim * ollamaKVBytesPerElem
+
+	headroom := vramTotal - weightBytes - ollamaVramReserve
+	if headroom <= 0 {
+		// The weights alone do not fit: Ollama is going to spill layers to CPU
+		// whatever we ask for, so the window is no longer the binding
+		// constraint — and shrinking it would not win the memory back.
+		return min(ollamaFallbackCtx, ceiling)
+	}
+
+	fit := int(headroom / kvPerToken)
+	if fit < ollamaMinCtx {
+		return min(ollamaMinCtx, ceiling)
+	}
+	// Round down to a multiple of 1024 — a tidy window, and it keeps the value
+	// stable against small changes in the reported VRAM total.
+	fit -= fit % 1024
+	return min(fit, ceiling)
+}

@@ -67,6 +67,11 @@ export const LIBRARY_TREE = [
         id: 'counters',
         title: 'Counters',
         fromLibrary: ['CTU', 'CTD', 'CTUD']
+      },
+      {
+        id: 'signal_gen',
+        title: 'Signal Generation',
+        fromLibrary: ['Blink', 'Debounce', 'Gen_Signal']
       }
     ]
   },
@@ -266,16 +271,44 @@ export const LIBRARY_TREE = [
   },
 
   // ── 9. System & Time ─────────────────────────────────────────────────────
+  // Everything here is implemented as `static inline` in kronsystem.h, the one
+  // header tree file that is git-tracked and needs no libkron*.a rebuild.
   {
     id: 'system',
     title: 'System & Time',
     subcategories: [
       {
         id: 'rtc',
-        title: 'RTC',
-        fromLibrary: ['Read_System_Time']
+        title: 'Clock & Calendar',
+        fromLibrary: [
+          'Read_System_Time', 'Read_System_Date', 'Read_Epoch_Time', 'Epoch_To_Date'
+        ]
       },
       {
+        id: 'scheduling',
+        title: 'Scheduling',
+        fromLibrary: ['Time_Switch', 'Daily_Trigger', 'Astro_Clock']
+      },
+      {
+        id: 'sys_diagnostics',
+        title: 'Runtime Diagnostics',
+        fromLibrary: ['Read_Uptime', 'Cycle_Time_Monitor', 'Hour_Meter', 'Watchdog']
+      },
+      {
+        id: 'sys_health',
+        title: 'Host Health',
+        fromLibrary: ['Read_CPU_Temperature', 'Read_System_Load', 'Read_Disk_Free']
+      },
+      {
+        id: 'time_math',
+        title: 'TIME Arithmetic',
+        fromLibrary: [
+          'T_To_Ms', 'Ms_To_T', 'T_To_Sec', 'Sec_To_T',
+          'Add_T', 'Sub_T', 'Mul_T', 'Div_T'
+        ]
+      },
+      {
+        // ⚠️ Log_Data has no C implementation — see the note in system.xml.
         id: 'file_ops',
         title: 'File',
         fromLibrary: ['Log_Data']

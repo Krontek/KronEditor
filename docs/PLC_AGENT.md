@@ -70,7 +70,7 @@ Key mechanics in `AiAgentPanel.jsx`:
 | `anthropic-oauth` | Claude account sign-in (PKCE) | native | Bearer + `anthropic-beta: oauth-2025-04-20` + a "You are Claude Code" identity system block (subscription credential is only authorized for Claude Code). Tokens at `AppDataDir/anthropic_oauth.json`, auto-refresh ≤60s before expiry; refresh does NOT hold the mutex across the network call; `state` must match exactly. |
 | `openai` | API key | native | |
 | `gemini` / `google` | API key | native | Served through `callOpenAI` via Gemini's OpenAI-compat base URL |
-| `ollama` | none (local daemon) | synthesized | `callOllama` fabricates tool-call ids; prompt-based tool fallback for models with no tool API. One-click bootstrap: `ollama-setup` downloads the official archive into `AppDataDir/ollama` and spawns `ollama serve`; progress on SSE `ollama-setup-progress` / `ollama-pull-progress`. |
+| `ollama` | none (local daemon) | synthesized | `callOllama` fabricates tool-call ids; prompt-based tool fallback for models with no tool API. One-click bootstrap: `ollama-setup` downloads the official archive into `AppDataDir/ollama` and spawns `ollama serve`; progress on SSE `ollama-setup-progress` / `ollama-pull-progress`. ⚠️ `num_ctx` is sized per model by `ollamaNumCtx` (below), never left unset. |
 | `custom` | anything | OpenAI-dialect | Any OpenAI-compatible endpoint via `baseUrl` |
 
 Images: only `IMAGE_CAPABLE_PROVIDERS` (all except ollama) accept attachments.
@@ -93,7 +93,23 @@ Local/small models routinely mangle tool calls. The panel repairs, in order:
 | POU-target inference (§2) | Missing/wrong `pou` argument |
 | `set_ladder` auto-declare (§6) | Missing `add_variable` calls for ladder references |
 
-These make qwen2.5-coder-class models workable, but they are heuristics — expect occasional nonsense from 7B models regardless.
+These make small local models workable, but they are heuristics — expect occasional nonsense from anything under ~14B regardless.
+⚠️ Every model in `OLLAMA_CATALOG` must carry Ollama's **`tools`** capability badge; without a native tool API the layers above are the *only* path, and they fail silently-plausibly rather than loudly.
+
+
+### Ollama context sizing
+
+⚠️ **Never leave `num_ctx` unset.** Ollama defaults it to 4096 and silently DROPS the oldest messages past it — the project map falls out of the window mid-run and the model starts inventing POU names instead of failing. It was previously pinned at a flat `8192`, which is the same bug in slower motion: too small for a 30B with a 256K window, and too large once stacked on a 14B's weights on a 12 GB card (Ollama's answer to not fitting is to spill layers to CPU, so it reads as "slow", never as "misconfigured").
+
+`ollamaNumCtx` (`host-agent/ollama.go`) resolves it per model, cached per `base|model`:
+
+| Probe | Gives |
+|---|---|
+| `POST /api/show` | `general.architecture`, then the arch-prefixed `context_length`, `block_count`, `attention.head_count_kv`, `attention.key_length` (GGUF standard keys) |
+| `GET /api/tags` | the tag's on-disk size = what the weights occupy resident |
+| `detectGPU` | total VRAM, best-effort via nvidia-smi |
+
+`pickNumCtx` is the pure decision (`kv/token = 2 × blocks × kv_heads × head_dim × 2`; window = headroom after weights + a 1 GiB reserve), clamped to the model's own ceiling and to `[8192, 65536]`. Any probe failing — no nvidia-smi on AMD/Apple/CPU-only, missing metadata — falls back to `ollamaFallbackCtx` (16384). Covered by `ollama_numctx_test.go` with real catalogue shapes.
 
 ---
 
@@ -234,6 +250,8 @@ The system prompt routes STRICTLY per rung, not per POU:
 ## 7. Live diagnosis & hot-swap integration
 
 - While a simulation/PLC runs, the panel keeps a rolling ring buffer of timestamped live-variable snapshots. `read_live_variables` returns a condensed per-variable series (last/first/min/max, change count, oscillating/constant flags, down-sampled tail); `watch_live_variables` *waits* a window and then summarizes — the prompt routes any time-dependent check (did the timer fire? is it blinking at 1 Hz?) to `watch`, and tells the model to auto-verify after any change/deploy.
+- ⚠️ **The `<project-context>` run-state line is what makes live diagnosis happen at all.** Nothing else in the request tells the model whether a program is running — the tool schemas only describe how to *ask*. Without the line, a model that doesn't spontaneously reach for `read_live_variables` answers capability questions ("can you see the data?", "veriyi görebiliyor musun?") from its own priors and states that nothing is running, confidently and wrongly, while a real target streams values. Measured on `qwen3-coder:30b` against the transcript that exposed it: **0/4 turns called a live tool without the line, 4/4 with it** — and with the line reading STOPPED it correctly calls nothing. Neither temperature (0.0 was no better than 0.7) nor extra system-prompt rules fixed it; only the per-turn state line did. Keep VALUES out of it: they change every 500 ms and would defeat every provider's prompt cache. It is a pointer to the tools, not a substitute.
+- ⚠️ **Everything live is read through `liveRef` / `liveBufRef`, never the `liveVariables` prop closed over by `runTurn`.** `runTurn` is a `useCallback` that RECURSES for every turn of a run, so the prop it captured is frozen at the moment the run started: a multi-turn diagnostic would keep re-reporting that first snapshot as "current", and a run begun before Run was pressed would report "not running" for its whole life. `liveVariables` is therefore deliberately **not** a `runTurn` dep — as one it rebuilt the callback ~2×/second for the entire time a program ran and bought nothing.
 - **Online change:** when a hot-swap session is active, approving a proposal calls `onHotSwap(touchedPous)` → `App.handleAgentHotSwap`, which pre-checks `layoutSignatureDiff` (names exactly which non-swappable thing changed, if any), confirms with the user, then pushes the recompiled logic as a live swap (local sim) or to the target (`hotswapTargetLogic` + `hotswapDeploySwap`) — state preserved, no restart. The C-level `plc_state_layout_hash` remains the unconditional safety net.
 - ⚠️ **The agent cannot compile — there is deliberately no build tool.** `check_compile` was removed: it ran a real transpile + bundled-clang compile, whose ~242 MB clang cold load dominates the cost, and the model reached for it after almost every change, so each edit paid a full build and the agent felt interminably slow. Compiling is now a human, toolbar-initiated action. `applyToolCall` keeps a `case 'check_compile'` guard that returns a terminal, actionable error (a model can still name it from an older transcript), and the system prompt states plainly that it must never build or "verify by compiling". Do not re-add it without making it opt-in and bounding how often it can run.
 

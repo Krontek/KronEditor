@@ -155,7 +155,7 @@ func (c *ringController) loop() {
 		if nslots > 0 {
 			fill = float64(maxBacklog) / nslots
 		}
-		P := c.rc.ProducedBytesPerSec()
+		P := c.rc.WireBytesPerSec() // same unit as D (whole frames), see WireBytesPerSec
 
 		// analytic floor: smallest stride that keeps αD ≥ P/N
 		floor := uint32(1)
@@ -172,7 +172,24 @@ func (c *ringController) loop() {
 		case n < floor:
 			n = floor // jump up to the sustainable rate
 		case fill < ringFillLow && n > floor && n > 1:
-			n-- // shrink-slow toward best fidelity
+			// Shrink toward best fidelity — MULTIPLICATIVELY.
+			//
+			// ⚠️ This was `n--`, one step per 100 ms tick, against a grow branch
+			// that DOUBLES. A burst that took the stride to 2048 in eleven ticks
+			// then needed 2047 ticks — three and a half minutes — to walk back,
+			// and any single backlog blip on the way re-doubled it. Measured in
+			// the field: a 100 kHz counter stuck at stride ~1500, delivering
+			// 0.08% of scans, the stride falling by exactly 10 per second and
+			// never arriving. Ten percent per tick recovers from 2048 in about
+			// seven seconds while still being gentler than the grow step.
+			dec := n / 10
+			if dec < 1 {
+				dec = 1
+			}
+			n -= dec
+			if n < floor {
+				n = floor
+			}
 		}
 		if n < 1 {
 			n = 1
