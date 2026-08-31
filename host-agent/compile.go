@@ -482,12 +482,13 @@ func (s *Server) llvmCompileBaseArgs(target string) (string, []string, []string,
 	if target != "x86_64-w64-mingw32" {
 		args = append(args, "-nostdinc")
 	}
-	if target == "aarch64-linux-gnu" || target == "arm-linux-gnueabihf" {
+	if target == "aarch64-linux-gnu" || target == "arm-linux-gnueabihf" || target == "x86_64-linux-gnu" {
 		args = append(args, "--gcc-toolchain="+sysroot)
 		// ⚠️ --gcc-toolchain alone is not enough: the sysroots name their GCC
-		// dir with a "none" vendor (arm-none-linux-gnueabihf) that clang's
-		// candidate list does not match for arm, so -static could not find
-		// crtbeginT.o/crtend.o. -B points the driver straight at it.
+		// dir with a vendor clang's candidate list does not match
+		// (arm-none-linux-gnueabihf, x86_64-buildroot-linux-gnu), so -static
+		// could not find crtbeginT.o/crtend.o. -B points the driver straight
+		// at it.
 		if gcc := s.paths.LLVMGCCInstallDir(target); gcc != "" {
 			args = append(args, "-B", gcc)
 		}
