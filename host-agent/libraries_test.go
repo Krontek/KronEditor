@@ -489,3 +489,49 @@ func TestLibraryTargetsMacOnlyOnDarwin(t *testing.T) {
 		}
 	}
 }
+
+// The same data-loss shape as the HAL case above, but for a single file: no
+// Krontek repo ships kronsystem.h — it is authored in-repo (CLAUDE.md §14) —
+// so the top-level wipe deleted it on every successful run, taking all 25
+// SYSTEM/TIMERS blocks with it. Observed live: a Build Libraries run left
+// `git status` reporting `D resources/krontek-include/kronsystem.h`.
+func TestInstallKrontekHeadersPreservesLocallyOwnedHeaders(t *testing.T) {
+	s, resources := newTestServer(t)
+	inc := filepath.Join(resources, "krontek-include")
+	if err := os.MkdirAll(inc, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	sys := filepath.Join(inc, "kronsystem.h")
+	if err := os.WriteFile(sys, []byte("/* in-repo, not cloned */"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// A header that IS supplied upstream must still be replaced, so the wipe
+	// keeps doing its job for everything that is not locally owned.
+	stale := filepath.Join(inc, "kronold.h")
+	if err := os.WriteFile(stale, []byte("/* removed upstream */"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	stage := t.TempDir()
+	if err := os.WriteFile(filepath.Join(stage, "kronmath.h"), []byte("/* built */"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := s.installKrontekHeaders(stage); err != nil {
+		t.Fatalf("installKrontekHeaders: %v", err)
+	}
+
+	body, err := os.ReadFile(sys)
+	if err != nil {
+		t.Fatalf("kronsystem.h was deleted by a build that cannot restore it: %v", err)
+	}
+	if string(body) != "/* in-repo, not cloned */" {
+		t.Errorf("kronsystem.h content changed: %q", body)
+	}
+	if _, err := os.Stat(stale); err == nil {
+		t.Error("kronold.h survived: the top-level wipe must still remove non-owned headers")
+	}
+	if _, err := os.Stat(filepath.Join(inc, "kronmath.h")); err != nil {
+		t.Errorf("built header not installed: %v", err)
+	}
+}

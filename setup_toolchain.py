@@ -874,6 +874,7 @@ def main() -> int:
                 archive_url=BOOTLIN_X86_64_URL,
                 archive_name=BOOTLIN_X86_64_ARCHIVE,
                 archive_relative_path="x86_64-buildroot-linux-gnu/sysroot",
+                gcc_lib_relative_path="lib/gcc",
             )
         if "x86_64-w64-mingw32" in wanted:
             harvest_mingw_sysroot(root, cache_dir, args.force, args.force_download)
