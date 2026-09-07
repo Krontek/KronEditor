@@ -7,6 +7,7 @@
  * proper ladder-diagram power-flow, matching the HAL C structs in kronhal.h.
  */
 import { getBoardById } from './boardDefinitions';
+import { GENERIC_FB_DEFS } from './libraryTree';
 
 const GENERIC_COMM_INTERFACES = new Set(['I2C', 'SPI', 'UART', 'USB']);
 // ─── Channel counts per board family / board ─────────────────────────────────
@@ -618,4 +619,99 @@ export const getBoardLibraryTree = (boardId) => {
   }
 
   return subcategories;
+};
+
+// Generic communication FBs offered per protocol once a port of that protocol
+// is ENABLED in the board config. They are NOT part of getBoardLibraryTree's
+// output (GENERIC_COMM_INTERFACES skips those interfaces there) — the Toolbox,
+// App's block list and the AI agent's hardware catalog all append them from
+// here, so the three stay in agreement.
+export const COMM_PROTO_BLOCKS = {
+  UART: ['UART_Send', 'UART_Receive'],
+  I2C:  ['I2C_WriteRead'],
+  SPI:  ['SPI_Transfer'],
+  USB:  ['USB_Send', 'USB_Receive'],
+};
+
+// ⚠️ Blocks whose HAL body is a STUB. They are offered (the peripheral exists
+// on the header) and they compile, but the `_Call` does nothing — and some
+// report SUCCESS while doing it: `PCM_Output` sets `OK = EN` on the RPi and
+// Jetson HALs, which is exactly the "indistinguishable from a working read"
+// trap §10 of CLAUDE.md forbids. A human dragging one at least sees the block
+// is unfinished; the AI agent has no such cue, so the note rides the catalog.
+// Keep in sync with `kronhal_*.h` — delete an entry when its body lands.
+const BLOCK_NOTES = {
+  PCM_Output:        'NOT IMPLEMENTED — the HAL body is an empty stub that still reports OK. Do not use it; it cannot produce audio.',
+  PCM_Input:         'NOT IMPLEMENTED — the HAL body is an empty stub (DATA stays 0, READY stays FALSE).',
+  Grove_DigitalRead: 'NOT IMPLEMENTED — the Grove connectors are plain I2C2/UART2 pass-throughs; use the I2C/UART blocks instead.',
+  Grove_DigitalWrite:'NOT IMPLEMENTED — the Grove connectors are plain I2C2/UART2 pass-throughs; use the I2C/UART blocks instead.',
+  Grove_AnalogRead:  'NOT IMPLEMENTED — use ADC<n>_Read instead.',
+};
+const blockNoteFor = (blockType) =>
+  BLOCK_NOTES[blockType] || (/^PRU\d+_Execute$/.test(blockType)
+    ? 'NOT IMPLEMENTED — the HAL sets ERR_ID=1; PRU firmware loading is not wired up.'
+    : undefined);
+
+/**
+ * Flat, PIN-CARRYING list of every hardware block usable on this board: the
+ * board tree (GPIO / PWM / ADC / CAN / PCM / PRU …) plus the generic comm FBs
+ * of the protocols whose ports are enabled.
+ *
+ * ⚠️ Hardware blocks exist ONLY here — no `public/libraries/*.xml` declares
+ * them — so anything that needs a block catalog (the Toolbox, the Variable
+ * Manager drop-down, the AI agent) must come through this function or it will
+ * believe the board has no GPIO/PWM at all.
+ *
+ * Entry shape mirrors an XML library block, so consumers can treat both alike:
+ *   { blockType, label, desc, category, class, inputs:[{name,type}], outputs }
+ *
+ * @param {string} boardId
+ * @param {object} interfaceConfig  resources.res_config.content.deviceInterfaceConfig
+ */
+export const getBoardBlockDefs = (boardId, interfaceConfig = {}) => {
+  if (!boardId) return [];
+
+  const out = [];
+  const seen = new Set();
+  const push = (entry) => {
+    if (!entry.blockType || seen.has(entry.blockType)) return;
+    seen.add(entry.blockType);
+    out.push(entry);
+  };
+
+  for (const sub of getBoardLibraryTree(boardId)) {
+    for (const item of (sub.items || [])) {
+      const cd = item.customData || {};
+      push({
+        blockType: item.blockType,
+        label: item.label || item.blockType,
+        desc: item.desc || cd.desc || '',
+        note: blockNoteFor(item.blockType),
+        category: sub.title,
+        class: cd.class || 'FunctionBlock',
+        inputs: cd.inputs || [],
+        outputs: cd.outputs || [],
+      });
+    }
+  }
+
+  for (const proto of Object.keys(COMM_PROTO_BLOCKS)) {
+    const ports = (interfaceConfig || {})[proto];
+    if (!ports || !Object.values(ports).some(p => p?.enabled)) continue;
+    for (const blockType of COMM_PROTO_BLOCKS[proto]) {
+      const def = GENERIC_FB_DEFS[blockType];
+      if (!def) continue;
+      push({
+        blockType,
+        label: blockType,
+        desc: (def.inputs || []).find(i => i.name === 'Port_ID')?.desc || '',
+        category: proto,
+        class: def.class || 'FunctionBlock',
+        inputs: def.inputs || [],
+        outputs: def.outputs || [],
+      });
+    }
+  }
+
+  return out;
 };

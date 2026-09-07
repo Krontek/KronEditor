@@ -71,6 +71,15 @@ func main() {
 		srv.SizeRingSegment()
 	})
 
+	// Claim :7070 BEFORE touching any shared state. A duplicate agent (a
+	// doubled supervisor on an image without pkill, say) must lose here and
+	// exit, or its orphan reaper below would SIGTERM the live runtime owned by
+	// the agent that legitimately holds the port — every 2 s, forever.
+	if err := srv.Bind(); err != nil {
+		slog.Error("Failed to start server", "err", err)
+		os.Exit(1)
+	}
+
 	// Reap any runtime left behind by a previous agent crash. Must run
 	// BEFORE the HTTP server starts accepting: a Start RPC arriving in the
 	// window between listen and cleanup would get its fresh runtime killed

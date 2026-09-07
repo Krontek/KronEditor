@@ -636,7 +636,7 @@ function focusTarget(steps) {
 // line, 4/4 with it. Values themselves stay OUT (they change every 500 ms and
 // would defeat every provider's prompt cache) — this is a pointer to the tools,
 // not a substitute for them.
-function buildProjectContext(projectStructure, board, activeItem, liveVariables) {
+function buildProjectContext(projectStructure, board, activeItem, liveVariables, hardwareBlocks = []) {
   const overview = buildProjectOverview(projectStructure, board);
   const active = activeItem ? `${activeItem.name} (${activeItem.type})` : 'none';
   const pous = overview.pous.map((p) => `${p.name}[${p.language}${p.returnType ? ' ' + p.returnType : ''}]`).join(', ') || '(none)';
@@ -648,6 +648,8 @@ function buildProjectContext(projectStructure, board, activeItem, liveVariables)
   ].join(', ');
   // null = not running at all; {} = running but no sample has arrived yet, which
   // is a real and short-lived state right after Run and must not read as stopped.
+  const hwBlocks = (Array.isArray(hardwareBlocks) ? hardwareBlocks : [])
+    .map((b) => b.blockType).filter(Boolean).join(', ');
   const liveCount = liveVariables ? Object.keys(liveVariables).length : 0;
   const runLine = !liveVariables
     ? 'Runtime: STOPPED. No live values exist; read_live_variables will confirm this. Do not speculate about current values.'
@@ -660,6 +662,13 @@ function buildProjectContext(projectStructure, board, activeItem, liveVariables)
     `Global variables: ${globals}.`,
     dts ? `Data types: ${dts}.` : '',
     projBlocks ? `Project-defined blocks (call list_blocks for their pins): ${projBlocks}` : '',
+    // ⚠️ Board-dependent, so it belongs HERE and not in the cached system
+    // prompt. Without it a model reasons from its priors about what an SBC
+    // exposes and flatly tells the user the board "has no GPIO/PWM blocks",
+    // while the toolbox is showing them.
+    hwBlocks
+      ? `Hardware I/O blocks available on THIS board (call list_blocks for their pins; each is declared as an instance, EN-triggered, ENO out): ${hwBlocks}`
+      : 'Hardware I/O blocks: none — no board is selected, so no GPIO/PWM/ADC block exists yet. Tell the user to pick a board in Board Config.',
     runLine,
   ].filter(Boolean).join('\n');
 }
@@ -715,6 +724,7 @@ function buildSystemPrompt(libraryData = [], agentMode = 'manual') {
     '- Function blocks (TON, TOF, TP, CTU, CTD, R_TRIG, motion MC_*, communication, user FBs) are INSTANCES, not functions. For each you must: (1) add_variable with type = the FB name itself (e.g. type "TON" — NOT "TIME"/"BOOL"); (2) CALL it as `name(IN := …, PT := …);`; (3) read its outputs as `name.Q`, `name.ET`. NEVER write `name := TON(…)` — assigning an FB call is invalid IEC and will not compile.',
     '- ARRAYS, STRUCTS, and ENUMS are NEVER written inline into a variable\'s type. NEVER set a variable\'s type to a literal like "ARRAY[0..31] OF BYTE" or "STRUCT...END_STRUCT" — the transpiler does not parse that and it silently produces broken generated code. Instead: (1) call create_data_type ONCE to define the named type (kind ARRAY/STRUCT/ENUM — e.g. create_data_type {"name":"RxFrame","kind":"ARRAY","baseType":"BYTE","dimensions":[{"min":0,"max":31}]}), then (2) add_variable/update_variable with type set to that NAME (e.g. type:"RxFrame"). Reuse an existing data type by name (see "Data types" below) instead of creating a duplicate with the same shape.',
     '- RETENTIVE variables: pass retain:true to add_variable/update_variable when a value must SURVIVE a restart or power cycle instead of going back to its initial value — production/piece counters, totalizers, run-hour meters, operator setpoints and recipe values, and the current step of a machine that must resume where it stopped. The user asks for this as "kalıcı", "hafızada tutulsun", "retentive", "remanent", "survives a power cut", "resets on restart? no". Do NOT mark everything retain: live I/O images, alarm/status flags, edge-detect helpers and scratch variables must start clean, and a retained fault flag can make a machine come back up already latched in an alarm. retain:true works on globals and PROGRAM locals; on an FB instance variable (e.g. "prodCount : CTU") it persists the WHOLE instance, so the counter resumes at its previous CV. It is NOT available inside a function block or function — retain the instance in the program instead.',
+    '- PHYSICAL I/O goes through the board\'s HARDWARE blocks, and they are REAL and USABLE: GPIO_Read / GPIO_Write / GPIO_SetMode (PIN = the physical header pin number), PWM<n> (DUTY %, FREQ Hz), ADC<n>, CAN<n>, SPI<n>_Transfer, I2C<n>_Read/Write, UART<n>_*. They are listed under `hardware` by list_blocks and in the <project-context> block; which ones exist depends on the SELECTED BOARD, so check there instead of assuming. NEVER tell the user the board has no GPIO/PWM/ADC blocks — if the context lists them, they exist. Each one is a stateful INSTANCE (add_variable with type "GPIO_Write", then call it), is triggered by EN and passes power out via ENO, and works in a ladder rung as the rung\'s `fb` exactly like a timer. Report a genuine absence only when the context line says no board is selected, or the block you want is missing from that list (e.g. the board has no ADC).',
     '- The blocks below are only NAMES — you do NOT know their exact pins from memory. BEFORE using any function block or function (standard or project-defined) in ST, call list_blocks (optionally filtered, e.g. {"filter":"MC_"}) to get its real input/output pin names and types, then use those exact pin names.',
     '- set_ladder example with a timer: {"pou":"Main","rungs":[{"branches":[[{"contact":"Sensor"}]],"fb":{"type":"TON","instance":"delayT","inputs":{"PT":"T#5s"}},"outputs":[{"coil":"Lamp"}]}]} — Lamp energizes 5s after Sensor. The trigger pin (IN/CU/CLK…) is fed by the rung power flow automatically; never put it in fb.inputs.',
     '- A correct TON blink is EXACTLY: declare `blink : TON;` (add_variable type TON) and `led : BOOL`, then body `blink(IN := NOT blink.Q, PT := T#500ms); IF blink.Q THEN led := NOT led; END_IF;`. Do not also toggle led outside the IF.',
@@ -739,6 +749,7 @@ export default function AiAgentPanel({
   setProjectStructure = null,
   selectedBoard = null,
   libraryData = [],            // standard block library (XML) — block types + I/O pins, for list_blocks
+  hardwareBlocks = [],         // ⚠️ the SELECTED BOARD's HAL blocks with pins (getBoardBlockDefs) — declared in no XML, so this is the agent's only route to GPIO/PWM/ADC/…
   liveVariables = null,        // live values from the running sim/PLC (for read_live_variables)
   onApplied = null,            // (pouNames[]) → reload the open editor after a commit
   onHotSwap = null,            // (pouNames[]) → push an online change while running
@@ -1237,7 +1248,7 @@ export default function AiAgentPanel({
       assistant = await host.aiChat({
         provider: config.provider, model: config.model, apiKey: config.apiKey, baseUrl: config.baseUrl,
         system: buildSystemPrompt(libraryData, agentModeRef.current),
-        context: buildProjectContext(psRef.current, selectedBoard, activeItem, liveRef.current),
+        context: buildProjectContext(psRef.current, selectedBoard, activeItem, liveRef.current, hardwareBlocks),
         messages: providerSafeMessages(apiMessages),
         tools: TOOL_DEFS,
       }, controller.signal);
@@ -1425,6 +1436,10 @@ export default function AiAgentPanel({
       // Tools that need the standard block library: list_blocks (catalog) and
       // set_ladder (FB pin resolution for fb-in-rung).
       if (tc.name === 'list_blocks' || tc.name === 'set_ladder') args.__library = libraryData;
+      // Board/HAL blocks: the catalog (list_blocks), ladder FB resolution
+      // (set_ladder) and instance-type resolution (add/update_variable) all
+      // need them — they are in no XML library.
+      if (tc.name === 'list_blocks' || tc.name === 'set_ladder' || tc.name === 'add_variable' || tc.name === 'update_variable') args.__hardware = hardwareBlocks;
       // Repair a missing/unresolvable local-scope POU target from context.
       if (needsLocalPou(tc.name, args) && !findPOU(working, args.pou)) {
         const inferred = inferPou();
@@ -1474,7 +1489,10 @@ export default function AiAgentPanel({
     // liveRef/liveBufRef above. As a dep it rebuilt this callback ~2x/second for
     // the whole time a program ran, and bought nothing — a run in flight kept
     // its own closure regardless.
-  }, [config, selectedBoard, activeItem]);
+    // hardwareBlocks IS a dep: it is memoized in App and only changes when the
+    // board or its enabled ports change — exactly when the agent's picture of
+    // the available I/O must change too.
+  }, [config, selectedBoard, activeItem, libraryData, hardwareBlocks]);
 
   // Commit a turn's composed result into the live project and push it online if
   // a hot-swap session is active. Shared by AUTO mode and manual approval.

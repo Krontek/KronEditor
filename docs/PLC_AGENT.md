@@ -58,6 +58,8 @@ Key mechanics in `AiAgentPanel.jsx`:
 - **POU-target inference (weak-model safety net).** A local-scope tool whose `pou` doesn't resolve is rewritten to the last-touched / just-created / currently-open POU. It only ever overrides an *unresolvable* target, never a valid one.
 - **Argument injection.** The panel injects panel-side context the pure module can't know:
   - `args.__library` (the XML block library) for `list_blocks` **and `set_ladder`** (FB pin resolution).
+  - `args.__hardware` (the **selected board's HAL blocks, with pins** — `getBoardBlockDefs(board, deviceInterfaceConfig)`) for `list_blocks`, `set_ladder` and `add_variable`/`update_variable`. ⚠️ **No XML declares GPIO/PWM/ADC/CAN/PCM/PRU blocks** — `boardLibraryBlocks.js` mints them from the board, and the transpiler registers them into its FB tables only for the duration of one transpile (`HAL_BLOCK_TYPES`, via `halBlockMeta`). So anything reading only `libraryData` concludes the board has no physical I/O at all, which is exactly what the agent used to tell users. The board's block list also rides the `<project-context>` block (volatile, board-dependent — never the cached system prompt).
+  - ⚠️ A hardware block wired for power **must** get `data.executionControl: true` in the emitted node (`compileLadderRung`). `RungContainer` treats EN/ENO as the power-flow pair and filters them out of a board block's pin body; only that flag (normally the BlockSettingsModal checkbox) renders `in_EN`/`out_ENO` handles. Without it ReactFlow cannot resolve either handle and drops the contact→EN and ENO→rail edges — the rung compiles to correct C but is drawn as an unconnected island, which is exactly how it was first reported.
 - **Config** persists in `localStorage["aiAgentConfig"]` (`{provider, model, apiKey, baseUrl}`). User-visible name is "PLC Agent"; code symbols keep `AiAgentPanel`/`aiAgentConfig`.
 
 ---
@@ -133,7 +135,7 @@ Before this tool the prompt told the model to write its questions as prose with 
 |---|---|
 | `get_project_overview` | Every POU (name/language/var counts), globals, data types, board. The prompt tells the model to call this first. |
 | `read_pou` | Full source of one POU: ST code, **rendered ladder** (`renderRungs` — see below), and its variable table. |
-| `list_blocks` | The block catalog with REAL pin names/types (`buildBlockCatalog`): standard XML library + the project's own FBs/functions. The prompt forbids using any FB's pins from memory — it must call this. |
+| `list_blocks` | The block catalog with REAL pin names/types (`buildBlockCatalog`), in three groups: `standard` (XML library), `hardware` (the selected board's HAL I/O — see `args.__hardware` above) and `project` (the project's own FBs/functions). The prompt forbids using any FB's pins from memory — it must call this. |
 | `read_live_variables` | Buffered snapshot + recent history of live values (only meaningful while sim/PLC is running). |
 | `watch_live_variables` | Awaits a trailing time-window of per-variable samples, then injects a condensed summary (`summarizeWatch`) — the tool for time-dependent verification (timers, oscillation). |
 

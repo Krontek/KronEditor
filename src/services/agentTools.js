@@ -135,11 +135,17 @@ const STANDARD_FB_TYPES = new Map(
 // fixed transparently (array literal) or REJECTED with actionable guidance,
 // instead of silently flowing into broken generated C the way it used to.
 // Returns { ok:true, type, newDataType? } or { ok:false, error }.
-function resolveVarType(struct, rawType) {
+function resolveVarType(struct, rawType, hardware) {
   const t = String(rawType || '').trim();
   if (!t) return { ok: true, type: 'BOOL' };
   const upper = t.toUpperCase();
   if (SCALAR_IEC_TYPES.has(upper)) return { ok: true, type: upper };
+  // A board/HAL block (GPIO_Read, PWM0, ADC1, …) is a stateful FB and is
+  // declared as an instance exactly like TON — but it lives only in the
+  // board's generated catalog, so without this it failed as "unknown type".
+  // Canonical spelling, since the transpiler's HAL tables are keyed exactly.
+  const hwDef = hardwareBlockDef(hardware, t);
+  if (hwDef) return { ok: true, type: hwDef.blockType, isInstance: true };
   // Project types/POUs win over the standard catalogue: a user FB named "TON"
   // shadows the standard one, exactly as the transpiler resolves it.
   const dt = findDataType(struct, t);
@@ -349,7 +355,20 @@ function pouPins(pou) {
 // performs — they must agree, or the catalogue documents pins the compiler
 // doesn't use. Same fallback the compiler applies to project FBs with no entry
 // in the transpiler's tables (first BOOL input / first BOOL output).
-export function powerPins(type, inputs, outputs) {
+export function powerPins(type, inputs, outputs, isHardware = false) {
+  // ⚠️ Board/HAL blocks are absent from FB_TRIGGER_PIN here (the transpiler
+  // registers them only for the duration of a transpile, via halBlockMeta),
+  // and the generic "first BOOL input" fallback picks the WRONG pin for them:
+  // GPIO_Write's first BOOL is VALUE, the data pin, not the enable. Mirror
+  // halBlockMeta.js instead — every board block is EN-triggered with ENO as
+  // its power output. The generic comm FBs (UART_Send, …) ARE in the table and
+  // keep their real Execute/Done pins.
+  if (isHardware && !FB_TRIGGER_PIN[type]) {
+    const has = (arr, n) => (arr || []).some((p) => p.name === n);
+    if (has(inputs, 'EN')) {
+      return { trigger: 'EN', powerOutput: has(outputs, 'ENO') ? 'ENO' : null };
+    }
+  }
   const trigger = FB_TRIGGER_PIN[type]
     || ((inputs || []).find((p) => p.type === 'BOOL') || (inputs || [])[0] || {}).name || null;
   const powerOutput = FB_Q_OUTPUT[type]
@@ -357,7 +376,20 @@ export function powerPins(type, inputs, outputs) {
   return { trigger, powerOutput };
 }
 
-export function buildBlockCatalog(struct, library, filter) {
+// ⚠️ Hardware (HAL) blocks — GPIO_Read/Write/SetMode, PWM<n>, ADC<n>, CAN<n>,
+// SPI<n>_Transfer, … — are declared in NO xml: `boardLibraryBlocks.js` mints
+// them from the selected board, and the transpiler registers them into its FB
+// tables only transiently (HAL_BLOCK_TYPES, cleared after each transpile). So
+// they are invisible to anything that only reads `libraryData`, which is why
+// the agent used to insist a board "has no GPIO/PWM blocks". The panel passes
+// the board's list in as `args.__hardware` (a `getBoardBlockDefs` array) and
+// every lookup below consults it alongside the XML library.
+function hardwareBlockDef(hardware, type) {
+  const t = String(type || '').toLowerCase();
+  return (Array.isArray(hardware) ? hardware : []).find((b) => String(b.blockType || '').toLowerCase() === t) || null;
+}
+
+export function buildBlockCatalog(struct, library, filter, hardware) {
   const f = (filter || '').trim().toLowerCase();
   const matches = (type, category) => !f || (type || '').toLowerCase().includes(f) || (category || '').toLowerCase().includes(f);
   const pinList = (arr) => (arr || []).map((p) => ({ name: p.name, type: p.type }));
@@ -391,6 +423,30 @@ export function buildBlockCatalog(struct, library, filter) {
     }
   }
 
+  // Hardware blocks are a SEPARATE group on purpose: they exist only for the
+  // selected board, and the model must not offer a GPIO block on a project
+  // whose board has no such interface.
+  const hw = [];
+  for (const b of (Array.isArray(hardware) ? hardware : [])) {
+    if (!b.blockType || !matches(b.blockType, b.category)) continue;
+    const inputs = pinList(b.inputs);
+    const outputs = pinList(b.outputs);
+    const { trigger, powerOutput } = powerPins(b.blockType, b.inputs, b.outputs, true);
+    hw.push({
+      type: b.blockType,
+      kind: b.class || 'FunctionBlock',
+      category: `Hardware / ${b.category}`,
+      description: b.desc || undefined,
+      // A stub-bodied block (see BLOCK_NOTES in boardLibraryBlocks.js): offered
+      // and compilable, but the HAL does nothing. Said out loud so the model
+      // doesn't build a program on a peripheral that will never respond.
+      ...(b.note ? { warning: b.note } : {}),
+      inputs, outputs,
+      ...(trigger ? { triggerPin: trigger, triggerNote: `power flows in via "${trigger}" — do NOT pass it in fb.inputs` } : {}),
+      ...(powerOutput ? { powerOutputPin: powerOutput } : {}),
+    });
+  }
+
   const project = [];
   for (const category of ['functionBlocks', 'functions']) {
     for (const p of (struct[category] || [])) {
@@ -407,7 +463,7 @@ export function buildBlockCatalog(struct, library, filter) {
       project.push(category === 'functions' ? entry : withPower(entry, inputs, outputs));
     }
   }
-  return { standard, project };
+  return { standard, hardware: hw, project };
 }
 
 // ── tool definitions (sent to the model) ─────────────────────────────────────
@@ -476,7 +532,7 @@ export const TOOL_DEFS = [
   },
   {
     name: 'list_blocks',
-    description: 'List the building blocks you can use, EACH WITH ITS INPUT AND OUTPUT PINS: the standard library function blocks & functions (timers TON/TOF, counters CTU/CTD, math, comparison, motion MC_*, communication, conversion, HAL I/O blocks) AND the project\'s own function blocks/functions. ALWAYS call this before using any function block or function in ST so you reference the correct pin names and types. Optionally filter by a name/category substring.',
+    description: 'List the building blocks you can use, EACH WITH ITS INPUT AND OUTPUT PINS, in three groups: `standard` (library FBs & functions — timers TON/TOF, counters CTU/CTD, math, comparison, motion MC_*, conversion), `hardware` (the physical I/O blocks of the SELECTED BOARD — GPIO_Read/GPIO_Write/GPIO_SetMode, PWM<n>, ADC<n>, CAN<n>, SPI<n>_Transfer, I2C<n>_Read/Write, UART<n>_*, plus the generic comm FBs of any enabled port) and `project` (the project\'s own FBs/functions). ALWAYS call this before using any block so you reference the correct pin names and types — and call it to find out which real I/O the board actually offers instead of assuming it has none. Optionally filter by a name/category substring (e.g. {"filter":"GPIO"}).',
     parameters: S({ filter: str('Optional case-insensitive substring to match block type or category (optional)') }),
   },
   {
@@ -667,9 +723,9 @@ export function applyToolCall(struct, name, args = {}) {
       }
 
       case 'list_blocks': {
-        const cat = buildBlockCatalog(struct, args.__library, args.filter);
-        if (cat.standard.length === 0 && cat.project.length === 0) {
-          return { mutation: false, ok: true, result: { note: args.filter ? `No blocks match "${args.filter}".` : 'No block library loaded.', standard: [], project: [] } };
+        const cat = buildBlockCatalog(struct, args.__library, args.filter, args.__hardware);
+        if (cat.standard.length === 0 && cat.hardware.length === 0 && cat.project.length === 0) {
+          return { mutation: false, ok: true, result: { note: args.filter ? `No blocks match "${args.filter}".` : 'No block library loaded.', standard: [], hardware: [], project: [] } };
         }
         return { mutation: false, ok: true, result: cat };
       }
@@ -858,7 +914,7 @@ export function applyToolCall(struct, name, args = {}) {
         if (dsl.length === 0) return { ok: false, error: 'rungs must be a non-empty array' };
         const fbVarHints = []; // pin-typed declare candidates from fb.inputs/fb.outputs
         let compiled;
-        try { compiled = dsl.map((r, i) => compileLadderRung(r, i, { struct, pou: hit.item, library: args.__library, collect: (h) => fbVarHints.push(h) })); }
+        try { compiled = dsl.map((r, i) => compileLadderRung(r, i, { struct, pou: hit.item, library: args.__library, hardware: args.__hardware, collect: (h) => fbVarHints.push(h) })); }
         catch (e) { return { ok: false, error: `ladder: ${e.message}` }; }
         // SCL rungs carry a per-rung language tag; ladder rungs are 'LD'.
         if (hit.item.type === 'SCL') compiled = compiled.map((r) => ({ ...r, lang: 'LD' }));
@@ -889,7 +945,8 @@ export function applyToolCall(struct, name, args = {}) {
           ];
           for (const c of contacts) if (c && c.contact) declare(String(c.contact), 'BOOL', false);
           for (const o of (Array.isArray(r.outputs) ? r.outputs : [])) if (o && o.coil) declare(String(o.coil), 'BOOL', false);
-          if (r.fb && r.fb.instance) declare(String(r.fb.instance), String(r.fb.type), true);
+          // The fb INSTANCE is declared from the compile-time hints below, so it
+          // carries the block's canonical type spelling.
         }
         // Variables referenced inside fb pins (inputs like R:="ResetBtn",
         // captures like ET⇒elapsed) — typed by the PIN, collected during compile.
@@ -923,7 +980,7 @@ export function applyToolCall(struct, name, args = {}) {
         if (!args.name || !args.name.trim()) return { ok: false, error: 'name is required' };
         if (!isValidIecName(args.name)) return { ok: false, error: `invalid variable name "${args.name}" — must be an IEC identifier (no spaces; can't start with a digit)` };
         if (isReservedTranspilerName(args.name)) return { ok: false, error: `"${args.name}" is reserved by the transpiler/runtime (e.g. "S" is the internal PlcState pointer) — pick a different name` };
-        const resolved = resolveVarType(struct, args.type);
+        const resolved = resolveVarType(struct, args.type, args.__hardware);
         if (!resolved.ok) return { ok: false, error: resolved.error };
         // An inline "ARRAY[..] OF TYPE" got auto-recovered into a real named
         // data type — fold it into the base struct BEFORE building/placing the
@@ -996,7 +1053,7 @@ export function applyToolCall(struct, name, args = {}) {
         let base = struct;
         const extraLines = [];
         if (args.type != null) {
-          const resolved = resolveVarType(struct, args.type);
+          const resolved = resolveVarType(struct, args.type, args.__hardware);
           if (!resolved.ok) return { ok: false, error: resolved.error };
           changes.type = resolved.type;
           // Retype BOOL→TON (or back) must move the instance flag with it, or a
@@ -1586,7 +1643,17 @@ function checkBoolTarget(ctx, kind, name, idx) {
 // an agent-authored FB block is indistinguishable from a human-dropped one
 // (the editor renders pins from customData; the transpiler reads user-FB pins
 // from customData.content.variables).
-function resolveFbBlockDef(struct, library, type) {
+function resolveFbBlockDef(struct, library, type, hardware) {
+  // Board/HAL blocks first: they are board-specific and shadow nothing, but a
+  // GPIO/PWM/ADC type will never be found in the XML library or GENERIC_FB_DEFS.
+  const hwDef = hardwareBlockDef(hardware, type);
+  if (hwDef) {
+    return {
+      inputs: hwDef.inputs || [], outputs: hwDef.outputs || [], isUser: false, isHardware: true,
+      canonicalType: hwDef.blockType,
+      customData: { inputs: hwDef.inputs || [], outputs: hwDef.outputs || [], class: hwDef.class || 'FunctionBlock', desc: hwDef.desc || '' },
+    };
+  }
   for (const cat of (Array.isArray(library) ? library : [])) {
     for (const b of (cat.blocks || [])) {
       if (b.blockType === type) {
@@ -1656,19 +1723,27 @@ function compileLadderRung(r, idx, ctx = {}) {
     if (!fb.instance || !isValidIecName(fb.instance)) throw new Error(`rung ${idx + 1}: fb.instance must be a valid IEC identifier (the instance variable name, e.g. "timer0")`);
     // Inline math/move/compare check FIRST — it is type-table-based and must
     // fire even when the block library isn't loaded/passed.
-    if (FB_TRIGGER_PIN[fb.type] === 'EN' && !SYSTEM_FB_TYPES.has(fb.type)) throw new Error(`rung ${idx + 1}: "${fb.type}" is an inline math/move/compare operation — express it in an ST rung (set_st_code) instead of ladder`);
-    fbDef = resolveFbBlockDef(ctx.struct, ctx.library, fb.type);
+    // A board/HAL block is EN-triggered too, but it is a real stateful FB with
+    // a ladder body — it must NOT be diverted to ST as inline math.
+    const isHwBlock = !!hardwareBlockDef(ctx.hardware, fb.type);
+    if (!isHwBlock && FB_TRIGGER_PIN[fb.type] === 'EN' && !SYSTEM_FB_TYPES.has(fb.type)) throw new Error(`rung ${idx + 1}: "${fb.type}" is an inline math/move/compare operation — express it in an ST rung (set_st_code) instead of ladder`);
+    fbDef = resolveFbBlockDef(ctx.struct, ctx.library, fb.type, ctx.hardware);
     if (!fbDef) throw new Error(`rung ${idx + 1}: unknown block type "${fb.type}" — call list_blocks to see available types`);
     if ((fbDef.inputs || []).some((p) => p.type === 'AXIS_REF')) throw new Error(`rung ${idx + 1}: "${fb.type}" is a motion FB (needs an Axis) — author motion in an ST rung (set_st_code)`);
     const inputNames = (fbDef.inputs || []).map((p) => p.name);
     const outputNames = (fbDef.outputs || []).map((p) => p.name);
     // Shared with buildBlockCatalog so the pins the model is TOLD about are
     // exactly the pins wired here.
-    ({ trigger: fbTrigger, powerOutput: fbQ } = powerPins(fb.type, fbDef.inputs, fbDef.outputs));
+    ({ trigger: fbTrigger, powerOutput: fbQ } = powerPins(fb.type, fbDef.inputs, fbDef.outputs, fbDef.isHardware));
     if (outputs.length > 0 && !fbQ) throw new Error(`rung ${idx + 1}: "${fb.type}" has no boolean output to drive coils — remove the outputs or use ST`);
     // ctx.collect gathers auto-declare candidates WITH pin-accurate types:
     // an identifier fed to a TIME pin declares as TIME, a CTU.R reference as
     // BOOL, an ET capture as TIME — not a blanket BOOL guess.
+    // The instance itself, typed with the CANONICAL block name (set_ladder's
+    // auto-declare consumes these hints; declaring it from the raw fb.type
+    // would store e.g. "gpio_write", which the transpiler's HAL tables — keyed
+    // exactly — would not recognise as an FB at all).
+    ctx.collect?.({ name: String(fb.instance), type: fbDef.canonicalType || fb.type, isInstance: true });
     const pinType = (arr, pin) => (arr.find((p) => p.name === pin) || {}).type || 'BOOL';
     const isIdentRef = (v) => isValidIecName(String(v)) && !/^(true|false)$/i.test(String(v));
     for (const [pin, val] of Object.entries(fb.inputs || {})) {
@@ -1697,8 +1772,23 @@ function compileLadderRung(r, idx, ctx = {}) {
   if (fb) {
     const id = bid();
     blocks.push({
-      id, type: fb.type, position: { x: colX, y: LD_FB_Y },
-      data: { label: fb.type, instanceName: fb.instance, customData: fbDef.customData, values: fbValues },
+      // ⚠️ The CANONICAL spelling, not what the model typed: hardware block
+      // types are matched case-insensitively but the transpiler's HAL tables
+      // are keyed exactly ('GPIO_Write', 'PWM0').
+      id, type: fbDef.canonicalType || fb.type, position: { x: colX, y: LD_FB_Y },
+      data: {
+        label: fbDef.canonicalType || fb.type, instanceName: fb.instance, customData: fbDef.customData, values: fbValues,
+        // ⚠️ EN/ENO have NO HANDLES in the editor unless the block opts into
+        // `executionControl` — RungContainer strips them from a board block's
+        // pin body (they are the power-flow pair, not data pins) and only that
+        // flag re-adds them, normally via BlockSettingsModal's checkbox. We
+        // wire power through `in_EN`/`out_ENO`, so without it ReactFlow finds
+        // no such handle and silently drops BOTH edges: the rung rendered as
+        // an unconnected island (codegen was fine, the picture was not).
+        // It also validates LD_FB_Y, whose arithmetic assumes the trigger is
+        // the FIRST pin row — with the flag, EN is.
+        ...(fbTrigger === 'EN' ? { executionControl: true } : {}),
+      },
     });
     chainIds.push(id);
     // Editor handles are name-based (`in_IN`, `out_Q`); the transpiler reads

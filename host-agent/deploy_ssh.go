@@ -21,8 +21,8 @@ import (
 //
 // Ports the old Tauri ssh2 implementation to Go: SCPs the prebuilt KronServer
 // ("plc-agent") binary for the target board to <home>/plc/plc-agent over SFTP,
-// then installs a supervisor (systemd unit when available, else a cron @reboot
-// script) and starts it. Progress is streamed to the editor over SSE on the
+// then installs a supervisor (systemd unit when available, else a plain
+// restart-on-crash script with best-effort boot persistence) and starts it. Progress is streamed to the editor over SSE on the
 // "server-deploy-progress" topic (the frontend opens that stream before the POST).
 
 type deployServerReq struct {
@@ -143,14 +143,19 @@ func (s *Server) handleDeployServerToTarget(w http.ResponseWriter, r *http.Reque
 	}
 
 	progress("Stopping existing plc-agent...")
-	stopCmd := fmt.Sprintf(
-		"%[1]ssystemctl stop plc-agent 2>/dev/null; "+
-			"%[1]spkill -f plc-agent-supervisor 2>/dev/null; "+
-			"%[1]spkill -f '%[2]s' 2>/dev/null; "+
-			"rm -f %[2]s; sleep 1; true",
-		sudo, remoteBin)
+	stopScript := killPatternPrologue +
+		"systemctl stop plc-agent 2>/dev/null\n" +
+		"killpat plc-agent-supervisor\n" +
+		"killpat " + remoteBin + "\n" +
+		"sleep 1\n" +
+		"killpat plc-agent-supervisor KILL\n" +
+		"killpat " + remoteBin + " KILL\n" +
+		"rm -f " + remoteBin + "\n" +
+		"exit 0\n"
 	// Best-effort by design (nothing may be installed yet) — but log failures.
-	_ = sshRunLogged(client, stopCmd, progress, "stopping existing agent")
+	if out, err := runStagedScript(client, sudo, "/tmp/kron-stop.sh", stopScript); err != nil {
+		progress("warning: stopping existing agent failed: " + err.Error() + "\n" + out)
+	}
 
 	progress("Uploading server binary via SFTP...")
 	sc, err := sftp.NewClient(client)
@@ -193,17 +198,21 @@ func (s *Server) handleDeployServerToTarget(w http.ResponseWriter, r *http.Reque
 		}
 		mode = "systemd"
 	} else {
-		progress("systemd not found — installing cron @reboot supervisor...")
-		if out, err := installCronSupervisor(client, sudo, remoteBin, remoteDir); err != nil {
-			writeError(w, http.StatusBadGateway, "cron supervisor install failed: "+err.Error()+"\n"+out)
+		progress("systemd not found — installing script supervisor...")
+		if out, err := installSupervisorScript(client, remoteBin, remoteDir); err != nil {
+			writeError(w, http.StatusBadGateway, "supervisor install failed: "+err.Error()+"\n"+out)
 			return
 		}
+		// Boot persistence is BEST-EFFORT: a minimal image may have neither
+		// systemd nor crontab nor a writable rc.local, and that must not fail a
+		// deploy — the agent still runs now, it just won't come back on reboot.
+		hook := installBootHook(client, sudo, remoteDir, progress)
 		progress("Starting plc-agent supervisor...")
-		if out, err := startCronSupervisor(client, sudo, remoteDir); err != nil {
+		if out, err := startSupervisorScript(client, sudo, remoteDir); err != nil {
 			writeError(w, http.StatusBadGateway, "supervisor start failed: "+err.Error()+"\n"+out)
 			return
 		}
-		mode = "cron @reboot supervisor"
+		mode = "script supervisor, autostart: " + hook
 	}
 
 	// Verify the agent answers /status (ARM boards can take 10+ s to come up).
@@ -229,8 +238,9 @@ func (s *Server) handleDeployServerToTarget(w http.ResponseWriter, r *http.Reque
 				"journalctl -u plc-agent -n 20 2>&1; echo '---'; tail -20 %s/plc-agent.log 2>&1", remoteDir)
 	} else {
 		diagCmd = fmt.Sprintf(
-			"ps -ef | grep -E 'plc-agent(-supervisor)?' | grep -v grep; echo '---'; "+
-				"%scrontab -l 2>&1 | grep plc-agent; echo '---'; tail -40 %s/plc-agent.log 2>&1", sudo, remoteDir)
+			"{ ps -ef 2>/dev/null || ps; } | grep -E 'plc-agent(-supervisor)?' | grep -v grep; echo '---'; "+
+				"command -v crontab >/dev/null 2>&1 && %scrontab -l 2>&1 | grep plc-agent; echo '---'; "+
+				"tail -40 %s/plc-agent.log 2>&1", sudo, remoteDir)
 	}
 	if diag := strings.TrimSpace(sshRunLogged(client, diagCmd, progress, "diagnostics collection")); diag != "" {
 		progress("Agent did not start. Diagnostics:\n" + diag)
@@ -278,6 +288,45 @@ func sshRunLogged(client *ssh.Client, cmd string, progress func(string), what st
 	return out
 }
 
+// killPatternPrologue is a POSIX-sh replacement for `pkill -f`. Minimal images
+// (BusyBox/Yocto) ship neither pkill nor pgrep, and the old `pkill -f ...
+// 2>/dev/null` was therefore a SILENT no-op: "Stopping existing plc-agent"
+// stopped nothing, deploys accumulated supervisors, and each surplus agent
+// killed the live runtime as an "orphan" every 2 s.
+//
+// It matches /proc/<pid>/cmdline with shell globbing only (no grep child) and
+// ⚠️ skips its OWN process ancestry, walking PPIDs up from $$. Without that it
+// signals the shell running it — every deploy command line necessarily
+// contains the pattern it is about to kill. Ancestry is used rather than a
+// sentinel string in the script, which only ever protected callers whose
+// command line happened to carry it. The PPID is read past the last ")"
+// because /proc/<pid>/stat's comm field is itself parenthesised and may hold
+// spaces ("(plc-agent-super)").
+const killPatternPrologue = "#!/bin/sh\n" +
+	"kron_skip=\" \"\n" +
+	"kron_p=$$\n" +
+	"while [ \"$kron_p\" -gt 1 ] 2>/dev/null; do\n" +
+	"  kron_skip=\"$kron_skip$kron_p \"\n" +
+	"  kron_p=$(sed 's/.*) //' /proc/$kron_p/stat 2>/dev/null | cut -d' ' -f2)\n" +
+	"  [ -n \"$kron_p\" ] || break\n" +
+	"done\n" +
+	"killpat() {\n" +
+	"  for d in /proc/[0-9]*; do\n" +
+	"    pid=${d#/proc/}\n" +
+	"    case \"$kron_skip\" in *\" $pid \"*) continue ;; esac\n" +
+	"    cl=$(tr '\\0' ' ' < \"$d/cmdline\" 2>/dev/null) || continue\n" +
+	"    case \"$cl\" in *\"$1\"*) kill -\"${2:-TERM}\" \"$pid\" 2>/dev/null ;; esac\n" +
+	"  done\n" +
+	"}\n"
+
+// runStagedScript uploads body to remotePath and executes it (under sudo when
+// given), so no script has to survive nested shell quoting.
+func runStagedScript(client *ssh.Client, sudo, remotePath, body string) (string, error) {
+	return sshRun(client, fmt.Sprintf(
+		"cat > %[1]s << 'KRONSTAGED'\n%[2]sKRONSTAGED\nchmod +x %[1]s && %[3]ssh %[1]s",
+		remotePath, body, sudo))
+}
+
 // installSystemdUnit writes /etc/systemd/system/plc-agent.service and enables it.
 // Restart=always keeps the agent up across crashes.
 func installSystemdUnit(client *ssh.Client, sudo, remoteBin, remoteDir string) (string, error) {
@@ -292,34 +341,106 @@ func installSystemdUnit(client *ssh.Client, sudo, remoteBin, remoteDir string) (
 	return sshRun(client, cmd)
 }
 
-// installCronSupervisor writes a POSIX-sh restart-on-crash supervisor and a
-// @reboot crontab entry (de-duplicated across re-deploys).
-func installCronSupervisor(client *ssh.Client, sudo, remoteBin, remoteDir string) (string, error) {
-	sup := remoteDir + "/plc-agent-supervisor.sh"
-	content := "#!/bin/sh\n" +
+// supervisorBody is the supervisor script text (split out so it can be
+// exercised by a test without an SSH connection).
+func supervisorBody(remoteBin, remoteDir string) string {
+	return "#!/bin/sh\n" +
 		"# plc-agent supervisor — restarts the agent on crash.\n" +
 		"BIN=" + remoteBin + "\n" +
 		"DIR=" + remoteDir + "\n" +
 		"LOG=$DIR/plc-agent.log\n" +
-		"trap 'kill -TERM \"$CHILD\" 2>/dev/null; exit 0' TERM INT\n" +
+		"PIDF=$DIR/plc-agent-supervisor.pid\n" +
+		// Second line of defence against a doubled supervisor (rc.local plus a
+		// manual start): a live supervisor owns the pidfile, a newcomer exits.
+		// The cmdline is re-checked so a recycled PID cannot lock us out.
+		"if [ -f \"$PIDF\" ]; then\n" +
+		"  OLD=$(cat \"$PIDF\" 2>/dev/null)\n" +
+		"  if [ -n \"$OLD\" ] && [ -r /proc/$OLD/cmdline ] && " +
+		"tr '\\0' ' ' < /proc/$OLD/cmdline | grep -q plc-agent-supervisor; then exit 0; fi\n" +
+		"fi\n" +
+		"echo $$ > \"$PIDF\"\n" +
+		"trap 'rm -f \"$PIDF\"; kill -TERM \"$CHILD\" 2>/dev/null; exit 0' TERM INT\n" +
 		"while true; do\n" +
 		"  \"$BIN\" -addr :7070 -deploy-dir \"$DIR\" -shm-name plc_runtime -shm-size 65536 >> \"$LOG\" 2>&1 &\n" +
 		"  CHILD=$!\n" +
 		"  wait \"$CHILD\"\n" +
 		"  sleep 2\n" +
 		"done\n"
-	cmd := fmt.Sprintf(
-		"cat > %[1]s << 'SUPERVISOR'\n%[2]sSUPERVISOR\nchmod +x %[1]s && "+
-			"( %[3]scrontab -l 2>/dev/null | grep -v plc-agent-supervisor ; echo '@reboot %[1]s >/dev/null 2>&1' ) | %[3]scrontab -",
-		sup, content, sudo)
+}
+
+// installSupervisorScript writes a POSIX-sh restart-on-crash supervisor into
+// the deploy dir. It touches nothing outside remoteDir, so it works on any
+// image (BusyBox/Alpine/Yocto/OpenWRT) regardless of the init system.
+func installSupervisorScript(client *ssh.Client, remoteBin, remoteDir string) (string, error) {
+	sup := remoteDir + "/plc-agent-supervisor.sh"
+	cmd := fmt.Sprintf("cat > %[1]s << 'SUPERVISOR'\n%[2]sSUPERVISOR\nchmod +x %[1]s", sup, supervisorBody(remoteBin, remoteDir))
 	return sshRun(client, cmd)
 }
 
-// startCronSupervisor (re)launches the supervisor detached so it survives our
-// SSH disconnect.
-func startCronSupervisor(client *ssh.Client, sudo, remoteDir string) (string, error) {
+// installBootHook tries, in order, a @reboot crontab entry and an /etc/rc.local
+// line so the supervisor comes back after a power cycle. Every step is
+// best-effort: it returns a human-readable description of what stuck (or
+// "none") and never an error — see the caller.
+func installBootHook(client *ssh.Client, sudo, remoteDir string, progress func(string)) string {
 	sup := remoteDir + "/plc-agent-supervisor.sh"
-	return sshRun(client, fmt.Sprintf("%[1]spkill -f plc-agent-supervisor 2>/dev/null; sleep 1; %[1]snohup %[2]s >/dev/null 2>&1 &", sudo, sup))
+	line := sup + " >/dev/null 2>&1 &"
+
+	if strings.TrimSpace(sshRun2(client, "command -v crontab >/dev/null 2>&1 && echo yes")) == "yes" {
+		cmd := fmt.Sprintf("( %[2]scrontab -l 2>/dev/null | grep -v plc-agent-supervisor ; echo '@reboot %[1]s >/dev/null 2>&1' ) | %[2]scrontab -", sup, sudo)
+		if out, err := sshRun(client, cmd); err == nil {
+			progress("Autostart: @reboot crontab entry installed.")
+			return "cron @reboot"
+		} else {
+			progress("warning: crontab install failed, trying /etc/rc.local: " + err.Error() + "\n" + out)
+		}
+	} else {
+		progress("crontab not found — trying /etc/rc.local for autostart...")
+	}
+
+	// rc.local: strip any previous entry, then insert before the final "exit 0"
+	// (BusyBox/Debian both honour it when executable). Staged as a script file
+	// so nothing has to survive nested shell quoting.
+	hook := remoteDir + "/plc-rc-hook.sh"
+	// ⚠️ `line` ends in "&", which sed's replacement expands to the whole match.
+	sedLine := strings.ReplaceAll(line, "&", "\\&")
+	script := "#!/bin/sh\n" +
+		"[ -f /etc/rc.local ] || printf '#!/bin/sh\\nexit 0\\n' > /etc/rc.local\n" +
+		"sed -i '/plc-agent-supervisor/d' /etc/rc.local\n" +
+		"if grep -q '^exit 0' /etc/rc.local; then\n" +
+		"  sed -i \"0,/^exit 0/s|^exit 0|" + sedLine + "\\nexit 0|\" /etc/rc.local\n" +
+		"else\n" +
+		"  printf '%s\\n' \"" + line + "\" >> /etc/rc.local\n" +
+		"fi\n" +
+		"chmod +x /etc/rc.local\n"
+	rc := fmt.Sprintf("cat > %[1]s << 'RCHOOK'\n%[2]sRCHOOK\nchmod +x %[1]s && %[3]ssh %[1]s", hook, script, sudo)
+	if out, err := sshRun(client, rc); err == nil {
+		progress("Autostart: /etc/rc.local entry installed.")
+		return "/etc/rc.local"
+	} else {
+		progress("warning: no autostart could be installed (" + err.Error() + "\n" + out +
+			") — the agent runs now but will NOT restart after a reboot.")
+	}
+	return "none"
+}
+
+// startSupervisorScript (re)launches the supervisor detached so it survives our
+// SSH disconnect.
+func startSupervisorScript(client *ssh.Client, sudo, remoteDir string) (string, error) {
+	sup := remoteDir + "/plc-agent-supervisor.sh"
+	body := killPatternPrologue +
+		"killpat plc-agent-supervisor\n" +
+		"sleep 1\n" +
+		"rm -f " + remoteDir + "/plc-agent-supervisor.pid\n" +
+		"nohup " + sup + " >/dev/null 2>&1 &\n" +
+		"exit 0\n"
+	return runStagedScript(client, sudo, remoteDir+"/plc-agent-start.sh", body)
+}
+
+// sshRun2 runs a probe command and returns its output, ignoring the exit status
+// (a failing `command -v` is a normal answer, not an error).
+func sshRun2(client *ssh.Client, cmd string) string {
+	out, _ := sshRun(client, cmd)
+	return out
 }
 
 // tofuHostKeyCallback returns a trust-on-first-use host-key verifier backed by

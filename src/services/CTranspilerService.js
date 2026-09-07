@@ -3335,6 +3335,125 @@ const KRON_FN = {
     // Range (kroncompare.h)
     'MAX': 'KRON_MAX', 'MIN': 'KRON_MIN', 'LIMIT': 'KRON_LIMIT',
 };
+// ── IEC selection / range functions in ST TEXT ──────────────────────────────
+// ⚠️ `KRON_FN` is consulted by the LD path ONLY. In ST these names used to
+// reach C verbatim, so `LIMIT(0, x, 100)` compiled as a call to an undeclared
+// `LIMIT` — reported by clang as `unknown type name` / implicit declaration,
+// i.e. exactly the phantom-block symptom, on code that is perfectly valid IEC.
+//
+// They expand to plain C conditional expressions rather than the archive's
+// `KRON_LIMIT`/`KRON_MIN`/… macros, for two reasons:
+//   • those dispatch with `_Generic` on ONE argument (`mn` for LIMIT, `in0` for
+//     SEL), so a literal bound picks the int32 overload and silently truncates
+//     a REAL: `LIMIT(0, x_real, 100)` → `KRON_LIMIT_I`. C's usual arithmetic
+//     conversions get the mixed int/real case right by construction;
+//   • no dependency on the per-triple `.a`, so an ST-only project still builds.
+// ⚠️ Like the `ABS` macro, the expansion evaluates its arguments more than
+// once — fine for ST expressions, which are side-effect-free apart from a user
+// FUNCTION call. A variadic MIN/MAX folds pairwise, so each extra argument
+// past the second duplicates the accumulated text (3 args → 3 copies of the
+// first): normal use is fine, a 6-input MIN would bloat the C.
+const ST_SELECTION_FN_ARGS = {
+    MIN: null, MAX: null, MUX: null,          // variadic
+    LIMIT: ['MN', 'IN', 'MX'],
+    SEL: ['G', 'IN0', 'IN1'],
+};
+
+// splitTopLevelArgs splits an argument list on commas that are NOT inside
+// nested parentheses or brackets. String literals are already placeholder
+// tokens by the time this runs, so no quote handling is needed.
+const splitTopLevelArgs = (inner) => {
+    const args = [];
+    let depth = 0, cur = '';
+    for (const ch of inner) {
+        if (ch === '(' || ch === '[') depth++;
+        else if (ch === ')' || ch === ']') depth--;
+        if (ch === ',' && depth === 0) { args.push(cur); cur = ''; continue; }
+        cur += ch;
+    }
+    if (cur.trim() !== '' || args.length > 0) args.push(cur);
+    return args.map(a => a.trim()).filter(a => a !== '');
+};
+
+// expandSTSelectionCalls rewrites MIN/MAX/LIMIT/SEL/MUX calls in an ST
+// expression. Recurses through arguments so nested calls expand too, and
+// leaves a name alone when the project declares its own function/FB of that
+// name. Accepts positional and named (`LIMIT(MN := 0, …)`, already normalised
+// to `MN = 0` by the assignment pass) argument forms — the same "by NAME, not
+// position" rule the LD path follows.
+const expandSTSelectionCalls = (expr, isUserDefinedName = () => false) => {
+    const re = /\b(MIN|MAX|LIMIT|SEL|MUX)\s*\(/i;
+    const m = re.exec(expr);
+    if (!m) return expr;
+    const name = m[1].toUpperCase();
+    if (isUserDefinedName(m[1])) {
+        // Not ours: skip past this call head and keep scanning.
+        const head = expr.slice(0, m.index + m[0].length);
+        return head + expandSTSelectionCalls(expr.slice(m.index + m[0].length), isUserDefinedName);
+    }
+    const open = m.index + m[0].length - 1;
+    let depth = 0, close = -1;
+    for (let i = open; i < expr.length; i++) {
+        if (expr[i] === '(') depth++;
+        else if (expr[i] === ')' && --depth === 0) { close = i; break; }
+    }
+    if (close < 0) throw new Error(`ST: unbalanced parentheses in ${name}(...)`);
+
+    let args = splitTopLevelArgs(expr.slice(open + 1, close))
+        .map(a => expandSTSelectionCalls(a, isUserDefinedName));
+
+    // Named arguments → positional, by the pin names the LD side uses.
+    const named = {};
+    const allNamed = args.length > 0 && args.every(a => {
+        const mm = a.match(/^([A-Za-z_][A-Za-z0-9_]*)\s*=(?!=)\s*([\s\S]+)$/);
+        if (!mm) return false;
+        named[mm[1].toUpperCase()] = mm[2].trim();
+        return true;
+    });
+    if (allNamed) {
+        const order = ST_SELECTION_FN_ARGS[name] ||
+            (name === 'MUX' ? ['K', ...Object.keys(named).filter(k => k !== 'K').sort()]
+                : Object.keys(named).sort());
+        const missing = order.filter(k => named[k] === undefined);
+        if (missing.length) throw new Error(`ST: ${name}(...) is missing argument(s) ${missing.join(', ')}`);
+        args = order.map(k => named[k]);
+    }
+
+    const p = args.map(a => `(${a})`);
+    let out;
+    switch (name) {
+        case 'MIN':
+        case 'MAX': {
+            if (p.length < 2) throw new Error(`ST: ${name}(...) needs at least 2 arguments, got ${p.length}`);
+            const op = name === 'MIN' ? '<' : '>';
+            out = p.reduce((acc, cur) => `(${acc} ${op} ${cur} ? ${acc} : ${cur})`);
+            break;
+        }
+        case 'LIMIT':
+            if (p.length !== 3) throw new Error(`ST: LIMIT(MN, IN, MX) needs 3 arguments, got ${p.length}`);
+            out = `(${p[1]} < ${p[0]} ? ${p[0]} : (${p[1]} > ${p[2]} ? ${p[2]} : ${p[1]}))`;
+            break;
+        case 'SEL':
+            if (p.length !== 3) throw new Error(`ST: SEL(G, IN0, IN1) needs 3 arguments, got ${p.length}`);
+            out = `(${p[0]} ? ${p[2]} : ${p[1]})`;
+            break;
+        case 'MUX': {
+            if (p.length < 2) throw new Error(`ST: MUX(K, IN0, ...) needs at least 2 arguments, got ${p.length}`);
+            const k = p[0], ins = p.slice(1);
+            // Out-of-range K clamps to the last input (IEC leaves it undefined).
+            out = ins.slice(0, -1).reduceRight(
+                (acc, cur, i) => `(${k} == ${i} ? ${cur} : ${acc})`,
+                ins[ins.length - 1]);
+            out = `(${out})`;
+            break;
+        }
+        default:
+            return expr;
+    }
+    return expr.slice(0, m.index) + out +
+        expandSTSelectionCalls(expr.slice(close + 1), isUserDefinedName);
+};
+
 // Bitwise — use C operators directly
 const BITWISE_OP = {
     'BAND': '&', 'BOR': '|', 'BXOR': '^', 'BNOT': '~',
@@ -3626,6 +3745,21 @@ const transpileSTLogics = (code, stdFunctions = {}, parentName = '', category = 
     if (!code) return `    // ST Implementation Empty\n`;
     const { fnReturnVar = null, userFunctionInputs = {}, userFBInputs = {} } = opts;
 
+    // ⚠️ A project may declare its own MIN/MAX/… FUNCTION or FB type; that name
+    // must keep its own meaning instead of expanding to the IEC selection form.
+    // Declared VARIABLES are deliberately NOT in this set: the expander only
+    // matches a call form (`MIN(`), which a variable can never be, and
+    // including them turned `MIN(a, b)` in a POU that also declares `Min` into
+    // `S->prog_X_Min(a, b)` — invalid C from valid IEC. A bare `Min + 1` is
+    // untouched either way. Compared case-INSENSITIVELY per the IEC identifier
+    // rule (these keys keep their declared case, so a direct lookup misses
+    // `Min`), and precomputed once rather than per line.
+    const shadowedStdNames = new Set([
+        ...Object.keys(userFunctionInputs),
+        ...userFBTypes,
+    ].map(n => String(n).toLowerCase()));
+    const isShadowedStdName = (n) => shadowedStdNames.has(String(n).toLowerCase());
+
     // Strip IEC 61131-3 comments and VAR…END_VAR blocks before splitting:
     //   (* block comments — single or multi-line *)
     //   // line comments
@@ -3916,6 +4050,9 @@ const transpileSTLogics = (code, stdFunctions = {}, parentName = '', category = 
                 return ct ? `(${ct})(` : match;
             }
         );
+        // IEC selection/range functions (MIN/MAX/LIMIT/SEL/MUX) → C conditionals.
+        // Runs BEFORE variable resolution so the arguments are resolved after.
+        result = expandSTSelectionCalls(result, isShadowedStdName);
         result = resolveVarsInExpr(result);
         // Restore protected strings
         return result.replace(/(\d+)/g, (_, i) => stringTokens[+i]);

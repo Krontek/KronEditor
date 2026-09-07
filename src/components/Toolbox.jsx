@@ -3,7 +3,7 @@ import { useTranslation } from 'react-i18next';
 import EtherCATIconSrc from '../assets/icons/ethercat.png';
 import { PLC_BLOCKS } from '../utils/plcStandards';
 import { LIBRARY_TREE, ETHERCAT_LIBRARY_TREE, GENERIC_FB_DEFS } from '../utils/libraryTree';
-import { getBoardLibraryTree } from '../utils/boardLibraryBlocks';
+import { getBoardLibraryTree, COMM_PROTO_BLOCKS } from '../utils/boardLibraryBlocks';
 import { getBoardFamily } from '../utils/boardDefinitions';
 import DragDropManager from '../utils/DragDropManager';
 
@@ -199,13 +199,6 @@ const COIL_COLOR = '#8b3a0f'; // coils (brown-red)
 const BOARD_COLOR = '#00695c'; // board-specific blocks (teal)
 const EC_COLOR    = '#1565c0'; // EtherCAT blocks (blue)
 
-const COMM_PROTO_BLOCKS = {
-  UART: ['UART_Send', 'UART_Receive'],
-  I2C:  ['I2C_WriteRead'],
-  SPI:  ['SPI_Transfer'],
-  USB:  ['USB_Send', 'USB_Receive'],
-};
-
 const Toolbox = ({ userDefinedBlocks = [], libraryData = [], activeFileType, selectedBoard, buses = [], interfaceConfig = {} }) => {
   const { t } = useTranslation();
   const hasEtherCAT = buses.some(b => b.type === 'ethercat');
@@ -293,7 +286,7 @@ const Toolbox = ({ userDefinedBlocks = [], libraryData = [], activeFileType, sel
   const boardTree = useMemo(() => {
     const tree = getBoardLibraryTree(selectedBoard);
     // Append subcategories for each enabled comm protocol
-    for (const proto of ['UART', 'I2C', 'SPI', 'USB']) {
+    for (const proto of Object.keys(COMM_PROTO_BLOCKS)) {
       const ports = interfaceConfig[proto];
       const hasEnabled = ports && Object.values(ports).some(p => p?.enabled);
       if (!hasEnabled) continue;

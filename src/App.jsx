@@ -29,7 +29,7 @@ import { isReservedTranspilerName } from './utils/reservedNames';
 import { getBoardById } from './utils/boardDefinitions';
 import { getBoardFamilyDefine } from './utils/devicePortMapping';
 import { buildHardwarePortVars } from './utils/hwPortVars';
-import { getBoardLibraryTree } from './utils/boardLibraryBlocks';
+import { getBoardBlockDefs } from './utils/boardLibraryBlocks';
 import ArrayTypeEditor from './components/ArrayTypeEditor';
 import StructureTypeEditor from './components/StructureTypeEditor';
 import EnumTypeEditor from './components/EnumTypeEditor';
@@ -2294,35 +2294,19 @@ function App() {
   // (The agent's check_compile tool was removed — see agentTools.js. Compiling
   // is a human, toolbar-initiated action; the agent never builds.)
 
-  const boardBlocks = useMemo(() => {
-    if (!selectedBoard) return [];
-    const COMM_PROTO_BLOCKS = {
-      UART: ['UART_Send', 'UART_Receive'],
-      I2C:  ['I2C_WriteRead'],
-      SPI:  ['SPI_Transfer'],
-      USB:  ['USB_Send', 'USB_Receive'],
-    };
-    const out = [];
-    for (const sub of getBoardLibraryTree(selectedBoard)) {
-      for (const item of (sub.items || [])) {
-        if (!item?.blockType) continue;
-        out.push({ name: item.blockType, category: `Hardware / ${sub.title}` });
-      }
-    }
-    for (const proto of ['UART', 'I2C', 'SPI', 'USB']) {
-      const ports = deviceInterfaceConfig[proto];
-      if (!ports || !Object.values(ports).some(p => p?.enabled)) continue;
-      for (const blockType of COMM_PROTO_BLOCKS[proto]) {
-        out.push({ name: blockType, category: `Hardware / ${proto}` });
-      }
-    }
-    const seen = new Set();
-    return out.filter(b => {
-      if (seen.has(b.name)) return false;
-      seen.add(b.name);
-      return true;
-    });
-  }, [selectedBoard, deviceInterfaceConfig]);
+  // Every hardware block of the selected board, WITH its pins. Declared in no
+  // XML — `getBoardBlockDefs` is the only source — so both the Variable
+  // Manager list below and the AI agent's catalog hang off this one memo.
+  const hardwareBlocks = useMemo(
+    () => getBoardBlockDefs(selectedBoard, deviceInterfaceConfig),
+    [selectedBoard, deviceInterfaceConfig]
+  );
+
+  // Names-only projection for the Variable Manager's instance-type drop-down.
+  const boardBlocks = useMemo(
+    () => hardwareBlocks.map(b => ({ name: b.blockType, category: `Hardware / ${b.category}` })),
+    [hardwareBlocks]
+  );
 
   const handleDeviceInterfaceConfigChange = useCallback((nextConfig) => {
     setProjectStructure(prev => ({
@@ -3206,6 +3190,7 @@ function App() {
                         setProjectStructure={setProjectStructure}
                         selectedBoard={selectedBoard}
                         libraryData={libraryData}
+                        hardwareBlocks={hardwareBlocks}
                         liveVariables={(isSimulationMode || isRunning) ? (liveVariables || {}) : null}
                         onApplied={handleAgentApplied}
                         onHotSwap={handleAgentHotSwap}

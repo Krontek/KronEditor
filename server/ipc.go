@@ -112,9 +112,45 @@ type IPCManager struct {
 	ringConfig      *RingConfig // payload layout for the capture ring (may be nil)
 }
 
+// ensureShmDir makes /dev/shm usable on minimal images (BusyBox/Yocto init
+// often never creates it), where O_CREAT on /dev/shm/<name> fails with ENOENT
+// and the agent used to exit(1) in a crash-restart loop. The runtime's
+// shm_open() needs the same directory, so this fixes both processes.
+// Everything here is best-effort: the mkdir alone is enough for mmap, the
+// tmpfs mount is the correct POSIX setup and is attempted when the directory
+// sits on a non-tmpfs filesystem (needs root; a failure is logged, not fatal).
+func ensureShmDir() {
+	const dir = "/dev/shm"
+	if err := os.MkdirAll(dir, 0o1777); err != nil {
+		slog.Warn("Could not create shared-memory directory", "dir", dir, "err", err)
+		return
+	}
+	// Chmod separately: MkdirAll applies the umask, and 1777 is what other
+	// (non-root) processes on the board expect.
+	_ = os.Chmod(dir, 0o1777)
+
+	const (
+		tmpfsMagic = 0x01021994
+		ramfsMagic = 0x858458f6
+	)
+	var st syscall.Statfs_t
+	if err := syscall.Statfs(dir, &st); err == nil {
+		if int64(st.Type) == tmpfsMagic || int64(st.Type) == ramfsMagic {
+			return // already a tmpfs/ramfs mount — nothing to do
+		}
+	}
+	if err := syscall.Mount("tmpfs", dir, "tmpfs", 0, "mode=1777"); err != nil {
+		slog.Warn("Could not mount tmpfs on /dev/shm — using a plain directory",
+			"err", err)
+		return
+	}
+	slog.Info("Mounted tmpfs on /dev/shm")
+}
+
 // NewIPCManager opens (or creates) /dev/shm/<shmName> and memory maps it.
 // The C++ runtime should open the same name using shm_open + ftruncate.
 func NewIPCManager(shmName string, shmSize int) (*IPCManager, error) {
+	ensureShmDir()
 	shmPath := "/dev/shm/" + shmName
 
 	// Open or create the file. The C++ side usually creates it first.

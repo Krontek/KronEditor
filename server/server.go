@@ -90,6 +90,7 @@ type Server struct {
 	rtCfg   RuntimeConfig
 	mux     *http.ServeMux
 	httpSrv *http.Server
+	ln      net.Listener // claimed by Bind, consumed by Start (main-goroutine only)
 
 	hmiMu   sync.Mutex   // guards the dedicated HMI listener
 	hmiSrv  *http.Server // dedicated operator-facing HMI server (nil if none)
@@ -146,13 +147,39 @@ func (s *Server) registerRoutes() {
 	RegisterAPIRoutes(s.mux, api)
 }
 
-// Start launches the server in background (non-blocking).
-func (s *Server) Start() error {
+// Bind claims the listen address WITHOUT serving yet, so a second agent
+// instance loses the port before it can touch shared state.
+//
+// ⚠️ Bind must happen before ProcessManager.CleanupOrphanRuntime: that reaper
+// SIGTERMs whatever the PID file names, and a duplicate agent (a doubled
+// supervisor on an image without pkill, say) would otherwise kill the LIVE
+// runtime of the agent that legitimately owns the port, every time it
+// respawned — observed as "Run stops after ~2 seconds", with the crash
+// reported as "exit code -1". Failing the bind first makes the duplicate exit
+// harmlessly. Serving still starts only after the reaper has run, so a Start
+// RPC can never have its fresh runtime mistaken for an orphan.
+func (s *Server) Bind() error {
+	if s.ln != nil {
+		return nil
+	}
 	ln, err := net.Listen("tcp", s.cfg.ListenAddr)
 	if err != nil {
 		return fmt.Errorf("failed to start TCP listener (%s): %w", s.cfg.ListenAddr, err)
 	}
 	slog.Info("Server listening", "addr", ln.Addr().String())
+	s.ln = ln
+	return nil
+}
+
+// Start launches the server in background (non-blocking).
+func (s *Server) Start() error {
+	if s.ln == nil {
+		if err := s.Bind(); err != nil {
+			return err
+		}
+	}
+	ln := s.ln
+	s.ln = nil
 	go func() {
 		if err := s.httpSrv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			slog.Error("HTTP server error", "err", err)
