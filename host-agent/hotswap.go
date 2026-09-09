@@ -1113,6 +1113,39 @@ func (s *Server) handleHotSwapStop(w http.ResponseWriter, r *http.Request) {
 // hotswapPoller reads the host-owned /dev/shm mirror by offset and streams live
 // variables, identical to the editor's existing simulation-output feed.
 func (s *Server) hotswapPoller(specs []ShmSpec, stop <-chan struct{}) {
+	plan, bufSize := make([]pollSpec, 0, len(specs)), 0
+	for _, sp := range specs {
+		if ps, ok := newPollSpec(sp.Key, sp.VType, sp.Offset); ok {
+			plan = append(plan, ps)
+			if ps.size > bufSize {
+				bufSize = ps.size
+			}
+		}
+	}
+	if len(plan) == 0 {
+		return // nothing readable — don't wake up 5 times a second to say so
+	}
+	// One scratch buffer for the whole run — see simulationPoller.
+	buf := make([]byte, bufSize)
+
+	// ⚠️ The mirror is held OPEN across ticks, not re-attached every 200 ms.
+	// The loader-host owns it and it survives a logic swap BY DESIGN (that is
+	// the whole point of host-owned shm), so re-mapping per tick bought nothing
+	// and cost an mmap+munmap pair — and on Windows a MapViewOfFile /
+	// UnmapViewOfFile pair with its TLB shootdown — five times a second for the
+	// entire run.
+	//
+	// It is opened lazily because a tick can still land before the host has
+	// created the segment, and dropped again when a whole tick reads nothing:
+	// a Win32 section object dies with its creator, so a stale view over a
+	// crashed host would otherwise never recover.
+	var mirror *shmMirror
+	defer func() {
+		if mirror != nil {
+			mirror.Close()
+		}
+	}()
+
 	time.Sleep(150 * time.Millisecond)
 	ticker := time.NewTicker(200 * time.Millisecond)
 	defer ticker.Stop()
@@ -1122,27 +1155,27 @@ func (s *Server) hotswapPoller(specs []ShmSpec, stop <-chan struct{}) {
 			return
 		case <-ticker.C:
 		}
-		mirror, err := openShmMirror(s.paths.BuildDir(), hotswapShmName, hotswapShmSize, false)
-		if err != nil {
-			continue // mirror not up yet
-		}
-		vars := make(map[string]interface{})
-		anyOK := false
-		for _, sp := range specs {
-			size := typeSize(sp.VType)
-			if size == 0 {
-				continue
+		if mirror == nil {
+			m, err := openShmMirror(s.paths.BuildDir(), hotswapShmName, hotswapShmSize, false)
+			if err != nil {
+				continue // mirror not up yet
 			}
-			buf := make([]byte, size)
-			if err := mirror.ReadAt(buf, int64(sp.Offset)); err == nil {
-				vars[sp.Key] = decodeValue(buf, sp.VType)
+			mirror = m
+		}
+		vars := make(map[string]interface{}, len(plan))
+		anyOK := false
+		for _, sp := range plan {
+			if err := mirror.ReadAt(buf[:sp.size], sp.offset); err == nil {
+				vars[sp.key] = decodeValue(buf[:sp.size], sp.vtype)
 				anyOK = true
 			}
 		}
-		mirror.Close()
 		if anyOK {
 			s.events.Emit("simulation-output", map[string]any{"vars": vars})
 			broadcastPlcVars(vars)
+			continue
 		}
+		mirror.Close()
+		mirror = nil
 	}
 }

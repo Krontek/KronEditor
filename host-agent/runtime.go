@@ -338,12 +338,35 @@ func broadcastPlcVars(vars map[string]interface{}) {
 // ── simulation poller ────────────────────────────────────────────────────────
 
 func (s *Server) simulationPoller(pid int, specs []VarSpec, stop <-chan struct{}) {
+	plan, bufSize := make([]pollSpec, 0, len(specs)), 0
+	for _, sp := range specs {
+		if ps, ok := newPollSpec(sp.Key, sp.VType, sp.Address); ok {
+			plan = append(plan, ps)
+			if ps.size > bufSize {
+				bufSize = ps.size
+			}
+		}
+	}
+	if len(plan) == 0 {
+		return // nothing readable — don't wake up 5 times a second to say so
+	}
+	// One scratch buffer for the whole run: decodeValue never retains buf (each
+	// branch copies scalars out or builds a fresh map), so allocating one per
+	// variable per tick was pure garbage.
+	buf := make([]byte, bufSize)
+
 	memPath := fmt.Sprintf("/proc/%d/mem", pid)
 	time.Sleep(100 * time.Millisecond)
-	if _, err := os.Stat(memPath); err != nil {
+	// ⚠️ The fd is held OPEN across ticks. Re-opening cost an open+close pair
+	// (plus a redundant Stat) every 200 ms for a path whose identity cannot
+	// change during a run — the pid is fixed and the process is ours.
+	f, err := os.Open(memPath)
+	if err != nil {
 		s.events.Emit("simulation-output", map[string]any{"error": "Failed to open process memory"})
 		return
 	}
+	defer f.Close()
+
 	ticker := time.NewTicker(200 * time.Millisecond)
 	defer ticker.Stop()
 	for {
@@ -352,30 +375,25 @@ func (s *Server) simulationPoller(pid int, specs []VarSpec, stop <-chan struct{}
 			return
 		case <-ticker.C:
 		}
-		if _, err := os.Stat(memPath); err != nil {
-			return
-		}
-		f, err := os.Open(memPath)
-		if err != nil {
-			return
-		}
-		vars := make(map[string]interface{})
+		vars := make(map[string]interface{}, len(plan))
 		anyOK := false
-		for _, sp := range specs {
-			size := typeSize(sp.VType)
-			if size == 0 {
-				continue
-			}
-			buf := make([]byte, size)
-			if _, err := f.ReadAt(buf, int64(sp.Address)); err == nil {
-				vars[sp.Key] = decodeValue(buf, sp.VType)
+		for _, sp := range plan {
+			if _, err := f.ReadAt(buf[:sp.size], sp.offset); err == nil {
+				vars[sp.key] = decodeValue(buf[:sp.size], sp.vtype)
 				anyOK = true
 			}
 		}
-		f.Close()
 		if anyOK {
 			s.events.Emit("simulation-output", map[string]any{"vars": vars})
 			broadcastPlcVars(vars)
+			continue
+		}
+		// Nothing read at all. A dead process is the likely cause and the
+		// poller used to end the goroutine on that (it Stat'd the path at the
+		// top of every tick), so confirm it here instead — on the failure path
+		// only, and never ending the run over a transient read error.
+		if _, err := os.Stat(memPath); err != nil {
+			return
 		}
 	}
 }
@@ -583,6 +601,28 @@ func buildVarSpecs(varTable map[string]interface{}, symbols map[string]uint64) [
 }
 
 // ── type encoding/decoding ───────────────────────────────────────────────────
+
+// pollSpec is a poller's precomputed view of one monitored variable. The
+// pollers run at 5 Hz for the whole life of a run, so everything that does not
+// change between ticks is resolved ONCE here: the size (typeSize is a
+// strings.ToUpper + switch) and the type name already upper-cased, which makes
+// decodeValue's own ToUpper hit its no-allocation fast path.
+type pollSpec struct {
+	key    string
+	vtype  string
+	offset int64
+	size   int
+}
+
+// newPollSpec reports false for a type with no readable size, so the unreadable
+// variables are dropped from the plan instead of being re-tested every tick.
+func newPollSpec(key, vtype string, offset uint64) (pollSpec, bool) {
+	size := typeSize(vtype)
+	if size == 0 {
+		return pollSpec{}, false
+	}
+	return pollSpec{key: key, vtype: strings.ToUpper(vtype), offset: int64(offset), size: size}, true
+}
 
 func typeSize(t string) int {
 	switch strings.ToUpper(t) {
