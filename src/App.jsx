@@ -43,6 +43,7 @@ import SavePathModal from './components/SavePathModal';
 import { transpileToC, validateProjectST } from './services/CTranspilerService';
 import { PLCClient } from './services/PLCClient';
 import { host } from './services/HostClient';
+import { ERROR_CATEGORY, formatCompileFailure, categorize } from './utils/errorFormat';
 import PlcIcon from './assets/icons/plc-icon.png';
 import EtherCATIconSrc from './assets/icons/ethercat.png';
 const EtherCATTabIcon = <img src={EtherCATIconSrc} height="13" style={{ objectFit: 'contain', verticalAlign: 'middle' }} alt="EtherCAT" />;
@@ -590,7 +591,7 @@ function App() {
               if (!plcClientRef.current.isStreamHealthy) {
                 stopStreamRef.current = plcClientRef.current.streamVars(
                   (vars) => { Object.assign(liveVarsRef.current, vars); liveVarsDirtyRef.current = true; },
-                  (err) => addLog('error', `Stream error: ${err.message}`),
+                  (err) => addLog('error', categorize(ERROR_CATEGORY.RUNTIME, `Stream error: ${err.message}`)),
                 );
               }
             } else if (!status.running && isRunningRef.current && !isSimulationModeRef.current) {
@@ -1135,7 +1136,7 @@ function App() {
           setIsRunning(false);
           addLog('warning', t('logs.simulationStatus', { status: parsed.status }) || `Simulation ${parsed.status}.`);
         } else if (parsed.error) {
-          addLog('error', t('logs.simulationError', { error: parsed.error }) || `Simulation: ${parsed.error}`);
+          addLog('error', categorize(ERROR_CATEGORY.RUNTIME, t('logs.simulationError', { error: parsed.error }) || `Simulation: ${parsed.error}`));
         }
       } catch (e) {
         console.error('Failed to parse simulation output:', e, msg);
@@ -1399,7 +1400,7 @@ function App() {
       setIsHotSwap(true);
       layoutSigRef.current = layoutSignature(projectStructure, selectedBoard, buses, busConfigs);
     } catch (err) {
-      addLog('error', `Failed to start simulation: ${err.message || err}`);
+      addLog('error', categorize(ERROR_CATEGORY.RUNTIME, `Failed to start simulation: ${err.message || err}`));
       setIsRunning(false);
     }
   };
@@ -1418,8 +1419,19 @@ function App() {
       setCompileBusy('sim');
       addLog('info', t('logs.compilingSimulationTranspile') || 'Compiling Project for Simulation (C Transpilation)...');
       try {
+        // Transpile (Transpile category) and hotswapBuild (Compile category —
+        // it shells out to clang and, unlike compile.go, embeds any raw
+        // multi-line diagnostic dump directly in err.message; formatCompileFailure
+        // handles both shapes, see errorFormat.js) fail for different reasons
+        // and each returns early so the category shown matches the real cause.
         const standardHeaders = await host.getStandardHeaders().catch(() => []);
-        const cCode = transpileToC(projectStructure, standardHeaders, selectedBoard, true, buses, busConfigs);
+        var cCode;
+        try {
+          cCode = transpileToC(projectStructure, standardHeaders, selectedBoard, true, buses, busConfigs);
+        } catch (err) {
+          addLog('error', categorize(ERROR_CATEGORY.TRANSPILE, err.message || err));
+          return;
+        }
 
         // Strict task semantics: only task-assigned programs run. Warn about any
         // program that won't execute (so "I made it but no data" is diagnosable).
@@ -1435,13 +1447,18 @@ function App() {
         // binary — so the running sim is reloadable and an agent change can be
         // applied live (with a confirm). hotswapBuild writes the C files itself.
         addLog('info', t('logs.compilingSimulation') || 'Compiling simulation executable...');
-        await host.hotswapBuild({
-          header: cCode.header,
-          source: cCode.source,
-          variableTable: JSON.stringify(cCode.variableTable, null, 2),
-          hal: cCode.hal || '',
-          hostGlue: cCode.hostGlue || '',
-        });
+        try {
+          await host.hotswapBuild({
+            header: cCode.header,
+            source: cCode.source,
+            variableTable: JSON.stringify(cCode.variableTable, null, 2),
+            hal: cCode.hal || '',
+            hostGlue: cCode.hostGlue || '',
+          });
+        } catch (err) {
+          formatCompileFailure(ERROR_CATEGORY.COMPILE, err).forEach(({ type, msg }) => addLog(type, msg));
+          return;
+        }
         addLog('success', 'Simulation built (hot-swap enabled — live code is reloadable).');
         // Compile phase is over — stop the spinner NOW, before the run starts
         // (the finally below is only the error-path safety net). Keeping it
@@ -1462,14 +1479,13 @@ function App() {
         setLiveVariables(initialLiveVars);
         addLog('info', t('logs.simulationEnabled') || 'Simulation Mode Enabled. Variables populated with default values.');
 
-        // Toggling Simulation ON auto-starts the run (no separate Run click).
+        // Toggling Simulation ON auto-starts the run (Runtime category — see
+        // runSimulationNow's own catch); no separate Run click needed.
         await runSimulationNow();
       } catch (error) {
-        addLog('error', t('logs.simulationCompileFailed', { error: error }) || `Simulation Compilation Failed: ${error}`);
-        // Surface the actual compiler output (clang errors) so the failure has a reason.
-        if (error && error.log && String(error.log).trim()) {
-          String(error.log).trim().split('\n').forEach(line => addLog('error', line));
-        }
+        // Safety net only — transpile/compile above already return early on
+        // their own failures, so anything reaching here is unexpected.
+        addLog('error', categorize(ERROR_CATEGORY.RUNTIME, error.message || error));
       } finally {
         setCompileBusy(null);
       }
@@ -1516,7 +1532,7 @@ function App() {
             v !== 0 && v !== false && v !== null && v !== undefined
           )
           .map(([k, v]) => client.writeVar(k, v).catch((e) => {
-            addLog('error', `Auto force-write failed for '${k}': ${e.message}`);
+            addLog('error', categorize(ERROR_CATEGORY.RUNTIME, `Auto force-write failed for '${k}': ${e.message}`));
           }));
         if (shadowWrites.length > 0) await Promise.all(shadowWrites);
 
@@ -1529,12 +1545,12 @@ function App() {
               liveVarsDirtyRef.current = true;
             },
             (err) => {
-              addLog('error', `Stream error: ${err.message}`);
+              addLog('error', categorize(ERROR_CATEGORY.RUNTIME, `Stream error: ${err.message}`));
             },
           );
         }
       } catch (err) {
-        addLog('error', `Failed to start PLC: ${err.message || err}`);
+        addLog('error', categorize(ERROR_CATEGORY.RUNTIME, `Failed to start PLC: ${err.message || err}`));
         setIsRunning(false);
       }
     }
@@ -1548,7 +1564,7 @@ function App() {
         try {
           await host.hotswapStop(); // sim runs the hot-swap loader-host now
         } catch (err) {
-          addLog('error', `Failed to stop simulation: ${err.message || err}`);
+          addLog('error', categorize(ERROR_CATEGORY.RUNTIME, `Failed to stop simulation: ${err.message || err}`));
         }
         hotSwapActiveRef.current = false;
         setIsHotSwap(false);
@@ -1560,7 +1576,7 @@ function App() {
           stopStreamRef.current = null;
         }
         // Send stop + clear forces (fire-and-forget; errors just logged).
-        plcClientRef.current.stop().catch((e) => addLog('error', `Stop failed: ${e.message}`));
+        plcClientRef.current.stop().catch((e) => addLog('error', categorize(ERROR_CATEGORY.RUNTIME, `Stop failed: ${e.message}`)));
         plcClientRef.current.clearAllForces().catch(() => {});
         // Re-check server status immediately so connection indicator stays green.
         if (plcAddress && connectionEnabled) {
@@ -1594,13 +1610,13 @@ function App() {
       // Remote force write — skip FB instance variables (no SHM slot)
       if (!remoteVarKeysRef.current.includes(key)) return;
       plcClientRef.current.writeVar(key, normalizedValue).catch((e) => {
-        addLog('error', `Force write failed for '${key}': ${e.message}`);
+        addLog('error', categorize(ERROR_CATEGORY.RUNTIME, `Force write failed for '${key}': ${e.message}`));
       });
     } else {
       try {
         await host.writeVariable(key, value, mode);
       } catch (err) {
-        addLog('error', `Force write failed for '${key}': ${err.message || err}`);
+        addLog('error', categorize(ERROR_CATEGORY.RUNTIME, `Force write failed for '${key}': ${err.message || err}`));
       }
     }
   }, [isRunning, isSimulationMode, addLog]);
@@ -1655,26 +1671,45 @@ function App() {
     if (!checkTaskAssignments()) return;
     const stErrors = validateProjectST(projectStructure, [], hwPortVars);
     if (stErrors.length > 0) {
-      stErrors.forEach(e => addLog('error', `[${e.context}] Line ${e.line}:${e.column} — Undefined identifier: '${e.word}'`));
-      addLog('error', `Build aborted: ${stErrors.length} ST validation error(s). Fix before building.`);
+      stErrors.forEach(e => addLog('error', categorize(ERROR_CATEGORY.TRANSPILE, `[${e.context}] Line ${e.line}:${e.column} — Undefined identifier: '${e.word}'`)));
+      addLog('error', categorize(ERROR_CATEGORY.TRANSPILE, `Build aborted: ${stErrors.length} ST validation error(s). Fix before building.`));
       return;
     }
     const boardInfo = getBoardById(selectedBoard);
     addLog('info', `Build started for board: ${boardInfo?.name || selectedBoard}...`);
     setCompileBusy('build');
     try {
-      const standardHeaders = await host.getStandardHeaders().catch(() => []);
-      const cCode = transpileToC(projectStructure, standardHeaders, selectedBoard, true, buses, busConfigs);
+      // Split transpile (pure JS, can throw on an invalid project — e.g. a bad
+      // IEC address, an array-bounds/SHM overflow) from the actual clang
+      // invocation below: they fail for completely different reasons, so a
+      // shared catch-all "Build failed: <err>" told the user nothing about
+      // WHICH stage broke. See errorFormat.js for why the compiler failure
+      // needs its own (much heavier) handling.
+      var cCode;
+      try {
+        const standardHeaders = await host.getStandardHeaders().catch(() => []);
+        cCode = transpileToC(projectStructure, standardHeaders, selectedBoard, true, buses, busConfigs);
+      } catch (err) {
+        addLog('error', categorize(ERROR_CATEGORY.TRANSPILE, err.message || err));
+        return;
+      }
       await host.writePlcFiles({
         header: cCode.header,
         source: cCode.source,
         variableTable: JSON.stringify(cCode.variableTable, null, 2),
         hal: cCode.hal || ''
       });
-      await host.compileSimulation();
+      try {
+        await host.compileSimulation();
+      } catch (err) {
+        formatCompileFailure(ERROR_CATEGORY.COMPILE, err).forEach(({ type, msg }) => addLog(type, msg));
+        return;
+      }
       addLog('success', 'Build successful.');
     } catch (err) {
-      addLog('error', `Build failed: ${err.message || err}`);
+      // Transpile/compile above already returned on their own failures — only
+      // the writePlcFiles I/O step can still land here.
+      addLog('error', categorize(ERROR_CATEGORY.COMPILE, `Build failed: ${err.message || err}`));
     } finally {
       setCompileBusy(null);
     }
@@ -1688,8 +1723,8 @@ function App() {
     }
     const stErrors = validateProjectST(projectStructure, [], hwPortVars);
     if (stErrors.length > 0) {
-      stErrors.forEach(e => addLog('error', `[${e.context}] Line ${e.line}:${e.column} — Undefined identifier: '${e.word}'`));
-      addLog('error', `Build aborted: ${stErrors.length} ST validation error(s). Fix before building.`);
+      stErrors.forEach(e => addLog('error', categorize(ERROR_CATEGORY.TRANSPILE, `[${e.context}] Line ${e.line}:${e.column} — Undefined identifier: '${e.word}'`)));
+      addLog('error', categorize(ERROR_CATEGORY.TRANSPILE, `Build aborted: ${stErrors.length} ST validation error(s). Fix before building.`));
       return;
     }
     // The runtime may be live (local simulation, or a running remote PLC). A full
@@ -1711,8 +1746,21 @@ function App() {
     addLog('info', `Build & Send for ${boardInfo?.name || selectedBoard}...`);
     setCompileBusy('build');
     try {
-      const standardHeaders = await host.getStandardHeaders().catch(() => []);
-      const cCode = transpileToC(projectStructure, standardHeaders, selectedBoard, false, buses, busConfigs);
+      // Transpile (pure JS) and cross-compile (spawns clang) fail for
+      // completely different reasons and need completely different handling —
+      // a compiler failure can dump many lines of raw diagnostic text (see
+      // errorFormat.js), a transpile failure is already a clean one-line
+      // message. Both get their own try/catch + early return so the category
+      // shown to the user always matches what actually broke, instead of one
+      // generic "Build & Send failed: <err>" for either.
+      var cCode;
+      try {
+        const standardHeaders = await host.getStandardHeaders().catch(() => []);
+        cCode = transpileToC(projectStructure, standardHeaders, selectedBoard, false, buses, busConfigs);
+      } catch (err) {
+        addLog('error', categorize(ERROR_CATEGORY.TRANSPILE, err.message || err));
+        return;
+      }
 
       // Inject API password hash into variable table
       if (apiPassword) {
@@ -1731,15 +1779,23 @@ function App() {
       // deploy mis-named). Build & Send is a full deploy + restart; live reload
       // stays a SIMULATION-only feature.
       addLog('info', 'Cross-compiling for target...');
-      await host.compileForTarget({
-        header: cCode.header,
-        source: cCode.source,
-        variableTable: JSON.stringify(cCode.variableTable, null, 2),
-        hal: cCode.hal || '',
-        boardId: selectedBoard,
-      });
+      try {
+        await host.compileForTarget({
+          header: cCode.header,
+          source: cCode.source,
+          variableTable: JSON.stringify(cCode.variableTable, null, 2),
+          hal: cCode.hal || '',
+          boardId: selectedBoard,
+        });
+      } catch (err) {
+        formatCompileFailure(ERROR_CATEGORY.COMPILE, err).forEach(({ type, msg }) => addLog(type, msg));
+        return;
+      }
       addLog('success', 'Cross-compilation successful.');
 
+      // Everything from here on is the DEPLOY stage (SSH/HTTP to the target) —
+      // the outer catch below is now reached only by these steps, so it is
+      // safe to label unconditionally as a deploy failure.
       addLog('info', `Deploying to ${plcAddress}...`);
       await host.deployToServer(plcAddress);
       addLog('success', `Deployed to ${plcAddress}.`);
@@ -1761,7 +1817,7 @@ function App() {
       try {
         projResp = await postProjectFile();
       } catch (firstErr) {
-        addLog('warning', `Sending project file failed (${firstErr.message || firstErr}) — retrying once...`);
+        addLog('warning', categorize(ERROR_CATEGORY.DEPLOY, `Sending project file failed (${firstErr.message || firstErr}) — retrying once...`));
         projResp = await postProjectFile();
       }
       if (!projResp.ok) {
@@ -1783,7 +1839,7 @@ function App() {
           body: hmiPayload,
         });
         if (!hmiResp.ok) {
-          addLog('warning', `HMI layout deploy failed: ${hmiResp.status} ${hmiResp.statusText}`);
+          addLog('warning', categorize(ERROR_CATEGORY.DEPLOY, `HMI layout deploy failed: ${hmiResp.status} ${hmiResp.statusText}`));
         } else {
           const result = await hmiResp.json();
           if (hasHmiPages) {
@@ -1791,7 +1847,7 @@ function App() {
           }
         }
       } catch (hmiErr) {
-        addLog('warning', `HMI layout deploy skipped: ${hmiErr.message}`);
+        addLog('warning', categorize(ERROR_CATEGORY.DEPLOY, `HMI layout deploy skipped: ${hmiErr.message}`));
       }
 
       // Deploy autorun + HMI port config. `restart` makes the server swap the
@@ -1809,7 +1865,7 @@ function App() {
         });
         if (shouldRestart) addLog('info', 'Restarting runtime with new code...');
       } catch (cfgErr) {
-        addLog('warning', `Runtime config deploy skipped: ${cfgErr.message}`);
+        addLog('warning', categorize(ERROR_CATEGORY.DEPLOY, `Runtime config deploy skipped: ${cfgErr.message}`));
       }
 
       setIsDeployed(true);
@@ -1832,10 +1888,9 @@ function App() {
         remoteVarKeysRef.current = remoteKeys;
       }
     } catch (err) {
-      addLog('error', `Build & Send failed: ${err.message || err}`);
-      if (err && err.log && String(err.log).trim()) {
-        String(err.log).trim().split('\n').forEach(line => addLog('error', line));
-      }
+      // transpile and cross-compile already returned above on failure — only
+      // the deploy steps (SSH/HTTP to the target) can still land here.
+      addLog('error', categorize(ERROR_CATEGORY.DEPLOY, err.message || err));
     } finally {
       setCompileBusy(null);
     }
@@ -2388,15 +2443,31 @@ function App() {
   const startHotSwapSession = useCallback(async () => {
     setHotSwapBusy(true);
     const standardHeaders = await host.getStandardHeaders().catch(() => []);
+    const remote = isPlcConnected && plcAddress;
     try {
-      if (isPlcConnected && plcAddress) {
+      // Transpile and the hotswap build step each fail for a different reason
+      // (and the build step can carry an embedded multi-line clang dump — see
+      // errorFormat.js) so both get their own try/catch + early return; only
+      // the final deploy/run call is left to the outer catch below.
+      var cCode;
+      try {
+        cCode = transpileToC(projectStructure, standardHeaders, selectedBoard, !remote, buses, busConfigs);
+      } catch (err) {
+        addLog('error', categorize(ERROR_CATEGORY.TRANSPILE, err.message || err));
+        return;
+      }
+      if (remote) {
         addLog('info', 'Deploying hot-swap runtime to target…');
-        const cCode = transpileToC(projectStructure, standardHeaders, selectedBoard, false, buses, busConfigs);
-        await host.hotswapTargetBuild({
-          header: cCode.header, source: cCode.source,
-          variableTable: JSON.stringify(cCode.variableTable, null, 2), hal: cCode.hal || '',
-          hostGlue: cCode.hostGlue || '', boardId: selectedBoard,
-        });
+        try {
+          await host.hotswapTargetBuild({
+            header: cCode.header, source: cCode.source,
+            variableTable: JSON.stringify(cCode.variableTable, null, 2), hal: cCode.hal || '',
+            hostGlue: cCode.hostGlue || '', boardId: selectedBoard,
+          });
+        } catch (err) {
+          formatCompileFailure(ERROR_CATEGORY.COMPILE, err).forEach(({ type, msg }) => addLog(type, msg));
+          return;
+        }
         // Dedicated hot-swap deploy path (NOT plain deployToServer, which is
         // Build & Send's self-contained-binary path and deliberately never
         // uploads a logic.so) — uploads runtime.bin(loader-host) + variables +
@@ -2408,12 +2479,16 @@ function App() {
         setIsRunning(true);                     // the loader-host is now running the logic
         addLog('success', 'Field hot-swap runtime deployed — online change enabled on the target (state preserved across edits).');
       } else {
-        const cCode = transpileToC(projectStructure, standardHeaders, selectedBoard, true, buses, busConfigs);
-        await host.hotswapBuild({
-          header: cCode.header, source: cCode.source,
-          variableTable: JSON.stringify(cCode.variableTable, null, 2), hal: cCode.hal || '',
-          hostGlue: cCode.hostGlue || '',
-        });
+        try {
+          await host.hotswapBuild({
+            header: cCode.header, source: cCode.source,
+            variableTable: JSON.stringify(cCode.variableTable, null, 2), hal: cCode.hal || '',
+            hostGlue: cCode.hostGlue || '',
+          });
+        } catch (err) {
+          formatCompileFailure(ERROR_CATEGORY.COMPILE, err).forEach(({ type, msg }) => addLog(type, msg));
+          return;
+        }
         await host.hotswapRun();
         hotSwapActiveRef.current = true;
         setIsHotSwap(true);
@@ -2424,7 +2499,8 @@ function App() {
       // Baseline for the layout-change guard below.
       layoutSigRef.current = layoutSignature(projectStructure, selectedBoard, buses, busConfigs);
     } catch (err) {
-      addLog('error', `Failed to start hot-swap session: ${err.message || err}`);
+      // Only the deploy/run call above (not build) can still land here.
+      addLog('error', categorize(remote ? ERROR_CATEGORY.DEPLOY : ERROR_CATEGORY.RUNTIME, `Failed to start hot-swap session: ${err.message || err}`));
     } finally {
       setHotSwapBusy(false);
     }
@@ -2469,14 +2545,29 @@ function App() {
       await host.hotswapStop().catch(() => {});
       setIsRunning(false);
       const standardHeaders = await host.getStandardHeaders().catch(() => []);
-      const cCode = transpileToC(projectStructure, standardHeaders, selectedBoard, true, buses, busConfigs);
-      await host.hotswapBuild({
-        header: cCode.header,
-        source: cCode.source,
-        variableTable: JSON.stringify(cCode.variableTable, null, 2),
-        hal: cCode.hal || '',
-        hostGlue: cCode.hostGlue || '',
-      });
+      // Transpile and the hotswap build each fail for a different reason (the
+      // build step can carry an embedded multi-line clang dump — see
+      // errorFormat.js), so both return early under their own category
+      // instead of falling into the generic "Simulation restart failed" catch.
+      var cCode;
+      try {
+        cCode = transpileToC(projectStructure, standardHeaders, selectedBoard, true, buses, busConfigs);
+      } catch (err) {
+        addLog('error', categorize(ERROR_CATEGORY.TRANSPILE, err.message || err));
+        return;
+      }
+      try {
+        await host.hotswapBuild({
+          header: cCode.header,
+          source: cCode.source,
+          variableTable: JSON.stringify(cCode.variableTable, null, 2),
+          hal: cCode.hal || '',
+          hostGlue: cCode.hostGlue || '',
+        });
+      } catch (err) {
+        formatCompileFailure(ERROR_CATEGORY.COMPILE, err).forEach(({ type, msg }) => addLog(type, msg));
+        return;
+      }
       setCompileBusy(null);
       await runSimulationNow(); // refreshes layoutSigRef via its own snapshot
       runStructSnapRef.current = projectStructure;
@@ -2502,10 +2593,9 @@ function App() {
       }
       addLog('success', `Simulation restarted with the new code — ${carried} variable value(s) carried over.`);
     } catch (e) {
-      addLog('error', `Simulation restart failed: ${e.message || e}`);
-      if (e && e.log && String(e.log).trim()) {
-        String(e.log).trim().split('\n').forEach(line => addLog('error', line));
-      }
+      // Transpile/build above already returned on their own failures — only
+      // the restart/carry-over steps (Runtime) can still land here.
+      addLog('error', categorize(ERROR_CATEGORY.RUNTIME, `Simulation restart failed: ${e.message || e}`));
     } finally {
       setCompileBusy(null);
     }
@@ -2544,8 +2634,31 @@ function App() {
           addLog('info', 'Hot reload cancelled — change kept; it will apply on the next restart/Build & Send.');
           return;
         }
-        const cCode = transpileToC(projectStructure, standardHeaders, selectedBoard, true, buses, busConfigs);
-        await host.hotswapSwap({ header: cCode.header, source: cCode.source });
+        let cCode;
+        try {
+          cCode = transpileToC(projectStructure, standardHeaders, selectedBoard, true, buses, busConfigs);
+        } catch (err) {
+          addLog('error', categorize(ERROR_CATEGORY.TRANSPILE, err.message || err));
+          return;
+        }
+        try {
+          await host.hotswapSwap({ header: cCode.header, source: cCode.source });
+        } catch (err) {
+          const msg = String(err?.message || err);
+          // The loader-host's plc_state_layout_hash rejected the swap (the JS
+          // pre-check can miss exotic layout changes — the C hash is the hard
+          // net). Turn that rejection into the same restart offer instead of
+          // a log-only error the user won't see — the local sim only.
+          if (/LAYOUT/i.test(msg)) {
+            await offerSimRestart('The running program\'s memory layout differs from this change (the safety check rejected the live swap and rolled back — the OLD logic is still running).');
+            return;
+          }
+          // Anything else here is the edited code failing to compile (the
+          // swap step recompiles it) — same raw-dump shape as every other
+          // hotswapBuild/hotswapSwap call, see errorFormat.js.
+          formatCompileFailure(ERROR_CATEGORY.COMPILE, err).forEach(({ type, msg: m }) => addLog(type, m));
+          return;
+        }
         addLog('success', `Hot reload applied (sim): ${what}`);
         runStructSnapRef.current = projectStructure; // this structure is now what runs
         setPendingOnlineChange(false);
@@ -2554,28 +2667,37 @@ function App() {
           addLog('info', 'Online change to target cancelled.');
           return;
         }
+        let cCode;
+        try {
+          cCode = transpileToC(projectStructure, standardHeaders, selectedBoard, false, buses, busConfigs);
+        } catch (err) {
+          addLog('error', categorize(ERROR_CATEGORY.TRANSPILE, err.message || err));
+          return;
+        }
         // Stage the new logic (host-agent picks the local staging slot) then push
         // it to the target, which ping-pongs it into the slot NOT currently
         // running and swaps only after confirming — surfacing a rejected swap
         // (e.g. a layout mismatch caught by the loader-host) as an error.
-        const cCode = transpileToC(projectStructure, standardHeaders, selectedBoard, false, buses, busConfigs);
-        await host.hotswapTargetLogic({ header: cCode.header, source: cCode.source, boardId: selectedBoard });
-        await host.hotswapDeploySwap(plcAddress);
+        try {
+          await host.hotswapTargetLogic({ header: cCode.header, source: cCode.source, boardId: selectedBoard });
+        } catch (err) {
+          formatCompileFailure(ERROR_CATEGORY.COMPILE, err).forEach(({ type, msg }) => addLog(type, msg));
+          return;
+        }
+        try {
+          await host.hotswapDeploySwap(plcAddress);
+        } catch (err) {
+          addLog('error', categorize(ERROR_CATEGORY.DEPLOY, `Hot-swap apply failed (a layout change needs a full redeploy): ${err?.message || err}`));
+          return;
+        }
         addLog('success', `Online change applied to target: ${what}`);
         runStructSnapRef.current = projectStructure; // this structure is now what runs
         setPendingOnlineChange(false);
       }
     } catch (e) {
-      const msg = String(e?.message || e);
-      // The loader-host's plc_state_layout_hash rejected the swap (the JS
-      // pre-check can miss exotic layout changes — the C hash is the hard
-      // net). For the local sim, turn that rejection into the same restart
-      // offer instead of a log-only error the user won't see.
-      if (hotSwapActiveRef.current && /LAYOUT/i.test(msg)) {
-        await offerSimRestart('The running program\'s memory layout differs from this change (the safety check rejected the live swap and rolled back — the OLD logic is still running).');
-        return;
-      }
-      addLog('error', `Hot-swap apply failed (a layout change needs a full redeploy): ${msg}`);
+      // Safety net only — every step above now returns early on its own
+      // failure, categorized for the stage that actually broke.
+      addLog('error', categorize(ERROR_CATEGORY.RUNTIME, `Hot-swap apply failed: ${e.message || e}`));
     }
   }, [projectStructure, selectedBoard, buses, busConfigs, isHotSwap, fieldHotSwap, isPlcConnected, plcAddress, addLog, offerSimRestart]); // eslint-disable-line react-hooks/exhaustive-deps
 

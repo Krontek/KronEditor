@@ -681,6 +681,48 @@ export const TOOL_DEFS = [
   },
 ];
 
+// ── local filesystem tools (PERMISSION-GATED) ────────────────────────────────
+//
+// ⚠️ These are NOT part of TOOL_DEFS: they reach the model only while the user
+// has granted file access in the panel (the 📁 button), and the write tool only
+// while write access is granted on top of that. Withholding the declaration —
+// rather than declaring them and refusing at call time — is deliberate: a model
+// that can see a tool will keep retrying it and then explain the failure as a
+// project problem instead of asking the user for the permission it needs.
+//
+// ⚠️ Like read_live_variables/watch_live_variables, the actual I/O happens in
+// AiAgentPanel (host-agent HTTP calls are async; applyToolCall is a pure sync
+// executor). The panel resolves + scope-checks the path, performs the call and
+// injects the outcome as `args.__fs`; the cases below only unwrap it.
+
+export const FS_TOOL_DEFS = [
+  {
+    name: 'list_dir',
+    description: 'List the entries of a directory on the LOCAL machine running the editor. Paths may be absolute or relative to the granted root folder. Use this to explore before reading — never guess a path.',
+    parameters: S({ path: str('Directory path. Relative paths resolve against the granted root folder; "." is the root itself.') }, ['path']),
+  },
+  {
+    name: 'read_file',
+    description: 'Read a TEXT file from the LOCAL machine running the editor (source, CSV, JSON, config, log, a datasheet dump). Binary files are refused. Long files come back truncated with a note saying so — read a specific part by asking again after list_dir, do not assume the tail exists.',
+    parameters: S({ path: str('File path. Relative paths resolve against the granted root folder.') }, ['path']),
+  },
+];
+
+export const FS_WRITE_TOOL_DEFS = [
+  {
+    name: 'write_file',
+    description: 'Write a TEXT file on the LOCAL machine running the editor, creating parent directories as needed. OVERWRITES an existing file completely — read it first if you mean to change only part of it. Only available while the user has granted write access. Never use this to edit the PLC project itself: POUs, variables and ladder are edited with the project tools.',
+    parameters: S({
+      path: str('File path. Relative paths resolve against the granted root folder.'),
+      content: str('The complete new file content.'),
+    }, ['path', 'content']),
+  },
+];
+
+// Every filesystem tool name, whatever the current permission is — the panel
+// uses this to route a call to the async host-agent executor.
+export const FS_TOOL_NAMES = new Set([...FS_TOOL_DEFS, ...FS_WRITE_TOOL_DEFS].map((t) => t.name));
+
 // ── executor ─────────────────────────────────────────────────────────────────
 //
 // Returns one of:
@@ -720,6 +762,18 @@ export function applyToolCall(struct, name, args = {}) {
           mutation: false, ok: true,
           result: { running: true, waitedSeconds: w.waitedSeconds, history: w.history || null },
         };
+      }
+
+      // Filesystem: the panel did the I/O and injected the outcome. A missing
+      // __fs means the call reached the executor without the panel's async
+      // step — treat it as "no permission" rather than silently succeeding.
+      case 'list_dir':
+      case 'read_file':
+      case 'write_file': {
+        const fs = args.__fs;
+        if (!fs) return { ok: false, error: 'file access is not granted — ask the user to enable it with the 📁 button in the agent panel.' };
+        if (fs.error) return { ok: false, error: fs.error };
+        return { mutation: false, ok: true, result: fs.result };
       }
 
       case 'list_blocks': {

@@ -179,8 +179,9 @@ func (s *Server) handleDeployServerToTarget(w http.ResponseWriter, r *http.Reque
 	_ = sc.Chmod(remoteBin, 0o755)
 	_ = sshRunLogged(client, "chmod +x "+remoteBin, progress, "chmod") // belt-and-suspenders
 
-	// Install + start a supervisor: systemd when the target actually boots under
-	// it, else a cron @reboot script (works on BusyBox/Alpine/Yocto/OpenWRT).
+	// Install + start a supervisor: systemd when the target actually boots
+	// under it, else a restart-on-crash script plus every boot hook the image
+	// really runs (works on BusyBox/Alpine/Yocto/OpenWRT — see installBootHook).
 	systemd := strings.TrimSpace(sshRunLogged(client,
 		"if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then echo systemd; else echo cron; fi",
 		progress, "init-system detection")) == "systemd"
@@ -377,50 +378,186 @@ func installSupervisorScript(client *ssh.Client, remoteBin, remoteDir string) (s
 	return sshRun(client, cmd)
 }
 
-// installBootHook tries, in order, a @reboot crontab entry and an /etc/rc.local
-// line so the supervisor comes back after a power cycle. Every step is
-// best-effort: it returns a human-readable description of what stuck (or
-// "none") and never an error — see the caller.
+// bootCaps is the one-round-trip probe of what the target's init system can
+// actually be hooked into. ⚠️ Each field means "this hook is RUN AT BOOT", not
+// merely "this file can be written" — the previous version installed an
+// /etc/rc.local line on a Yocto/BusyBox image and reported success, but that
+// image runs /etc/init.d/rcS → /etc/rc<N>.d/S* symlinks and nothing there ever
+// reads rc.local, so the agent silently never came back after a power cycle.
+type bootCaps struct {
+	initd   bool   // /etc/init.d/rcS exists → an init.d script is run at boot
+	rcDir   string // runlevel dir whose S* symlinks are run ("" = none; sysvinit)
+	crontab bool   // crontab(1) present → @reboot entry
+	rcLocal bool   // something actually EXECUTES /etc/rc.local
+}
+
+// probeBootCaps asks the target once, in POSIX sh, which boot hooks are real.
+// ⚠️ The runlevel dir comes from inittab's `initdefault`, not a guess: this
+// Yocto image defaults to runlevel 5, so a symlink dropped in rc3.d (the
+// conventional choice) would never be executed.
+func probeBootCaps(client *ssh.Client) bootCaps {
+	script := "#!/bin/sh\n" +
+		// BusyBox/Buildroot inittab runs rcS, which either executes
+		// /etc/init.d/S??* directly or the S* symlinks of a runlevel dir.
+		"if [ -d /etc/init.d ] && { [ -f /etc/init.d/rcS ] || " +
+		"grep -q 'init.d/rcS' /etc/inittab 2>/dev/null; }; then echo initd; fi\n" +
+		"RL=$(sed -n 's/^[a-zA-Z0-9]*:\\([0-9]\\):initdefault.*/\\1/p' /etc/inittab 2>/dev/null | head -n 1)\n" +
+		"for d in /etc/rc$RL.d /etc/rc5.d /etc/rc3.d /etc/rc2.d /etc/rcS.d; do\n" +
+		"  [ -d \"$d\" ] && { echo \"rcdir=$d\"; break; }\n" +
+		"done\n" +
+		"command -v crontab >/dev/null 2>&1 && echo crontab\n" +
+		// rc.local is only honoured by sysvinit's own init script, systemd's
+		// rc-local generator unit, or an explicit inittab line.
+		"if [ -f /etc/init.d/rc.local ] || ls /etc/rc*.d/*rc.local >/dev/null 2>&1 || " +
+		"[ -f /lib/systemd/system/rc-local.service ] || " +
+		"[ -f /usr/lib/systemd/system/rc-local.service ] || " +
+		"grep -q 'rc.local' /etc/inittab 2>/dev/null; then echo rclocal; fi\n" +
+		"exit 0\n"
+	out := sshRun2(client, fmt.Sprintf(
+		"cat > /tmp/kron-bootprobe.sh << 'PROBE'\n%sPROBE\nsh /tmp/kron-bootprobe.sh; rm -f /tmp/kron-bootprobe.sh", script))
+	var c bootCaps
+	for _, ln := range strings.Split(out, "\n") {
+		switch ln = strings.TrimSpace(ln); {
+		case ln == "initd":
+			c.initd = true
+		case ln == "crontab":
+			c.crontab = true
+		case ln == "rclocal":
+			c.rcLocal = true
+		case strings.HasPrefix(ln, "rcdir="):
+			c.rcDir = strings.TrimPrefix(ln, "rcdir=")
+		}
+	}
+	return c
+}
+
+// installBootHook installs EVERY boot hook the target actually runs (an
+// init.d/runlevel script, a @reboot crontab entry, an /etc/rc.local line) so
+// the supervisor comes back after a power cycle. Installing more than one is
+// safe: the supervisor's pidfile guard makes a second start a no-op.
+//
+// Every step is best-effort — it returns a human-readable list of what stuck
+// (or "none") and never an error, see the caller. ⚠️ A step counts as
+// installed only when the target is known to EXECUTE it at boot
+// (probeBootCaps) AND a read-back confirms the hook is in place: both of the
+// bugs this replaced reported success while doing nothing.
 func installBootHook(client *ssh.Client, sudo, remoteDir string, progress func(string)) string {
 	sup := remoteDir + "/plc-agent-supervisor.sh"
-	line := sup + " >/dev/null 2>&1 &"
+	caps := probeBootCaps(client)
+	var installed []string
 
-	if strings.TrimSpace(sshRun2(client, "command -v crontab >/dev/null 2>&1 && echo yes")) == "yes" {
+	// 1. init.d script (+ runlevel symlink) — the only hook a Yocto/Buildroot
+	//    image runs. rcS/rc invokes it as `S99plc-agent start`, so it must
+	//    background the supervisor and return at once or it hangs the boot.
+	if caps.initd {
+		if out, err := installInitdHook(client, sudo, remoteDir, caps.rcDir); err == nil {
+			where := "/etc/init.d/S99plc-agent"
+			if caps.rcDir != "" {
+				where += " (+ " + caps.rcDir + " symlink)"
+			}
+			progress("Autostart: " + where + " installed.")
+			installed = append(installed, where)
+		} else {
+			progress("warning: init.d hook install failed: " + err.Error() + "\n" + out)
+		}
+	}
+
+	// 2. @reboot crontab entry (Alpine/OpenWRT/anything shipping cron).
+	if caps.crontab {
 		cmd := fmt.Sprintf("( %[2]scrontab -l 2>/dev/null | grep -v plc-agent-supervisor ; echo '@reboot %[1]s >/dev/null 2>&1' ) | %[2]scrontab -", sup, sudo)
 		if out, err := sshRun(client, cmd); err == nil {
 			progress("Autostart: @reboot crontab entry installed.")
-			return "cron @reboot"
+			installed = append(installed, "cron @reboot")
 		} else {
-			progress("warning: crontab install failed, trying /etc/rc.local: " + err.Error() + "\n" + out)
+			progress("warning: crontab install failed: " + err.Error() + "\n" + out)
 		}
 	} else {
-		progress("crontab not found — trying /etc/rc.local for autostart...")
+		progress("crontab not found — skipping @reboot entry.")
 	}
 
-	// rc.local: strip any previous entry, then insert before the final "exit 0"
-	// (BusyBox/Debian both honour it when executable). Staged as a script file
-	// so nothing has to survive nested shell quoting.
-	hook := remoteDir + "/plc-rc-hook.sh"
-	// ⚠️ `line` ends in "&", which sed's replacement expands to the whole match.
-	sedLine := strings.ReplaceAll(line, "&", "\\&")
-	script := "#!/bin/sh\n" +
+	// 3. /etc/rc.local, only when something actually runs the file.
+	if caps.rcLocal {
+		if out, err := installRcLocalHook(client, sudo, remoteDir); err == nil {
+			progress("Autostart: /etc/rc.local entry installed.")
+			installed = append(installed, "/etc/rc.local")
+		} else {
+			progress("warning: /etc/rc.local install failed: " + err.Error() + "\n" + out)
+		}
+	} else {
+		progress("/etc/rc.local is not executed by this image — skipping.")
+	}
+
+	if len(installed) == 0 {
+		progress("warning: no autostart could be installed — the agent runs now but will NOT restart after a reboot.")
+		return "none"
+	}
+	return strings.Join(installed, " + ")
+}
+
+// initdHookBody is the /etc/init.d/S99plc-agent text (split out so a test can
+// exercise it without an SSH connection). BusyBox's rcS and sysvinit's rc both
+// call it with "start" and WAIT for it to exit — hence the background launch.
+func initdHookBody(remoteDir string) string {
+	return "#!/bin/sh\n" +
+		"# plc-agent boot hook — starts the KronServer supervisor at boot.\n" +
+		"# Installed by KronEditor \"Deploy Server to Target\".\n" +
+		"SUP=" + remoteDir + "/plc-agent-supervisor.sh\n" +
+		"PIDF=" + remoteDir + "/plc-agent-supervisor.pid\n" +
+		"case \"$1\" in\n" +
+		"  start|'')\n" +
+		"    [ -x \"$SUP\" ] || exit 0\n" +
+		// A stale pidfile from the power cut would make the supervisor's own
+		// guard bail; the cmdline re-check there handles a recycled PID, but
+		// clearing it here keeps the common case unambiguous.
+		"    [ -f \"$PIDF\" ] && [ ! -r /proc/$(cat \"$PIDF\" 2>/dev/null)/cmdline ] && rm -f \"$PIDF\"\n" +
+		"    \"$SUP\" >/dev/null 2>&1 &\n" +
+		"    ;;\n" +
+		"  stop)\n" +
+		"    [ -f \"$PIDF\" ] && kill -TERM \"$(cat \"$PIDF\" 2>/dev/null)\" 2>/dev/null\n" +
+		"    ;;\n" +
+		"  restart)\n" +
+		"    \"$0\" stop; sleep 1; \"$0\" start\n" +
+		"    ;;\n" +
+		"esac\n" +
+		"exit 0\n"
+}
+
+// installInitdHook writes /etc/init.d/S99plc-agent and, when the image runs
+// runlevel directories (Yocto/Debian sysvinit run the rc<N>.d S* symlinks, NOT
+// every init.d file), symlinks it there too. It read-back-verifies and returns
+// an error when the hook is not in place.
+func installInitdHook(client *ssh.Client, sudo, remoteDir, rcDir string) (string, error) {
+	body := "#!/bin/sh\n" +
+		"cat > /etc/init.d/S99plc-agent << 'INITD'\n" + initdHookBody(remoteDir) + "INITD\n" +
+		"chmod +x /etc/init.d/S99plc-agent\n"
+	if rcDir != "" {
+		body += "ln -sf /etc/init.d/S99plc-agent " + rcDir + "/S99plc-agent\n" +
+			"[ -x " + rcDir + "/S99plc-agent ] || { echo 'runlevel symlink missing'; exit 1; }\n"
+	}
+	body += "[ -x /etc/init.d/S99plc-agent ] || { echo 'init.d script missing'; exit 1; }\nexit 0\n"
+	return runStagedScript(client, sudo, remoteDir+"/plc-initd-hook.sh", body)
+}
+
+// installRcLocalHook inserts the supervisor launch before rc.local's final
+// "exit 0" (creating the file when absent) and verifies the result.
+// ⚠️ Insertion uses awk, NOT sed's `0,/re/` first-match address: that is a GNU
+// extension BusyBox sed rejects, so the old one-line edit failed on every
+// BusyBox image while the deploy still reported "rc.local entry installed".
+func installRcLocalHook(client *ssh.Client, sudo, remoteDir string) (string, error) {
+	body := "#!/bin/sh\n" +
+		"LINE='" + remoteDir + "/plc-agent-supervisor.sh >/dev/null 2>&1 &'\n" +
 		"[ -f /etc/rc.local ] || printf '#!/bin/sh\\nexit 0\\n' > /etc/rc.local\n" +
 		"sed -i '/plc-agent-supervisor/d' /etc/rc.local\n" +
 		"if grep -q '^exit 0' /etc/rc.local; then\n" +
-		"  sed -i \"0,/^exit 0/s|^exit 0|" + sedLine + "\\nexit 0|\" /etc/rc.local\n" +
+		"  awk -v L=\"$LINE\" '!d && /^exit 0/ { print L; d=1 } { print }' /etc/rc.local > /tmp/kron-rc.local && \n" +
+		"    cat /tmp/kron-rc.local > /etc/rc.local && rm -f /tmp/kron-rc.local\n" +
 		"else\n" +
-		"  printf '%s\\n' \"" + line + "\" >> /etc/rc.local\n" +
+		"  printf '%s\\n' \"$LINE\" >> /etc/rc.local\n" +
 		"fi\n" +
-		"chmod +x /etc/rc.local\n"
-	rc := fmt.Sprintf("cat > %[1]s << 'RCHOOK'\n%[2]sRCHOOK\nchmod +x %[1]s && %[3]ssh %[1]s", hook, script, sudo)
-	if out, err := sshRun(client, rc); err == nil {
-		progress("Autostart: /etc/rc.local entry installed.")
-		return "/etc/rc.local"
-	} else {
-		progress("warning: no autostart could be installed (" + err.Error() + "\n" + out +
-			") — the agent runs now but will NOT restart after a reboot.")
-	}
-	return "none"
+		"chmod +x /etc/rc.local\n" +
+		"grep -q plc-agent-supervisor /etc/rc.local || { echo 'rc.local edit did not stick'; exit 1; }\n" +
+		"exit 0\n"
+	return runStagedScript(client, sudo, remoteDir+"/plc-rc-hook.sh", body)
 }
 
 // startSupervisorScript (re)launches the supervisor detached so it survives our

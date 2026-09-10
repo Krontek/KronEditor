@@ -3,6 +3,7 @@ import { createPortal } from 'react-dom';
 import ForceWriteModal from './common/ForceWriteModal';
 import { ErrorCodeService } from '../services/ErrorCodeService';
 import { findVarByName } from '../utils/iecNames';
+import { ERROR_CATEGORY } from '../utils/errorFormat';
 
 const LOG_COLORS = {
     info:    '#c8c8c8',
@@ -393,9 +394,21 @@ const WatchVariablePicker = ({ projectStructure, liveVariables, watchTable, onAd
     );
 };
 
+// Any message already run through errorFormat.js's categorize()/
+// formatCompileFailure() starts with "<Stage> error:"/"<Stage> warning:" and
+// IS the one clean line to show — none of the heuristics below (which exist
+// to rescue a raw, uncategorized compiler/linker line) should touch it, or
+// e.g. an "undefined reference to …" fallback line loses its "Compile error:"
+// prefix to the undefRef branch below and the category disappears from view.
+const CATEGORY_PREFIX = new RegExp(`^(?:${Object.values(ERROR_CATEGORY).join('|')})\\s+(?:error|warning)\\s*:`, 'i');
+
 // Extracts the most relevant part of a compiler/linker error message.
 const summarizeMsg = (msg) => {
     if (!msg) return msg;
+    const trimmedInput = msg.trim();
+    if (CATEGORY_PREFIX.test(trimmedInput)) {
+        return trimmedInput.length <= 160 ? trimmedInput : trimmedInput.slice(0, 157) + '…';
+    }
     const multiDef = msg.match(/multiple definition of [`']([^`']+)[`']/);
     if (multiDef) return `Multiple definition: ${multiDef[1]}`;
     const undefRef = msg.match(/undefined reference to [`']([^`']+)[`']/);

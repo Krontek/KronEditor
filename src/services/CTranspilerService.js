@@ -4654,6 +4654,42 @@ const transpileLDLogics = (rungs, stdFunctions = {}, parentName = '', category =
         // Tracks which sorted block indices use REAL inline mode (for source-ref resolution)
         const realInlineBlocks = new Set();
 
+        // ⚠️ Stateless inline blocks (X_TO_Y conversions, MIN/MAX/LIMIT/SEL/MUX,
+        // bitwise, comparisons) get NO PlcState instance — they are emitted as a
+        // pure C expression. So when their OUT/Q pin is WIRED into another
+        // block's data input, the consumer must substitute that expression, not
+        // read `<instance>.OUT`: that member does not exist and clang failed with
+        // "no member named 'prog_X_INT_TO_UINT0' in 'struct PlcState'". Only the
+        // MATH_FB_BLOCKS subset had a local-variable escape hatch; every other
+        // inline family fell through to the struct reference. Substitution is
+        // safe because the expressions are pure — they may be evaluated more than
+        // once and are not gated on the source block's power flow (the consumer
+        // has its own EN). Sorted (topological) order guarantees the producer
+        // registers here before any consumer reads it, and every symbol the
+        // expression names is declared earlier in the SAME emitted C block.
+        //   sorted block index → the block's C result expression
+        const inlineOutExpr = new Map();
+
+        // Resolve a wired named output pin (out_OUT / out_Q / out_ENO) of an
+        // INLINE source block. Returns null when the source is a real FB, so the
+        // caller falls back to its `<instance>.<pin>` struct read — and also for
+        // an inline source not yet emitted, which only happens if the rung graph
+        // has a CYCLE (the topological sort covers data wires, not just power
+        // flow, so a well-formed rung always emits the producer first). That
+        // fallback then fails at clang rather than silently substituting 0.
+        const inlineSourceRef = (srcType, srcIdx, pinName, rIdx) => {
+            if (!isInlineMathType(srcType)) return null;
+            // ENO is the block's power flow, never part of the value expression.
+            if (pinName === 'ENO') return `out_r${rIdx}_b${srcIdx}`;
+            if (MATH_FB_BLOCKS.has(srcType)) {
+                return realInlineBlocks.has(srcIdx)
+                    ? `_m_r${rIdx}_b${srcIdx}_rout`
+                    : `_m_r${rIdx}_b${srcIdx}.${pinName}`;
+            }
+            const expr = inlineOutExpr.get(srcIdx);
+            return expr ? `(${expr})` : null;
+        };
+
         // Build power-flow (inExpr) for a block:
         //   Contact / Coil use handle id "in"
         //   FB trigger input uses "in_<triggerPinName>" (e.g. in_CU, in_IN, in_CLK)
@@ -4787,13 +4823,10 @@ const transpileLDLogics = (rungs, stdFunctions = {}, parentName = '', category =
                             const srcBlock = nodeMap[c.source];
                             const srcType = srcBlock?.type || srcBlock?.data?.type || '';
                             const srcInstName = (srcBlock?.data?.instanceName || srcType || '');
-                            if (isInlineMathType(srcType) && MATH_FB_BLOCKS.has(srcType)) {
-                                const srcIdx = sortedIndex[c.source];
-                                if (realInlineBlocks.has(srcIdx)) {
-                                    argValues[pinName] = `_m_r${rungIdx}_b${srcIdx}_rout`;
-                                } else {
-                                    argValues[pinName] = `_m_r${rungIdx}_b${srcIdx}.${sp.slice(4)}`;
-                                }
+                            const srcIdx = sortedIndex[c.source];
+                            const inlineRef = inlineSourceRef(srcType, srcIdx, sp.slice(4), rungIdx);
+                            if (inlineRef !== null) {
+                                argValues[pinName] = inlineRef;
                             } else {
                                 argValues[pinName] = `${getCallTarget(srcInstName)}.${sp.slice(4)}`;
                             }
@@ -4913,6 +4946,12 @@ const transpileLDLogics = (rungs, stdFunctions = {}, parentName = '', category =
                     } else {
                         resultExpr = `/* unknown inline: ${type} */ 0`;
                     }
+
+                    // Publish the expression for any block wired to this one's
+                    // OUT/Q pin (see inlineOutExpr above). Registered BEFORE the
+                    // emit branches below, which only cover the case where the
+                    // user typed a variable name into the OUT/Q field.
+                    inlineOutExpr.set(idx, resultExpr);
 
                     const hasOutPin = (FB_OUTPUTS[type] || []).includes('OUT');
                     const hasQPin   = (FB_OUTPUTS[type] || []).includes('Q');
@@ -5040,16 +5079,13 @@ const transpileLDLogics = (rungs, stdFunctions = {}, parentName = '', category =
                             const srcBlock = nodeMap[c.source];
                             const srcType = srcBlock?.type || srcBlock?.data?.type || '';
                             const srcInstName = (srcBlock?.data?.instanceName || srcType || '');
-                            // Inline math blocks use a local variable, not a persistent instance
-                            let srcRef;
-                            if (isInlineMathType(srcType) && MATH_FB_BLOCKS.has(srcType)) {
-                                const srcIdx = sortedIndex[c.source];
-                                srcRef = realInlineBlocks.has(srcIdx)
-                                    ? `_m_r${rungIdx}_b${srcIdx}_rout`
-                                    : `_m_r${rungIdx}_b${srcIdx}.${sp.slice(4)}`;
-                            } else {
-                                srcRef = `${getCallTarget(srcInstName)}.${sp.slice(4)}`;
-                            }
+                            // Inline blocks have no persistent instance: math FBs
+                            // use a rung-local struct/float, the rest a pure expression.
+                            const srcIdx = sortedIndex[c.source];
+                            const inlineRef = inlineSourceRef(srcType, srcIdx, sp.slice(4), rungIdx);
+                            const srcRef = inlineRef !== null
+                                ? inlineRef
+                                : `${getCallTarget(srcInstName)}.${sp.slice(4)}`;
                             const sourceExpr = adaptExprForInputPin(type, pinName, srcRef, data.customData);
                             out += `    ${callTarget}.${cPin} = ${sourceExpr};\n`;
                         } else {

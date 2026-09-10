@@ -141,6 +141,25 @@ Before this tool the prompt told the model to write its questions as prose with 
 
 `renderRungs` is the agent's *eyes* for ladder: it traces each rung's power-flow graph into readable boolean logic (`Motor := (Start | Motor) & NOT Stop`), renders edge contacts as `RISING(x)`/`FALLING(x)`, and for each FB reports `{ type, instance, triggeredBy, pins, qOutput }` — downstream coil logic reads `instance.Q`, so the model can reconstruct and edit an existing rung rather than just knowing "there's a timer".
 
+### Panel input box
+
+The prompt box **auto-grows with its content** up to a ceiling the user drags (the grip on its top edge, persisted in `localStorage["aiAgentInputHeight"]`). ⚠️ The measuring effect must reset `height` to `0px` before reading `scrollHeight`, or the box only ever grows — `scrollHeight` never drops on its own when text is deleted. It was a fixed `rows={2}` with `resize:none`, so anything longer than two lines scrolled out of sight while being typed.
+
+### Local file tools (permission-gated, OFF by default)
+
+The agent has **no access to the local disk until the user grants it** with the 📁 button in the panel header. The grant — `localStorage["aiAgentFsAccess"] = {enabled, root, allowWrite}` — names ONE root folder and, separately, whether writing is allowed. Two buttons grant it ("Allow reading" / "Allow reading + writing"), one revokes it.
+
+| Tool | Purpose |
+|---|---|
+| `list_dir` | List a directory (≤400 entries, then a `truncated` note). |
+| `read_file` | Read a TEXT file (≤60 000 chars, then a `truncated` note; a NUL byte ⇒ refused as binary). |
+| `write_file` | Overwrite/create a text file. **Only declared while `allowWrite`.** |
+
+- ⚠️ **The tools are DECLARED to the model only while access is granted** (`FS_TOOL_DEFS` / `FS_WRITE_TOOL_DEFS` are kept OUT of `TOOL_DEFS` and appended in `runTurn`). Declaring them always and refusing at call time was rejected: a model that sees a tool retries it and then explains the failure as a project defect instead of naming the permission it needs. The toggle invalidates the prompt cache once — the right trade.
+- ⚠️ **`resolveInRoot` (AiAgentPanel) is the WHOLE guard** — the host agent's `/api/host/read-file|write-file|list-dir` deliberately do not sandbox (files.go, §12: same-machine trust). It normalizes `.`/`..` into segments and requires the root's segments to be a prefix (case-insensitively on Windows), so `../`, an absolute path elsewhere, and a sibling with a shared prefix all fail. Relative paths resolve against the root. It bounds the MODEL, not a hostile process.
+- ⚠️ **The I/O runs in the panel, not the executor** — like `watch_live_variables`, `runTurn` awaits the host call and injects `args.__fs = {result|error}`; `applyToolCall` only unwraps it, and a missing `__fs` is reported as "not granted" rather than a silent success.
+- Every file operation also posts a **note into the thread** (`📄 Read …`, `💾 Wrote …`, `🚫 …`) — a file the agent touched must never be invisible. Permission state rides `<project-context>` (volatile ⇒ never the cached system prompt), so a model with no file tools tells the user about the button instead of claiming the editor cannot read files.
+
 ### Write tools (gated by approval)
 
 | Tool | Purpose / notable rules |

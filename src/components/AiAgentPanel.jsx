@@ -1,6 +1,6 @@
 import { useState, useRef, useEffect, useCallback } from 'react';
 import { host } from '../services/HostClient';
-import { TOOL_DEFS, applyToolCall, buildProjectOverview, findPOU, summarizeLiveSamples, summarizeWatch } from '../services/agentTools';
+import { TOOL_DEFS, FS_TOOL_DEFS, FS_WRITE_TOOL_DEFS, FS_TOOL_NAMES, applyToolCall, buildProjectOverview, findPOU, summarizeLiveSamples, summarizeWatch } from '../services/agentTools';
 import { setEditorScope, EDITOR_SCOPE } from '../utils/editorScope';
 import PasswordInput from './common/PasswordInput';
 
@@ -262,7 +262,7 @@ const nextId = () => _mid++;
 // Safety cap so a misbehaving model can't loop on tool calls forever.
 const MAX_AGENT_TURNS = 16;
 
-const KNOWN_TOOLS = new Set(TOOL_DEFS.map((t) => t.name));
+const KNOWN_TOOLS = new Set([...TOOL_DEFS, ...FS_TOOL_DEFS, ...FS_WRITE_TOOL_DEFS].map((t) => t.name));
 
 // Scan a string for every TOP-LEVEL balanced {...} JSON object, ignoring braces
 // inside strings. Handles models that emit several tool-call objects back to
@@ -570,6 +570,86 @@ function cleanToolArgs(raw) {
   return out;
 }
 
+// ── local file access (permission-gated) ─────────────────────────────────────
+//
+// The agent reaches the local disk ONLY through the host agent's file endpoints,
+// and only while the user has granted access in the panel. The grant carries a
+// ROOT FOLDER and every path is resolved inside it — the host agent itself does
+// not sandbox (see files.go), so this scope check is the whole guard. It is a
+// UI-side guard by design: it stops the MODEL from wandering, not a hostile
+// process, which the same-machine trust model (§12) already assumes away.
+
+const FS_PERM_KEY = 'aiAgentFsAccess';
+const DEFAULT_FS_PERM = { enabled: false, root: '', allowWrite: false };
+const loadFsPerm = () => {
+  try {
+    const raw = JSON.parse(localStorage.getItem(FS_PERM_KEY) || 'null');
+    return raw ? { ...DEFAULT_FS_PERM, ...raw } : { ...DEFAULT_FS_PERM };
+  } catch { return { ...DEFAULT_FS_PERM }; }
+};
+const saveFsPerm = (perm) => {
+  try { localStorage.setItem(FS_PERM_KEY, JSON.stringify(perm)); } catch { /* quota */ }
+};
+
+// A read that would flood the context is truncated, loudly. Same for a listing.
+const MAX_FS_READ_CHARS = 60000;
+const MAX_FS_ENTRIES = 400;
+
+const isWindowsPath = (p) => /^[a-zA-Z]:/.test(p) || (p.includes('\\') && !p.startsWith('/'));
+
+// Normalize to path segments, applying "." and ".." — so an escape attempt
+// collapses into a shorter path that then fails the containment test below.
+function pathSegments(p) {
+  const out = [];
+  for (const seg of String(p).split(/[\\/]+/)) {
+    if (seg === '' || seg === '.') continue;
+    if (seg === '..') { out.pop(); continue; }
+    out.push(seg);
+  }
+  return out;
+}
+
+const isAbsolutePath = (p) => /^([a-zA-Z]:[\\/]|[\\/])/.test(p);
+
+// Resolve `raw` (absolute, or relative to `root`) and refuse anything outside
+// the granted root. Returns { ok, path } or { ok:false, error }.
+function resolveInRoot(root, raw) {
+  const path = String(raw ?? '').trim();
+  if (!path) return { ok: false, error: 'path is required' };
+  const win = isWindowsPath(root);
+  const rootSegs = pathSegments(root);
+  if (rootSegs.length === 0) return { ok: false, error: 'no root folder is granted' };
+  const combined = isAbsolutePath(path) ? path : `${root}/${path}`;
+  const segs = pathSegments(combined);
+  const eq = (a, b) => (win ? a.toLowerCase() === b.toLowerCase() : a === b);
+  const inside = segs.length >= rootSegs.length && rootSegs.every((seg, i) => eq(seg, segs[i]));
+  if (!inside) {
+    return { ok: false, error: `"${path}" is outside the folder the user granted access to (${root}). Only paths inside that folder can be read or written; ask the user to grant a different folder if you need one.` };
+  }
+  return { ok: true, path: win ? segs.join('\\') : '/' + segs.join('/') };
+}
+
+// A text file only — a binary blob would be nonsense in the transcript and can
+// blow a whole context window on one call.
+const looksBinary = (text) => text.includes('\u0000');
+
+// ── prompt box sizing ────────────────────────────────────────────────────────
+//
+// The box AUTO-GROWS with what you type, up to a ceiling the user can drag (the
+// grip on its top edge). Fixed `rows={2}` meant a long prompt scrolled inside
+// two invisible lines, so you could not see what you had written.
+
+const INPUT_H_KEY = 'aiAgentInputHeight';
+const INPUT_MIN_H = 34;      // ~2 lines — the old fixed size, now the floor
+const INPUT_MAX_H = 600;     // absolute ceiling for the drag handle
+const DEFAULT_INPUT_H = 120;
+const loadInputH = () => {
+  try {
+    const n = Number(localStorage.getItem(INPUT_H_KEY));
+    return n >= INPUT_MIN_H && n <= INPUT_MAX_H ? n : DEFAULT_INPUT_H;
+  } catch { return DEFAULT_INPUT_H; }
+};
+
 // Build the `tool` message we feed back to the model for one executed step.
 function toolResultMessage(step) {
   const { tc, res, outcome } = step;
@@ -636,7 +716,7 @@ function focusTarget(steps) {
 // line, 4/4 with it. Values themselves stay OUT (they change every 500 ms and
 // would defeat every provider's prompt cache) — this is a pointer to the tools,
 // not a substitute for them.
-function buildProjectContext(projectStructure, board, activeItem, liveVariables, hardwareBlocks = []) {
+function buildProjectContext(projectStructure, board, activeItem, liveVariables, hardwareBlocks = [], fsPerm = DEFAULT_FS_PERM) {
   const overview = buildProjectOverview(projectStructure, board);
   const active = activeItem ? `${activeItem.name} (${activeItem.type})` : 'none';
   const pous = overview.pous.map((p) => `${p.name}[${p.language}${p.returnType ? ' ' + p.returnType : ''}]`).join(', ') || '(none)';
@@ -670,6 +750,13 @@ function buildProjectContext(projectStructure, board, activeItem, liveVariables,
       ? `Hardware I/O blocks available on THIS board (call list_blocks for their pins; each is declared as an instance, EN-triggered, ENO out): ${hwBlocks}`
       : 'Hardware I/O blocks: none — no board is selected, so no GPIO/PWM/ADC block exists yet. Tell the user to pick a board in Board Config.',
     runLine,
+    // ⚠️ Permission state is volatile, so it rides the context and never the
+    // cached system prompt. Without it a model with no file tools explains the
+    // absence as "this editor cannot read files" instead of telling the user
+    // about the button that grants it.
+    fsPerm?.enabled && fsPerm.root
+      ? `Local file access: GRANTED for ${fsPerm.root} (${fsPerm.allowWrite ? 'read and write' : 'read-only'}). Use list_dir/read_file${fsPerm.allowWrite ? '/write_file' : ''} for anything on disk; paths outside that folder are refused.`
+      : 'Local file access: NOT GRANTED — you have no file tools. If a task needs a file from this machine, tell the user to press the 📁 button in this panel and pick a folder; never claim the editor is incapable of it.',
   ].filter(Boolean).join('\n');
 }
 
@@ -882,6 +969,24 @@ export default function AiAgentPanel({
     agentModeRef.current = agentMode;
     try { localStorage.setItem('aiAgentMode', agentMode); } catch { /* ignore */ }
   }, [agentMode]);
+  // Local file access: OFF until the user grants it with the 📁 button. The
+  // grant is { enabled, root, allowWrite } and persists across sessions.
+  const [fsPerm, setFsPerm] = useState(loadFsPerm);
+  const [fsPanelOpen, setFsPanelOpen] = useState(false);
+  const [fsRootDraft, setFsRootDraft] = useState('');
+  // Mirror in a ref: runTurn is a useCallback and must read the CURRENT grant,
+  // not the one that existed when the run started (the user may revoke mid-run).
+  const fsPermRef = useRef(fsPerm);
+  useEffect(() => { fsPermRef.current = fsPerm; saveFsPerm(fsPerm); }, [fsPerm]);
+
+  // Prompt box: `inputMaxH` is the user-dragged ceiling; the box itself sizes to
+  // its content up to that, so short prompts stay compact and long ones show.
+  const [inputMaxH, setInputMaxH] = useState(loadInputH);
+  const taRef = useRef(null);
+  useEffect(() => {
+    try { localStorage.setItem(INPUT_H_KEY, String(inputMaxH)); } catch { /* quota */ }
+  }, [inputMaxH]);
+
   const scrollRef = useRef(null);
   // The AbortController for the in-flight fetch/wait of the CURRENT turn, and a
   // flag checked between turns so Stop also breaks the auto-continue recursion
@@ -1218,6 +1323,55 @@ export default function AiAgentPanel({
   const setViewStatus = (viewId, status) =>
     setMessages((m) => m.map((x) => (x.id === viewId ? { ...x, status } : x)));
 
+  // Execute one filesystem tool against the host agent, honouring the current
+  // grant. Returns the { result } / { error } blob the executor unwraps as
+  // `args.__fs` — errors come back as tool errors (the model can read them and
+  // ask the user for permission) rather than as thrown exceptions.
+  const runFsTool = async (name, args) => {
+    const perm = fsPermRef.current;
+    if (!perm.enabled || !perm.root) {
+      return { error: 'file access is not granted. The user must enable it with the 📁 button in the agent panel — tell them so instead of retrying.' };
+    }
+    if (name === 'write_file' && !perm.allowWrite) {
+      return { error: 'write access is not granted — the user allowed READ-ONLY file access. Ask them to tick "Allow writing" under the 📁 button if the change really has to be written to disk.' };
+    }
+    const r = resolveInRoot(perm.root, args.path);
+    if (!r.ok) return { error: r.error };
+    try {
+      if (name === 'list_dir') {
+        const entries = await host.listDir(r.path);
+        const shown = entries.slice(0, MAX_FS_ENTRIES);
+        return {
+          result: {
+            path: r.path,
+            entries: shown.map((e) => ({ name: e.name, kind: e.isDir ? 'dir' : 'file', size: e.isDir ? undefined : e.size })),
+            truncated: entries.length > shown.length ? `only the first ${MAX_FS_ENTRIES} of ${entries.length} entries are shown` : undefined,
+          },
+          note: `📁 Listed ${r.path} (${entries.length} entries)`,
+        };
+      }
+      if (name === 'read_file') {
+        const content = await host.readFile(r.path);
+        if (looksBinary(content)) return { error: `"${r.path}" is a binary file — it cannot be read as text.` };
+        const truncated = content.length > MAX_FS_READ_CHARS;
+        return {
+          result: {
+            path: r.path,
+            content: truncated ? content.slice(0, MAX_FS_READ_CHARS) : content,
+            truncated: truncated ? `file is ${content.length} characters; only the first ${MAX_FS_READ_CHARS} are shown` : undefined,
+          },
+          note: `📄 Read ${r.path} (${content.length} chars)`,
+        };
+      }
+      // write_file
+      const content = String(args.content ?? '');
+      await host.writeFile(r.path, content);
+      return { result: { path: r.path, written: content.length }, note: `💾 Wrote ${r.path} (${content.length} chars)` };
+    } catch (e) {
+      return { error: e?.message || String(e) };
+    }
+  };
+
   // One model turn: ask the provider for the assistant's next message, run any
   // read tools automatically, and surface write tools as a proposal to approve.
   const runTurn = useCallback(async (apiMessages, turn, gen) => {
@@ -1248,9 +1402,15 @@ export default function AiAgentPanel({
       assistant = await host.aiChat({
         provider: config.provider, model: config.model, apiKey: config.apiKey, baseUrl: config.baseUrl,
         system: buildSystemPrompt(libraryData, agentModeRef.current),
-        context: buildProjectContext(psRef.current, selectedBoard, activeItem, liveRef.current, hardwareBlocks),
+        context: buildProjectContext(psRef.current, selectedBoard, activeItem, liveRef.current, hardwareBlocks, fsPermRef.current),
         messages: providerSafeMessages(apiMessages),
-        tools: TOOL_DEFS,
+        // ⚠️ The filesystem tools are DECLARED ONLY while access is granted —
+        // a model that can see a tool it may not use keeps retrying it and then
+        // blames the project. Toggling access invalidates the prompt cache once,
+        // which is the right trade for the model knowing what it actually has.
+        tools: fsPerm.enabled
+          ? [...TOOL_DEFS, ...FS_TOOL_DEFS, ...(fsPerm.allowWrite ? FS_WRITE_TOOL_DEFS : [])]
+          : TOOL_DEFS,
       }, controller.signal);
     } catch (e) {
       // A stop already reported itself and reset the UI — don't double-post.
@@ -1445,6 +1605,17 @@ export default function AiAgentPanel({
         const inferred = inferPou();
         if (inferred) args.pou = inferred;
       }
+      // Filesystem tools: the I/O is async and lives outside the pure executor,
+      // exactly like watch_live_variables. Every one is also surfaced as a note
+      // in the thread — a file the agent touched must never be invisible.
+      if (FS_TOOL_NAMES.has(tc.name)) {
+        setActivity(tc.name === 'write_file' ? 'writing a file' : 'reading local files');
+        const fs = await runFsTool(tc.name, args);
+        args.__fs = fs;
+        pushView({ role: 'note', text: fs.error ? `🚫 ${tc.name} ${args.path || ''} — ${fs.error}` : fs.note });
+        setActivity('applying');
+      }
+      if (controller.signal.aborted) break;
       const res = applyToolCall(working, tc.name, args);
       if (res.mutation && res.ok) {
         working = res.next;
@@ -1492,7 +1663,7 @@ export default function AiAgentPanel({
     // hardwareBlocks IS a dep: it is memoized in App and only changes when the
     // board or its enabled ports change — exactly when the agent's picture of
     // the available I/O must change too.
-  }, [config, selectedBoard, activeItem, libraryData, hardwareBlocks]);
+  }, [config, selectedBoard, activeItem, libraryData, hardwareBlocks, fsPerm]);
 
   // Commit a turn's composed result into the live project and push it online if
   // a hot-swap session is active. Shared by AUTO mode and manual approval.
@@ -1506,6 +1677,56 @@ export default function AiAgentPanel({
     // If a hot-swap session is live, push the change online (App decides
     // whether a swap is possible or a cold restart is needed).
     onHotSwap && onHotSwap(touched);
+  };
+
+  // Open the permission popover, pre-filling the folder: the current grant, else
+  // the user's home directory from the host agent (so a first grant is one click
+  // and never a hand-typed path).
+  const openFsPanel = async () => {
+    if (fsPanelOpen) { setFsPanelOpen(false); return; }
+    setFsPanelOpen(true);
+    if (fsRootDraft) return;
+    if (fsPerm.root) { setFsRootDraft(fsPerm.root); return; }
+    try { setFsRootDraft(await host.homeDir()); } catch { /* type it by hand */ }
+  };
+  const grantFsAccess = (allowWrite) => {
+    const root = fsRootDraft.trim();
+    if (!root) return;
+    setFsPerm({ enabled: true, root, allowWrite: !!allowWrite });
+    setFsPanelOpen(false);
+    pushView({ role: 'note', text: `📁 File access granted: ${root} (${allowWrite ? 'read and write' : 'read-only'}).` });
+  };
+  const revokeFsAccess = () => {
+    setFsPerm({ ...DEFAULT_FS_PERM });
+    setFsPanelOpen(false);
+    pushView({ role: 'note', text: '📁 File access revoked — the agent can no longer read local files.' });
+  };
+
+  // Re-measure on every content change: reset to 0 first so the box also
+  // SHRINKS when text is deleted (scrollHeight never drops on its own).
+  useEffect(() => {
+    const ta = taRef.current;
+    if (!ta) return;
+    ta.style.height = '0px';
+    ta.style.height = `${Math.max(INPUT_MIN_H, Math.min(ta.scrollHeight, inputMaxH))}px`;
+  }, [input, inputMaxH, attachments.length]);
+
+  // Drag the grip on the top edge to raise/lower the ceiling. Listeners go on
+  // the window so the drag survives the pointer leaving the 6px grip.
+  const startInputResize = (e) => {
+    e.preventDefault();
+    const startY = e.clientY;
+    const startH = taRef.current ? taRef.current.clientHeight : inputMaxH;
+    const onMove = (ev) => {
+      const h = Math.max(INPUT_MIN_H, Math.min(INPUT_MAX_H, startH + (startY - ev.clientY)));
+      setInputMaxH(h);
+    };
+    const onUp = () => {
+      window.removeEventListener('mousemove', onMove);
+      window.removeEventListener('mouseup', onUp);
+    };
+    window.addEventListener('mousemove', onMove);
+    window.addEventListener('mouseup', onUp);
   };
 
   const send = (text) => {
@@ -1658,6 +1879,16 @@ export default function AiAgentPanel({
           ))}
         </div>
         {activeOllamaModel && <RuntimeBadge rt={runtime} />}
+        {/* ⚠️ Local file access is OFF by default and granted HERE, per folder.
+            The agent's file tools are not declared to the model at all until
+            this is on — see the tools array in runTurn. */}
+        <button
+          onClick={openFsPanel}
+          title={fsPerm.enabled ? `File access: ${fsPerm.root} (${fsPerm.allowWrite ? 'read/write' : 'read-only'})` : 'Give the agent access to local files'}
+          style={{ background: fsPerm.enabled ? '#1e3a2a' : 'transparent', border: `1px solid ${fsPerm.enabled ? '#2e5a3e' : C.border2}`, color: fsPerm.enabled ? C.green : C.sub, fontSize: 11, padding: '2px 8px', borderRadius: 10, cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 4 }}
+        >
+          📁<span style={{ fontSize: 10 }}>{fsPerm.enabled ? (fsPerm.allowWrite ? 'R/W' : 'R') : 'Off'}</span>
+        </button>
         <button
           onClick={() => { setDraftCfg(config || draftCfg); setConfigOpen(o => !o); }}
           title={ollamaNotRunning ? 'Ollama is not running — open settings → Download & Setup to start it' : 'Model settings'}
@@ -1673,6 +1904,48 @@ export default function AiAgentPanel({
           <span style={{ color: C.muted }}>⚙</span>
         </button>
       </div>
+
+      {/* ── local file access permission ──────────────────────────────── */}
+      {fsPanelOpen && (
+        <div style={{ padding: 10, background: C.input, borderBottom: `1px solid ${C.border}`, display: 'flex', flexDirection: 'column', gap: 8 }}>
+          <div style={{ fontSize: 11, color: C.text, fontWeight: 600 }}>Local file access</div>
+          <div style={{ fontSize: 10, color: C.muted, lineHeight: 1.5 }}>
+            The agent can read files on this machine only inside the folder you pick here — everything outside it is refused.
+            Grant the narrowest folder that does the job; it can be changed or revoked at any time.
+          </div>
+          <label style={{ fontSize: 10, color: C.sub }}>Folder the agent may access</label>
+          <input
+            value={fsRootDraft}
+            onChange={(e) => setFsRootDraft(e.target.value)}
+            placeholder="/home/you/projects"
+            spellCheck={false}
+            style={{ background: C.panel, border: `1px solid ${C.border2}`, color: C.text, fontSize: 11, padding: '5px 6px', fontFamily: 'monospace' }}
+          />
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+            <button onClick={() => grantFsAccess(false)} disabled={!fsRootDraft.trim()}
+              title="The agent may list and read files in this folder"
+              style={{ background: fsRootDraft.trim() ? C.accentBtn : '#333', border: 'none', color: fsRootDraft.trim() ? '#fff' : '#777', fontSize: 11, padding: '5px 12px', borderRadius: 3, cursor: fsRootDraft.trim() ? 'pointer' : 'default' }}>
+              Allow reading
+            </button>
+            <button onClick={() => grantFsAccess(true)} disabled={!fsRootDraft.trim()}
+              title="The agent may also create and OVERWRITE files in this folder"
+              style={{ background: 'transparent', border: `1px solid ${C.border2}`, color: fsRootDraft.trim() ? '#e0a94f' : '#555', fontSize: 11, padding: '5px 12px', borderRadius: 3, cursor: fsRootDraft.trim() ? 'pointer' : 'default' }}>
+              Allow reading + writing
+            </button>
+            {fsPerm.enabled && (
+              <button onClick={revokeFsAccess}
+                style={{ marginLeft: 'auto', background: 'transparent', border: '1px solid #8b3a3a', color: '#ff9b9b', fontSize: 11, padding: '5px 12px', borderRadius: 3, cursor: 'pointer' }}>
+                Revoke access
+              </button>
+            )}
+          </div>
+          <div style={{ fontSize: 10, color: fsPerm.enabled ? C.green : C.muted }}>
+            {fsPerm.enabled
+              ? `Currently granted: ${fsPerm.root} — ${fsPerm.allowWrite ? 'read and write (write_file OVERWRITES files)' : 'read-only'}.`
+              : 'Currently no access — the agent has no file tools at all.'}
+          </div>
+        </div>
+      )}
 
       {/* ── inline model config ───────────────────────────────────────── */}
       {configOpen && (
@@ -1888,6 +2161,11 @@ export default function AiAgentPanel({
             </button>
           )}
         </div>
+        {/* Drag grip: raises/lowers the prompt box's ceiling (persisted). */}
+        <div onMouseDown={startInputResize} title="Drag to resize the prompt box"
+          style={{ height: 8, cursor: 'ns-resize', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+          <div style={{ width: 34, height: 3, borderRadius: 2, background: C.border2 }} />
+        </div>
         <div style={{ border: `1px solid ${C.border2}`, borderRadius: 6, background: C.input, padding: 6, opacity: (pending || asking) ? 0.55 : 1 }}>
           {attachments.length > 0 && (
             <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', marginBottom: 6 }}>
@@ -1913,9 +2191,10 @@ export default function AiAgentPanel({
             onPaste={handlePaste}
             placeholder={pending ? 'Approve or reject the proposed changes first…'
               : asking ? 'Answer the question above…' : 'Describe the change you want…'}
-            rows={2}
+            ref={taRef}
+            rows={1}
             disabled={!!pending || !!asking}
-            style={{ width: '100%', resize: 'none', background: 'transparent', border: 'none', outline: 'none', color: C.text, fontSize: 12, fontFamily: 'inherit' }}
+            style={{ width: '100%', minHeight: INPUT_MIN_H, maxHeight: inputMaxH, overflowY: 'auto', resize: 'none', background: 'transparent', border: 'none', outline: 'none', color: C.text, fontSize: 12, fontFamily: 'inherit', lineHeight: 1.45 }}
           />
           <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginTop: 4 }}>
             <input ref={fileInputRef} type="file" accept="image/*" multiple style={{ display: 'none' }}
