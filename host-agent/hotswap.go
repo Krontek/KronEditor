@@ -104,6 +104,7 @@ type ShmSpec struct {
 	Key      string
 	Offset   uint64
 	VType    string
+	Size     int    // slot width from the variable table; only STRING needs it
 	ForceOff uint64 // force-flag byte offset (0 = none; real flags live at >= 32768)
 }
 
@@ -196,7 +197,8 @@ func buildShmSpecs(variableTableJSON string) []ShmSpec {
 			vType = "BOOL"
 		}
 		forceOff, _ := em["force_flag_offset"].(float64)
-		specs = append(specs, ShmSpec{Key: key, Offset: uint64(off), VType: vType, ForceOff: uint64(forceOff)})
+		sz, _ := em["size"].(float64)
+		specs = append(specs, ShmSpec{Key: key, Offset: uint64(off), VType: vType, Size: int(sz), ForceOff: uint64(forceOff)})
 	}
 	return specs
 }
@@ -230,6 +232,14 @@ func (s *Server) writeHotSwapVariable(w http.ResponseWriter, req writeVariableRe
 	}
 	if !found {
 		writeError(w, http.StatusNotFound, "Variable not found: "+req.Name)
+		return
+	}
+	if isTextType(spec.VType) {
+		// plc_shm_sync rewrites a text slot every scan regardless of the force
+		// flag, and plc_shm_pull never copies one back (a PLC STRING is a
+		// `char *` the runtime does not own). A write would look accepted and
+		// vanish on the next scan, so refuse it here instead.
+		writeError(w, http.StatusBadRequest, "STRING variables are read-only: "+req.Name)
 		return
 	}
 	data, ok := encodeValue(spec.VType, req.Value)
@@ -1115,7 +1125,7 @@ func (s *Server) handleHotSwapStop(w http.ResponseWriter, r *http.Request) {
 func (s *Server) hotswapPoller(specs []ShmSpec, stop <-chan struct{}) {
 	plan, bufSize := make([]pollSpec, 0, len(specs)), 0
 	for _, sp := range specs {
-		if ps, ok := newPollSpec(sp.Key, sp.VType, sp.Offset); ok {
+		if ps, ok := newMirrorPollSpec(sp.Key, sp.VType, sp.Offset, sp.Size); ok {
 			plan = append(plan, ps)
 			if ps.size > bufSize {
 				bufSize = ps.size

@@ -85,6 +85,102 @@ const POINTER_INPUT_TYPES = new Set(['POINTER']);
 const IDENTIFIER_REF_REGEX = /^[A-Za-z_][A-Za-z0-9_]*(\[[^\]]*\]|\.[A-Za-z_][A-Za-z0-9_]*)*$/;
 
 const isPointerInputType = (iecType) => POINTER_INPUT_TYPES.has(String(iecType || '').toUpperCase());
+const isStringInputType = (iecType) => /^W?STRING$/i.test(String(iecType || '').trim());
+// Bytes a STRING occupies in the shared-memory mirror, NUL-padded. Matches
+// KRON_SYS_TEXT_LEN in kronsystem.h so a reader block's whole line fits.
+const STRING_SHM_BYTES = 64;
+
+// IEC type name → the KRON_ library's spelling, e.g. INT→INT16. Module level
+// because the ST rewrite and the ladder conversion branch must agree; they had
+// separate copies and only one of them knew about text.
+const IEC_KRON_NAME = {
+    BOOL: 'BOOL', BYTE: 'BYTE', WORD: 'WORD', DWORD: 'DWORD', LWORD: 'LWORD',
+    SINT: 'INT8', INT: 'INT16', DINT: 'INT32', LINT: 'INT64',
+    USINT: 'UINT8', UINT: 'UINT16', UDINT: 'UINT32', ULINT: 'UINT64',
+    REAL: 'REAL', LREAL: 'LREAL', STRING: 'STRING',
+};
+// Buffer symbol for one x_TO_STRING call site. A conversion to text has to
+// write SOMEWHERE, and every ownerless answer is wrong: a static races between
+// task threads, a thread-local pool goes stale, a compound literal dangles
+// after the scan. Giving each call site a PlcState field makes the text live
+// exactly as long as the instance and survive a hot-swap.
+const strConvSymbol = (progName, tag) => `prog_${progName}_sconv_${tag}`;
+// Upper bound on ST call sites. Comments and string literals are stripped
+// before the rewrite runs, so the rewrite can only consume FEWER than this —
+// never more, which would reference a field that was never declared.
+const countStringConvCalls = (code) => ((String(code || '')
+    .replace(/\(\*[\s\S]*?\*\)/g, '')
+    .replace(/\/\/[^\n]*/g, '')
+    .match(/\b[A-Za-z]+_TO_STRING\s*\(/g)) || []).length;
+
+// ── Shared-memory mirror: one emitter per direction ─────────────────────────
+// ⚠️ Both plc_shm_sync/pull and their per-task twins in generateMainLoop are
+// generated from these, so the two copies cannot drift apart.
+//
+// A STRING variable is a `char *` into the runtime's own memory, so the slot
+// carries the TEXT: copy the characters, NUL-pad the rest, truncate past the
+// slot. Two consequences, both deliberate:
+//   - the mirror is written UNCONDITIONALLY for text, ignoring the force flag,
+//     because a string cannot be forced (see below) and honouring a stray flag
+//     would freeze the display;
+//   - text is NEVER pulled back. Writing into `char *` would have to own a
+//     buffer, and the pointer usually addresses a literal or a block's own
+//     field. STRING is a read-only live value.
+const shmSyncLine = ({ c_symbol, offset, size, flagOffset, isString }) => isString
+    ? `    { const char *__s = (const char *)(S->${c_symbol}); size_t __n = __s ? strlen(__s) : 0u;` +
+      ` if (__n > ${size - 1}u) __n = ${size - 1}u;` +
+      ` if (__n) memcpy(__plc_shm + ${offset}, __s, __n);` +
+      ` memset(__plc_shm + ${offset} + __n, 0, ${size}u - __n); }\n`
+    : `    if (__plc_shm[${flagOffset}] == 0) { memcpy(__plc_shm + ${offset}, (const void*)&(S->${c_symbol}), ${size}); }\n`;
+
+const shmPullLine = ({ c_symbol, offset, size, flagOffset, isString }) => isString
+    ? ''
+    : `    if (__plc_shm[${flagOffset}]) { memcpy((void*)&(S->${c_symbol}), __plc_shm + ${offset}, ${size}); if (__plc_shm[${flagOffset}] == 2) __plc_shm[${flagOffset}] = 0; }\n`;
+// ── IEC STRING literals ───────────────────────────────────────────────────
+// IEC escapes the `$` character ($$ $' $" $L $N $P $R $T and $xx hex); C
+// escapes the backslash. Decoding to plain text FIRST and re-escaping for C
+// second is what keeps a Windows path or an apostrophe from producing a
+// broken (or silently different) C literal.
+const iecStringDecode = (body) => {
+    let out = '';
+    for (let i = 0; i < body.length; i++) {
+        const ch = body[i];
+        if (ch === '$' && i + 1 < body.length) {
+            const n = body[i + 1];
+            const up = n.toUpperCase();
+            if (n === '$' || n === "'" || n === '"') { out += n; i++; continue; }
+            if (up === 'L' || up === 'N') { out += '\n'; i++; continue; }
+            if (up === 'P') { out += '\f'; i++; continue; }
+            if (up === 'R') { out += '\r'; i++; continue; }
+            if (up === 'T') { out += '\t'; i++; continue; }
+            const hex = body.slice(i + 1, i + 3);
+            if (/^[0-9A-Fa-f]{2}$/.test(hex)) { out += String.fromCharCode(parseInt(hex, 16)); i += 2; continue; }
+        }
+        out += ch;
+    }
+    return out;
+};
+const cEscapeString = (text) => String(text).replace(/[\\"\n\r\t\f\v\0]/g, (ch) => ({
+    '\\': '\\\\', '"': '\\"', '\n': '\\n', '\r': '\\r',
+    '\t': '\\t', '\f': '\\f', '\v': '\\v', '\0': '\\0',
+}[ch]));
+// Strip the surrounding IEC `'…'` (or `"…"`) quotes and decode; null if the
+// text is not quoted at all.
+const unquoteIecString = (s) => {
+    const m = /^'([\s\S]*)'$/.exec(String(s)) || /^"([\s\S]*)"$/.exec(String(s));
+    return m ? iecStringDecode(m[1]) : null;
+};
+// Literal BODY (already unquoted) → C string literal.
+const iecStringToC = (body) => '"' + cEscapeString(iecStringDecode(body)) + '"';
+// Quoted literal → C string literal, else null.
+const quotedStringToC = (s) => {
+    const text = unquoteIecString(s);
+    return text === null ? null : '"' + cEscapeString(text) + '"';
+};
+// Any user-entered STRING text (quoted or bare) → C string literal. Quotes a
+// user typed around a value are DELIMITERS, never part of it — leaving them in
+// produced a path like "'/sys/class/hwmon/hwmon1/'" that could never open.
+const anyStringToC = (s) => quotedStringToC(s) ?? iecStringToC(String(s));
 const isBooleanLiteral = (value) => /^(?:BOOL#)?(?:TRUE|FALSE)$/i.test(String(value || '').trim());
 const normalizeBooleanLiteral = (value) => {
     const normalized = String(value || '').trim().replace(/^BOOL#/i, '').toUpperCase();
@@ -370,7 +466,7 @@ const ST_KEYWORDS_LOWER = new Set([
 // IEC 61131-3 type-conversion functions (X_TO_Y) are stateless and inlined by
 // the transpiler. The validator accepts any TYPE_TO_TYPE pair to avoid hard-
 // coding all 90+ combinations.
-const ST_CONVERSION_REGEX = /^(?:BOOL|BYTE|WORD|DWORD|LWORD|SINT|USINT|INT|UINT|DINT|UDINT|LINT|ULINT|REAL|LREAL)_TO_(?:BOOL|BYTE|WORD|DWORD|LWORD|SINT|USINT|INT|UINT|DINT|UDINT|LINT|ULINT|REAL|LREAL)$/i;
+const ST_CONVERSION_REGEX = /^(?:BOOL|BYTE|WORD|DWORD|LWORD|SINT|USINT|INT|UINT|DINT|UDINT|LINT|ULINT|REAL|LREAL|STRING)_TO_(?:BOOL|BYTE|WORD|DWORD|LWORD|SINT|USINT|INT|UINT|DINT|UDINT|LINT|ULINT|REAL|LREAL|STRING)$/i;
 
 /**
  * Validate all ST/SCL code in the project before compilation.
@@ -527,7 +623,15 @@ export const transpileToC = (projectStructure, standardHeaders = [], boardId = n
         'BOOL': 1, 'SINT': 1, 'USINT': 1, 'BYTE': 1,
         'INT': 2, 'UINT': 2, 'WORD': 2,
         'DINT': 4, 'UDINT': 4, 'TIME': 4, 'REAL': 4, 'DWORD': 4,
-        'LINT': 8, 'ULINT': 8, 'LREAL': 8, 'LWORD': 8
+        'LINT': 8, 'ULINT': 8, 'LREAL': 8, 'LWORD': 8,
+        // ⚠️ STRING is a `char *` in the generated C, so its slot holds the
+        // TEXT, not the pointer — an address from the runtime's own memory
+        // would mean nothing to KronServer. Fixed width, NUL-padded, and
+        // TRUNCATED past it; see the string branch of plc_shm_sync. It stays
+        // out of IEC_TYPE_PREFIX (not addressable, so never in the capture
+        // ring) and out of IEC_CAST_C / IEC_TO_KRON_TYPE (no X_TO_Y
+        // conversion is a C cast, which is meaningless for text).
+        'STRING': STRING_SHM_BYTES
     };
 
     // Shared memory offset tracker — each scalar PLC variable gets a consecutive slot
@@ -536,7 +640,7 @@ export const transpileToC = (projectStructure, standardHeaders = [], boardId = n
     const FORCE_FLAGS_BASE = 32768;
     const PLC_SHM_TOTAL_SIZE = 65536; // must match PLC_SHM_SIZE emitted into plc.c
     let shmOffset = 0;
-    const shmEntries = []; // {c_symbol, offset, size, flagOffset} used to generate plc_shm_sync()
+    const shmEntries = []; // {c_symbol, offset, size, flagOffset, isString} → plc_shm_sync()
     const tryAssignShm = (type, c_symbol) => {
         const size = IEC_TYPE_SIZES[type?.toUpperCase()];
         if (!size) return {}; // FB, user-defined type or unknown — no SHM slot
@@ -552,7 +656,10 @@ export const transpileToC = (projectStructure, standardHeaders = [], boardId = n
             throw new Error(`Too many variables for shared memory: force-flag region exceeds the ${PLC_SHM_TOTAL_SIZE}-byte segment at variable "${c_symbol}". Reduce the number of monitored variables.`);
         }
         shmOffset += size;
-        shmEntries.push({ c_symbol, offset, size, flagOffset });
+        // The flag rides on the ENTRY, not a closure: generateMainLoop emits a
+        // second copy of these functions from the same array and would
+        // otherwise have no way to tell text from a number.
+        shmEntries.push({ c_symbol, offset, size, flagOffset, isString: isStringInputType(type) });
         return { offset, size, force_flag_offset: flagOffset };
     };
 
@@ -569,7 +676,7 @@ export const transpileToC = (projectStructure, standardHeaders = [], boardId = n
                 const b = s.toLowerCase();
                 return b === 'true' || b === '1';
             }
-            if (T === 'STRING') return s.replace(/^"|"$/g, '');
+            if (T === 'STRING' || T === 'WSTRING') return unquoteIecString(s) ?? iecStringDecode(s);
             if (T === 'TIME' && /^(?:T|TIME)#/i.test(s)) return mapIECtoTimeUs(s);
             const radix = s.match(/^(\d+)#([0-9A-Fa-f_]+)$/);
             if (radix) {
@@ -581,7 +688,7 @@ export const transpileToC = (projectStructure, standardHeaders = [], boardId = n
             return Number.isFinite(num) ? num : 0;
         }
         if (T === 'BOOL') return false;
-        if (T === 'STRING') return "";
+        if (T === 'STRING' || T === 'WSTRING') return "";
         return 0;
     };
 
@@ -1109,6 +1216,11 @@ ${boardDefines}${runtimePortHelpers}${customIncludes}${ecCfgEarly.motionIncludes
                 };
             });
 
+            // Text buffers for x_TO_STRING call sites in this program.
+            collectStringConvBuffers(prog, progName).forEach(sym => {
+                stateFields.push(`char ${sym}[${STRING_SHM_BYTES}];`);
+            });
+
             // Collect input shadow vars — writable placeholders for unassigned/literal FB input pins
             const inputShadowVars = (prog.type === 'LD' || prog.type === 'SCL')
                 ? collectInputShadowVars(prog.content?.rungs, progName)
@@ -1190,6 +1302,7 @@ ${boardDefines}${runtimePortHelpers}${customIncludes}${ecCfgEarly.motionIncludes
         'ULINT': 'uint64', 'LWORD': 'uint64',
         'REAL': 'float32',
         'LREAL': 'float64',
+        'STRING': 'string',
         'TIME': 'uint32',
     };
     variableTable.variables = Object.entries(variableTable.debugDefaults)
@@ -1278,15 +1391,11 @@ ${boardDefines}${runtimePortHelpers}${customIncludes}${ecCfgEarly.motionIncludes
         // same scan.
         source += `static void plc_shm_pull(void) {\n`;
         source += `    if (!__plc_shm) return;\n`;
-        shmEntries.forEach(({ c_symbol, offset, size, flagOffset }) => {
-            source += `    if (__plc_shm[${flagOffset}]) { memcpy((void*)&(S->${c_symbol}), __plc_shm + ${offset}, ${size}); if (__plc_shm[${flagOffset}] == 2) __plc_shm[${flagOffset}] = 0; }\n`;
-        });
+        shmEntries.forEach(e => { source += shmPullLine(e); });
         source += `}\n`;
         source += `static void plc_shm_sync(void) {\n`;
         source += `    if (!__plc_shm) return;\n`;
-        shmEntries.forEach(({ c_symbol, offset, size, flagOffset }) => {
-            source += `    if (__plc_shm[${flagOffset}] == 0) { memcpy(__plc_shm + ${offset}, (const void*)&(S->${c_symbol}), ${size}); }\n`;
-        });
+        shmEntries.forEach(e => { source += shmSyncLine(e); });
         source += `}\n`;
         source += `#endif /* __linux__ || _WIN32 */\n\n`;
     }
@@ -1478,7 +1587,7 @@ const mapIECtoTimeUs = (iecTimeStr) => {
 const formatVarInitial = (raw, type) => {
     if (raw === undefined || raw === null || raw === '') return '';
     const T = String(type || '').toUpperCase();
-    if (T === 'STRING') return ` = "${raw}"`;
+    if (T === 'STRING' || T === 'WSTRING') return ` = ${anyStringToC(String(raw))}`;
     if (T === 'BOOL') {
         const b = String(raw).trim().toLowerCase();
         return ` = ${(b === 'true' || b === '1') ? 'true' : 'false'}`;
@@ -2370,15 +2479,11 @@ const generateMainLoop = (projectStructure, config, boardId = null, shmEnabled =
             // 2 = PULSE (apply once, auto-clear, logic resumes same scan).
             mainSrc += `static void plc_shm_pull_${tg.taskName}(void) {\n`;
             mainSrc += `    if (!__plc_shm) return;\n`;
-            shmEntries.forEach(({ c_symbol, offset, size, flagOffset }) => {
-                mainSrc += `    if (__plc_shm[${flagOffset}]) { memcpy((void*)&(S->${c_symbol}), __plc_shm + ${offset}, ${size}); if (__plc_shm[${flagOffset}] == 2) __plc_shm[${flagOffset}] = 0; }\n`;
-            });
+            shmEntries.forEach(e => { mainSrc += shmPullLine(e); });
             mainSrc += `}\n`;
             mainSrc += `static void plc_shm_sync_${tg.taskName}(void) {\n`;
             mainSrc += `    if (!__plc_shm) return;\n`;
-            shmEntries.forEach(({ c_symbol, offset, size, flagOffset }) => {
-                mainSrc += `    if (__plc_shm[${flagOffset}] == 0) { memcpy(__plc_shm + ${offset}, (const void*)&(S->${c_symbol}), ${size}); }\n`;
-            });
+            shmEntries.forEach(e => { mainSrc += shmSyncLine(e); });
             mainSrc += `}\n`;
         });
         mainSrc += `\n`;
@@ -2847,6 +2952,10 @@ const transpilePOUSource = (pou, category, stdFunctions = {}, parentName = '', g
         fnReturnVar: (category === 'function' && fnRetType !== 'void') ? '__ret' : null,
         userFunctionInputs,
         userFBInputs,
+        // ONE counter for the whole POU: an SCL program calls transpileSTLogics
+        // once per ST rung, and a per-call counter would hand the same buffer
+        // to two different conversions.
+        strConv: category === 'program' ? { progName: safeName, next: 0 } : null,
     };
 
     if (pou.type === 'ST') {
@@ -2924,6 +3033,7 @@ const FB_TRIGGER_PIN = {
     'Time_Switch': 'EN', 'Daily_Trigger': 'EN', 'Astro_Clock': 'EN',
     'Read_Uptime': 'EN', 'Cycle_Time_Monitor': 'EN',
     'Read_CPU_Temperature': 'EN', 'Read_System_Load': 'EN', 'Read_Disk_Free': 'EN',
+    'Read_Sys_File': 'EN', 'Read_Hwmon': 'EN',
     'T_To_Ms': 'EN', 'Ms_To_T': 'EN', 'T_To_Sec': 'EN', 'Sec_To_T': 'EN',
     'Add_T': 'EN', 'Sub_T': 'EN', 'Mul_T': 'EN', 'Div_T': 'EN',
     'Gen_Signal': 'EN',
@@ -2981,6 +3091,7 @@ const FB_Q_OUTPUT = {
     'Read_Uptime': 'ENO', 'Cycle_Time_Monitor': 'ENO', 'Hour_Meter': 'Q',
     'Watchdog': 'EXPIRED',
     'Read_CPU_Temperature': 'ENO', 'Read_System_Load': 'ENO', 'Read_Disk_Free': 'ENO',
+    'Read_Sys_File': 'ENO', 'Read_Hwmon': 'ENO',
     'T_To_Ms': 'ENO', 'Ms_To_T': 'ENO', 'T_To_Sec': 'ENO', 'Sec_To_T': 'ENO',
     'Add_T': 'ENO', 'Sub_T': 'ENO', 'Mul_T': 'ENO', 'Div_T': 'ENO',
     'Blink': 'OUT', 'Debounce': 'OUT', 'Gen_Signal': 'ENO',
@@ -3017,6 +3128,8 @@ const SYSTEM_FB_OUTPUT_TYPES = {
     'Read_CPU_Temperature': { 'TEMP': 'REAL', 'ERR_ID': 'USINT' },
     'Read_System_Load':     { 'LOAD_1M': 'REAL', 'MEM_FREE_MB': 'UDINT', 'MEM_TOTAL_MB': 'UDINT', 'ERR_ID': 'USINT' },
     'Read_Disk_Free':       { 'FREE_MB': 'UDINT', 'TOTAL_MB': 'UDINT', 'ERR_ID': 'USINT' },
+    'Read_Sys_File':        { 'VALUE': 'STRING', 'ERR_ID': 'USINT' },
+    'Read_Hwmon':           { 'VALUE': 'STRING', 'ERR_ID': 'USINT' },
     'T_To_Ms':              { 'OUT': 'DINT' },
     'Ms_To_T':              { 'OUT': 'TIME' },
     'T_To_Sec':             { 'OUT': 'REAL' },
@@ -3109,6 +3222,43 @@ const collectShadowVars = (rungs, progName) => {
     return vars;
 };
 
+// Every x_TO_STRING call site in a PROGRAM needs its own text buffer in
+// PlcState (see strConvSymbol). Ladder sites are named after the block
+// instance; ST sites are numbered, and the count is an UPPER BOUND — comments
+// and string literals are stripped before the rewrite runs, so it consumes
+// fewer. Over-allocating wastes 64 bytes; under-allocating would reference a
+// field that does not exist, which is a compile error rather than a silent
+// wrong value. Ladder tags are deduped so a repeated instance name shares a
+// buffer instead of naming a field nobody declared.
+const collectStringConvBuffers = (prog, progName) => {
+    const syms = [];
+    const seen = new Set();
+    const add = (tag) => {
+        const sym = strConvSymbol(progName, tag);
+        if (seen.has(sym)) return;
+        seen.add(sym);
+        syms.push(sym);
+    };
+    const rungs = prog.content?.rungs || [];
+    if (prog.type === 'LD' || prog.type === 'SCL') {
+        rungs.forEach(rung => {
+            if (rung.lang === 'ST') return;
+            (rung.blocks || []).forEach((b, i) => {
+                const t = (b.type || '').trim();
+                if (!/^[A-Z]+_TO_STRING$/.test(t)) return;
+                add(((b.data?.instanceName) || `${t}${i}`).trim().replace(/\s+/g, '_'));
+            });
+        });
+    }
+    // ST sources, concatenated in the SAME order transpilePOUSource visits
+    // them, so the numbering the rewrite hands out matches these fields.
+    let stText = '';
+    if (prog.type === 'ST') stText = prog.content?.code || '';
+    else if (prog.type === 'SCL') stText = rungs.filter(r => r.lang === 'ST').map(r => r.code || '').join('\n');
+    for (let i = 0; i < countStringConvCalls(stText); i++) add(`st${i}`);
+    return syms;
+};
+
 // Collect writable input shadow variables for unassigned/literal FB input pins.
 // Returns shadow entries with initial values so the simulator can track and write them.
 const collectInputShadowVars = (rungs, progName) => {
@@ -3131,6 +3281,10 @@ const collectInputShadowVars = (rungs, progName) => {
             const pinTypes = FB_INPUT_TYPES[type];
             Object.entries(pinTypes).forEach(([editorPin, iecType]) => {
                 if (isPointerInputType(iecType)) return;
+                // A STRING pin is a char* into the module's rodata: no SHM slot
+                // type exists for it and a shadow field would be NULL, so the
+                // literal is assigned directly every scan instead.
+                if (isStringInputType(iecType)) return;
                 const rawVal = data.values?.[editorPin];
                 if (isVarRef(rawVal)) return;
                 const sym = `prog_${progName}_in_${instName}_${editorPin}`;
@@ -3201,6 +3355,9 @@ const collectUndeclaredPinVars = (rungs, progName, declaredVarNames, globalVarNa
             Object.entries(vals).forEach(([pinName, rawVal]) => {
                 const v = rawVal ? (rawVal + '').replace(/[🌍🏠⊞⊡⊟]/g, '').trim() : '';
                 if (!v || !IDENTIFIER_REF_REGEX.test(v) || isLiteral(v)) return;
+                // A bare word on a STRING pin is literal text, not a variable —
+                // declaring it here would mint a BOOL and break the C assignment.
+                if (isStringInputType(FB_INPUT_TYPES[type]?.[pinName])) return;
                 const baseName = v.split(/[.[]/)[0];
                 if (globalVarNames.includes(baseName) || declaredVarNames.has(baseName) || seen.has(baseName)) return;
                 seen.add(baseName);
@@ -3281,6 +3438,8 @@ const FB_OUTPUTS = {
     'Read_CPU_Temperature': ['ENO', 'TEMP', 'ERR_ID'],
     'Read_System_Load': ['ENO', 'LOAD_1M', 'MEM_FREE_MB', 'MEM_TOTAL_MB', 'ERR_ID'],
     'Read_Disk_Free': ['ENO', 'FREE_MB', 'TOTAL_MB', 'ERR_ID'],
+    'Read_Sys_File': ['ENO', 'VALUE', 'ERR_ID'],
+    'Read_Hwmon': ['ENO', 'VALUE', 'ERR_ID'],
     'T_To_Ms': ['ENO', 'OUT'], 'Ms_To_T': ['ENO', 'OUT'],
     'T_To_Sec': ['ENO', 'OUT'], 'Sec_To_T': ['ENO', 'OUT'],
     'Add_T': ['ENO', 'OUT'], 'Sub_T': ['ENO', 'OUT'],
@@ -3289,7 +3448,12 @@ const FB_OUTPUTS = {
 };
 // All conversion blocks (X_TO_Y) share ['ENO', 'OUT'] — built dynamically below
 // Programmatically populate all 72 X_TO_Y conversion entries across lookup tables
-const _CONV_TYPES = ['BOOL', 'BYTE', 'WORD', 'DWORD', 'INT', 'UINT', 'DINT', 'UDINT', 'REAL'];
+// ⚠️ STRING is in this list, so the 18 STRING_TO_x / x_TO_STRING pairs get the
+// same FB tables as the numeric ones. Their C side is NOT in libkron*.a — it is
+// static inline in kronsystem.h — and the TO_STRING half needs an output
+// buffer, which is why both directions are emitted by name below instead of
+// through the generic C-cast branch.
+const _CONV_TYPES = ['BOOL', 'BYTE', 'WORD', 'DWORD', 'INT', 'UINT', 'DINT', 'UDINT', 'REAL', 'STRING'];
 _CONV_TYPES.forEach(src => _CONV_TYPES.forEach(dst => {
     if (src === dst) return;
     const k = `${src}_TO_${dst}`;
@@ -3487,8 +3651,9 @@ const SYSTEM_FB_TYPES = new Set([
     'Time_Switch', 'Daily_Trigger', 'Astro_Clock',
     // Runtime diagnostics
     'Read_Uptime', 'Cycle_Time_Monitor',
-    // Host health
+    // Host health + generic sysfs readers
     'Read_CPU_Temperature', 'Read_System_Load', 'Read_Disk_Free',
+    'Read_Sys_File', 'Read_Hwmon',
     // TIME arithmetic. These are stateless, but they cannot take the inline
     // path: that branch dispatches through KRON_FN / BITWISE_OP / MATH_FB_BLOCKS
     // and a name in none of those tables has nowhere to be emitted. They are
@@ -3596,6 +3761,8 @@ const FB_INPUTS = {
     'Read_CPU_Temperature': ['EN'],
     'Read_System_Load': ['EN'],
     'Read_Disk_Free': ['EN'],
+    'Read_Sys_File': ['EN', 'PATH', 'POLL_MS'],
+    'Read_Hwmon': ['EN', 'NAME', 'ATTR', 'POLL_MS'],
     'T_To_Ms': ['EN', 'IN'], 'Ms_To_T': ['EN', 'IN'],
     'T_To_Sec': ['EN', 'IN'], 'Sec_To_T': ['EN', 'IN'],
     'Add_T': ['EN', 'IN1', 'IN2'], 'Sub_T': ['EN', 'IN1', 'IN2'],
@@ -3693,6 +3860,10 @@ const FB_INPUT_TYPES = {
     'I2C_WriteRead': { 'Port_ID': 'USINT', 'Device_Address': 'USINT', 'Register_Address': 'USINT', 'pTxBuffer': 'POINTER', 'TxLength': 'UINT', 'pRxBuffer': 'POINTER', 'RxLength': 'UINT' },
     'SPI_Transfer': { 'Port_ID': 'USINT', 'pTxBuffer': 'POINTER', 'pRxBuffer': 'POINTER', 'Length': 'UINT' },
     'UART_Send': { 'Port_ID': 'USINT', 'pTxBuffer': 'POINTER', 'Length': 'UINT' },
+    // STRING pins: no writable shadow var (collectInputShadowVars skips the
+    // type) — the literal is emitted as a C string every scan, see resolveVal.
+    'Read_Sys_File': { 'PATH': 'STRING', 'POLL_MS': 'UDINT' },
+    'Read_Hwmon': { 'NAME': 'STRING', 'ATTR': 'STRING', 'POLL_MS': 'UDINT' },
     'UART_Receive': { 'Port_ID': 'USINT', 'pRxBuffer': 'POINTER', 'MaxSize': 'UINT' },
     'USB_Send': { 'Port_ID': 'USINT', 'pTxBuffer': 'POINTER', 'Length': 'UINT' },
     'USB_Receive': { 'Port_ID': 'USINT', 'pRxBuffer': 'POINTER', 'MaxSize': 'UINT' },
@@ -3743,7 +3914,7 @@ _CONV_TYPES.forEach(src => _CONV_TYPES.forEach(dst => {
 
 const transpileSTLogics = (code, stdFunctions = {}, parentName = '', category = 'program', varMap = {}, varTypeMap = {}, userFBTypes = new Set(), opts = {}) => {
     if (!code) return `    // ST Implementation Empty\n`;
-    const { fnReturnVar = null, userFunctionInputs = {}, userFBInputs = {} } = opts;
+    const { fnReturnVar = null, userFunctionInputs = {}, userFBInputs = {}, strConv = null } = opts;
 
     // ⚠️ A project may declare its own MIN/MAX/… FUNCTION or FB type; that name
     // must keep its own meaning instead of expanding to the IEC selection form.
@@ -3997,6 +4168,33 @@ const transpileSTLogics = (code, stdFunctions = {}, parentName = '', category = 
             });
         });
 
+        // ⚠️ A STRING comparison must become strcmp, not `==`: comparing two
+        // `char *` in C tests ADDRESSES, so equal text in different buffers is
+        // "not equal" and the program silently never matches. Lowered here,
+        // BEFORE the `=` → `==` pass, while the operands are still IEC text and
+        // string literals are still protected tokens.
+        {
+            const isStrOperand = (o) => {
+                if (/^\x01\d+\x02$/.test(o)) return true;             // string literal
+                const t = varTypeMap[o] ?? varTypeMap[Object.keys(varTypeMap)
+                    .find(k => k.toLowerCase() === o.toLowerCase()) ?? ''];
+                return /^W?STRING$/i.test(String(t || ''));
+            };
+            const OPERAND = `(?:\\x01\\d+\\x02|[A-Za-z_][A-Za-z0-9_.]*)`;
+            const cmpRe = new RegExp(`(${OPERAND})\\s*(<>|<=|>=|<|>|(?<![:=<>!])=(?!=))\\s*(${OPERAND})`, 'g');
+            work = work.replace(cmpRe, (m, lhs, op, rhs) => {
+                if (!isStrOperand(lhs) && !isStrOperand(rhs)) return m;
+                if (op === '=')  return `__kron_streq(${lhs}, ${rhs})`;
+                if (op === '<>') return `(!__kron_streq(${lhs}, ${rhs}))`;
+                // Ordering two strings has no defined meaning here and would
+                // compare pointers; say so rather than emit it.
+                const shown = m.replace(/\x01(\d+)\x02/g, (_, i) => stringTokens[+i]);
+                throw new Error(
+                    `STRING comparison "${shown.trim()}" is not supported: only = and <> ` +
+                    `work on text. Convert with STRING_TO_DINT / STRING_TO_REAL to order values.`);
+            });
+        }
+
         let result = work
             .replace(/\b[A-Za-z_][A-Za-z0-9_]*#([A-Za-z_][A-Za-z0-9_]*)\b/g, '$1') // TypeName#EnumValue → EnumValue
             .replace(/\b16#([0-9A-Fa-f]+)/gi, '0x$1')  // IEC hex literal: 16#FF → 0xFF
@@ -4024,17 +4222,26 @@ const transpileSTLogics = (code, stdFunctions = {}, parentName = '', category = 
         result = result.replace(/\b(?:T|TIME)#(?:[\d._]+(?:MS|US|NS|D|H|M|S))+\b/gi, m => String(mapIECtoTimeUs(m)));
         result = result.replace(/\bADR\s*\(\s*([^)]+?)\s*\)/gi, (_, inner) => `(&(${resolveVarsInExpr(inner.trim())}))`);
         result = result.replace(/\bNULL\b/gi, 'NULL');
+        // x_TO_STRING FIRST and as a WHOLE call: it needs an output buffer
+        // appended, which the name-only rewrite below cannot do through its
+        // lookahead. Non-nested argument lists only, the same limit the
+        // named-argument rewrite above carries.
+        result = result.replace(/\b([A-Za-z]+)_TO_STRING\s*\(([^()]*)\)/g, (match, src, arg) => {
+            const ks = IEC_KRON_NAME[src.toUpperCase()];
+            if (!ks || ks === 'STRING') return match;
+            if (!strConv) {
+                throw new Error(
+                    `${src.toUpperCase()}_TO_STRING is only available inside a PROGRAM. ` +
+                    `A FUNCTION or FUNCTION_BLOCK has no PlcState field to hold the text.`);
+            }
+            const buf = strConvSymbol(strConv.progName, `st${strConv.next++}`);
+            return `KRON_${ks}_TO_STRING(${arg}, S->${buf}, ${STRING_SHM_BYTES})`;
+        });
         // IEC 61131-3 type-conversion functions → KRON_ library names
         // e.g. BYTE_TO_UINT(...) → KRON_BYTE_TO_UINT16(...)
-        const IEC_TO_KRON_TYPE = {
-            BOOL:'BOOL', BYTE:'BYTE', WORD:'WORD', DWORD:'DWORD', LWORD:'LWORD',
-            SINT:'INT8', INT:'INT16', DINT:'INT32', LINT:'INT64',
-            USINT:'UINT8', UINT:'UINT16', UDINT:'UINT32', ULINT:'UINT64',
-            REAL:'REAL', LREAL:'LREAL',
-        };
         result = result.replace(/\b([A-Za-z]+)_TO_([A-Za-z]+)(?=\s*\()/g, (match, src, dst) => {
-            const ks = IEC_TO_KRON_TYPE[src.toUpperCase()];
-            const kd = IEC_TO_KRON_TYPE[dst.toUpperCase()];
+            const ks = IEC_KRON_NAME[src.toUpperCase()];
+            const kd = IEC_KRON_NAME[dst.toUpperCase()];
             return (ks && kd) ? `KRON_${ks}_TO_${kd}` : match;
         });
         // IEC type cast functions: INT(x) → (int16_t)(x), DINT(x) → (int32_t)(x), etc.
@@ -4054,8 +4261,13 @@ const transpileSTLogics = (code, stdFunctions = {}, parentName = '', category = 
         // Runs BEFORE variable resolution so the arguments are resolved after.
         result = expandSTSelectionCalls(result, isShadowedStdName);
         result = resolveVarsInExpr(result);
-        // Restore protected strings
-        return result.replace(/(\d+)/g, (_, i) => stringTokens[+i]);
+        // Restore protected strings. IEC single-quoted STRING literals become
+        // C double-quoted ones (a multi-char `'abc'` is an int in C); a
+        // double-quoted WSTRING is passed through unchanged.
+        return result.replace(/(\d+)/g, (_, i) => {
+            const tok = stringTokens[+i];
+            return tok.startsWith("'") ? iecStringToC(tok.slice(1, -1)) : tok;
+        });
     };
 
     lines.forEach(line => {
@@ -4499,6 +4711,9 @@ const transpileLDLogics = (rungs, stdFunctions = {}, parentName = '', category =
         if (s.toUpperCase().startsWith('T#') || s.toUpperCase().startsWith('TIME#')) {
             return mapIECtoTimeUs(s).toString();
         }
+        // Quoted STRING literal ('…' IEC, "…" also accepted) → C string
+        const strLit = quotedStringToC(s);
+        if (strLit !== null) return strLit;
         // IEC hex literal 16#FF → 0xFF
         if (/^16#[0-9A-Fa-f]+$/i.test(s)) return '0x' + s.slice(3).toUpperCase();
         // Binary literal 0b... → decimal (C99 doesn't support 0b).
@@ -4553,6 +4768,19 @@ const transpileLDLogics = (rungs, stdFunctions = {}, parentName = '', category =
         }
 
         const pinMeta = getInputPinMeta(blockType, pinName, customData);
+        if (isStringInputType(pinMeta.type)) {
+            // Quoted text is always a literal. Bare text resolves to a variable
+            // ONLY if one is actually declared under that name — otherwise it is
+            // the text itself. Reading a bare word as an undeclared variable
+            // turned `NAME := pwmfan` into a BOOL auto-declared behind the
+            // user's back, and a path only escaped that because of its slashes.
+            const quoted = quotedStringToC(cleanValue);
+            if (quoted !== null) return quoted;
+            const base = cleanValue.split(/[.[]/)[0];
+            const declared = IDENTIFIER_REF_REGEX.test(cleanValue) &&
+                (localVarNames.has(base) || fbInstanceNames.has(base) || globalVarNames.includes(base));
+            return declared ? resolveVar(cleanValue) : iecStringToC(cleanValue);
+        }
         if (pinMeta.passByReference) {
             if (/^NULL$/i.test(cleanValue)) return 'NULL';
             const adrMatch = cleanValue.match(/^ADR\s*\(\s*(.+?)\s*\)$/i);
@@ -4798,13 +5026,22 @@ const transpileLDLogics = (rungs, stdFunctions = {}, parentName = '', category =
                 const inputPins = FB_INPUTS[type] || [];
                 const dataInputPins = inputPins.filter(p => p !== 'EN');
 
-                // Collect argument values from static pin values and wire connections
+                // Collect argument values from static pin values and wire connections.
+                // ⚠️ `argIsString` rides along because a comparison of text must
+                // become strcmp, not `==` on two `char *` (which tests addresses
+                // and silently never matches). It is set where the TYPE is still
+                // known — the pin's own value, or the source block's output pin.
                 const argValues = {};
+                const argIsString = {};
+                const markStr = (pin, yes) => { if (yes) argIsString[pin] = true; };
                 if (data.values) {
                     Object.entries(data.values).forEach(([pinName, val]) => {
                         if (['EN', 'ENO', 'OUT'].includes(pinName)) return;
                         const resolved = resolveVal(val);
-                        if (resolved !== null) argValues[pinName] = resolved;
+                        if (resolved === null) return;
+                        argValues[pinName] = resolved;
+                        markStr(pinName, /^"/.test(resolved) ||
+                            /^W?STRING$/i.test(String(cSymTypeMap[resolved] || '')));
                     });
                 }
                 (rung.connections || []).forEach(c => {
@@ -4830,6 +5067,8 @@ const transpileLDLogics = (rungs, stdFunctions = {}, parentName = '', category =
                             } else {
                                 argValues[pinName] = `${getCallTarget(srcInstName)}.${sp.slice(4)}`;
                             }
+                            markStr(pinName, /^W?STRING$/i.test(
+                                String(getOutputPinType(srcType, sp.slice(4), srcBlock?.data?.customData) || '')));
                         } else {
                             argValues[pinName] = `out_r${rungIdx}_b${sortedIndex[c.source]}`;
                         }
@@ -4932,7 +5171,20 @@ const transpileLDLogics = (rungs, stdFunctions = {}, parentName = '', category =
                         // by NAME instead of position.
                         resultExpr = `KRON_LIMIT(${argValues['MN'] || '0'}, ${argValues['IN'] || '0'}, ${argValues['MX'] || '0'})`;
                     } else if (KRON_FN[type]) {
-                        resultExpr = `${KRON_FN[type]}(${args.join(', ')})`;
+                        // Text operands: KRON_EQ's _Generic dispatch would pick the
+                        // numeric overload and compare pointers, so lower to strcmp.
+                        // Ordering text has no meaning here and is refused instead.
+                        const textCmp = dataInputPins.some(pin => argIsString[pin]);
+                        if (textCmp && (type === 'EQ' || type === 'NE')) {
+                            const eq = `__kron_streq(${args[0]}, ${args[1]})`;
+                            resultExpr = type === 'EQ' ? eq : `(!${eq})`;
+                        } else if (textCmp && ['GT', 'GE', 'LT', 'LE'].includes(type)) {
+                            throw new Error(
+                                `${type} compares text on rung ${rungIdx + 1}: only EQ and NE work ` +
+                                `on STRING. Convert with STRING_TO_DINT / STRING_TO_REAL first.`);
+                        } else {
+                            resultExpr = `${KRON_FN[type]}(${args.join(', ')})`;
+                        }
                     } else if (BITWISE_OP[type]) {
                         if (args.length === 1) {
                             resultExpr = `(${BITWISE_OP[type]}${args[0]})`;
@@ -4940,9 +5192,29 @@ const transpileLDLogics = (rungs, stdFunctions = {}, parentName = '', category =
                             resultExpr = `(${args[0]} ${BITWISE_OP[type]} ${args[1]})`;
                         }
                     } else if (type.match(/^[A-Z]+_TO_[A-Z]+$/)) {
-                        // Conversion — use C cast
-                        const dstType = type.split('_TO_')[1];
-                        resultExpr = `(${mapType(dstType)})(${args[0]})`;
+                        const [srcType, dstType] = type.split('_TO_');
+                        if (dstType === 'STRING' || srcType === 'STRING') {
+                            // Text cannot be a C cast: `(int32_t)(char*)` reads the
+                            // pointer and `(char*)(int32_t)` invents one. Both
+                            // directions are real calls, and TO_STRING writes into
+                            // this call site's own PlcState buffer.
+                            const ks = IEC_KRON_NAME[srcType], kd = IEC_KRON_NAME[dstType];
+                            if (!ks || !kd) throw new Error(`Unsupported conversion block "${type}"`);
+                            if (dstType === 'STRING') {
+                                if (category !== 'program') {
+                                    throw new Error(
+                                        `${type} is only available inside a PROGRAM. A FUNCTION or ` +
+                                        `FUNCTION_BLOCK has no PlcState field to hold the text.`);
+                                }
+                                const buf = strConvSymbol(parentName, (data.instanceName || `${type}${idx}`).trim().replace(/\s+/g, '_'));
+                                resultExpr = `KRON_${ks}_TO_STRING(${args[0]}, S->${buf}, ${STRING_SHM_BYTES})`;
+                            } else {
+                                resultExpr = `KRON_STRING_TO_${kd}(${args[0]})`;
+                            }
+                        } else {
+                            // Numeric conversion — a C cast is exact and free
+                            resultExpr = `(${mapType(dstType)})(${args[0]})`;
+                        }
                     } else {
                         resultExpr = `/* unknown inline: ${type} */ 0`;
                     }

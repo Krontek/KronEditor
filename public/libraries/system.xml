@@ -201,6 +201,42 @@
       </Outputs>
     </Block>
 
+    <!-- ── Generic sysfs / procfs readers ────────────────────
+         These blocks only READ. VALUE is the file's text; compare it with
+         EQ/NE and convert it with the STRING_TO_x blocks.
+         String pins take a QUOTED literal ('/sys/class/hwmon/hwmon1/pwm1',
+         'pwmfan') or the name of a STRING variable. Quotes are optional: an
+         unquoted word is used as text unless a variable of that name exists.
+         ⚠ A STRING has no shared-memory slot, so VALUE is NOT visible in the
+         live table or over REST. Convert it, or compare it to a BOOL. -->
+
+    <Block type="Read_Sys_File" description="Read a text file (sysfs/procfs). VALUE is the first line as STRING" class="FunctionBlock">
+      <Inputs>
+        <Variable name="EN"      type="BOOL"   default="FALSE" />
+        <Variable name="PATH"    type="STRING" default="" />
+        <Variable name="POLL_MS" type="UDINT"  default="0" />
+      </Inputs>
+      <Outputs>
+        <Variable name="ENO"    type="BOOL" />
+        <Variable name="VALUE"  type="STRING" />
+        <Variable name="ERR_ID" type="USINT" />
+      </Outputs>
+    </Block>
+
+    <Block type="Read_Hwmon" description="hwmon attribute found by device NAME, stable across hwmonN renumbering: NAME='pwmfan' ATTR='pwm1'. VALUE is the text (Linux only)" class="FunctionBlock">
+      <Inputs>
+        <Variable name="EN"      type="BOOL"   default="FALSE" />
+        <Variable name="NAME"    type="STRING" default="" />
+        <Variable name="ATTR"    type="STRING" default="" />
+        <Variable name="POLL_MS" type="UDINT"  default="0" />
+      </Inputs>
+      <Outputs>
+        <Variable name="ENO"    type="BOOL" />
+        <Variable name="VALUE"  type="STRING" />
+        <Variable name="ERR_ID" type="USINT" />
+      </Outputs>
+    </Block>
+
     <!-- ── TIME arithmetic and conversion ───────────────────────────────────
          Named without the X_TO_Y pattern on purpose: the transpiler rewrites
          that spelling to KRON_<src>_TO_<dst>, which only resolves in the

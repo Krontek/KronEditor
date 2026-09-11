@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"debug/dwarf"
 	"debug/elf"
 	"encoding/binary"
@@ -624,6 +625,31 @@ func newPollSpec(key, vtype string, offset uint64) (pollSpec, bool) {
 	return pollSpec{key: key, vtype: strings.ToUpper(vtype), offset: int64(offset), size: size}, true
 }
 
+// newMirrorPollSpec is newPollSpec for the SHM MIRROR, where a slot's width
+// comes from the deployed variable table instead of the C type. ⚠️ The two
+// cannot be merged: the legacy /proc/mem poller reads PlcState directly, where
+// a STRING field is an 8-byte `char *` and not the text, so typeSize keeps
+// returning 0 for it and that poller keeps skipping it. Reading the table
+// width there would hand back whatever bytes follow the pointer.
+func newMirrorPollSpec(key, vtype string, offset uint64, tableSize int) (pollSpec, bool) {
+	size := typeSize(vtype)
+	if size == 0 && isTextType(vtype) {
+		size = tableSize
+	}
+	if size <= 0 || size > maxMirrorSlotBytes {
+		return pollSpec{}, false
+	}
+	return pollSpec{key: key, vtype: strings.ToUpper(vtype), offset: int64(offset), size: size}, true
+}
+
+func isTextType(t string) bool {
+	u := strings.ToUpper(t)
+	return u == "STRING" || u == "WSTRING"
+}
+
+// maxMirrorSlotBytes bounds a width taken from an on-disk variable table.
+const maxMirrorSlotBytes = 1024
+
 func typeSize(t string) int {
 	switch strings.ToUpper(t) {
 	case "BOOL", "SINT", "USINT", "BYTE":
@@ -667,6 +693,16 @@ func decodeValue(buf []byte, t string) interface{} {
 		return sanitizeFloat(float64(math.Float32frombits(binary.LittleEndian.Uint32(buf[:4]))), true)
 	case "LREAL":
 		return sanitizeFloat(math.Float64frombits(binary.LittleEndian.Uint64(buf[:8])), false)
+	case "STRING", "WSTRING":
+		// A fixed, NUL-padded slot in the shm mirror (a full slot has no
+		// terminator). ToValidUTF8 guards json.Marshal the same way
+		// sanitizeFloat guards it for NaN: the bytes come from a device file,
+		// and one stray byte would drop the WHOLE variable frame.
+		b := buf
+		if i := bytes.IndexByte(b, 0); i >= 0 {
+			b = b[:i]
+		}
+		return strings.ToValidUTF8(string(b), "")
 	case "TON", "TOF":
 		if len(buf) >= 15 {
 			return map[string]interface{}{

@@ -125,48 +125,54 @@ export const LIBRARY_TREE = [
       {
         id: 'to_bool',
         title: 'TO_BOOL',
-        fromLibrary: ['BYTE_TO_BOOL', 'WORD_TO_BOOL', 'DWORD_TO_BOOL', 'INT_TO_BOOL', 'UINT_TO_BOOL', 'DINT_TO_BOOL', 'UDINT_TO_BOOL', 'REAL_TO_BOOL']
+        fromLibrary: ['BYTE_TO_BOOL', 'WORD_TO_BOOL', 'DWORD_TO_BOOL', 'INT_TO_BOOL', 'UINT_TO_BOOL', 'DINT_TO_BOOL', 'UDINT_TO_BOOL', 'REAL_TO_BOOL', 'STRING_TO_BOOL']
       },
       {
         id: 'to_byte',
         title: 'TO_BYTE',
-        fromLibrary: ['BOOL_TO_BYTE', 'WORD_TO_BYTE', 'DWORD_TO_BYTE', 'INT_TO_BYTE', 'UINT_TO_BYTE', 'DINT_TO_BYTE', 'UDINT_TO_BYTE', 'REAL_TO_BYTE']
+        fromLibrary: ['BOOL_TO_BYTE', 'WORD_TO_BYTE', 'DWORD_TO_BYTE', 'INT_TO_BYTE', 'UINT_TO_BYTE', 'DINT_TO_BYTE', 'UDINT_TO_BYTE', 'REAL_TO_BYTE', 'STRING_TO_BYTE']
       },
       {
         id: 'to_word',
         title: 'TO_WORD',
-        fromLibrary: ['BOOL_TO_WORD', 'BYTE_TO_WORD', 'DWORD_TO_WORD', 'INT_TO_WORD', 'UINT_TO_WORD', 'DINT_TO_WORD', 'UDINT_TO_WORD', 'REAL_TO_WORD']
+        fromLibrary: ['BOOL_TO_WORD', 'BYTE_TO_WORD', 'DWORD_TO_WORD', 'INT_TO_WORD', 'UINT_TO_WORD', 'DINT_TO_WORD', 'UDINT_TO_WORD', 'REAL_TO_WORD', 'STRING_TO_WORD']
       },
       {
         id: 'to_dword',
         title: 'TO_DWORD',
-        fromLibrary: ['BOOL_TO_DWORD', 'BYTE_TO_DWORD', 'WORD_TO_DWORD', 'INT_TO_DWORD', 'UINT_TO_DWORD', 'DINT_TO_DWORD', 'UDINT_TO_DWORD', 'REAL_TO_DWORD']
+        fromLibrary: ['BOOL_TO_DWORD', 'BYTE_TO_DWORD', 'WORD_TO_DWORD', 'INT_TO_DWORD', 'UINT_TO_DWORD', 'DINT_TO_DWORD', 'UDINT_TO_DWORD', 'REAL_TO_DWORD', 'STRING_TO_DWORD']
       },
       {
         id: 'to_int',
         title: 'TO_INT',
-        fromLibrary: ['BOOL_TO_INT', 'BYTE_TO_INT', 'WORD_TO_INT', 'DWORD_TO_INT', 'UINT_TO_INT', 'DINT_TO_INT', 'UDINT_TO_INT', 'REAL_TO_INT']
+        fromLibrary: ['BOOL_TO_INT', 'BYTE_TO_INT', 'WORD_TO_INT', 'DWORD_TO_INT', 'UINT_TO_INT', 'DINT_TO_INT', 'UDINT_TO_INT', 'REAL_TO_INT', 'STRING_TO_INT']
       },
       {
         id: 'to_uint',
         title: 'TO_UINT',
-        fromLibrary: ['BOOL_TO_UINT', 'BYTE_TO_UINT', 'WORD_TO_UINT', 'DWORD_TO_UINT', 'INT_TO_UINT', 'DINT_TO_UINT', 'UDINT_TO_UINT', 'REAL_TO_UINT']
+        fromLibrary: ['BOOL_TO_UINT', 'BYTE_TO_UINT', 'WORD_TO_UINT', 'DWORD_TO_UINT', 'INT_TO_UINT', 'DINT_TO_UINT', 'UDINT_TO_UINT', 'REAL_TO_UINT', 'STRING_TO_UINT']
       },
       {
         id: 'to_dint',
         title: 'TO_DINT',
-        fromLibrary: ['BOOL_TO_DINT', 'BYTE_TO_DINT', 'WORD_TO_DINT', 'DWORD_TO_DINT', 'INT_TO_DINT', 'UINT_TO_DINT', 'UDINT_TO_DINT', 'REAL_TO_DINT']
+        fromLibrary: ['BOOL_TO_DINT', 'BYTE_TO_DINT', 'WORD_TO_DINT', 'DWORD_TO_DINT', 'INT_TO_DINT', 'UINT_TO_DINT', 'UDINT_TO_DINT', 'REAL_TO_DINT', 'STRING_TO_DINT']
       },
       {
         id: 'to_udint',
         title: 'TO_UDINT',
-        fromLibrary: ['BOOL_TO_UDINT', 'BYTE_TO_UDINT', 'WORD_TO_UDINT', 'DWORD_TO_UDINT', 'INT_TO_UDINT', 'UINT_TO_UDINT', 'DINT_TO_UDINT', 'REAL_TO_UDINT']
+        fromLibrary: ['BOOL_TO_UDINT', 'BYTE_TO_UDINT', 'WORD_TO_UDINT', 'DWORD_TO_UDINT', 'INT_TO_UDINT', 'UINT_TO_UDINT', 'DINT_TO_UDINT', 'REAL_TO_UDINT', 'STRING_TO_UDINT']
       },
       {
         id: 'to_real',
         title: 'TO_REAL',
-        fromLibrary: ['BOOL_TO_REAL', 'BYTE_TO_REAL', 'WORD_TO_REAL', 'DWORD_TO_REAL', 'INT_TO_REAL', 'UINT_TO_REAL', 'DINT_TO_REAL', 'UDINT_TO_REAL']
+        fromLibrary: ['BOOL_TO_REAL', 'BYTE_TO_REAL', 'WORD_TO_REAL', 'DWORD_TO_REAL', 'INT_TO_REAL', 'UINT_TO_REAL', 'DINT_TO_REAL', 'UDINT_TO_REAL', 'STRING_TO_REAL']
       },
+      {
+        id: 'to_string',
+        title: 'TO_STRING',
+        fromLibrary: ['BOOL_TO_STRING', 'BYTE_TO_STRING', 'WORD_TO_STRING', 'DWORD_TO_STRING', 'INT_TO_STRING', 'UINT_TO_STRING', 'DINT_TO_STRING', 'UDINT_TO_STRING', 'REAL_TO_STRING']
+      },
+
       {
         id: 'scaling',
         title: 'Scaling',
@@ -298,6 +304,11 @@ export const LIBRARY_TREE = [
         id: 'sys_health',
         title: 'Host Health',
         fromLibrary: ['Read_CPU_Temperature', 'Read_System_Load', 'Read_Disk_Free']
+      },
+      {
+        id: 'sys_files',
+        title: 'File & Text',
+        fromLibrary: ['Read_Sys_File', 'Read_Hwmon']
       },
       {
         id: 'time_math',

@@ -39,13 +39,15 @@
  * the shared us_tick just before its own body, so on a multi-task project a
  * us_tick read can belong to another thread's scan.
  *
- * Dependencies: stdbool.h, stdint.h, stdio.h, string.h, math.h, time.h, and
- * sys/statvfs.h on POSIX only.
+ * Dependencies: stdbool.h, stdint.h, stdio.h, stdlib.h, string.h, errno.h,
+ * math.h, time.h, and sys/statvfs.h on POSIX only.
  *===========================================================================*/
 
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <errno.h>
 #include <string.h>
 #include <math.h>
 #include <time.h>
@@ -966,6 +968,249 @@ static inline void Read_Disk_Free_Call(Read_Disk_Free *inst)
 #else
     inst->FREE_MB  = 0;
     inst->TOTAL_MB = 0;
+    inst->ERR_ID   = KRON_SYS_ABSENT;
+#endif
+}
+
+/*===========================================================================*
+ * 4b. Generic sysfs / procfs readers
+ *
+ * These blocks do ONE thing: hand back the text a file contains. Read_Sys_File
+ * takes a path; Read_Hwmon takes a device name and an attribute and finds the
+ * path itself. What the text MEANS is the program's job — compare it with
+ * EQ/NE, convert it with the STRING_TO_x blocks. Parsing inside the reader
+ * would force one answer (a number) onto files that hold a word.
+ *
+ * Read_Hwmon exists because the hwmonN index is assigned in driver-probe order
+ * and is NOT stable across boots: a fan controller that is hwmon1 today can be
+ * hwmon2 after a kernel update, and a hard-coded path then reads a different
+ * device with no error at all. The block scans hwmonN/name for the requested
+ * name instead, and re-scans whenever the attribute stops opening.
+ *
+ * String pins. IEC STRING maps to `char *` in the generated C. The transpiler
+ * assigns an input pin from a literal (or a STRING variable) every scan before
+ * the call, so the pointer is valid whenever the block reads it, including
+ * right after a hot-swap. VALUE is an in-struct BUFFER, not a pointer, so it
+ * lives as long as the instance does; Read_Hwmon keeps its own COPY of NAME
+ * for the same reason, and detects a changed literal by comparing text.
+ *
+ * ⚠️ STRING has no IEC_TYPE_SIZES entry, so a STRING variable gets no
+ * shared-memory slot and is NOT visible in the live table, over REST or in the
+ * HMI. Convert it to a number, or compare it to a BOOL, for anything you need
+ * to watch while the program runs.
+ *
+ * POLL_MS = 0 selects the shared default (KRON_SYS_POLL_US). There is no lower
+ * clamp: a tachometer may genuinely need a 100 ms read, so the cost of one
+ * file open per period is the user's to choose knowingly.
+ *
+ * Both blocks are safe to Retain: the poll deadline is validated against the
+ * current clock (see __kron_sys_cached) and Read_Hwmon re-scans whenever the
+ * attribute stops opening, so a restored index that has since moved heals
+ * itself rather than quietly reading another device.
+ *===========================================================================*/
+
+#define KRON_SYS_HWMON_MAX 64          /* hwmon0 .. hwmon63 are scanned */
+/* VALUE buffer, including the NUL. sysfs and procfs one-liners are short; a
+ * longer line is TRUNCATED rather than rejected. */
+#define KRON_SYS_TEXT_LEN  64
+
+/* Is a cached reading still current? A RETAINED instance carries a deadline
+ * taken from a PREVIOUS boot's monotonic clock, which restarted at zero, so a
+ * far-future value would freeze the block for as long as that gap lasts. A
+ * deadline further away than one whole period cannot be one this run set, and
+ * is discarded — the block reads once and re-arms from the current clock. */
+static inline bool __kron_sys_cached(bool primed, uint64_t now, uint64_t deadline,
+                                     uint64_t period)
+{
+    return primed && now < deadline && (deadline - now) <= period;
+}
+
+/* IEC STRING equality. The transpiler lowers `=` and `<>` on STRING operands
+ * to this: comparing two `char *` with C's own `==` tests ADDRESSES, which is
+ * false for equal text held in different buffers and true for nothing useful.
+ * A NULL operand (an unwired pin) equals nothing, not even another NULL. */
+static inline bool __kron_streq(const char *a, const char *b)
+{
+    return a && b && strcmp(a, b) == 0;
+}
+
+/* Read the first line of a text file into `text`, NUL-terminated with the
+ * trailing newline and blanks removed. Returns 0 the line was read, 2 not
+ * openable as a file, 3 read failed or the file was empty.
+ *
+ * A DIRECTORY opens successfully on Linux and only fails on the first read, so
+ * the EISDIR case is folded back into "open failed" — pointing at
+ * /sys/class/hwmon/hwmon1/ instead of one attribute inside it is a wrong path,
+ * and reporting it as a read error sends the user hunting for a problem that
+ * is not there. */
+static inline int __kron_sys_read_line(const char *path, char *text, size_t textsz)
+{
+    FILE   *f;
+    char    buf[KRON_SYS_TEXT_LEN];
+    size_t  n, copy;
+
+    if (text && textsz) text[0] = '\0';
+    if (!path || !*path) return KRON_SYS_OPENFAIL;
+    f = fopen(path, "r");
+    if (!f) return KRON_SYS_OPENFAIL;
+    errno = 0;
+    if (!fgets(buf, (int)sizeof(buf), f)) {
+        int e = errno;
+        fclose(f);
+        return (e == EISDIR) ? KRON_SYS_OPENFAIL : KRON_SYS_IOERR;
+    }
+    fclose(f);
+
+    n = strlen(buf);
+    while (n && (buf[n - 1] == '\n' || buf[n - 1] == '\r' ||
+                 buf[n - 1] == ' '  || buf[n - 1] == '\t')) buf[--n] = '\0';
+    if (text && textsz) {
+        copy = (n < textsz - 1) ? n : textsz - 1;   /* truncates, never overruns */
+        memcpy(text, buf, copy);
+        text[copy] = '\0';
+    }
+    return KRON_SYS_OK;
+}
+
+/* -- Read_Sys_File --------------------------------------------------------
+ * VALUE = the first line of PATH. Works on any text file; the sysfs and procfs
+ * convention of one value per file is what makes it useful on an SBC.
+ *
+ * ERR_ID: 0 read - 2 PATH does not open as a file (missing, no permission, or
+ * it names a directory) - 3 the file is empty.
+ */
+typedef struct {
+    char        VALUE[KRON_SYS_TEXT_LEN]; /* first line, trimmed    (output) */
+    uint8_t     ERR_ID;     /* 0 read, 2 not openable, 3 empty     (output) */
+    uint32_t    POLL_MS;    /* re-read period, 0 = 1000 ms         (input)  */
+    const char *PATH;       /* file to read                        (input)  */
+    uint64_t    __next_us;  /* cache deadline                               */
+    bool        __primed;   /* false until the first read                   */
+    bool        EN;         /* enable - power flow                 (input)  */
+    bool        ENO;        /* echoes EN                           (output) */
+} Read_Sys_File;
+
+static inline void Read_Sys_File_Call(Read_Sys_File *inst)
+{
+    uint64_t now, period;
+
+    inst->ENO = inst->EN;
+    if (!inst->EN) return;
+
+    now    = __kron_mono_us();
+    period = inst->POLL_MS ? (uint64_t)inst->POLL_MS * 1000ULL : KRON_SYS_POLL_US;
+    if (__kron_sys_cached(inst->__primed, now, inst->__next_us, period)) return;
+    inst->__primed  = true;
+    inst->__next_us = now + period;
+
+    inst->ERR_ID = (uint8_t)__kron_sys_read_line(inst->PATH, inst->VALUE,
+                                                 sizeof(inst->VALUE));
+}
+
+/* -- Read_Hwmon -----------------------------------------------------------
+ * VALUE = the text in /sys/class/hwmon/hwmon<i>/<ATTR> for the device whose
+ * name file equals NAME. Typical pairs: ("pwmfan", "pwm1") for the duty the
+ * driver commands, ("pwm_tach", "fan1_input") for the measured rpm,
+ * ("coretemp", "temp1_input") for millidegrees. Raw sysfs units, no scaling.
+ *
+ * ERR_ID: 0 read - 1 no hwmon device carries NAME (or not Linux) - 2 ATTR does
+ * not open on that device - 3 the file is empty.
+ *
+ * Resolution is cached by NAME text and dropped when NAME changes or the
+ * attribute stops opening. Indices need not be contiguous (a removed device
+ * leaves a hole), so the scan skips missing directories rather than stopping
+ * at the first one.
+ */
+typedef struct {
+    char        VALUE[KRON_SYS_TEXT_LEN]; /* attribute text, trimmed (output) */
+    uint8_t     ERR_ID;     /* 0 read, 1 no NAME, 2 ATTR, 3 empty  (output) */
+    uint32_t    POLL_MS;    /* re-read period, 0 = 1000 ms         (input)  */
+    const char *NAME;       /* hwmonN/name to match, e.g. "pwmfan" (input)  */
+    const char *ATTR;       /* attribute file, e.g. "pwm1"         (input)  */
+    uint64_t    __next_us;  /* cache deadline                               */
+    int16_t     __idx;      /* resolved hwmon index                         */
+    bool        __resolved; /* __idx and __name are valid                   */
+    bool        __primed;   /* false until the first read                   */
+    char        __name[32]; /* NAME the index was resolved for              */
+    bool        EN;         /* enable - power flow                 (input)  */
+    bool        ENO;        /* echoes EN                           (output) */
+} Read_Hwmon;
+
+#if defined(__linux__)
+/* Index of the hwmon device whose name file equals `name`, else -1. */
+static inline int __kron_hwmon_find(const char *name)
+{
+    char   path[64], buf[64];
+    int    i;
+
+    if (!name || !*name) return -1;
+    for (i = 0; i < KRON_SYS_HWMON_MAX; i++) {
+        FILE  *f;
+        size_t n;
+        snprintf(path, sizeof(path), "/sys/class/hwmon/hwmon%d/name", i);
+        f = fopen(path, "r");
+        if (!f) continue;
+        if (!fgets(buf, sizeof(buf), f)) { fclose(f); continue; }
+        fclose(f);
+        n = strlen(buf);
+        while (n && (buf[n - 1] == '\n' || buf[n - 1] == '\r' || buf[n - 1] == ' ')) buf[--n] = '\0';
+        if (strcmp(buf, name) == 0) return i;
+    }
+    return -1;
+}
+#endif
+
+static inline void Read_Hwmon_Call(Read_Hwmon *inst)
+{
+    uint64_t now, period;
+
+    inst->ENO = inst->EN;
+    if (!inst->EN) return;
+
+    now    = __kron_mono_us();
+    period = inst->POLL_MS ? (uint64_t)inst->POLL_MS * 1000ULL : KRON_SYS_POLL_US;
+    if (__kron_sys_cached(inst->__primed, now, inst->__next_us, period)) return;
+    inst->__primed  = true;
+    inst->__next_us = now + period;
+
+#if defined(__linux__)
+    {
+        char path[160];
+        int  rc;
+
+        if (!inst->NAME || !*inst->NAME || !inst->ATTR || !*inst->ATTR) {
+            inst->VALUE[0] = '\0'; inst->ERR_ID = KRON_SYS_ABSENT; return;
+        }
+        if (inst->__resolved &&
+            strncmp(inst->__name, inst->NAME, sizeof(inst->__name) - 1) != 0)
+            inst->__resolved = false;                          /* NAME edited */
+
+        if (!inst->__resolved) {
+            int idx = __kron_hwmon_find(inst->NAME);
+            if (idx < 0) { inst->VALUE[0] = '\0'; inst->ERR_ID = KRON_SYS_ABSENT; return; }
+            inst->__idx      = (int16_t)idx;
+            inst->__resolved = true;
+            snprintf(inst->__name, sizeof(inst->__name), "%s", inst->NAME);
+        }
+
+        snprintf(path, sizeof(path), "/sys/class/hwmon/hwmon%d/%s", inst->__idx, inst->ATTR);
+        rc = __kron_sys_read_line(path, inst->VALUE, sizeof(inst->VALUE));
+        if (rc == KRON_SYS_OPENFAIL) {
+            /* Device re-probed under another index? Re-scan once, retry if it moved. */
+            int idx = __kron_hwmon_find(inst->NAME);
+            if (idx < 0) {
+                inst->__resolved = false;
+                rc = KRON_SYS_ABSENT;
+            } else if (idx != inst->__idx) {
+                inst->__idx = (int16_t)idx;
+                snprintf(path, sizeof(path), "/sys/class/hwmon/hwmon%d/%s", idx, inst->ATTR);
+                rc = __kron_sys_read_line(path, inst->VALUE, sizeof(inst->VALUE));
+            }
+        }
+        inst->ERR_ID = (uint8_t)rc;
+    }
+#else
+    inst->VALUE[0] = '\0';
     inst->ERR_ID   = KRON_SYS_ABSENT;
 #endif
 }

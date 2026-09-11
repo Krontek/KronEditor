@@ -572,6 +572,8 @@ export const TOOL_DEFS = [
       'Start/Stop seal-in: rungs: [{ "branches": [[{"contact":"Start"}], [{"contact":"Motor"}]], "seriesAfter": [{"contact":"Stop","subType":"NC"}], "outputs": [{"coil":"Motor"}] }]. ' +
       '5s on-delay: rungs: [{ "branches": [[{"contact":"Sensor"}]], "fb": { "type":"TON", "instance":"delayTimer", "inputs": {"PT":"T#5s"}, "outputs": {"ET":"elapsed"} }, "outputs": [{"coil":"Lamp"}] }]. ' +
       'Counter with reset: rungs: [{ "branches": [[{"contact":"PartSensor"}]], "fb": { "type":"CTU", "instance":"partCounter", "inputs": {"PV":"100","R":"ResetBtn"} }, "outputs": [{"coil":"BatchDone"}] }]. ' +
+      'STRING pins (a file path, a device name) take QUOTED text: {"PATH":"\'/sys/class/hwmon/hwmon2/fan1_input\'"}. An unquoted word is used as text too, unless a variable of that name is declared — then it reads that variable. ' +
+      'Read_Sys_File / Read_Hwmon return the file text on VALUE (a STRING): compare it in an ST rung with = or <>, or convert it with a STRING_TO_x block. A STRING has no live value, so publish a converted number or a comparison result. ' +
       'Note: inline math/move/compare (ADD, MOVE, GT, …) and motion (MC_*) do NOT go in ladder — write those in an ST rung (set_st_code).',
     parameters: S({
       pou: str('Target LD POU name'),
@@ -1803,7 +1805,13 @@ function compileLadderRung(r, idx, ctx = {}) {
     for (const [pin, val] of Object.entries(fb.inputs || {})) {
       if (!inputNames.includes(pin)) throw new Error(`rung ${idx + 1}: "${fb.type}" has no input pin "${pin}" (inputs: ${inputNames.join(', ') || 'none'})`);
       fbValues[pin] = String(val);
-      if (isIdentRef(val)) ctx.collect?.({ name: String(val), type: pinType(fbDef.inputs, pin), isInstance: false });
+      // ⚠️ A STRING pin's value is TEXT unless a variable of that name is
+      // already declared (the transpiler applies the same rule). Auto-declaring
+      // it turned `NAME: 'pwmfan'` into an empty STRING variable that read as a
+      // NULL path at runtime — a block reporting "not available" with a name
+      // that looked right in the editor.
+      const isStringPin = /^W?STRING$/i.test(pinType(fbDef.inputs, pin));
+      if (isIdentRef(val) && !isStringPin) ctx.collect?.({ name: String(val), type: pinType(fbDef.inputs, pin), isInstance: false });
     }
     for (const [pin, val] of Object.entries(fb.outputs || {})) {
       if (!outputNames.includes(pin)) throw new Error(`rung ${idx + 1}: "${fb.type}" has no output pin "${pin}" (outputs: ${outputNames.join(', ') || 'none'})`);

@@ -11,6 +11,7 @@
 package main
 
 import (
+	"bytes"
 	"crypto/subtle"
 	"encoding/binary"
 	"encoding/json"
@@ -41,7 +42,18 @@ const (
 	VarUint64  VarType = "uint64"
 	VarFloat32 VarType = "float32"
 	VarFloat64 VarType = "float64"
+	// VarString is the only VARIABLE-WIDTH type: the slot holds NUL-padded
+	// text, and Size comes from the variable table rather than typeSizeMap.
+	// It is READ-ONLY — the runtime never pulls text back out of the mirror
+	// (a PLC STRING is a `char *` it does not own), so WriteVariable refuses
+	// it rather than writing bytes nothing will ever read.
+	VarString VarType = "string"
 )
+
+// maxStringBytes bounds a string slot from an UNTRUSTED variable table. The
+// generator uses 64; the ceiling only has to stop an absurd Size from being
+// accepted, the bounds check below still confirms it fits the segment.
+const maxStringBytes = 1024
 
 // Variable represents one symbol record in variable_table.json.
 //
@@ -218,12 +230,18 @@ func (m *IPCManager) LoadVariableTable(path string) error {
 		if v.Name == "" {
 			return fmt.Errorf("empty variable name detected")
 		}
-		expectedSize, ok := typeSizeMap[v.Type]
-		if !ok {
-			return fmt.Errorf("unsupported type: %s (variable: %s)", v.Type, v.Name)
-		}
-		if v.Size != expectedSize {
-			return fmt.Errorf("size mismatch: expected %d for %s, got %d", expectedSize, v.Name, v.Size)
+		if v.Type == VarString {
+			if v.Size < 1 || v.Size > maxStringBytes {
+				return fmt.Errorf("string variable '%s' has size %d, expected 1..%d", v.Name, v.Size, maxStringBytes)
+			}
+		} else {
+			expectedSize, ok := typeSizeMap[v.Type]
+			if !ok {
+				return fmt.Errorf("unsupported type: %s (variable: %s)", v.Type, v.Name)
+			}
+			if v.Size != expectedSize {
+				return fmt.Errorf("size mismatch: expected %d for %s, got %d", expectedSize, v.Name, v.Size)
+			}
 		}
 		// Offsets come from an uploaded file and must be treated as untrusted:
 		// a negative or overflowing offset would pass a naive `offset+size >
@@ -346,6 +364,15 @@ func decodeValue(t VarType, b []byte) (any, error) {
 	case VarFloat64:
 		bits := binary.LittleEndian.Uint64(b)
 		return math.Float64frombits(bits), nil
+	case VarString:
+		// NUL-terminated inside a fixed slot; a full slot has no terminator.
+		// ToValidUTF8 guards the JSON encoder: the bytes come from a device
+		// file, and one stray byte would otherwise make the whole variable
+		// frame unmarshalable for every client.
+		if i := bytes.IndexByte(b, 0); i >= 0 {
+			b = b[:i]
+		}
+		return strings.ToValidUTF8(string(b), ""), nil
 	default:
 		return nil, fmt.Errorf("decode: unknown type: %s", t)
 	}
@@ -414,6 +441,12 @@ func (m *IPCManager) ClearAllForces() {
 
 // encodeValue converts a raw JSON value into a Little Endian byte slice.
 func encodeValue(t VarType, raw json.RawMessage) ([]byte, error) {
+	if t == VarString {
+		// The runtime has no pull path for text (see VarString), so a write
+		// would land in the mirror and be overwritten on the next scan with
+		// no sign anything went wrong. Refuse instead of pretending.
+		return nil, fmt.Errorf("string variables are read-only")
+	}
 	buf := make([]byte, typeSizeMap[t])
 
 	// Coerce string payloads like "1", "0", "true" to typed JSON values.
