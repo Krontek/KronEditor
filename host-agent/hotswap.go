@@ -1081,8 +1081,27 @@ func (s *Server) handleHotSwapSwap(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	if err := sendSwapSignal(pid); err != nil {
-		writeError(w, http.StatusInternalServerError, "signal failed: "+err.Error())
+	// ⚠️ Re-check the pid UNDER mu and signal without letting go of it. The pid
+	// was read before compileLogic, which is a real clang invocation (tens of
+	// ms to seconds) — long enough for a concurrent Stop() to reap the host and
+	// hand its pid back to the OS, after which SIGUSR1 would land on whatever
+	// process inherited the number. The reaper goroutine can only zero
+	// s.hotswap.pid while holding mu, so taking mu across the kill leaves only
+	// the goroutine-scheduling gap between cmd.Wait() returning and the reaper
+	// acquiring mu, instead of a whole compile.
+	s.hotswap.mu.Lock()
+	stillRunning := s.hotswap.pid == pid
+	var sigErr error
+	if stillRunning {
+		sigErr = sendSwapSignal(pid)
+	}
+	s.hotswap.mu.Unlock()
+	if !stillRunning {
+		writeError(w, http.StatusConflict, "simulation stopped or restarted while the new logic was compiling — swap aborted")
+		return
+	}
+	if sigErr != nil {
+		writeError(w, http.StatusInternalServerError, "signal failed: "+sigErr.Error())
 		return
 	}
 

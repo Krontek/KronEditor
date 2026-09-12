@@ -2645,12 +2645,15 @@ function App() {
           await host.hotswapSwap({ header: cCode.header, source: cCode.source });
         } catch (err) {
           const msg = String(err?.message || err);
-          // The loader-host's plc_state_layout_hash rejected the swap (the JS
-          // pre-check can miss exotic layout changes — the C hash is the hard
-          // net). Turn that rejection into the same restart offer instead of
-          // a log-only error the user won't see — the local sim only.
-          if (/LAYOUT/i.test(msg)) {
-            await offerSimRestart('The running program\'s memory layout differs from this change (the safety check rejected the live swap and rolled back — the OLD logic is still running).');
+          // The loader-host rejected the swap (the JS pre-check can miss exotic
+          // changes — the C-side checks are the hard net). LAYOUT = the
+          // PlcState shape differs; TASKCOUNT = the number of tasks differs,
+          // which the layout hash does NOT cover and the loader's scan threads
+          // cannot follow (host.c resolve_and_bind). Turn either rejection into
+          // the same restart offer instead of a log-only error the user won't
+          // see — the local sim only.
+          if (/LAYOUT|TASKCOUNT/i.test(msg)) {
+            await offerSimRestart('The running program\'s memory layout or task table differs from this change (the safety check rejected the live swap and rolled back — the OLD logic is still running).');
             return;
           }
           // Anything else here is the edited code failing to compile (the

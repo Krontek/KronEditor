@@ -98,11 +98,21 @@ func handleBuild(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if bad := rejectedCompilerArg(req.CompilerArgs); bad != "" {
+		writeError(w, http.StatusBadRequest, "compiler argument not allowed: "+bad)
+		return
+	}
+
 	outputPath := filepath.Join(buildDir, req.Output)
 
-	args := []string{"-o", outputPath}
-	args = append(args, sourceFiles...)
+	// ⚠️ -o goes LAST, after the caller's args: gcc/clang honour the LAST -o,
+	// so building the command the other way round let compilerArgs silently
+	// undo the req.Output containment check above. rejectedCompilerArg is the
+	// second half of that fix (a linker -o, or a flag that makes the compiler
+	// load caller-chosen code, would slip past ordering alone).
+	args := append([]string{}, sourceFiles...)
 	args = append(args, req.CompilerArgs...)
+	args = append(args, "-o", outputPath)
 
 	cmd := exec.Command(req.Compiler, args...)
 	cmd.Dir = buildDir
@@ -126,6 +136,69 @@ func handleBuild(w http.ResponseWriter, r *http.Request) {
 	resp.BinaryPath = outputPath
 	writeJSON(w, http.StatusOK, resp)
 }
+
+// rejectedCompilerArg returns the first caller-supplied compiler argument that
+// must not be passed through, or "" when all of them are fine.
+//
+// The endpoint's entire sandbox is "the compiler may only write inside
+// buildDir". Two classes of argument break that regardless of where -o sits on
+// the command line, so they are refused by name:
+//
+//   - output redirection that outranks or bypasses the driver's own -o
+//     (-o itself in any spelling, a linker -o smuggled through -Wl,/-Xlinker,
+//     a GCC response file @args).
+//   - anything that makes the compiler load and run caller-chosen code
+//     (-fplugin=, -specs=, -B, -wrapper, -Xclang -load, a linker -plugin or
+//     linker script).
+//
+// Everything else stays permissive — -I/-L/-l/-O/-D/-W/-f/-std and bare
+// operands are what the frontend legitimately sends. A bare (non-flag) operand
+// is always allowed: it is a source or library file, never an output path, and
+// allowing it is what lets value-taking flags like `-isysroot /path` work.
+func rejectedCompilerArg(args []string) string {
+	for _, a := range args {
+		if a == "" {
+			continue
+		}
+		if strings.HasPrefix(a, "@") {
+			return a // GCC response file: arbitrary extra args from a file
+		}
+		if !strings.HasPrefix(a, "-") {
+			continue // an operand (source / library / a flag's value)
+		}
+		for _, bad := range deniedArgPrefixes {
+			if strings.HasPrefix(a, bad) {
+				return a
+			}
+		}
+		// -Wl,/-Wa,/-Wp,/-Xlinker pass their payload straight to another tool,
+		// so inspect the payload rather than trusting the wrapper.
+		if strings.HasPrefix(a, "-Wl,") || strings.HasPrefix(a, "-Wa,") || strings.HasPrefix(a, "-Wp,") {
+			for _, tok := range strings.Split(a[4:], ",") {
+				for _, bad := range deniedPassthroughArgs {
+					if tok == bad || strings.HasPrefix(tok, bad+"=") {
+						return a
+					}
+				}
+			}
+		}
+	}
+	return ""
+}
+
+// deniedArgPrefixes are matched with HasPrefix so the fused spellings
+// (-ofile, -fplugin=x, -Bdir) are caught alongside the separated ones.
+// "-o" does not collide with "-O2": the match is case-sensitive.
+var deniedArgPrefixes = []string{
+	"-o", "--output",
+	"-B", "-specs=", "--specs", "-wrapper", "--wrapper",
+	"-fplugin", "-fuse-ld=",
+	"-Xclang", "-Xlinker", "-Xpreprocessor",
+	"-T", "--script",
+}
+
+// deniedPassthroughArgs are the tokens refused inside a -Wl,/-Wa,/-Wp, payload.
+var deniedPassthroughArgs = []string{"-o", "--output", "-T", "--script", "-plugin", "--plugin"}
 
 // allowedCompilers is the exec allowlist for POST /api/host/build.
 var allowedCompilers = map[string]bool{

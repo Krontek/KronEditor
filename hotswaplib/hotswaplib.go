@@ -185,6 +185,12 @@ func ClearResultFile(path string) error {
 	return nil
 }
 
+// DetailNoRequest is the reason token hotswaphost/host.c writes when a swap
+// signal arrives but ./swap_request is missing, empty or unreadable. It is the
+// only result token that is NOT tied to a generation number — see
+// PollSwapResult for why it is accepted regardless of the one it names.
+const DetailNoRequest = "NOREQUEST"
+
 // PollSwapResult polls path (the plain-text "<STATUS> <gen> [<detail>]" file
 // written by hotswaphost/host.c's write_swap_result) until it reports an
 // outcome for expectGen, or timeout elapses.
@@ -200,10 +206,18 @@ func ClearResultFile(path string) error {
 // polling continues (it can only be a stale leftover ClearResultFile failed
 // to remove, or — defensively — a race with another in-flight swap; either
 // way it must never be mistaken for this swap's outcome).
+//
+// The ONE exception is DetailNoRequest: the loader-host writes it when it was
+// signalled but could not read a swap request at all, so it has no generation
+// to name (it never saw the path that carries the number). It can only ever
+// describe the swap being polled for — the caller clears the result file
+// immediately before writing its request — so it is accepted whatever
+// generation it claims, turning a full poll timeout ("outcome unknown") into
+// the accurate "the request never reached the host, the old logic still runs".
 func PollSwapResult(path string, expectGen int, timeout time.Duration) (status, detail string, err error) {
 	deadline := time.Now().Add(timeout)
 	for {
-		if st, gen, det, ok := readSwapResult(path); ok && gen == expectGen {
+		if st, gen, det, ok := readSwapResult(path); ok && (gen == expectGen || det == DetailNoRequest) {
 			return st, det, nil
 		}
 		if time.Now().After(deadline) {

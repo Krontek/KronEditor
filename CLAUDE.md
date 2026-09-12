@@ -53,6 +53,7 @@ resources/<triple>/  per-arch artifacts ONLY: lib/*.a + server/. No headers.
 toolchains/    bundled LLVM + sysroots (~5 GB, gitignored)
 public/libraries/*.xml  block definitions;  KrontekLibraries/  SOURCE OF TRUTH for .c/.h
 experiments/   transpiler-check/ agent-check/;  docs/PLC_AGENT.md  full agent reference
+ApiSamples/    stdlib-only Python REST/ring clients + samples (own README.md); server/API.md = full REST reference
 ```
 
 ## 4. Dev workflow, versioning, packaging
@@ -63,6 +64,7 @@ npm run build               # → ./dist-binary/kron-host-agent
 ```
 - ⚠️ **A fresh clone cannot compile** — `toolchains/` and `resources/<triple>/` are gitignored (only `krontek-include/HAL/` + `kronsystem.h` are tracked). `bundled clang not found: toolchains\bin\clang.exe` is `paths.go`'s no-toolchain fallback; `/api/host/health` reports the resolved roots. Fix with `python setup_toolchain.py`, but **keep the repo's own `krontek-include/HAL/`**.
 - ⚠️ **Never commit a compiled agent** — `go build ./...` in `host-agent/` writes `kron-host-agent[.exe]` there; expected, gitignored.
+- **Tests: `cd host-agent && go test ./...`, `cd server && go test ./...`** (11 Go test files — AI truncation, ring sizing/decoding, library targets, GCC dir globbing), plus `cd ApiSamples && python3 -m unittest discover -p 'test_*.py'` (offline decoder tests, no device). ⚠️ These are the only checked-in verification — the two `experiments/` gates are gitignored (§5).
 - **Version = `package.json` `"version"`, never hardcoded:** Vite injects `__APP_VERSION__` → `src/version.js`; the agent gets `-ldflags "-X main.appVersion=…"` (`go run .` shows `dev`).
 
 **`packaging/`** holds only three scripts + README, each emitting ONE self-contained gitignored artifact beside itself (AppImage, NSIS `.exe`, `.dmg`). **[`packaging/README.md`](packaging/README.md) is the full reference.**
@@ -120,7 +122,8 @@ A stable **loader-host** owns `PlcState` + the shm mirror + timing + scan thread
 **Generations — bounded 2-slot ping-pong** (`hotswaplib/`):
 - ⚠️ Exactly two slots `logic_0.so` ↔ `logic_1.so`; each swap targets the slot **not** running (`PingPongGeneration(confirmedGen)`) so numbers never grow (`NextGeneration` = highest+1 is deprecated). `CleanupExcept` deletes the other only after a confirmed `OK`.
 - ⚠️ **Slot writes must be atomic** (names are reused): `.tmp` + rename gives a fresh inode, so an `mmap`'d `.so` is never truncated in place.
-- ⚠️ **`plc_state_layout_hash()`** (FNV-1a over the `stateFields` *shape*) is the hard safety net — host.c refuses+rolls back any swap whose hash differs from the first cold-start bind's (always the ORIGINAL, so drift can't accumulate).
+- ⚠️ **`plc_state_layout_hash()`** (FNV-1a over the `stateFields` *shape*) is the hard safety net — host.c refuses+rolls back any swap whose hash differs from the first cold-start bind's (always the ORIGINAL, so drift can't accumulate). ⚠️ It does **NOT** cover the TASK COUNT (removing a task leaves every field intact), and the scan threads are created once in `main()`, so `resolve_and_bind` **separately refuses `n != g_ntask`** (`TASKCOUNT`, handled like `LAYOUT` in App.jsx): a shrinking swap left `g_body[i≥n]` pointing into the `dlclose`d module, a growing one silently never ran the new task. Intervals stay swappable.
+- ⚠️ **A signalled swap with an unreadable/empty `swap_request` writes `FAIL -1 NOREQUEST`** — it has no generation to name, so `PollSwapResult` accepts that one token regardless of generation (`hotswaplib.DetailNoRequest`); a bare return burned the agent's whole poll timeout as "outcome unknown".
 - **`layoutSignature(...)`** (App.jsx) is the fast UX pre-check over `{task, variables, udts, blocks, ioEc}`; `blocks` = `stateBlocksSignature` covers every FB-style ladder block (shadow fields exist per BLOCK, not per declared variable) plus edge contacts/coils. ⚠️ `variableTableSignature` must read POU locals from **`p.content?.variables`**, not the legacy `p.variables`.
 - **On a refused layout change the sim offers a rebuild+restart** (`offerSimRestart`); the field path stays warn-only. ⚠️ **Carry real state ONLY** — bare locals/globals + FB struct members; **skip** `__exec_us`, composites and **`in_`/`out_` pin shadows** (`in_` holds the source's pin literal, so carrying it reverts a pin edit).
 
@@ -140,6 +143,7 @@ Both run the SAME hot-swap runtime; only the legacy plain sim is Linux-only. **S
 | sleep | `clock_nanosleep(ABSTIME)` | waitable timer | `mach_wait_until` |
 | barrier | `pthread_barrier_*` | winpthreads | mutex+condvar shim, same names |
 
+- ⚠️ **Mirror offsets come from the CLIENT's variable table; all three `shmMirror.ReadAt/WriteAt` bounds-check** — memory safety on Windows (`unsafe.Slice`), and on Linux/macOS it stops an out-of-range write silently EXTENDING the backing file.
 - ⚠️ **The agent OPENS the mirror and event; the loader-host CREATES both** — a Win32 section/event lives only while a handle is open, and an auto-reset event silently latches an early swap signal.
 - ⚠️ **Neither a PE DLL nor a Mach-O bundle resolves symbols from its loader** the way ELF does, so the host exports an import library (Windows) / is passed as `-bundle_loader` (macOS) — that keeps `__hs_*`, `us_tick`, `plc_stop`, `__plc_shm` in the host across a swap, and makes the loader-host a build-order prerequisite.
 - ⚠️ **Windows locks a LOADED module's file** — the ping-pong handles it; **do not "simplify" to a single slot**. Slot files keep the `logic_<n>.so` name everywhere (a slot id, not a format claim).
@@ -250,13 +254,16 @@ Every hardware block = **struct + `_Call`**: hardware struct `HAL_UART_Send`, ge
 ⚠️ **INVARIANT — the prefix MUST agree with the type; nothing downstream re-derives it.** An address is a width *claim* but only a label to the runtime (which addresses by `Offset`/`Size` from the TYPE), so a mismatch **never fails anywhere** — it surfaces when SCADA reads a word where a bit was published. `iecAddress.js` is the single rule, applied by **VariableManager** (⚠️ type + address must land in **ONE** update, hence the object patch in both `handleUpdateVar`s), **`agentTools`** (address resolved *after* the type), and **the transpiler gate** in `transpileToC` — a hard `throw`, the only one covering hand-edited XML.
 ⚠️ **Only elementary types can be addressed** — debugDefaults expansion hands the SAME address to every element, so an addressed `ARRAY[0..9] OF INT` publishes ten variables claiming one location. Keep `IEC_TYPE_PREFIX` in sync with the four transpiler tables (§5). **Deliberate gaps:** addresses on FB/FUNCTION locals do nothing; duplicates are not a build error.
 
-**REST (`api.go`, Bearer from `POST /api/v1/auth`):** `GET/POST /variables[/{name}]` · `GET /stream` (SSE, addressed only) · `POST /forces/clear` · `GET/POST /runtime[/start|/stop|/config]`.
+**REST — [`server/API.md`](server/API.md) is the full reference; `ApiSamples/` the runnable one** (`kron_client.py` + numbered samples, stdlib only, variables discovered not hardcoded). ⚠️ Both docs still call the editor a **Tauri app** — stale (§2). Endpoints (`api.go`, Bearer from `POST /api/v1/auth`): `GET/POST /variables[/{name}]` · `GET /stream` (SSE, addressed only) · `POST /forces/clear` · `GET/POST /runtime[/start|/stop|/config]`.
 - ⚠️ KronServer **auto-rehydrates `variable_table.json` on startup**, else the API password is empty after every reboot; the runtime need not run for REST to work.
 - ⚠️ **`restart` is a transient action flag** — `handleDeployRuntime` only overwrites `runtime.bin` on disk while the running process keeps the old binary in memory, so Build & Send sends `restart: autoRun || isRunning` last. `/deploy/config` takes a partial body.
 
 ## 12. Security model
 ⚠️ **Both agents origin-gate every request** (host-agent `isAllowedOrigin`, KronServer `isAllowedCORSOrigin`): a request *with* an `Origin` is allowed only from local/private ones (localhost, `.local`, loopback, RFC1918/ULA, link-local), reflected with `Vary: Origin` — never `*`. Disallowed origins get **403 without processing on all methods**, not just preflight; requests **without** an Origin (curl, connect-web) pass unchanged. This stops a website driving the agent (file R/W, compile/exec, KronServer's unauthenticated `/deploy/*` running a binary as root).
-Also: `build.go` restricts `Compiler` to a bare-name allowlist and rejects `..`/separators in `Output`; both agents set body limits + `ReadHeaderTimeout`. Deploy endpoints stay unauthenticated by design (trust model = same machine / trusted LAN); a shared secret on `/deploy/*` is the next step if that widens.
+Also: `build.go` restricts `Compiler` to a bare-name allowlist and rejects `..`/separators in `Output`; both agents set body limits + `ReadHeaderTimeout`.
+- ⚠️ **`Output` containment needs `CompilerArgs` filtered too** — clang honours the **LAST `-o`**, so the sibling field undid the check: `-o` now goes AFTER the caller's args AND `rejectedCompilerArg` refuses redirection (`-o`, `-Wl,-o`, `@file`) + code loading (`-fplugin=`, `-specs=`, `-B`, `-Xclang`, `-T`); bare operands stay legal so `-isysroot /path` works.
+- ⚠️ **shm modes are `0600` (hot-swap) / `0660` (transpiler, = KronServer + ring), never `0666`** — same-machine trust still shouldn't hand every live variable to any local account, and the target runtime is root.
+- ⚠️ **A pid is stale the moment its mutex drops:** `handleHotSwapSwap` signalled one read before a full clang run, so a concurrent Stop could free it for reuse — re-check and signal INSIDE one critical section (`writeProcMem` re-checks too). Deploy endpoints stay unauthenticated by design (trust model = same machine / trusted LAN); a shared secret on `/deploy/*` is the next step if that widens.
 
 ## 13. EtherCAT & motion
 **Motion:** the `MOTION_FB_AXIS_PARAM` set — every `MC_*` block calls `MC_xxx_Call(&inst, &axisVar)`; `Axis` (AXIS_REF) is not a struct field (skipped in value assignment + null-init). `MC_Power`: trigger `Enable`, Q `Status`; `MC_MoveAbsolute/Relative`: `Execute`/`Done`. All `motion.xml` blocks list `Axis` first.

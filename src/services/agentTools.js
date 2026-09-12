@@ -20,6 +20,7 @@
 
 import { isReservedTranspilerName } from '../utils/reservedNames';
 import { validateIECAddress, retargetIECAddress } from '../utils/iecAddress';
+import { findVarByName } from '../utils/iecNames';
 // Single source of truth for FB power-flow wiring: the transpiler reads the
 // trigger pin (power in) and Q pin (power out) from these tables, so the
 // ladder the agent authors must use exactly the same pins.
@@ -980,15 +981,19 @@ export function applyToolCall(struct, name, args = {}) {
         // fb instances → the FB type. Every auto-declared variable is surfaced
         // in the approval diff, so a typo'd name is visible to the human
         // instead of silently splitting the logic across two variables.
+        // ⚠️ Lowercased — IEC identifiers are case-insensitive, so `motorRun`
+        // against a declared `MotorRun` must NOT mint a second variable: the
+        // transpiler collapses the two in its lowercase map while emitting two
+        // PlcState fields, leaving ladder and ST on different storage.
         const declared = new Set([
-          ...(hit.item.content?.variables || []).map((v) => v.name),
-          ...getGlobals(struct).map((v) => v.name),
+          ...(hit.item.content?.variables || []).map((v) => (v.name || '').toLowerCase()),
+          ...getGlobals(struct).map((v) => (v.name || '').toLowerCase()),
         ]);
         const newVars = [];
         const declare = (name, type, isInstance) => {
-          if (!isValidIecName(name) || declared.has(name)) return;
+          if (!isValidIecName(name) || declared.has(String(name).toLowerCase())) return;
           if (isReservedTranspilerName(name)) return; // compileLadderRung already ran; let the transpiler surface this loudly
-          declared.add(name);
+          declared.add(String(name).toLowerCase());
           newVars.push({
             id: `var_${Date.now()}_${newVars.length}`, name, class: 'Local', type,
             initialValue: '', description: '', address: '', ...(isInstance ? { _isInstance: true } : {}),
@@ -1150,6 +1155,11 @@ export function applyToolCall(struct, name, args = {}) {
           const idx = globals.findIndex((g) => (g.name || '').toLowerCase() === String(args.name).toLowerCase());
           if (idx < 0) return { ok: false, error: `global "${args.name}" not found` };
           const before = globals[idx];
+          // ⚠️ A rename must pass the SAME uniqueness checks as add_variable —
+          // without them the agent could rename a global onto another one and
+          // silently collapse two variables into one PlcState field.
+          if (changes.name && globals.some((g, i) => i !== idx && (g.name || '').toLowerCase() === changes.name.toLowerCase()))
+            return { ok: false, error: `a global variable named "${changes.name}" already exists — pick a different name` };
           const addr = finalizeAddress(before);
           if (!addr.ok) return { ok: false, error: addr.error };
           if (addr.address !== undefined) changes.address = addr.address;
@@ -1169,6 +1179,15 @@ export function applyToolCall(struct, name, args = {}) {
         const idx = vars.findIndex((x) => (x.name || '').toLowerCase() === String(args.name).toLowerCase());
         if (idx < 0) return { ok: false, error: `"${args.pou}" has no variable "${args.name}"` };
         const before = vars[idx];
+        if (changes.name) {
+          if (vars.some((x, i) => i !== idx && (x.name || '').toLowerCase() === changes.name.toLowerCase()))
+            return { ok: false, error: `"${hit.item.name}" already has a variable named "${changes.name}" — pick a different name` };
+          // Same shadowing hazard add_variable guards against: a local carrying a
+          // global's name silently re-binds every existing reference to the local.
+          const shadowedBy = getGlobals(base).find((g) => (g.name || '').toLowerCase() === changes.name.toLowerCase());
+          if (shadowedBy)
+            return { ok: false, error: `a GLOBAL variable named "${shadowedBy.name}" (${shadowedBy.type}) already exists — renaming this local to it would shadow the global and silently re-bind existing references. Pick a different name.` };
+        }
         const addrLocal = finalizeAddress(before);
         if (!addrLocal.ok) return { ok: false, error: addrLocal.error };
         if (addrLocal.address !== undefined) changes.address = addrLocal.address;
@@ -1684,8 +1703,11 @@ function checkBoolTarget(ctx, kind, name, idx) {
   }
   const struct = ctx.struct;
   if (!struct) return;
-  const local = (ctx.pou?.content?.variables || []).find((v) => v.name === name);
-  const global = getGlobals(struct).find((v) => v.name === name);
+  // ⚠️ Case-insensitive, like every other name match in this file: an exact
+  // compare let a BOOL check silently pass for `motorRun` vs a declared INT
+  // `MotorRun`, and the rung then compiled against the wrong storage.
+  const local = findVarByName(ctx.pou?.content?.variables || [], name);
+  const global = findVarByName(getGlobals(struct), name);
   const found = local || global;
   if (found && String(found.type).toUpperCase() !== 'BOOL') {
     throw new Error(`rung ${idx + 1}: ${kind} "${name}" is ${found.type}, but contacts and coils only work on BOOL. Use a different BOOL variable, or express this in an ST rung (set_st_code).`);

@@ -1,6 +1,7 @@
 import { useRef, useCallback, useMemo } from 'react';
 import HmiComponentRenderer from './HmiComponentRenderer';
 import { COMPONENT_DEFS } from './hmiComponentDefs';
+import { liveGet, liveResolveKey } from '../../utils/iecNames';
 
 const GRID = 10;
 const snap = v => Math.round(v / GRID) * GRID;
@@ -147,16 +148,23 @@ const HmiCanvas = ({
     }, [selectedId, onDelete, isPreview]);
 
     /* ── Live value resolver ─────────────────────────────────── */
+    // ⚠️ Resolved through liveGet/liveResolveKey, never `liveVariables[key]`:
+    // the binding field is free text (the datalist only suggests), so a typed
+    // `motorrun` must still find the declared `MotorRun`'s key — an exact index
+    // left the widget blank while the program ran. liveResolveKey is what a
+    // write targets, so it must return the key as the runtime spells it.
     const getLiveValue = useCallback((comp) => {
         if (!liveVariables || !comp.props?.variable) return undefined;
         const key = resolveVar(comp.props.variable, projectStructure);
-        return key ? liveVariables[key] : undefined;
+        return key ? liveGet(liveVariables, key) : undefined;
     }, [liveVariables, projectStructure]);
 
     const getLiveKey = useCallback((comp) => {
         if (!comp.props?.variable) return null;
-        return resolveVar(comp.props.variable, projectStructure);
-    }, [projectStructure]);
+        const key = resolveVar(comp.props.variable, projectStructure);
+        if (!key) return null;
+        return liveResolveKey(liveVariables, key) || key;
+    }, [liveVariables, projectStructure]);
 
     /* ── Grid background style ───────────────────────────────── */
     const gridBg = useMemo(() => ({

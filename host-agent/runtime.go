@@ -260,6 +260,18 @@ func (s *Server) handleWriteVariable(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, fmt.Sprintf("Cannot encode %q as %s", req.Value, spec.VType))
 		return
 	}
+	// Re-check the pid under the lock: it was read before encodeValue, and a
+	// Stop() in that window frees the number for reuse — a /proc/<pid>/mem
+	// write would then land in an unrelated process. The gap is microseconds
+	// (unlike the hot-swap path, which had a clang run in it), but the check
+	// is free.
+	s.sim.mu.Lock()
+	stillRunning := s.sim.pid == pid
+	s.sim.mu.Unlock()
+	if !stillRunning {
+		writeError(w, http.StatusConflict, "simulation stopped while the write was being prepared")
+		return
+	}
 	if err := writeProcMem(pid, spec.Address, data); err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return

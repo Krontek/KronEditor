@@ -33,7 +33,8 @@ import (
 // becomes a plain os.Remove. The loader-host creates it (host.c, __APPLE__
 // branch) using the identical name transformation below.
 type shmMirror struct {
-	f *os.File
+	f    *os.File
+	size int
 }
 
 // mirrorPath maps the POSIX shm name emitted by the generated plc.c
@@ -66,15 +67,35 @@ func openShmMirror(dir, name string, size int, write bool) (*shmMirror, error) {
 		_ = f.Close()
 		return nil, fmt.Errorf("mirror not sized yet (%d of %d bytes)", st.Size(), size)
 	}
-	return &shmMirror{f: f}, nil
+	return &shmMirror{f: f, size: size}, nil
+}
+
+// checkBounds rejects an offset/length pair that falls outside the segment.
+// ⚠️ The offset comes from the client-supplied variable table and is not
+// validated upstream. Unlike the Windows implementation this path goes through
+// safe file I/O, so an out-of-range access was never memory-unsafe — but a
+// write past the end silently EXTENDS the backing file (a real on-disk file
+// here, not tmpfs), which is not something a mirror of a fixed-size segment
+// should ever do.
+func (m *shmMirror) checkBounds(off int64, n int) error {
+	if off < 0 || n < 0 || off+int64(n) > int64(m.size) {
+		return fmt.Errorf("access at 0x%x len %d out of mirror bounds (%d)", off, n, m.size)
+	}
+	return nil
 }
 
 func (m *shmMirror) ReadAt(b []byte, off int64) error {
+	if err := m.checkBounds(off, len(b)); err != nil {
+		return err
+	}
 	_, err := m.f.ReadAt(b, off)
 	return err
 }
 
 func (m *shmMirror) WriteAt(b []byte, off int64) error {
+	if err := m.checkBounds(off, len(b)); err != nil {
+		return err
+	}
 	n, err := m.f.WriteAt(b, off)
 	if err == nil && n != len(b) {
 		return fmt.Errorf("short write (%d of %d)", n, len(b))

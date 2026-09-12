@@ -324,7 +324,7 @@ static void write_swap_result(const char *status, int gen, const char *detail) {
 
 #define RB_OK            0
 #define RB_ERR_SYMBOL    1   /* a required export is missing (old/incompatible build) */
-#define RB_ERR_TASKCOUNT 2   /* plc_task_count() out of range */
+#define RB_ERR_TASKCOUNT 2   /* plc_task_count() out of range, or changed since cold start */
 #define RB_ERR_LAYOUT    3   /* PlcState shape differs from the cold-start reference */
 
 /* Resolve the ABI exports from a loaded handle and re-bind the live state.
@@ -347,6 +347,21 @@ static int resolve_and_bind(void *h) {
 
     int n = tcount();
     if (n < 0 || n > MAXT) return RB_ERR_TASKCOUNT;
+    /* ⚠️ The task THREADS are created once in main() for the cold-start count
+     * and never adjusted, so the count itself is as unswappable as the state
+     * layout — and plc_state_layout_hash does NOT cover it (it fingerprints the
+     * PlcState field shape only, and removing a task leaves every field intact).
+     * Without this check a shrinking swap left g_body[i] for i >= n pointing
+     * into the module about to be dlclose'd, and the still-running thread i
+     * called into unmapped memory on its very next scan; a growing swap bumped
+     * g_ntask for a thread that was never created, so the new task silently
+     * never ran while the swap reported OK. Refuse both — the editor turns this
+     * into the same rebuild+restart offer as a LAYOUT rejection.
+     * The first bind establishes the reference (same condition as the layout
+     * hash above), and rejecting BEFORE any global is touched keeps the
+     * caller's rollback re-bind exact. Intervals stay swappable: g_interval is
+     * read by the running threads every scan. */
+    if (g_layout_hash_set && n != g_ntask) return RB_ERR_TASKCOUNT;
     for (int i = 0; i < n; i++) {
         char nm[32]; snprintf(nm, sizeof nm, "plc_task_body_%d", i);
         body_fn b = (body_fn)plc_dlsym(h, nm);
@@ -384,7 +399,20 @@ static void do_swap_locked(void) {
         while (n && (path[n-1] == '\n' || path[n-1] == '\r' || path[n-1] == ' ' || path[n-1] == '\t')) path[--n] = 0;
         fclose(rf);
     }
-    if (!path[0]) return;
+    if (!path[0]) {
+        /* ⚠️ No bare return here: the Go supervisor learns the outcome of a
+         * signalled swap ONLY from swap_result (see write_swap_result), so a
+         * missing/empty/unreadable request file would burn its whole poll
+         * timeout and report the useless "outcome unknown" while this host is
+         * alive and happily running the old logic. There is no generation to
+         * name here (the number lives in the request path we could not read),
+         * so this writes -1 and hotswaplib.PollSwapResult accepts the
+         * NOREQUEST reason regardless of the generation it claims — see
+         * hotswaplib.DetailNoRequest. */
+        fprintf(stderr, "[host] swap signalled but no readable swap_request (keeping current)\n");
+        write_swap_result("FAIL", -1, "NOREQUEST");
+        return;
+    }
     int gen = parse_gen_from_path(path);
 
     plc_module_t nh = plc_dlopen(path);
@@ -580,7 +608,11 @@ int main(int argc, char **argv) {
         /* File-backed mirror in the cwd (= the build dir the agent spawned us
          * in), which is exactly where shmmirror_darwin.go looks. See
          * mirror_path() for why macOS cannot use shm_open here. */
-        int fd = open(mirror_path(shm_name()), O_CREAT | O_RDWR, 0666);
+        /* 0600, not 0666: the loader-host CREATES this mirror and the agent
+         * that spawned it is the only reader/writer, always the same uid. A
+         * world-readable mode published every live PLC variable to any other
+         * local account for free. */
+        int fd = open(mirror_path(shm_name()), O_CREAT | O_RDWR, 0600);
         if (fd >= 0) {
             if (ftruncate(fd, (off_t)sz) == 0) {
                 void *m = mmap(NULL, sz, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
@@ -589,7 +621,7 @@ int main(int argc, char **argv) {
             close(fd);
         }
 #else
-        int fd = shm_open(shm_name(), O_CREAT | O_RDWR, 0666);
+        int fd = shm_open(shm_name(), O_CREAT | O_RDWR, 0600); /* see the mode note above */
         if (fd >= 0) {
             if (ftruncate(fd, (off_t)sz) == 0) {
                 void *m = mmap(NULL, sz, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);

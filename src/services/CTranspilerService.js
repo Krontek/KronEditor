@@ -1372,7 +1372,11 @@ ${boardDefines}${runtimePortHelpers}${customIncludes}${ecCfgEarly.motionIncludes
         // shm_open does. The mirror macOS actually uses is the file-backed one
         // the loader-host creates (hotswaphost/host.c, __APPLE__ branch).
         source += `static void plc_shm_init(void) {\n`;
-        source += `    int fd = shm_open(PLC_SHM_NAME, O_CREAT | O_RDWR, 0666);\n`;
+        // 0660 (not 0666) matches what KronServer's NewIPCManager and the
+        // capture-ring segment already open this with, so nothing on target
+        // changes — it just stops publishing every live variable to any other
+        // local account on a shared machine.
+        source += `    int fd = shm_open(PLC_SHM_NAME, O_CREAT | O_RDWR, 0660);\n`;
         source += `    if (fd < 0) return;\n`;
         source += `    ftruncate(fd, PLC_SHM_SIZE);\n`;
         source += `    __plc_shm = (uint8_t *)mmap(NULL, PLC_SHM_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);\n`;

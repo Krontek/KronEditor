@@ -510,7 +510,10 @@ static inline void HAL_SPI_Call(HAL_SPI *inst, uint8_t ch) {
     inst->DONE    = false;
     inst->ERR_ID  = 0;
     if (!inst->EN) return;
-    uint8_t cs = (inst->CS >= 0 && inst->CS < 4) ? (uint8_t)inst->CS : 0;
+    /* Out-of-range CS must FAIL, not silently fall back to CS0 — talking to
+     * the wrong device with DONE=true is the sham-success HAL rule forbids. */
+    if (inst->CS < 0 || inst->CS >= 4) { inst->ERR_ID = 1; return; }
+    uint8_t cs = (uint8_t)inst->CS;
     int fd = _rpi_spi_open(ch, cs, 0, inst->CLK_HZ);
     if (fd < 0) { inst->ERR_ID = 2; return; }
     uint8_t tx = inst->TX_DATA, rx = 0;

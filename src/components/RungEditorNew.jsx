@@ -10,7 +10,7 @@ import { registerIECSTLanguage } from '../utils/iecSTLanguage';
 import { findStMarkers } from '../utils/stValidation';
 import { writeClipboard, readClipboard, useKronClipboard, CLIP_KIND } from '../utils/kronClipboard';
 import { setEditorScope, getEditorScope, EDITOR_SCOPE, hasTextSelection } from '../utils/editorScope';
-import { liveGet, liveResolveKey } from '../utils/iecNames';
+import { liveGet, liveResolveKey, hasVarNamed, findVarByName } from '../utils/iecNames';
 
 // IEC ST identifier validation for SCL inline editors.
 // Returns Monaco markers for undeclared identifiers.
@@ -480,16 +480,18 @@ const RungEditorNew = ({ variables, setVariables, rungs, setRungs, availableBloc
         .filter(({ b }) => b.data?.type !== 'Contact' && b.data?.type !== 'Coil' && b.data?.instanceName);
       let newVariables = variables;
       if (fbBlocks.length) {
-        const names = new Set(variables.map(v => v.name));
+        // Lowercased — a paste must not declare a second instance for a name
+        // that differs only in case from a declared one (IEC names are
+        // case-insensitive; two PlcState fields, one collapsed name).
+        const names = new Set(variables.map(v => (v.name || '').toLowerCase()));
         const extra = [];
         fbBlocks.forEach(({ b, orig }) => {
-          if (names.has(b.data.instanceName)) return;
+          if (names.has((b.data.instanceName || '').toLowerCase())) return;
           const srcName = orig?.data?.instanceName;
-          const def = variables.find(v => v.name === srcName)
-            || bundledVars.find(v => v.name === srcName);
+          const def = findVarByName(variables, srcName) || findVarByName(bundledVars, srcName);
           if (def) {
             extra.push({ ...def, id: `var_${Date.now()}_${Math.random()}`, name: b.data.instanceName });
-            names.add(b.data.instanceName);
+            names.add((b.data.instanceName || '').toLowerCase());
           }
         });
         if (extra.length) {
@@ -542,9 +544,9 @@ const RungEditorNew = ({ variables, setVariables, rungs, setRungs, availableBloc
     let newVariables = variables;
     if (newBlock.data.type !== 'Contact' && newBlock.data.type !== 'Coil') {
         newBlock.data.instanceName = `${newBlock.data.instanceName}_copy`;
-        if (!variables.some(v => v.name === newBlock.data.instanceName)) {
-           const varDef = variables.find(v => v.name === copied.data.instanceName)
-             || (bundledInstanceVar && bundledInstanceVar.name === copied.data.instanceName ? bundledInstanceVar : null);
+        if (!hasVarNamed(variables, newBlock.data.instanceName)) {
+           const varDef = findVarByName(variables, copied.data.instanceName)
+             || (bundledInstanceVar && findVarByName([bundledInstanceVar], copied.data.instanceName) ? bundledInstanceVar : null);
            if (varDef) {
               newVariables = [...variables, { ...varDef, id: `var_${Date.now()}`, name: newBlock.data.instanceName }];
               setVariables(newVariables);
@@ -661,7 +663,7 @@ const RungEditorNew = ({ variables, setVariables, rungs, setRungs, availableBloc
     const isFBBlock = oldBlockType && oldBlockType !== 'Contact' && oldBlockType !== 'Coil';
     let newVariables = variables;
     if (isFBBlock && blockUpdates.instanceName && oldInstanceName && blockUpdates.instanceName !== oldInstanceName) {
-       newVariables = variables.map(v => v.name === oldInstanceName ? { ...v, name: blockUpdates.instanceName } : v);
+       newVariables = variables.map(v => ((v.name || '').toLowerCase() === String(oldInstanceName).toLowerCase()) ? { ...v, name: blockUpdates.instanceName } : v);
        setVariables(newVariables);
     }
 
@@ -800,18 +802,17 @@ const RungEditorNew = ({ variables, setVariables, rungs, setRungs, availableBloc
     const fbBlocks = newBlocks.filter(b => b.data?.type !== 'Contact' && b.data?.type !== 'Coil' && b.data?.instanceName);
     if (fbBlocks.length) {
       setVariables(prev => {
-        const names = new Set(prev.map(v => v.name));
+        const names = new Set(prev.map(v => (v.name || '').toLowerCase()));
         const extra = [];
         fbBlocks.forEach(b => {
-          if (names.has(b.data.instanceName)) return;
+          if (names.has((b.data.instanceName || '').toLowerCase())) return;
           const origBlockId = Object.keys(idMap).find(k => idMap[k] === b.id);
           const origBlock = src.blocks.find(ob => ob.id === origBlockId);
           const srcName = origBlock?.data?.instanceName;
-          const orig = prev.find(v => v.name === srcName)
-            || bundledVars.find(v => v.name === srcName);
+          const orig = findVarByName(prev, srcName) || findVarByName(bundledVars, srcName);
           if (orig) {
             extra.push({ ...orig, id: `var_${Date.now()}_${Math.random()}`, name: b.data.instanceName });
-            names.add(b.data.instanceName);
+            names.add((b.data.instanceName || '').toLowerCase());
           }
         });
         return extra.length ? [...prev, ...extra] : prev;
@@ -1034,7 +1035,9 @@ const RungEditorNew = ({ variables, setVariables, rungs, setRungs, availableBloc
         let newName = '';
         while (true) {
           const candidate = `Var${index}`;
-          if (!allVars.some(v => v.name === candidate)) {
+          // ⚠️ Case-insensitive: IEC names are, so an existing `var0` must not
+          // let this mint a second `Var0` on a different PlcState field.
+          if (!hasVarNamed(allVars, candidate)) {
             newName = candidate;
             break;
           }
@@ -1081,7 +1084,7 @@ const RungEditorNew = ({ variables, setVariables, rungs, setRungs, availableBloc
 
         while (true) {
           const candidateName = `${baseName}${index}`;
-          if (!variables.some(v => v.name === candidateName) && !(globalVars || []).some(v => v.name === candidateName)) {
+          if (!hasVarNamed(variables, candidateName) && !hasVarNamed(globalVars || [], candidateName)) {
             instanceName = candidateName;
             break;
           }
@@ -1109,7 +1112,7 @@ const RungEditorNew = ({ variables, setVariables, rungs, setRungs, availableBloc
 
       while (true) {
         const candidate = `${baseName}${index}`;
-        if (!variables.some(v => v.name === candidate) && !(globalVars || []).some(v => v.name === candidate)) {
+        if (!hasVarNamed(variables, candidate) && !hasVarNamed(globalVars || [], candidate)) {
           instanceName = candidate;
           break;
         }
@@ -1136,7 +1139,7 @@ const RungEditorNew = ({ variables, setVariables, rungs, setRungs, availableBloc
 
       while (true) {
         const candidate = `${baseName}${index}`;
-        if (!variables.some(v => v.name === candidate) && !(globalVars || []).some(v => v.name === candidate)) {
+        if (!hasVarNamed(variables, candidate) && !hasVarNamed(globalVars || [], candidate)) {
           instanceName = candidate;
           break;
         }

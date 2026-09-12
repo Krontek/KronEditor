@@ -7,7 +7,7 @@ import RungEditorNew from './RungEditorNew';
 import ResourceEditor from './ResourceEditor';
 import DragDropManager from '../utils/DragDropManager';
 import ForceWriteModal from './common/ForceWriteModal';
-import { liveGet, memberGet, liveEntriesWithPrefix } from '../utils/iecNames';
+import { liveGet, memberGet, liveEntriesWithPrefix, findVarByName, hasVarNamed } from '../utils/iecNames';
 
 // IEC scalar (elementary) types — anything else (FB instances like TON/CTU,
 // UDTs, ARRAY[...]) is a COMPOSITE whose live value is a struct/array, shown in
@@ -209,7 +209,11 @@ const EditorPane = ({
   // Mirrors ResourceEditor.handleUpdateVar's signature.
   const handleUpdateVar = (id, fieldOrObj, value) => {
     const patch = (typeof fieldOrObj === 'string') ? { [fieldOrObj]: value } : fieldOrObj;
-    const field = (typeof fieldOrObj === 'string') ? fieldOrObj : null;
+    // ⚠️ The cascades below read the PATCH, never the `fieldOrObj` form: a
+    // retype that also retargets the address arrives as an object, and gating on
+    // the string form left the ladder blocks showing the OLD type until reload.
+    const nextName = Object.prototype.hasOwnProperty.call(patch, 'name') ? patch.name : undefined;
+    const nextType = Object.prototype.hasOwnProperty.call(patch, 'type') ? patch.type : undefined;
     const oldVar = variables.find(v => v.id === id);
     const oldName = oldVar?.name;
 
@@ -217,15 +221,20 @@ const EditorPane = ({
       prev.map((v) => (v.id === id ? { ...v, ...patch } : v))
     );
 
-    if (field === 'name' && (fileType === 'LD' || fileType === 'SCL') && oldName && oldName !== value) {
+    // Names are matched case-insensitively (§IEC identifiers): a block may hold
+    // `var0` for a declared `Var0`, and an exact compare left it dangling.
+    const sameName = (a, b) => typeof a === 'string' && typeof b === 'string'
+      && a.toLowerCase() === b.toLowerCase();
+
+    if (nextName !== undefined && (fileType === 'LD' || fileType === 'SCL') && oldName && !sameName(oldName, nextName)) {
       setRungs(prevRungs => prevRungs.map(rung => ({
         ...rung,
         blocks: (rung.blocks || []).map(block => {
           const newData = { ...block.data };
           let changed = false;
 
-          if (newData.instanceName === oldName) {
-            newData.instanceName = value;
+          if (sameName(newData.instanceName, oldName)) {
+            newData.instanceName = nextName;
             changed = true;
           }
 
@@ -237,8 +246,8 @@ const EditorPane = ({
             const newValues = { ...newData.values };
             let valuesChanged = false;
             Object.keys(newValues).forEach(key => {
-              if (newValues[key] === oldName) {
-                newValues[key] = value;
+              if (sameName(newValues[key], oldName)) {
+                newValues[key] = nextName;
                 valuesChanged = true;
               }
             });
@@ -250,19 +259,22 @@ const EditorPane = ({
           return changed ? { ...block, data: newData } : block;
         })
       })));
-    } else if (field === 'type' && (fileType === 'LD' || fileType === 'SCL') && oldName) {
-      // Cascade variable type change to the matching Block instances in Rungs
+    } else if (nextType !== undefined && (fileType === 'LD' || fileType === 'SCL') && oldName && oldVar?.type !== nextType) {
+      // Cascade variable type change to the matching Block INSTANCES in Rungs.
+      // ⚠️ Only blocks that actually RENDER the variable's type (an FB
+      // instance) may be retyped — a contact/coil names the same variable but its
+      // `type` is the contact kind, and rewriting that to `INT` destroys the rung.
       setRungs(prevRungs => prevRungs.map(rung => ({
         ...rung,
         blocks: (rung.blocks || []).map(block => {
-          if (block.data.instanceName === oldName) {
+          if (sameName(block.data.instanceName, oldName) && block.data.type === oldVar?.type) {
             return {
               ...block,
-              type: value,
+              type: nextType,
               data: {
                 ...block.data,
-                type: value,
-                label: value
+                type: nextType,
+                label: nextType
               }
             };
           }
@@ -501,7 +513,7 @@ const EditorPane = ({
         const dotMatch = beforeCursor.match(/(\w+)\.(\w*)$/);
         if (dotMatch) {
           const baseName = dotMatch[1];
-          const baseVar = allVars.find(v => v.name === baseName);
+          const baseVar = findVarByName(allVars, baseName);
           if (baseVar) {
             const dt = getMembersOf(baseVar.type);
             if (dt?.type === 'Structure') {
@@ -533,7 +545,7 @@ const EditorPane = ({
         const bracketMatch = beforeCursor.match(/(\w+)\[(\d*)$/);
         if (bracketMatch) {
           const baseName = bracketMatch[1];
-          const baseVar = allVars.find(v => v.name === baseName);
+          const baseVar = findVarByName(allVars, baseName);
           if (baseVar) {
             const dt = getMembersOf(baseVar.type);
             if (dt?.type === 'Array') {
@@ -870,7 +882,8 @@ const EditorPane = ({
 
           while (true) {
             const candidate = `${baseName}${index}`;
-            if (!allVars.some(v => v.name === candidate)) {
+            // Case-insensitive: `ton0` already declared must not yield `TON0`.
+            if (!hasVarNamed(allVars, candidate)) {
               newName = candidate;
               break;
             }

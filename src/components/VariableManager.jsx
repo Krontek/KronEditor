@@ -383,13 +383,20 @@ const VariableManager = ({
       alert(`"${trimmed}" is reserved by the transpiler/runtime and can't be used as a variable name.`);
       return;
     }
+    // ⚠️ Both checks below are CASE-INSENSITIVE: IEC identifiers are, and an
+    // exact compare let `Counter` + `counter` coexist as two PlcState fields
+    // that the transpiler's lowercase map then collapses — ladder and ST end up
+    // on different storage with nothing warning.
+    const lower = trimmed.toLowerCase();
     // Block duplicate within same scope
-    if (variables.some(v => v.id !== id && v.name === trimmed)) {
+    if (variables.some(v => v.id !== id && (v.name || '').toLowerCase() === lower)) {
       alert(t('errors.varExistsScope', { name: trimmed }));
       return;
     }
-    // Block same name AND same type as a global variable
-    if (globalVars.some(v => v.name === trimmed && v.type === currentVar.type)) {
+    // ⚠️ Block shadowing a global REGARDLESS of type — the old `&& v.type ===`
+    // gate let a local of a different type take a global's name, which silently
+    // re-binds every existing reference in this POU to the new local.
+    if (globalVars.some(v => (v.name || '').toLowerCase() === lower)) {
       alert(t('errors.varExistsScope', { name: trimmed }));
       return;
     }

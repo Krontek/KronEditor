@@ -543,7 +543,10 @@ static inline void HAL_SPI_Call(HAL_SPI *inst, uint8_t ch) {
     inst->DONE    = false;
     inst->ERR_ID  = 0;
     if (!inst->EN) return;
-    uint8_t cs = (inst->CS >= 0 && inst->CS < 4) ? (uint8_t)inst->CS : 0;
+    /* Out-of-range CS must FAIL, not silently fall back to CS0 — talking to
+     * the wrong device with DONE=true is the sham-success HAL rule forbids. */
+    if (inst->CS < 0 || inst->CS >= 4) { inst->ERR_ID = 1; return; }
+    uint8_t cs = (uint8_t)inst->CS;
     int fd = _spi_open(ch, cs, 0, inst->CLK_HZ);
     if (fd < 0) { inst->ERR_ID = 2; return; }
     uint8_t tx = inst->TX_DATA, rx = 0;
@@ -647,39 +650,49 @@ static inline int _i2c_open(uint8_t ch) {
     return _i2c_fd[ch];
 }
 
+/* ERR_ID contract (same as every other block here, and as the RPi/BB twins of
+ * these two): 0 = OK, 2 = bus open failed, 3 = I/O error. It MUST be cleared on
+ * entry and set on every failure — the instance is a PlcState field, so an
+ * untouched ERR_ID keeps the PREVIOUS scan's code and a fresh bus failure reads
+ * back as the last success. */
 static inline void HAL_I2C_Read_Call(HAL_I2C_Read *inst, uint8_t ch) {
-    inst->ENO  = inst->EN;
-    inst->DATA = 0;
-    inst->OK   = false;
+    inst->ENO    = inst->EN;
+    inst->DATA   = 0;
+    inst->OK     = false;
+    inst->ERR_ID = 0;
     if (!inst->EN) return;
 
     int fd = _i2c_open(ch);
-    if (fd < 0) return;
+    if (fd < 0) { inst->ERR_ID = 2; return; }
 
-    if (ioctl(fd, I2C_SLAVE, (long)inst->ADDR) < 0) return;
+    if (ioctl(fd, I2C_SLAVE, (long)inst->ADDR) < 0) { inst->ERR_ID = 3; return; }
 
     uint8_t reg = inst->REG;
-    if (write(fd, &reg, 1) != 1) return;
+    if (write(fd, &reg, 1) != 1) { inst->ERR_ID = 3; return; }
 
     uint8_t buf = 0;
     if (read(fd, &buf, 1) == 1) {
         inst->DATA = buf;
         inst->OK   = true;
+    } else {
+        inst->ERR_ID = 3;
     }
 }
 
 static inline void HAL_I2C_Write_Call(HAL_I2C_Write *inst, uint8_t ch) {
-    inst->ENO = inst->EN;
-    inst->OK  = false;
+    inst->ENO    = inst->EN;
+    inst->OK     = false;
+    inst->ERR_ID = 0;
     if (!inst->EN) return;
 
     int fd = _i2c_open(ch);
-    if (fd < 0) return;
+    if (fd < 0) { inst->ERR_ID = 2; return; }
 
-    if (ioctl(fd, I2C_SLAVE, (long)inst->ADDR) < 0) return;
+    if (ioctl(fd, I2C_SLAVE, (long)inst->ADDR) < 0) { inst->ERR_ID = 3; return; }
 
     uint8_t buf[2] = { inst->REG, inst->DATA };
     inst->OK = (write(fd, buf, 2) == 2);
+    if (!inst->OK) inst->ERR_ID = 3;
 }
 
 static inline void HAL_I2C_BurstRead_Call(HAL_I2C_BurstRead *inst, uint8_t ch) {
@@ -955,12 +968,13 @@ static inline int _can_open(uint8_t ch) {
 }
 
 static inline void HAL_CAN_Send_Call(HAL_CAN_Send *inst, uint8_t ch) {
-    inst->ENO  = inst->EN;
-    inst->DONE = false;
+    inst->ENO    = inst->EN;
+    inst->DONE   = false;
+    inst->ERR_ID = 0;
     if (!inst->EN) return;
 
     int fd = _can_open(ch);
-    if (fd < 0) return;
+    if (fd < 0) { inst->ERR_ID = 2; return; }
 
     struct can_frame frame;
     memset(&frame, 0, sizeof(frame));
@@ -969,17 +983,19 @@ static inline void HAL_CAN_Send_Call(HAL_CAN_Send *inst, uint8_t ch) {
     if (frame.can_dlc > 0) frame.data[0] = inst->DATA;
 
     inst->DONE = (write(fd, &frame, sizeof(frame)) == (ssize_t)sizeof(frame));
+    if (!inst->DONE) inst->ERR_ID = 3;
 }
 
 static inline void HAL_CAN_Receive_Call(HAL_CAN_Receive *inst, uint8_t ch) {
-    inst->ENO   = inst->EN;
-    inst->READY = false;
-    inst->DATA  = 0;
-    inst->ID    = 0;
+    inst->ENO    = inst->EN;
+    inst->READY  = false;
+    inst->DATA   = 0;
+    inst->ID     = 0;
+    inst->ERR_ID = 0;
     if (!inst->EN) return;
 
     int fd = _can_open(ch);
-    if (fd < 0) return;
+    if (fd < 0) { inst->ERR_ID = 2; return; }
 
     struct can_frame frame;
     ssize_t n = read(fd, &frame, sizeof(frame));
