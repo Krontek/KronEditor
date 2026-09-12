@@ -26,7 +26,7 @@ That is reported as decimation, not as loss. Only IRREGULAR steps are loss.
 
 Run:
     python3 ml0_sequence_check.py
-    (fill in host / password, press Start — defaults 192.168.0.11 / krontek)
+    (fill in host / password, press Start — defaults 192.168.1.104 / krontek)
 
 Requires a runtime built with the capture ring (a normal Build & Send) and a
 KronServer that serves /api/v1/stream/ring. If /api/v1/ring/info returns 404 the
@@ -401,7 +401,7 @@ class App:
         # ---- connection bar ----
         bar = ttk.Frame(root, padding=8)
         bar.pack(fill="x")
-        self.host = tk.StringVar(value="192.168.0.11")
+        self.host = tk.StringVar(value="192.168.1.104")
         self.port = tk.StringVar(value="7070")
         self.password = tk.StringVar(value="krontek")
         self.varname = tk.StringVar(value="")

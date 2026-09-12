@@ -12,7 +12,7 @@ The "number of variables" is what you enter in the "Variables from ML0" box —
 it reads that many, in %ML address order (ML0, ML1, ...).
 
 Run:  python3 ml0_ring_viewer.py
-(then fill in host / password and Connect — defaults 192.168.0.23 / krontek)
+(then fill in host / password and Connect — defaults 192.168.1.104 / krontek)
 
 Requires a runtime built with the capture ring (a normal Build & Send) and a
 KronServer that serves /api/v1/stream/ring.
@@ -221,7 +221,7 @@ class App:
 
         ttk.Label(top, text="Host:").grid(row=0, column=0, sticky="e")
         self.host = ttk.Entry(top, width=14)
-        self.host.insert(0, "10.42.0.50")
+        self.host.insert(0, "192.168.1.104")
         self.host.grid(row=0, column=1, padx=(2, 8))
 
         ttk.Label(top, text="Port:").grid(row=0, column=2, sticky="e")

@@ -200,7 +200,7 @@ class MotorControlApp(tk.Tk):
 
         lbl("Host:").pack(side=tk.LEFT)
         self.ent_host = ent(15)
-        self.ent_host.insert(0, "192.168.1.121")
+        self.ent_host.insert(0, "192.168.1.104")
         self.ent_host.pack(side=tk.LEFT, padx=(3, 10))
 
         lbl("Port:").pack(side=tk.LEFT)

@@ -66,3 +66,4 @@ experiments/*
 /dist-binary/
 /host-agent/kron-host-agent
 /host-agent/kron-host-agent.exe
+__pycache__/
