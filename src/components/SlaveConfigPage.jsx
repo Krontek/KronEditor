@@ -71,6 +71,15 @@ export default function SlaveConfigPage({ slave, onChange, onAddGlobalVars, isRu
     singleTurnBits: 13,
     multiTurnBits: 12,
     simMode: false,
+    // ⚠️ Motion limits default to '' (blank), NOT 0. AXIS_REF_Init installs
+    // usable defaults for the windows and the transpiler only emits a field the
+    // user actually filled in — a 0 here would either disable a limit or make
+    // InPositionWindow so tight that no move ever reports Done.
+    maxVelocity: '', maxAcceleration: '', maxDeceleration: '', maxJerk: '',
+    inPositionWindow: '', inVelocityWindow: '',
+    enableLimitNegative: false, swLimitNegative: 0,
+    enableLimitPositive: false, swLimitPositive: 0,
+    enablePosLagMonitoring: false, maxPositionLag: '',
   });
 
   const updateAxis = (field, value) =>
@@ -400,11 +409,64 @@ export default function SlaveConfigPage({ slave, onChange, onAddGlobalVars, isRu
                     </label>
                   </div>
 
+                  {/* ── Motion limits (kron_axis.h AXIS_REF) ───────────────── */}
+                  <div style={{ ...S.row, marginTop: 12, color: '#888', fontSize: 11, fontWeight: 600 }}>
+                    Motion Limits &amp; Windows
+                  </div>
+                  <div style={{ ...S.row, color: '#555', fontSize: 10 }}>
+                    Leave blank to keep the axis engine's own default. A blank field emits no code.
+                  </div>
+                  {[
+                    ['maxVelocity',      'Max Velocity',       'u/s — 0 or blank: each FB must supply its own'],
+                    ['maxAcceleration',  'Max Acceleration',   'u/s²'],
+                    ['maxDeceleration',  'Max Deceleration',   'u/s²'],
+                    ['maxJerk',          'Max Jerk',           'u/s³ — blank is effectively trapezoidal'],
+                    ['inPositionWindow', 'In-Position Window', 'u — a move reports Done inside this'],
+                    ['inVelocityWindow', 'In-Velocity Window', 'u/s — InVelocity inside this'],
+                  ].map(([key, label, hint]) => (
+                    <div style={S.row} key={key}>
+                      <span style={S.label}>{label}</span>
+                      <input type="number" step="any" style={{ ...S.input, maxWidth: 120 }}
+                        value={axisCfg[key] ?? ''} disabled={isRunning}
+                        onChange={e => updateAxis(key, e.target.value)} />
+                      <span style={{ color: '#555', fontSize: 10 }}>{hint}</span>
+                    </div>
+                  ))}
+                  {/* A software limit of 0.0 is a legitimate coordinate, so the
+                      checkbox — never "is the value non-zero" — enables it. */}
+                  {[
+                    ['enableLimitNegative', 'swLimitNegative', 'Software Limit −'],
+                    ['enableLimitPositive', 'swLimitPositive', 'Software Limit +'],
+                  ].map(([flag, val, label]) => (
+                    <div style={S.row} key={flag}>
+                      <label style={{ display: 'flex', alignItems: 'center', gap: 6, cursor: 'pointer', minWidth: 150 }}>
+                        <input type="checkbox" checked={!!axisCfg[flag]} disabled={isRunning}
+                          onChange={e => updateAxis(flag, e.target.checked)} />
+                        <span style={{ color: '#999', fontSize: 11 }}>{label}</span>
+                      </label>
+                      <input type="number" step="any" style={{ ...S.input, maxWidth: 120 }}
+                        value={axisCfg[val] ?? 0} disabled={isRunning || !axisCfg[flag]}
+                        onChange={e => updateAxis(val, e.target.value)} />
+                      <span style={{ color: '#555', fontSize: 10 }}>u</span>
+                    </div>
+                  ))}
+                  <div style={S.row}>
+                    <label style={{ display: 'flex', alignItems: 'center', gap: 6, cursor: 'pointer', minWidth: 150 }}>
+                      <input type="checkbox" checked={!!axisCfg.enablePosLagMonitoring} disabled={isRunning}
+                        onChange={e => updateAxis('enablePosLagMonitoring', e.target.checked)} />
+                      <span style={{ color: '#999', fontSize: 11 }}>Following Error Monitor</span>
+                    </label>
+                    <input type="number" step="any" style={{ ...S.input, maxWidth: 120 }}
+                      value={axisCfg.maxPositionLag ?? ''} disabled={isRunning || !axisCfg.enablePosLagMonitoring}
+                      onChange={e => updateAxis('maxPositionLag', e.target.value)} />
+                    <span style={{ color: '#555', fontSize: 10 }}>u — following error that trips the axis</span>
+                  </div>
+
                   {/* Generated code preview */}
                   <div style={{ marginTop: 12, background: '#1a1a1a', borderRadius: 4, padding: '8px 12px', fontFamily: 'monospace', fontSize: 10, color: '#6a9955', lineHeight: 1.6 }}>
                     <div style={{ color: '#555', marginBottom: 4 }}>// Generated in plc.c PLC_Init():</div>
                     <div style={{ color: '#ce9178' }}>
-                      {slave.axisRef.name || `Axis_${slave.position || 1}`}.GearRatio = {axisCfg.gearRatio ?? 1}f;<br />
+                      {slave.axisRef.name || `Axis_${slave.position || 1}`}.GearRatio = {axisCfg.gearRatio ?? 1};<br />
                       {slave.axisRef.name || `Axis_${slave.position || 1}`}.EncoderType = {
                         ({ incremental: 'KRON_ENC_INCREMENTAL', absolute_st: 'KRON_ENC_ABSOLUTE_ST', absolute_mt: 'KRON_ENC_ABSOLUTE_MT' })[axisCfg.encoderType] || 'KRON_ENC_INCREMENTAL'
                       };<br />

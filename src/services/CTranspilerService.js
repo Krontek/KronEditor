@@ -858,28 +858,56 @@ ${boardDefines}${runtimePortHelpers}${customIncludes}${ecCfgEarly.motionIncludes
     // 2. Global Variables
 
     // AXIS_REF fields exposed for SHM debugging (subset useful for diagnosing motion issues).
-    // `offset` = byte offset inside the real AXIS_REF C struct (kronmotion.h) on the
-    // LOCAL-SIM target (x86_64: 8-byte pointers, 4-byte enums, natural alignment) —
-    // used by the sim's /proc/<pid>/mem reader (base_symbol + byte_offset).
-    // Verified against offsetof() with the bundled clang; keep in sync with kronmotion.h.
+    // `offset` = byte offset inside the real AXIS_REF C struct (kron_axis.h) on the
+    // LOCAL-SIM target (x86_64: 8-byte pointers/doubles, 4-byte enums, natural
+    // alignment) — used by the sim's /proc/<pid>/mem reader (base_symbol + byte_offset).
+    // ⚠️ The axis engine works in DOUBLE (LREAL), not REAL: a float position
+    // accumulator drifts visibly on a long-travel axis. Typing one of these REAL
+    // would read 4 bytes of a double and show garbage.
+    // ⚠️ Re-verify with offsetof() after ANY edit to AXIS_REF — the struct was
+    // relaid out wholesale when kron_nc.c was replaced by kron_axis.c.
     const AXIS_REF_DEBUG_FIELDS = [
-        { name: 'AxisNo',           type: 'UINT', offset: 0 },
-        { name: 'Simulation',       type: 'BOOL', offset: 16 },
-        { name: 'ActualPosition',   type: 'REAL', offset: 32 },
-        { name: 'ActualVelocity',   type: 'REAL', offset: 36 },
-        { name: 'ActualTorque',     type: 'REAL', offset: 40 },
-        { name: 'IsHomed',          type: 'BOOL', offset: 61 },
-        { name: 'AxisWarning',      type: 'BOOL', offset: 62 },
-        { name: 'AxisErrorID',      type: 'UINT', offset: 64 },
-        { name: 'cmd_Seq',          type: 'UINT', offset: 66 },
-        { name: 'sts_AckSeq',       type: 'UINT', offset: 96 },
-        { name: 'sts_State',        type: 'UINT', offset: 100 },
-        { name: 'sts_Busy',         type: 'BOOL', offset: 104 },
-        { name: 'sts_Done',         type: 'BOOL', offset: 105 },
-        { name: 'sts_Error',        type: 'BOOL', offset: 106 },
-        { name: 'sts_ErrorID',      type: 'UINT', offset: 108 },
-        { name: 'drv_StatusWord',   type: 'UINT', offset: 110 },
-        { name: 'drv_ControlWord',  type: 'UINT', offset: 112 },
+        { name: 'AxisNo',            type: 'UINT',  offset: 0 },
+        { name: 'Simulation',        type: 'BOOL',  offset: 16 },
+        { name: 'MaxVelocity',       type: 'LREAL', offset: 24 },
+        { name: 'MaxAcceleration',   type: 'LREAL', offset: 32 },
+        { name: 'MaxDeceleration',   type: 'LREAL', offset: 40 },
+        { name: 'MaxJerk',           type: 'LREAL', offset: 48 },
+        { name: 'SwLimitNegative',   type: 'LREAL', offset: 56 },
+        { name: 'SwLimitPositive',   type: 'LREAL', offset: 64 },
+        { name: 'MaxPositionLag',    type: 'LREAL', offset: 80 },
+        { name: 'InPositionWindow',  type: 'LREAL', offset: 88 },
+        { name: 'InVelocityWindow',  type: 'LREAL', offset: 96 },
+        { name: 'VelFactor',         type: 'LREAL', offset: 104 },
+        { name: 'AccFactor',         type: 'LREAL', offset: 112 },
+        { name: 'JerkFactor',        type: 'LREAL', offset: 120 },
+        { name: 'GearRatio',         type: 'LREAL', offset: 128 },
+        { name: 'PositionOffset',    type: 'LREAL', offset: 144 },
+        { name: 'ActualPosition',    type: 'LREAL', offset: 152 },
+        { name: 'ActualVelocity',    type: 'LREAL', offset: 160 },
+        { name: 'ActualTorque',      type: 'LREAL', offset: 168 },
+        // Set = MotionState (Position, Velocity, Acceleration) — the trajectory
+        // core's answer for this cycle, i.e. what is actually sent to the drive.
+        // ⚠️ The name IS the C member path — it becomes the SHM slot's c_symbol
+        // (`S->Axis1.Set.Position`), so a flattened `SetPosition` would not compile.
+        { name: 'Set.Position',      type: 'LREAL', offset: 176 },
+        { name: 'Set.Velocity',      type: 'LREAL', offset: 184 },
+        { name: 'Set.Acceleration',  type: 'LREAL', offset: 192 },
+        { name: 'SetJerk',           type: 'LREAL', offset: 200 },
+        { name: 'BrakeDistance',     type: 'LREAL', offset: 208 },
+        { name: 'CommandedPosition', type: 'LREAL', offset: 216 },
+        { name: 'CommandedVelocity', type: 'LREAL', offset: 224 },
+        // MC_AXIS_STATE is a 4-byte enum — UDINT, not UINT.
+        { name: 'State',             type: 'UDINT', offset: 264 },
+        { name: 'PowerEnabled',      type: 'BOOL',  offset: 268 },
+        { name: 'PowerStatus',       type: 'BOOL',  offset: 271 },
+        { name: 'IsHomed',           type: 'BOOL',  offset: 272 },
+        { name: 'AxisWarning',       type: 'BOOL',  offset: 273 },
+        { name: 'AxisError',         type: 'BOOL',  offset: 274 },
+        { name: 'AxisErrorID',       type: 'UINT',  offset: 276 },
+        { name: 'drv_StatusWord',    type: 'UINT',  offset: 278 },
+        { name: 'drv_ControlWord',   type: 'UINT',  offset: 280 },
+        { name: 'StopActive',        type: 'BOOL',  offset: 344 },
     ];
 
     // Expand an ARRAY data type into the FULL index cross-product with row-major
@@ -1445,7 +1473,8 @@ ${boardDefines}${runtimePortHelpers}${customIncludes}${ecCfgEarly.motionIncludes
         shmEntries,
         plcStateLayoutHash,
         addressedRingVars,
-        retainEntries.length > 0
+        retainEntries.length > 0,
+        ecCfg.axisNames || []
     );
     source += mainLoop.src;
     if (mainLoop.ringConfig) variableTable.ring = mainLoop.ringConfig;
@@ -1908,17 +1937,31 @@ extern KRON_Process_Image __gpi;
         .map((slave, si) => ({ slave, si }))
         .filter(({ slave }) => slave.axisRef?.enabled);
 
-    // Helper: emit a float literal that always has a decimal point (C99 requires it)
+    // Helper: emit a float literal that always has a decimal point (C99 requires it).
+    // KRON_SERVO_SLOT's scaling fields are float; AXIS_REF's are double — hence
+    // the second helper. An `f`-suffixed literal assigned to a double silently
+    // rounds the value to single precision first.
     const floatLit = (n) => {
         const f = parseFloat(n);
         return Number.isInteger(f) ? `${f}.0f` : `${f}f`;
     };
+    const dblLit = (n) => {
+        const f = parseFloat(n);
+        return Number.isInteger(f) ? `${f}.0` : `${f}`;
+    };
+    const optNum = (v) => { const f = parseFloat(v); return Number.isFinite(f) ? f : null; };
 
     const hasAxes = axisSlaves.length > 0;
 
     // Generate GPI↔KRON_SERVO_SLOT bridge code for the IO Bus thread.
     // ncReadBridge : after kron_ec_pdo_read  — copy GPI inputs  → Kron_PI.servo[n]
-    // ncWriteBridge: after NC_ProcessOne     — copy Kron_PI.servo[n] → GPI outputs
+    // ncWriteBridge: before kron_ec_pdo_write — copy Kron_PI.servo[n] → GPI outputs
+    // ⚠️ These bridges are ALL the IO_Bus thread does for motion now. The axis
+    // engine itself (KronAxis_ReadInput/WriteOutput) runs in the LOGIC task next
+    // to the MC_* FBs — see generateMainLoop's axisPhase*. kron_axis.c replaced
+    // the old cmd_Seq/sts_AckSeq handshake with a plain request-pointer queue
+    // (AXIS_REF.Active/Buffer[]), which has NO cross-thread protection at all,
+    // so running the engine here again would race every KronAxis_Submit.
     let ncReadBridge = '';
     let ncWriteBridge = '';
     axisSlaves.forEach(({ slave, si }) => {
@@ -1959,8 +2002,40 @@ extern KRON_Process_Image __gpi;
             const encTypeMap = { incremental: 'KRON_ENC_INCREMENTAL', absolute_st: 'KRON_ENC_ABSOLUTE_ST', absolute_mt: 'KRON_ENC_ABSOLUTE_MT' };
             const encType = encTypeMap[slave.axisRef.encoderType] || 'KRON_ENC_INCREMENTAL';
             axisInitCode += `    S->${axisName}.Simulation        = ${sim};\n`;
-            axisInitCode += `    S->${axisName}.GearRatio         = ${floatLit(gRatio)};\n`;
+            axisInitCode += `    S->${axisName}.GearRatio         = ${dblLit(gRatio)};\n`;
             axisInitCode += `    S->${axisName}.EncoderType       = ${encType};\n`;
+            // Axis limits & windows. AXIS_REF_Init already installs usable
+            // defaults (overrides 1.0, windows non-zero), so ONLY fields the
+            // user actually configured are emitted — writing 0 for a blank
+            // field would disable the limit or make InPositionWindow so tight
+            // that no move ever reports Done.
+            const axisLimitFields = [
+                ['maxVelocity',      'MaxVelocity'],
+                ['maxAcceleration',  'MaxAcceleration'],
+                ['maxDeceleration',  'MaxDeceleration'],
+                ['maxJerk',          'MaxJerk'],
+                ['maxPositionLag',   'MaxPositionLag'],
+                ['inPositionWindow', 'InPositionWindow'],
+                ['inVelocityWindow', 'InVelocityWindow'],
+            ];
+            axisLimitFields.forEach(([cfgKey, cField]) => {
+                const n = optNum(slave.axisRef[cfgKey]);
+                if (n !== null && n > 0) axisInitCode += `    S->${axisName}.${cField}${' '.repeat(Math.max(1, 18 - cField.length))}= ${dblLit(n)};\n`;
+            });
+            // Software position limits are a PAIR with an explicit enable: a
+            // limit of 0.0 is a legitimate coordinate, so the enable flag —
+            // never "is it non-zero" — decides whether the axis honours it.
+            if (slave.axisRef.enableLimitNegative) {
+                axisInitCode += `    S->${axisName}.SwLimitNegative   = ${dblLit(optNum(slave.axisRef.swLimitNegative) ?? 0)};\n`;
+                axisInitCode += `    S->${axisName}.EnableLimitNegative = true;\n`;
+            }
+            if (slave.axisRef.enableLimitPositive) {
+                axisInitCode += `    S->${axisName}.SwLimitPositive   = ${dblLit(optNum(slave.axisRef.swLimitPositive) ?? 0)};\n`;
+                axisInitCode += `    S->${axisName}.EnableLimitPositive = true;\n`;
+            }
+            if (slave.axisRef.enablePosLagMonitoring) {
+                axisInitCode += `    S->${axisName}.EnablePosLagMonitoring = true;\n`;
+            }
             // Scaling factors on the servo slot (set after AXIS_REF_Init so slot is valid)
             axisInitCode += `    Kron_PI.servo[${axisNo}].counts_per_unit   = ${floatLit(cpu)};\n`;
             axisInitCode += `    Kron_PI.servo[${axisNo}].vel_raw_per_unit  = ${floatLit(vpu)};\n`;
@@ -1970,8 +2045,6 @@ extern KRON_Process_Image __gpi;
                 axisInitCode += `    Kron_PI.servo[${axisNo}].enc_multi_turn_bits  = ${parseInt(slave.axisRef.multiTurnBits) || 12}u;\n`;
             }
             axisInitCode += `    Kron_PI.servo[${axisNo}].present           = !${sim};\n`;
-            // NC engine private state
-            axisInitCode += `    NC_Init(&g_NC_Axes[${i}], &S->${axisName});\n`;
         });
     }
     initCode += axisInitCode;
@@ -1980,17 +2053,16 @@ extern KRON_Process_Image __gpi;
     // __gpi_snap is initialised to NULL; generateMainLoop sets it via
     // atomic_load_explicit at the top of every logic task's scan loop,
     // so it is always valid before any POU macro dereferences it.
-    const kronPIDecl = hasAxes
-        ? `KRON_PROCESS_IMAGE  Kron_PI;\n` +
-          `KRON_HAL_Driver    *Kron_HAL = NULL;\n` +
-          `NC_AXIS             g_NC_Axes[${axisSlaves.length}];\n`
-        : '';
-    // NC Engine stubs — provided inline so the build succeeds when libkronmotion
-    // does not yet export NC_Init / NC_ProcessOne.  The weak attribute lets a real
-    // library implementation take precedence if it is ever linked (GCC/Clang only).
-    // NC_Init and NC_ProcessOne are provided by libkronmotion.a — no inline
-    // stubs needed.  Using extern declarations so the linker pulls the real
-    // implementations from the archive (weak stubs would prevent this).
+    // ⚠️ plc.c must NOT define Kron_PI / Kron_HAL — `kron_pi.c` (→ libkron_pi.a)
+    // owns both definitions so a build without a generated plc.c still links,
+    // and defining them here too is a hard `multiple definition of 'Kron_PI'`
+    // at link time. kron_pi.h declares them extern; motionIncludes pulls it in.
+    // ⚠️ Kron_HAL therefore stays NULL: the fieldbus exchange is done by the
+    // IO_Bus thread below (kron_ec_pdo_read/write + the servo bridges), so the
+    // generated code calls KronAxis_ReadInput/WriteOutput per axis and NEVER
+    // KronMotion_ReadInputs/WriteOutputs — those wrappers go through this
+    // pointer and would do nothing.
+    const kronPIDecl = '';
     const ncStubs = '';
     const headerDecl =
 `\n#if defined(__linux__)\n` +
@@ -2008,7 +2080,7 @@ ncStubs;
     // motionIncludes: injected EARLY in plc.h (before global vars) so AXIS_REF type
     // is defined by the time the global variable `AXIS_REF Axis1;` is emitted.
     const motionIncludes = hasAxes
-        ? `#include "kron_pi.h"\n#include "kronmotion.h"\n#include "kron_nc.h"\nextern KRON_PROCESS_IMAGE Kron_PI;\n`
+        ? `#include "kron_pi.h"\n#include "kronmotion.h"\nextern KRON_PROCESS_IMAGE Kron_PI;\n`
         : '';
 
     // headerExtern: injected into plc.h in the EtherCAT HAL section (after global vars).
@@ -2016,10 +2088,7 @@ ncStubs;
     const headerExtern =
 `\n#include "kron_hal.h"\n` +
 `extern KRON_EC_Config __ec_cfg;\n` +
-(hasAxes
-    ? `extern NC_AXIS             g_NC_Axes[${axisSlaves.length}];\n` +
-      `extern KRON_HAL_Driver    *Kron_HAL;\n`
-    : '');
+'';
 
     // SDO background thread + watchdog thread + IO_Bus thread (Linux only)
     const ecThreadCode = `
@@ -2077,13 +2146,7 @@ static void* plc_task_IO_Bus(void *arg) {
         /* Step 3: Receive hardware inputs into HW staging */
         kron_ec_pdo_read(&__ec_cfg);
 
-${hasAxes ? `${ncReadBridge}        /* NC Engine: run motion profile for each axis (cycle-synchronous) */
-        { float __nc_dt = (float)__ec_cfg.cycle_us * 1e-6f;
-          for (uint16_t __i = 0; __i < ${axisSlaves.length}U; __i++) {
-              NC_ProcessOne(&g_NC_Axes[__i], __nc_dt);
-          }
-        }
-${ncWriteBridge}` : ''}        /* Step 4: Propagate HW-updated staging to the back buffer.
+${hasAxes ? `${ncReadBridge}${ncWriteBridge}` : ''}        /* Step 4: Propagate HW-updated staging to the back buffer.
          * Back buffer now has: fresh hardware inputs + last logic outputs. */
         *back = __gpi_hw;
 
@@ -2118,6 +2181,11 @@ ${ncWriteBridge}` : ''}        /* Step 4: Propagate HW-updated staging to the ba
         // Names of all GPI-macro-backed PDO variables — transpileToC excludes
         // same-named user globals from PlcState/SHM so the macro applies.
         gpiVarNames: uniqueGpiVars.map(v => v.varName),
+        // PlcState field names of every enabled axis, in declaration order.
+        // generateMainLoop wraps the fastest task's scan with the axis engine's
+        // read/write phases around these.
+        axisNames: axisSlaves.map(({ slave }) =>
+            (slave.axisRef.name || `Axis_${slave.position}`).replace(/[^A-Za-z0-9_]/g, '_')),
     };
 };
 
@@ -2299,7 +2367,7 @@ const generateRetainSupport = (retainEntries) => {
     return s;
 };
 
-const generateMainLoop = (projectStructure, config, boardId = null, shmEnabled = false, execTimeVars = [], initCode = '', cleanupCode = '', ecPdoReadCode = '', ecPdoWriteCode = '', ecThreadCode = '', ecThreadStartCode = '', ecThreadJoinCode = '', gpiMutexEnabled = false, shmEntries = [], plcStateLayoutHash = '0', addressedRingVars = [], retainEnabled = false) => {
+const generateMainLoop = (projectStructure, config, boardId = null, shmEnabled = false, execTimeVars = [], initCode = '', cleanupCode = '', ecPdoReadCode = '', ecPdoWriteCode = '', ecThreadCode = '', ecThreadStartCode = '', ecThreadJoinCode = '', gpiMutexEnabled = false, shmEntries = [], plcStateLayoutHash = '0', addressedRingVars = [], retainEnabled = false, axisNames = []) => {
     let mainSrc = `\n// --- DETERMINISTIC SCAN LOOP ---\n`;
 
     // --- 1. Discover task→program groupings (priority: taskConfig > res_config > fallback) ---
@@ -2475,6 +2543,56 @@ const generateMainLoop = (projectStructure, config, boardId = null, shmEnabled =
         ? Math.min(...taskGroups.map(tg => tg.intervalUs))
         : Infinity;
 
+    // ── Motion: the axis engine's two scan phases ───────────────────────────
+    // ⚠️ These MUST run in the same thread as the MC_* function blocks. kron_axis.c
+    // (which replaced kron_nc.c) hands a request POINTER living inside the FB
+    // instance to AXIS_REF.Active / Buffer[] with no lock and no sequence-number
+    // handshake, so a KronAxis_Submit racing KronAxis_WriteOutput corrupts the
+    // queue. The old NC engine had the cmd_Seq/sts_AckSeq protocol precisely so
+    // it could live in the IO_Bus thread; nothing replaces it — do NOT move
+    // these back there.
+    // Which task actually calls the MC_* blocks? An FB instance must be
+    // DECLARED to be called, in ladder and in ST alike, so the program's own
+    // variable list is the reliable signal — no rung/ST parsing needed.
+    const motionProgramNames = new Set(
+        (projectStructure.programs || [])
+            .filter(prog => (prog.content?.variables || [])
+                .some(v => MOTION_FB_AXIS_PARAM.has((v.type || '').trim())))
+            .map(prog => (prog.name || '').trim().replace(/\s+/g, '_'))
+    );
+    const motionTaskIdxs = taskGroups
+        .map((tg, i) => (tg.programs.some(pName => motionProgramNames.has(pName)) ? i : -1))
+        .filter(i => i >= 0);
+    if (motionTaskIdxs.length > 1) {
+        console.warn(`[transpiler] Motion function blocks are called from ${motionTaskIdxs.length} different tasks `
+            + `(${motionTaskIdxs.map(i => taskGroups[i].taskName).join(', ')}). The axis engine can only run in one of `
+            + `them (${taskGroups[motionTaskIdxs[0]].taskName}), so the others submit motion requests from a different `
+            + `thread with no locking — move every program that uses MC_* blocks into a single task.`);
+    }
+    // No MC_* program yet: still run the engine (it drives the CiA402 state
+    // machine and the feedback path), in the fastest task.
+    const motionTaskIdx = axisNames.length === 0
+        ? -1
+        : (motionTaskIdxs.length > 0
+            ? motionTaskIdxs.reduce((a, b) => (taskGroups[b].intervalUs < taskGroups[a].intervalUs ? b : a))
+            : taskGroups.findIndex(tg => tg.intervalUs === fastestIntervalUs));
+    // dt is the OWNING task's interval in seconds, not the fieldbus cycle: the
+    // trajectory core integrates once per call and is called once per scan of
+    // that task. A C literal needs the decimal point — a bare `1` for a 1 s task
+    // is an int, and while it promotes here, the next use of this string may not.
+    const motionDtUs = motionTaskIdx >= 0 ? taskGroups[motionTaskIdx].intervalUs : fastestIntervalUs;
+    const motionDt = Number.isFinite(motionDtUs)
+        ? (motionDtUs / 1e6).toFixed(9).replace(/0+$/, '0')
+        : '0.0';
+    const axisReadPhase = motionTaskIdx >= 0
+        ? `    /* Motion: fieldbus image -> axis (actual values, drive status, faults) */\n` +
+          axisNames.map(a => `    KronAxis_ReadInput(&S->${a});\n`).join('')
+        : '';
+    const axisWritePhase = motionTaskIdx >= 0
+        ? `    /* Motion: state diagram + one trajectory scan -> fieldbus image */\n` +
+          axisNames.map(a => `    KronAxis_WriteOutput(&S->${a}, ${motionDt});\n`).join('')
+        : '';
+
     // Per-task SHM pull/sync functions — each task calls its own named version.
     // All currently include the full variable set; partition per-task in future if needed.
     if (shmEnabled && shmEntries.length > 0) {
@@ -2606,6 +2724,7 @@ const generateMainLoop = (projectStructure, config, boardId = null, shmEnabled =
         mainSrc += `void plc_task_body_${ti}(void) {\n`;
         if (shmEnabled) mainSrc += `    plc_shm_pull_${tg.taskName}();\n`;
         if (gpiMutexEnabled) mainSrc += `    __gpi_snap = atomic_load_explicit(&__gpi, memory_order_acquire);\n`;
+        if (ti === motionTaskIdx) mainSrc += axisReadPhase;
         tg.programs.forEach(pName => {
             const etv = execTimeVars.find(e => e.progName === pName);
             if (etv) {
@@ -2618,6 +2737,10 @@ const generateMainLoop = (projectStructure, config, boardId = null, shmEnabled =
                 mainSrc += `    ${pName}();\n`;
             }
         });
+        // The engine runs AFTER the POUs — an FB submits on this scan and the
+        // trajectory core answers on the same one, which is what makes a new
+        // target take effect next cycle with no profile to re-plan.
+        if (ti === motionTaskIdx) mainSrc += axisWritePhase;
         if (shmEnabled) mainSrc += `    plc_shm_sync_${tg.taskName}();\n`;
         // Capture ring: append this task's addressed vars AFTER shm sync (values
         // final for the scan). No-op unless this task has addressed vars.
@@ -3023,9 +3146,10 @@ const FB_TRIGGER_PIN = {
     'MC_MoveAbsolute': 'Execute', 'MC_MoveRelative': 'Execute',
     'MC_MoveAdditive': 'Execute', 'MC_MoveVelocity': 'Execute',
     'MC_MoveSuperimposed': 'Execute', 'MC_HaltSuperimposed': 'Execute',
-    'MC_MoveContinuousAbsolute': 'Execute', 'MC_MoveContinuousRelative': 'Execute',
     'MC_SetPosition': 'Execute', 'MC_SetOverride': 'Enable',
     'MC_Reset': 'Execute',
+    'MC_ReadParameter': 'Enable', 'MC_ReadBoolParameter': 'Enable',
+    'MC_WriteParameter': 'Execute', 'MC_WriteBoolParameter': 'Execute',
     'MC_ReadActualPosition': 'Enable', 'MC_ReadActualVelocity': 'Enable',
     'MC_ReadActualTorque': 'Enable', 'MC_ReadStatus': 'Enable',
     'MC_ReadMotionState': 'Enable', 'MC_ReadAxisInfo': 'Enable', 'MC_ReadAxisError': 'Enable',
@@ -3082,9 +3206,10 @@ const FB_Q_OUTPUT = {
     'MC_MoveAbsolute': 'Done', 'MC_MoveRelative': 'Done',
     'MC_MoveAdditive': 'Done', 'MC_MoveVelocity': 'InVelocity',
     'MC_MoveSuperimposed': 'Done', 'MC_HaltSuperimposed': 'Done',
-    'MC_MoveContinuousAbsolute': 'InEndVelocity', 'MC_MoveContinuousRelative': 'InEndVelocity',
     'MC_SetPosition': 'Done', 'MC_SetOverride': 'Enabled',
     'MC_Reset': 'Done',
+    'MC_ReadParameter': 'Valid', 'MC_ReadBoolParameter': 'Valid',
+    'MC_WriteParameter': 'Done', 'MC_WriteBoolParameter': 'Done',
     'MC_ReadActualPosition': 'Valid', 'MC_ReadActualVelocity': 'Valid',
     'MC_ReadActualTorque': 'Valid', 'MC_ReadStatus': 'Valid',
     'MC_ReadMotionState': 'Valid', 'MC_ReadAxisInfo': 'Valid', 'MC_ReadAxisError': 'Valid',
@@ -3153,6 +3278,7 @@ const getOutputPinType = (blockType, pinName, customData) => {
     if (['Q', 'Q1', 'QU', 'QD', 'ENO'].includes(pinName)) return 'BOOL';
     if ((blockType === 'UART_Receive' || blockType === 'USB_Receive') && pinName === 'ReceivedLength') return 'UINT';
     if (SYSTEM_FB_OUTPUT_TYPES[blockType]?.[pinName]) return SYSTEM_FB_OUTPUT_TYPES[blockType][pinName];
+    if (MOTION_FB_OUTPUT_TYPES[blockType]?.[pinName]) return MOTION_FB_OUTPUT_TYPES[blockType][pinName];
     if (GENERATED_FB_OUTPUT_TYPES[blockType]?.[pinName]) return GENERATED_FB_OUTPUT_TYPES[blockType][pinName];
     if (pinName === 'ET') return 'TIME';
     if (pinName === 'CV') return 'INT';
@@ -3289,6 +3415,10 @@ const collectInputShadowVars = (rungs, progName) => {
                 // type exists for it and a shadow field would be NULL, so the
                 // literal is assigned directly every scan instead.
                 if (isStringInputType(iecType)) return;
+                // The Axis pin is passed as the _Call's 2nd parameter, not a
+                // struct field — a shadow var would declare a stray AXIS_REF
+                // PlcState field with no SHM slot when the pin is left empty.
+                if (iecType === 'AXIS_REF') return;
                 const rawVal = data.values?.[editorPin];
                 if (isVarRef(rawVal)) return;
                 const sym = `prog_${progName}_in_${instName}_${editorPin}`;
@@ -3407,25 +3537,28 @@ const FB_OUTPUTS = {
     // Motion control
     'MC_Power': ['Status', 'Valid', 'Error', 'ErrorID'],
     'MC_Home': ['Done', 'Busy', 'Active', 'CommandAborted', 'Error', 'ErrorID'],
-    'MC_Stop': ['Done', 'Busy', 'CommandAborted', 'Error', 'ErrorID'],
+    'MC_Stop': ['Done', 'Busy', 'Active', 'CommandAborted', 'Error', 'ErrorID'],
     'MC_Halt': ['Done', 'Busy', 'Active', 'CommandAborted', 'Error', 'ErrorID'],
     'MC_MoveAbsolute': ['Done', 'Busy', 'Active', 'CommandAborted', 'Error', 'ErrorID'],
     'MC_MoveRelative': ['Done', 'Busy', 'Active', 'CommandAborted', 'Error', 'ErrorID'],
     'MC_MoveAdditive': ['Done', 'Busy', 'Active', 'CommandAborted', 'Error', 'ErrorID'],
     'MC_MoveVelocity': ['InVelocity', 'Busy', 'Active', 'CommandAborted', 'Error', 'ErrorID'],
-    'MC_MoveSuperimposed': ['Done', 'Busy', 'Active', 'CommandAborted', 'Error', 'ErrorID'],
+    'MC_MoveSuperimposed': ['Done', 'Busy', 'Active', 'CommandAborted', 'Error', 'ErrorID', 'CoveredDistance'],
     'MC_HaltSuperimposed': ['Done', 'Busy', 'Active', 'CommandAborted', 'Error', 'ErrorID'],
-    'MC_MoveContinuousAbsolute': ['InEndVelocity', 'Busy', 'Active', 'CommandAborted', 'Error', 'ErrorID'],
-    'MC_MoveContinuousRelative': ['InEndVelocity', 'Busy', 'Active', 'CommandAborted', 'Error', 'ErrorID'],
     'MC_SetPosition': ['Done', 'Busy', 'Error', 'ErrorID'],
     'MC_SetOverride': ['Enabled', 'Busy', 'Error', 'ErrorID'],
     'MC_Reset': ['Done', 'Busy', 'Error', 'ErrorID'],
+    'MC_ReadParameter': ['Valid', 'Busy', 'Error', 'ErrorID', 'Value'],
+    'MC_ReadBoolParameter': ['Valid', 'Busy', 'Error', 'ErrorID', 'Value'],
+    'MC_WriteParameter': ['Done', 'Busy', 'Error', 'ErrorID'],
+    'MC_WriteBoolParameter': ['Done', 'Busy', 'Error', 'ErrorID'],
     'MC_ReadActualPosition': ['Valid', 'Busy', 'Error', 'ErrorID', 'Position'],
     'MC_ReadActualVelocity': ['Valid', 'Busy', 'Error', 'ErrorID', 'Velocity'],
     'MC_ReadActualTorque': ['Valid', 'Busy', 'Error', 'ErrorID', 'Torque'],
     'MC_ReadStatus': ['Valid', 'Busy', 'Error', 'ErrorID', 'ErrorStop', 'Disabled', 'Stopping', 'Homing', 'Standstill', 'DiscreteMotion', 'ContinuousMotion', 'SynchronizedMotion'],
     'MC_ReadMotionState': ['Valid', 'Busy', 'Error', 'ErrorID', 'ConstantVelocity', 'Accelerating', 'Decelerating', 'DirectionPositive', 'DirectionNegative'],
-    'MC_ReadAxisInfo': ['Valid', 'Busy', 'Error', 'ErrorID'],
+    'MC_ReadAxisInfo': ['Valid', 'Busy', 'Error', 'ErrorID', 'HomeAbsSwitch', 'LimitSwitchPos', 'LimitSwitchNeg',
+                        'Simulation', 'CommunicationReady', 'ReadyForPowerOn', 'PowerOn', 'IsHomed', 'AxisWarning'],
     'MC_ReadAxisError': ['Valid', 'Busy', 'Error', 'ErrorID', 'AxisErrorID'],
     // System / RTC / scheduling / diagnostics (kronsystem.h)
     'Read_System_Time': ['ENO', 'TIME'],
@@ -3729,26 +3862,28 @@ const FB_INPUTS = {
     'EC_WriteSDO':       ['Execute', 'SlaveAddress', 'Index', 'SubIndex', 'ByteSize', 'Value'],
     // Motion control — Axis parameter is NOT listed here (passed separately as 2nd arg to _Call)
     'MC_Power': ['Enable', 'EnablePositive', 'EnableNegative'],
-    'MC_Home': ['Execute', 'Position', 'HomingMode'],
+    'MC_Home': ['Execute', 'Position', 'BufferMode'],
     'MC_Stop': ['Execute', 'Deceleration', 'Jerk'],
     'MC_Halt': ['Execute', 'Deceleration', 'Jerk', 'BufferMode'],
-    'MC_MoveAbsolute': ['Execute', 'ContinuousUpdate', 'Position', 'Velocity', 'Acceleration', 'Deceleration', 'Jerk', 'BufferMode'],
+    'MC_MoveAbsolute': ['Execute', 'ContinuousUpdate', 'Position', 'Velocity', 'Acceleration', 'Deceleration', 'Jerk', 'Direction', 'BufferMode'],
     'MC_MoveRelative': ['Execute', 'ContinuousUpdate', 'Distance', 'Velocity', 'Acceleration', 'Deceleration', 'Jerk', 'BufferMode'],
     'MC_MoveAdditive': ['Execute', 'ContinuousUpdate', 'Distance', 'Velocity', 'Acceleration', 'Deceleration', 'Jerk', 'BufferMode'],
     'MC_MoveVelocity': ['Execute', 'ContinuousUpdate', 'Velocity', 'Acceleration', 'Deceleration', 'Jerk', 'Direction', 'BufferMode'],
-    'MC_MoveSuperimposed': ['Execute', 'Distance', 'VelocityDiff', 'AccelerationDiff', 'DecelerationDiff', 'JerkDiff'],
+    'MC_MoveSuperimposed': ['Execute', 'ContinuousUpdate', 'Distance', 'VelocityDiff', 'Acceleration', 'Deceleration', 'Jerk'],
     'MC_HaltSuperimposed': ['Execute', 'Deceleration', 'Jerk'],
-    'MC_MoveContinuousAbsolute': ['Execute', 'Position', 'EndVelocity', 'Velocity', 'Acceleration', 'Deceleration', 'Jerk'],
-    'MC_MoveContinuousRelative': ['Execute', 'Distance', 'EndVelocity', 'Velocity', 'Acceleration', 'Deceleration', 'Jerk'],
-    'MC_SetPosition': ['Execute', 'Position', 'Relative'],
+    'MC_SetPosition': ['Execute', 'Position', 'Relative', 'ExecutionMode'],
     'MC_SetOverride': ['Enable', 'VelFactor', 'AccFactor', 'JerkFactor'],
     'MC_Reset': ['Execute'],
+    'MC_ReadParameter': ['Enable', 'ParameterNumber'],
+    'MC_ReadBoolParameter': ['Enable', 'ParameterNumber'],
+    'MC_WriteParameter': ['Execute', 'ParameterNumber', 'Value', 'ExecutionMode'],
+    'MC_WriteBoolParameter': ['Execute', 'ParameterNumber', 'Value', 'ExecutionMode'],
     'MC_ReadActualPosition': ['Enable'],
     'MC_ReadActualVelocity': ['Enable'],
     'MC_ReadActualTorque': ['Enable'],
     'MC_ReadStatus': ['Enable'],
-    'MC_ReadMotionState': ['Enable'],
-    'MC_ReadAxisInfo': ['Enable'],
+    'MC_ReadMotionState': ['Enable', 'Source'],
+    'MC_ReadAxisInfo': ['Enable', 'HomeSwitchInput', 'LimitSwitchPosInput', 'LimitSwitchNegInput'],
     'MC_ReadAxisError': ['Enable'],
     // System / RTC / scheduling / diagnostics (kronsystem.h)
     'Read_System_Time': ['EN'],
@@ -3788,12 +3923,33 @@ const EC_FB_CFG_PARAM = new Set([
 const MOTION_FB_AXIS_PARAM = new Set([
     'MC_Power', 'MC_Home', 'MC_Stop', 'MC_Halt',
     'MC_MoveAbsolute', 'MC_MoveRelative', 'MC_MoveAdditive',
-    'MC_MoveVelocity', 'MC_MoveContinuousAbsolute', 'MC_MoveContinuousRelative',
-    'MC_MoveSuperimposed', 'MC_HaltSuperimposed',
+    'MC_MoveVelocity', 'MC_MoveSuperimposed', 'MC_HaltSuperimposed',
     'MC_SetPosition', 'MC_SetOverride', 'MC_Reset',
+    'MC_ReadParameter', 'MC_ReadBoolParameter',
+    'MC_WriteParameter', 'MC_WriteBoolParameter',
     'MC_ReadActualPosition', 'MC_ReadActualVelocity', 'MC_ReadActualTorque',
     'MC_ReadStatus', 'MC_ReadMotionState', 'MC_ReadAxisInfo', 'MC_ReadAxisError',
 ]);
+
+// Output pin types for the PLCopen motion FBs. REQUIRED: getOutputPinType's
+// generic rules key off pin NAMES and fall through to BOOL, so without this
+// table `MC_ReadActualPosition.Position` got a BOOL shadow var and every REAL
+// reading collapsed to 0/1 — and every `ErrorID` (uint16_t in kronmotion.h)
+// published a single bit. Keys must match the FB_OUTPUTS entries exactly.
+const MOTION_FB_OUTPUT_TYPES = {};
+[...MOTION_FB_AXIS_PARAM].forEach(k => { MOTION_FB_OUTPUT_TYPES[k] = { 'ErrorID': 'WORD' }; });
+// ⚠️ LREAL, not REAL: every numeric pin in kronmotion.h is a `double` (the
+// trajectory core works in double; a float position accumulator drifts visibly
+// on a long-travel axis). A REAL shadow var would silently halve the precision.
+Object.assign(MOTION_FB_OUTPUT_TYPES, {
+    'MC_MoveSuperimposed':   { 'ErrorID': 'WORD', 'CoveredDistance': 'LREAL' },
+    'MC_ReadParameter':      { 'ErrorID': 'WORD', 'Value': 'LREAL' },
+    'MC_ReadBoolParameter':  { 'ErrorID': 'WORD', 'Value': 'BOOL' },
+    'MC_ReadActualPosition': { 'ErrorID': 'WORD', 'Position': 'LREAL' },
+    'MC_ReadActualVelocity': { 'ErrorID': 'WORD', 'Velocity': 'LREAL' },
+    'MC_ReadActualTorque':   { 'ErrorID': 'WORD', 'Torque': 'LREAL' },
+    'MC_ReadAxisError':      { 'ErrorID': 'WORD', 'AxisErrorID': 'WORD' },
+});
 
 // Maps editor-facing pin names to actual C struct member names where they differ
 const FB_C_PIN_NAME = {

@@ -485,24 +485,50 @@ const VariableManager = ({
     return String(val);
   };
 
+  // ⚠️ Mirrors AXIS_REF_DEBUG_FIELDS in CTranspilerService.js — that list decides
+  // which members actually get a live slot, this one only decides what the
+  // Variable Manager offers to expand. Keep them in step, and keep both in step
+  // with kron_axis.h (the struct moved there when kron_nc.c was replaced).
+  // The axis engine works in double, so these are LREAL, not REAL.
   const AXIS_REF_BUILTIN = {
     name: 'AXIS_REF', type: 'Structure',
     content: { members: [
-      { name: 'AxisNo',         type: 'UINT' },
-      { name: 'Simulation',     type: 'BOOL' },
-      { name: 'ActualPosition', type: 'REAL' },
-      { name: 'ActualVelocity', type: 'REAL' },
-      { name: 'ActualTorque',   type: 'REAL' },
-      { name: 'IsHomed',        type: 'BOOL' },
-      { name: 'AxisWarning',    type: 'BOOL' },
-      { name: 'AxisErrorID',    type: 'UINT' },
-      { name: 'cmd_Seq',        type: 'UINT' },
-      { name: 'sts_AckSeq',     type: 'UINT' },
-      { name: 'sts_State',      type: 'UINT' },
-      { name: 'sts_Busy',       type: 'BOOL' },
-      { name: 'sts_Done',       type: 'BOOL' },
-      { name: 'sts_Error',      type: 'BOOL' },
-      { name: 'sts_ErrorID',    type: 'UINT' },
+      { name: 'AxisNo',            type: 'UINT'  },
+      { name: 'Simulation',        type: 'BOOL'  },
+      { name: 'MaxVelocity',       type: 'LREAL' },
+      { name: 'MaxAcceleration',   type: 'LREAL' },
+      { name: 'MaxDeceleration',   type: 'LREAL' },
+      { name: 'MaxJerk',           type: 'LREAL' },
+      { name: 'SwLimitNegative',   type: 'LREAL' },
+      { name: 'SwLimitPositive',   type: 'LREAL' },
+      { name: 'MaxPositionLag',    type: 'LREAL' },
+      { name: 'InPositionWindow',  type: 'LREAL' },
+      { name: 'InVelocityWindow',  type: 'LREAL' },
+      { name: 'VelFactor',         type: 'LREAL' },
+      { name: 'AccFactor',         type: 'LREAL' },
+      { name: 'JerkFactor',        type: 'LREAL' },
+      { name: 'GearRatio',         type: 'LREAL' },
+      { name: 'PositionOffset',    type: 'LREAL' },
+      { name: 'ActualPosition',    type: 'LREAL' },
+      { name: 'ActualVelocity',    type: 'LREAL' },
+      { name: 'ActualTorque',      type: 'LREAL' },
+      { name: 'Set.Position',      type: 'LREAL' },
+      { name: 'Set.Velocity',      type: 'LREAL' },
+      { name: 'Set.Acceleration',  type: 'LREAL' },
+      { name: 'SetJerk',           type: 'LREAL' },
+      { name: 'BrakeDistance',     type: 'LREAL' },
+      { name: 'CommandedPosition', type: 'LREAL' },
+      { name: 'CommandedVelocity', type: 'LREAL' },
+      { name: 'State',             type: 'UDINT' },
+      { name: 'PowerEnabled',      type: 'BOOL'  },
+      { name: 'PowerStatus',       type: 'BOOL'  },
+      { name: 'IsHomed',           type: 'BOOL'  },
+      { name: 'AxisWarning',       type: 'BOOL'  },
+      { name: 'AxisError',         type: 'BOOL'  },
+      { name: 'AxisErrorID',       type: 'UINT'  },
+      { name: 'drv_StatusWord',    type: 'UINT'  },
+      { name: 'drv_ControlWord',   type: 'UINT'  },
+      { name: 'StopActive',        type: 'BOOL'  },
     ]}
   };
   const dataTypes = [...(projectStructure?.dataTypes || []), AXIS_REF_BUILTIN];

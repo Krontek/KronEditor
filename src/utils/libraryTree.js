@@ -225,7 +225,7 @@ export const LIBRARY_TREE = [
       {
         id: 'motion_p2p',
         title: 'Point-to-Point',
-        fromLibrary: ['MC_MoveAbsolute', 'MC_MoveRelative', 'MC_MoveAdditive']
+        fromLibrary: ['MC_MoveAbsolute', 'MC_MoveRelative', 'MC_MoveAdditive', 'MC_SetPosition']
       },
       {
         id: 'motion_vel',
@@ -243,8 +243,21 @@ export const LIBRARY_TREE = [
         fromLibrary: [
           'MC_ReadActualPosition',
           'MC_ReadActualVelocity',
+          'MC_ReadActualTorque',
           'MC_ReadStatus',
+          'MC_ReadMotionState',
+          'MC_ReadAxisInfo',
           'MC_ReadAxisError'
+        ]
+      },
+      {
+        id: 'motion_param',
+        title: 'Parameters',
+        fromLibrary: [
+          'MC_ReadParameter',
+          'MC_ReadBoolParameter',
+          'MC_WriteParameter',
+          'MC_WriteBoolParameter'
         ]
       }
     ]

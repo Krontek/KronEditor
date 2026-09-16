@@ -178,6 +178,89 @@ const BeagleBoneHeaders = ({ pinout, onPinClick, selectedPin }) => {
   );
 };
 
+// ===== AUX HEADER RENDERER (display only: button / automation headers) =====
+// Aux headers carry system-control and debug signals, never programmable I/O,
+// so pins are not clickable and never reach the pin-config panel.
+const AuxHeaderView = ({ header }) => {
+  const rows = [];
+  for (let i = 0; i < header.pins.length; i += 2) {
+    rows.push([header.pins[i], header.pins[i + 1]]);
+  }
+  const dot = (pin) => (
+    <div
+      style={{
+        width: 24, height: 24, borderRadius: 3, flexShrink: 0,
+        background: pin ? pin.color : 'transparent',
+        color: '#fff', display: 'flex', alignItems: 'center', justifyContent: 'center',
+        fontSize: '8px', fontWeight: 'bold', cursor: 'default', opacity: 0.85,
+      }}
+      title={pin ? `${header.id}.${pin.pin}: ${pin.name}${pin.alt ? ` (${pin.alt})` : ''}` : ''}
+    >
+      {pin ? pin.pin : ''}
+    </div>
+  );
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 2, padding: '10px' }}>
+      {rows.map(([left, right], idx) => (
+        <div key={idx} style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+          <PinLabel pin={left} align="right" />
+          {dot(left)}
+          {dot(right)}
+          {right && <PinLabel pin={right} align="left" />}
+        </div>
+      ))}
+      {header.note && (
+        <div style={{ fontSize: '10px', color: '#777', maxWidth: 300, marginTop: 6 }}>
+          {header.note}
+        </div>
+      )}
+    </div>
+  );
+};
+
+// ===== PINOUT PANEL (main header + optional aux header tabs) =====
+const PinoutPanel = ({ board, onPinClick, selectedPin }) => {
+  const [activeTab, setActiveTab] = useState('main');
+  const auxHeaders = board.auxHeaders || [];
+  const active = auxHeaders.find(h => h.id === activeTab);
+
+  const mainHeader = (
+    <>
+      {board.pinLayout === 'rpi40' && (
+        <Rpi40PinHeader pinout={board.pinout} onPinClick={onPinClick} selectedPin={selectedPin} />
+      )}
+      {board.pinLayout === 'beaglebone' && (
+        <BeagleBoneHeaders pinout={board.pinout} onPinClick={onPinClick} selectedPin={selectedPin} />
+      )}
+    </>
+  );
+
+  if (auxHeaders.length === 0) return mainHeader;
+
+  const tabStyle = (on) => ({
+    padding: '6px 16px', borderRadius: 4, cursor: 'pointer',
+    background: on ? '#007acc' : '#333', color: on ? '#fff' : '#ccc',
+    border: 'none', fontSize: '12px', fontWeight: 'bold',
+  });
+
+  return (
+    <div>
+      <div style={{ display: 'flex', gap: 4, marginBottom: 8, flexWrap: 'wrap' }}>
+        <button onClick={() => setActiveTab('main')} style={tabStyle(activeTab === 'main')}>
+          {board.gpio}-pin Header
+        </button>
+        {auxHeaders.map(h => (
+          <button key={h.id} onClick={() => setActiveTab(h.id)} style={tabStyle(activeTab === h.id)}>
+            {h.name}
+          </button>
+        ))}
+      </div>
+      {active ? <AuxHeaderView header={active} /> : mainHeader}
+    </div>
+  );
+};
+
 // ===== PROTOCOL BADGE COLORS =====
 const PROTO_COLOR = { I2C: '#4a90d9', SPI: '#ff9800', UART: '#9c27b0' };
 
@@ -908,12 +991,7 @@ const BoardConfigPage = ({ boardId, interfaceConfig = {}, onInterfaceConfigChang
           <div style={{ flexShrink: 0 }}>
             <PinLegend />
             <div style={{ display: 'flex', justifyContent: 'center', padding: '0 8px 8px' }}>
-              {board.pinLayout === 'rpi40' && (
-                <Rpi40PinHeader pinout={board.pinout} onPinClick={handlePinClick} selectedPin={selectedPin} />
-              )}
-              {board.pinLayout === 'beaglebone' && (
-                <BeagleBoneHeaders pinout={board.pinout} onPinClick={handlePinClick} selectedPin={selectedPin} />
-              )}
+              <PinoutPanel board={board} onPinClick={handlePinClick} selectedPin={selectedPin} />
             </div>
           </div>
 

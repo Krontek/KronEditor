@@ -88,7 +88,7 @@ func (s *Server) compileSimulation() (string, string, error) {
 	args = append(args,
 		// -O0 for the SIMULATION build: it is a correctness/logic test, not a
 		// perf target, and -O3 is the dominant compile-time cost on large
-		// projects (motion/EtherCAT pull kron_nc.c etc. in as inline headers, and
+		// projects (motion/EtherCAT pull kron_axis.h / SOEM in as headers, and
 		// optimizing all of that per sim-start is slow). -O0 compiles much faster
 		// and keeps real-time scan timing (driven by us_tick, not CPU speed).
 		// (The cross-compiled TARGET/deploy build below stays -O3.)

@@ -250,6 +250,37 @@ const ORIN_40PIN_HEADER = [
   { pin: 40, name: 'I2S_DOUT',  type: 'gpio',   alt: 'I2S2 DOUT (pi0)', color: '#4caf50' },
 ];
 
+// Jetson button header — J14 on the Orin Nano / Orin NX / Xavier NX developer kit
+// carrier boards (2x6, 2.54 mm, on the board edge behind the 40-pin header).
+// These are system-control and debug-UART signals, NOT programmable I/O: they are
+// shown for wiring reference only and cannot be assigned to a HAL port.
+// Source: Jetson Orin Nano Developer Kit Carrier Board Spec SP-11324-001, Table 3-4
+// (identical to the Xavier NX carrier spec SP-09765-001, Table 3-4).
+const JETSON_BUTTON_HEADER_J14 = [
+  { pin: 1,  name: 'PC_LED-',         type: 'special', alt: 'Sleep/Wake LED cathode (5V)', color: '#607d8b' },
+  { pin: 2,  name: 'PC_LED+',         type: 'special', alt: 'Sleep/Wake LED anode', color: '#607d8b' },
+  { pin: 3,  name: 'UART2_RXD',       type: 'special', alt: 'Debug UART #2 RX (3.3V)', color: '#9c27b0' },
+  { pin: 4,  name: 'UART2_TXD',       type: 'special', alt: 'Debug UART #2 TX (3.3V)', color: '#9c27b0' },
+  { pin: 5,  name: 'AC_OK',           type: 'special', alt: 'Short 5-6 to disable Auto-Power-On', color: '#607d8b' },
+  { pin: 6,  name: 'PWR_ON_DISABLE',  type: 'ground',  alt: 'Pulled to GND, see pin 5', color: '#333333' },
+  { pin: 7,  name: 'GND',             type: 'ground',  color: '#333333' },
+  { pin: 8,  name: 'SYS_RESET*',      type: 'special', alt: 'Short 7-8 to reset the system', color: '#607d8b' },
+  { pin: 9,  name: 'GND',             type: 'ground',  color: '#333333' },
+  { pin: 10, name: 'FORCE_RECOVERY*', type: 'special', alt: 'Short 9-10 at power-on for USB recovery', color: '#607d8b' },
+  { pin: 11, name: 'GND',             type: 'ground',  color: '#333333' },
+  { pin: 12, name: 'SLEEP/WAKE*',     type: 'special', alt: 'Short 11-12 = power button', color: '#607d8b' },
+];
+
+// Extra (non-40-pin) headers shown as tabs next to the main pinout. Display only.
+const JETSON_AUX_HEADERS = [
+  {
+    id: 'J14',
+    name: 'Button Header (J14)',
+    pins: JETSON_BUTTON_HEADER_J14,
+    note: 'System control + debug-console UART on the board edge. Reference only — these pins are not assignable to HAL ports. To read pins 3/4 from a program, free the serial console on the target first, then point a UART channel at that device node with the UART override below (the 40-pin header UART on pins 8/10 needs none of that).',
+  },
+];
+
 // BeagleBone P8 header
 const BB_P8_HEADER = [
   { pin: 1,  name: 'GND',       type: 'ground', color: '#333333' },
@@ -589,6 +620,7 @@ export const BOARD_FAMILIES = [
         display: 'HDMI 2.0, DP 1.4',
         pinout: JETSON_40PIN_HEADER,
         pinLayout: 'rpi40',
+        auxHeaders: JETSON_AUX_HEADERS,
         interfaces: ['GPIO', 'I2C', 'SPI', 'UART', 'PWM', 'CAN', 'USB'],
         usbPorts: [
           { id: 'USB_0', type: 'USB 3.1', connector: 'Type-A' },
@@ -631,6 +663,7 @@ export const BOARD_FAMILIES = [
         display: 'HDMI 2.1, DP 1.4',
         pinout: ORIN_40PIN_HEADER,
         pinLayout: 'rpi40',
+        auxHeaders: JETSON_AUX_HEADERS,
         interfaces: ['GPIO', 'I2C', 'SPI', 'UART', 'PWM', 'CAN', 'USB'],
         usbPorts: [
           { id: 'USB_0', type: 'USB 3.2 Gen 2', connector: 'Type-A' },
@@ -653,6 +686,7 @@ export const BOARD_FAMILIES = [
         display: 'HDMI 2.1, DP 1.4',
         pinout: ORIN_40PIN_HEADER,
         pinLayout: 'rpi40',
+        auxHeaders: JETSON_AUX_HEADERS,
         interfaces: ['GPIO', 'I2C', 'SPI', 'UART', 'PWM', 'CAN', 'USB'],
         usbPorts: [
           { id: 'USB_0', type: 'USB 3.2 Gen 2', connector: 'Type-A' },
