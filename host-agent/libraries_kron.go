@@ -34,6 +34,98 @@ type libSource struct {
 	Repo string
 }
 
+// externalLibDep is a NON-Krontek repo that a Krontek library repo needs at
+// compile time. KronMotion's kron_axis.h does `#include "TrajectoryGenerator.h"`
+// from an outside core that its CMakeLists fetches — CMake is never run here
+// (this builder compiles the top-level .c files directly), so without this the
+// whole motion archive died on "TrajectoryGenerator.h: file not found" and the
+// only workaround was vendoring the file into KronMotion by hand.
+//
+// ⚠️ The dep's sources become archives of their OWN (libTrajectoryGenerator.a):
+// CollectStaticArchives links everything in resources/<triple>/lib, so a
+// separate archive is enough and keeps the one-archive-per-source rule.
+//
+// A var, not a const map, so tests can point it at a fixture.
+type externalLibDep struct {
+	URL    string
+	Subdir string   // directory inside the clone holding the .c/.h ("" = root)
+	Stems  []string // file stems to take; empty = every .c/.h in Subdir
+}
+
+var externalLibDeps = map[string]externalLibDep{
+	"kronmotion": {
+		URL:    "https://github.com/fehimkus/OnlineTrajectoryGenerator.git",
+		Subdir: "src",
+		// ⚠️ Stems, not "everything in src/": that repo also ships its own GUI
+		// demo (OnlineWindow.h/.cpp, online_main.cpp), and a stray header
+		// staged here gets INSTALLED into the shared krontek-include tree.
+		Stems: []string{"TrajectoryGenerator"},
+	},
+}
+
+// stageExternalDep clones repo's external dependency (if it has one) into
+// tempBase, stages its headers and returns its include dir plus its sources.
+// A dep that fails to clone is reported like any other failure; the compile
+// step then fails loudly rather than silently producing a motion archive that
+// cannot link.
+func (s *Server) stageExternalDep(repo, tempBase, stageInclude string) (incDir string, srcs []libSource, headers int, err error) {
+	dep, ok := externalLibDeps[strings.ToLower(repo)]
+	if !ok {
+		return "", nil, 0, nil
+	}
+	name := strings.TrimSuffix(filepath.Base(dep.URL), ".git")
+	dir := filepath.Join(tempBase, "_dep_"+name)
+	s.libLog("[%s] cloning dependency %s...", repo, name)
+	if err := gitClone(dep.URL, "", dir, 5*time.Minute); err != nil {
+		return "", nil, 0, fmt.Errorf("[%s] dependency %s clone failed: %w", repo, name, err)
+	}
+	root := dir
+	if dep.Subdir != "" {
+		root = filepath.Join(dir, dep.Subdir)
+	}
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		return "", nil, 0, fmt.Errorf("[%s] dependency %s: read %s: %w", repo, name, dep.Subdir, err)
+	}
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		if len(dep.Stems) > 0 {
+			stem := strings.TrimSuffix(e.Name(), filepath.Ext(e.Name()))
+			wanted := false
+			for _, w := range dep.Stems {
+				if w == stem {
+					wanted = true
+					break
+				}
+			}
+			if !wanted {
+				continue
+			}
+		}
+		p := filepath.Join(root, e.Name())
+		switch filepath.Ext(e.Name()) {
+		case ".h":
+			if err := copyFile(p, filepath.Join(stageInclude, e.Name())); err != nil {
+				return "", nil, 0, fmt.Errorf("[%s] stage dependency header %s: %w", repo, e.Name(), err)
+			}
+			headers++
+		case ".c":
+			if isSkippableSource(p) {
+				continue
+			}
+			srcs = append(srcs, libSource{
+				Name: strings.TrimSuffix(e.Name(), ".c"),
+				Path: p,
+				Repo: name,
+			})
+		}
+	}
+	s.libLog("[%s] dependency %s: %d header(s), %d source(s)", repo, name, headers, len(srcs))
+	return root, srcs, headers, nil
+}
+
 func (s *Server) runUpdateLibraries(repos []string) error {
 	targets := libraryTargets()
 
@@ -136,6 +228,16 @@ func (s *Server) runUpdateLibraries(repos []string) error {
 			})
 			found++
 		}
+		// ⚠️ External (non-Krontek) dependency, if this repo has one.
+		if depInc, depSrcs, depHdrs, err := s.stageExternalDep(repo, tempBase, stageInclude); err != nil {
+			s.libLog("  ✗ %v", err)
+			failures = append(failures, err.Error())
+		} else if depInc != "" {
+			cloneDirs = append(cloneDirs, depInc)
+			sources = append(sources, depSrcs...)
+			headerCount += depHdrs
+		}
+
 		s.libLog("[%s] %d header(s), %d source(s)%s", repo, len(headers), found,
 			map[bool]string{true: " → include/HAL/", false: ""}[isHAL])
 		if found == 0 && !isHAL {
