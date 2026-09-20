@@ -336,6 +336,42 @@ func (m *IPCManager) ReadAllVariables() (map[string]any, error) {
 	return result, nil
 }
 
+// ReadVariablesFiltered is ReadAllVariables restricted to the names `match`
+// accepts. The editor stream uses it to send only what is on screen (the open
+// POUs, the watch table, the HMI bindings) instead of every variable in the
+// project on every 50 ms tick.
+//
+// ⚠️ Matching happens per tick against the CURRENT table, not against a subset
+// resolved when the connection opened: a redeploy replaces m.vars underneath a
+// live stream, and a cached subset would then decode names that no longer
+// exist at the offsets they used to have.
+func (m *IPCManager) ReadVariablesFiltered(match func(string) bool) (map[string]any, error) {
+	if match == nil {
+		return m.ReadAllVariables()
+	}
+	m.mu.RLock()
+	vars := m.vars
+	mem := m.mem
+	m.mu.RUnlock()
+
+	if mem == nil {
+		return nil, fmt.Errorf("shared memory is closed")
+	}
+
+	result := make(map[string]any, len(vars))
+	for name, v := range vars {
+		if !match(name) {
+			continue
+		}
+		val, err := decodeValue(v.Type, mem[v.Offset:v.Offset+v.Size])
+		if err != nil {
+			continue
+		}
+		result[name] = val
+	}
+	return result, nil
+}
+
 // decodeValue converts raw bytes to the requested type.
 // All multi-byte values are interpreted as Little Endian (natural order on ARM/x86).
 func decodeValue(t VarType, b []byte) (any, error) {

@@ -64,7 +64,13 @@ func (s *SimState) Stop() bool {
 		return false
 	}
 	if cmd.Process != nil {
-		_ = cmd.Process.Kill()
+		// ⚠️ A privileged runtime is a root child of an unprivileged agent, so
+		// Kill comes back EPERM. Unlike the hot-swap host this binary has no
+		// file-based stop trigger (its main loop is generated code), so the
+		// privileged kill is the only way — it prompts for a password again.
+		if err := cmd.Process.Kill(); err != nil {
+			_ = privilegedKill(cmd.Process.Pid)
+		}
 	}
 	if done != nil {
 		select {
@@ -128,9 +134,18 @@ func (s *Server) handleRunSimulation(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusConflict, "Simulation is already running")
 		return
 	}
-	cmd := exec.Command(binPath)
+	// Same policy as the hot-swap host: the runtime always runs privileged
+	// (runtimeLaunchCmd), so the legacy plain sim gets the raw socket and the
+	// real-time scheduling its generated task threads ask for.
+	// ⚠️ This sim has NO file-based stop trigger of its own (that lives in
+	// hotswaphost/host.c), so a privileged plain sim can only be stopped
+	// through privilegedKill — see handleStopSimulation.
+	cmd, launchNote := runtimeLaunchCmd(binPath, nil)
 	cmd.Stdout = nil
 	cmd.Stderr = nil
+	if launchNote != "" {
+		s.events.Emit("runtime-log", map[string]any{"level": "info", "line": launchNote})
+	}
 	if err := cmd.Start(); err != nil {
 		s.sim.mu.Unlock()
 		writeError(w, http.StatusInternalServerError, "spawn: "+err.Error())
@@ -351,22 +366,37 @@ func broadcastPlcVars(vars map[string]interface{}) {
 // ── simulation poller ────────────────────────────────────────────────────────
 
 func (s *Server) simulationPoller(pid int, specs []VarSpec, stop <-chan struct{}) {
-	plan, bufSize := make([]pollSpec, 0, len(specs)), 0
-	for _, sp := range specs {
-		if ps, ok := newPollSpec(sp.Key, sp.VType, sp.Address); ok {
-			plan = append(plan, ps)
-			if ps.size > bufSize {
-				bufSize = ps.size
+	// Rebuilt on every editor subscription change, exactly as in
+	// hotswapPoller — an empty filter still means "everything".
+	var (
+		plan    []pollSpec
+		buf     []byte
+		planGen uint64
+		built   bool
+	)
+	rebuild := func() {
+		gen, match := s.live.Snapshot()
+		bufSize := 0
+		plan = plan[:0]
+		for _, sp := range specs {
+			if !match(sp.Key) {
+				continue
+			}
+			if ps, ok := newPollSpec(sp.Key, sp.VType, sp.Address); ok {
+				plan = append(plan, ps)
+				if ps.size > bufSize {
+					bufSize = ps.size
+				}
 			}
 		}
+		// One scratch buffer for the whole plan: decodeValue never retains buf
+		// (each branch copies scalars out or builds a fresh map), so allocating
+		// one per variable per tick was pure garbage.
+		if bufSize > len(buf) {
+			buf = make([]byte, bufSize)
+		}
+		planGen, built = gen, true
 	}
-	if len(plan) == 0 {
-		return // nothing readable — don't wake up 5 times a second to say so
-	}
-	// One scratch buffer for the whole run: decodeValue never retains buf (each
-	// branch copies scalars out or builds a fresh map), so allocating one per
-	// variable per tick was pure garbage.
-	buf := make([]byte, bufSize)
 
 	memPath := fmt.Sprintf("/proc/%d/mem", pid)
 	time.Sleep(100 * time.Millisecond)
@@ -387,6 +417,12 @@ func (s *Server) simulationPoller(pid int, specs []VarSpec, stop <-chan struct{}
 		case <-stop:
 			return
 		case <-ticker.C:
+		}
+		if !built || planGen != s.live.Gen() {
+			rebuild()
+		}
+		if len(plan) == 0 {
+			continue // nothing subscribed — the next tick re-checks
 		}
 		vars := make(map[string]interface{}, len(plan))
 		anyOK := false

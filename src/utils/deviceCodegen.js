@@ -138,6 +138,9 @@ const getBoardFamilyDefine = (boardId) => {
   if (boardId.startsWith('bpi_')) return 'HAL_BOARD_FAMILY_RPI';
   if (boardId.startsWith('libre_')) return 'HAL_BOARD_FAMILY_RPI';
   if (boardId.startsWith('pine_')) return 'HAL_BOARD_FAMILY_RPI';
+  // Generic Linux targets (industrial PC, VM, unlisted SBC): device-node
+  // peripherals only, same userspace HAL as the RPi.
+  if (boardId.startsWith('generic_linux')) return 'HAL_BOARD_FAMILY_RPI';
   return null;
 };
 

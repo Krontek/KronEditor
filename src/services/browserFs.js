@@ -74,8 +74,14 @@ async function verifyPermission(handle, writable) {
  * also yields a real path, so Save still works in-place afterwards. Falls
  * back further to <input type=file> only if no picker is registered (no
  * handle, no path → Save acts as Save As via a download).
+ *
+ * ⚠️ `adopt` (default false) is what makes the opened file the in-place Save
+ * target. ONLY the project-open path may pass true: loading any other .xml
+ * (e.g. an ESI device description) used to adopt it unconditionally, so the
+ * next Save silently overwrote that file with the project — it is gone, with
+ * no picker and no warning.
  */
-export async function openFile({ accept = '.xml' } = {}) {
+export async function openFile({ accept = '.xml', adopt = false } = {}) {
   if (typeof window.showOpenFilePicker === 'function') {
     try {
       const [handle] = await window.showOpenFilePicker({
@@ -84,8 +90,10 @@ export async function openFile({ accept = '.xml' } = {}) {
       });
       const file = await handle.getFile();
       const content = await file.text();
-      activeHandle = handle; // reuse for subsequent in-place Save
-      activeAgentPath = null;
+      if (adopt) {
+        activeHandle = handle; // reuse for subsequent in-place Save
+        activeAgentPath = null;
+      }
       return { name: handle.name, path: handle.name, content };
     } catch (err) {
       if (err && (err.name === 'AbortError' || err.code === 20)) return null;
@@ -97,8 +105,10 @@ export async function openFile({ accept = '.xml' } = {}) {
     const path = await promptForPath({ mode: 'open' });
     if (!path) return null;
     const content = await host.readFile(path);
-    activeHandle = null;
-    activeAgentPath = path;
+    if (adopt) {
+      activeHandle = null;
+      activeAgentPath = path;
+    }
     return { name: path.split(/[/\\]/).pop(), path, content };
   }
 
@@ -114,8 +124,10 @@ export async function openFile({ accept = '.xml' } = {}) {
       }
       const reader = new FileReader();
       reader.onload = (e) => {
-        activeHandle = null; // no writable handle from <input> → Save = Save As
-        activeAgentPath = null;
+        if (adopt) {
+          activeHandle = null; // no writable handle from <input> → Save = Save As
+          activeAgentPath = null;
+        }
         resolve({ name: file.name, path: file.name, content: String(e.target.result) });
       };
       reader.onerror = () => reject(reader.error || new Error('FileReader error'));

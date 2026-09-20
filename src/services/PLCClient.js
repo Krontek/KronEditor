@@ -64,20 +64,31 @@ export class PLCClient {
   // ---------------------------------------------------------------------------
 
   /**
-   * Stream live variable values. Server pushes a full snapshot every 50 ms.
+   * Stream live variable values. The server pushes a snapshot every 50 ms.
    *
    * @param {function(vars: Object): void} onUpdate — called on each snapshot
    * @param {function(err: Error): void}   onError  — called on fatal connection error
+   * @param {{prefixes?: string[], names?: string[]}} [sub] — what to stream.
+   *   `prefixes` are key prefixes (a POU's keys share `prog_<Name>_`, every
+   *   global shares `prog__`), `names` explicit keys. Omitted or empty = every
+   *   variable, which is also what a KronServer older than this filter does
+   *   with the query — so an un-upgraded target keeps working, just unfiltered.
+   *   The subscription is fixed for the life of the connection: to change it,
+   *   stop the stream and start a new one.
    * @returns {function} stop — call to cancel the stream
    */
-  streamVars(onUpdate, onError) {
+  streamVars(onUpdate, onError, sub = null) {
     // Close any previously active stream.
     if (this._es) {
       this._es.close();
       this._es = null;
     }
 
-    const es = new EventSource(`${this._base}/stream/vars`);
+    const q = new URLSearchParams();
+    if (sub?.prefixes?.length) q.set('p', sub.prefixes.join(','));
+    if (sub?.names?.length) q.set('v', sub.names.join(','));
+    const query = q.toString();
+    const es = new EventSource(`${this._base}/stream/vars${query ? `?${query}` : ''}`);
     this._es = es;
     this._lastEventAt = Date.now();
 

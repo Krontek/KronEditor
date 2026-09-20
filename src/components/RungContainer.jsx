@@ -320,14 +320,21 @@ export const blockConfig = {
   Contact: { label: 'Contact', inputs: [], outputs: [] },
   Coil: { label: 'Coil', inputs: [], outputs: [] },
   // --- ETHERCAT MASTER ---
-  EC_Init:        { label: 'EC_Init',        inputs: [{ name: 'EN', type: 'BOOL' }, { name: 'Interface', type: 'STRING' }], outputs: [{ name: 'ENO', type: 'BOOL' }, { name: 'Done', type: 'BOOL' }, { name: 'Error', type: 'BOOL' }, { name: 'ErrorID', type: 'INT' }] },
-  EC_Close:       { label: 'EC_Close',       inputs: [{ name: 'EN', type: 'BOOL' }],                                                                                                                                                                        outputs: [{ name: 'ENO', type: 'BOOL' }, { name: 'Done', type: 'BOOL' }] },
-  EC_ReadPDO:     { label: 'EC_ReadPDO',     inputs: [{ name: 'EN', type: 'BOOL' }, { name: 'Slave', type: 'INT' }, { name: 'Index', type: 'INT' }],                                                                                                        outputs: [{ name: 'ENO', type: 'BOOL' }, { name: 'Value', type: 'DWORD' }] },
-  EC_WritePDO:    { label: 'EC_WritePDO',    inputs: [{ name: 'EN', type: 'BOOL' }, { name: 'Slave', type: 'INT' }, { name: 'Index', type: 'INT' }, { name: 'Value', type: 'DWORD' }],                                                                      outputs: [{ name: 'ENO', type: 'BOOL' }] },
-  EC_ReadSDO:     { label: 'EC_ReadSDO',     inputs: [{ name: 'Execute', type: 'BOOL' }, { name: 'Slave', type: 'INT' }, { name: 'Index', type: 'WORD' }, { name: 'SubIndex', type: 'BYTE' }],                                                              outputs: [{ name: 'Done', type: 'BOOL' }, { name: 'Busy', type: 'BOOL' }, { name: 'Error', type: 'BOOL' }, { name: 'Value', type: 'DWORD' }] },
-  EC_WriteSDO:    { label: 'EC_WriteSDO',    inputs: [{ name: 'Execute', type: 'BOOL' }, { name: 'Slave', type: 'INT' }, { name: 'Index', type: 'WORD' }, { name: 'SubIndex', type: 'BYTE' }, { name: 'Value', type: 'DWORD' }],                            outputs: [{ name: 'Done', type: 'BOOL' }, { name: 'Busy', type: 'BOOL' }, { name: 'Error', type: 'BOOL' }] },
-  EC_SlaveStatus: { label: 'EC_SlaveStatus', inputs: [{ name: 'EN', type: 'BOOL' }, { name: 'Slave', type: 'INT' }],                                                                                                                                        outputs: [{ name: 'ENO', type: 'BOOL' }, { name: 'State', type: 'INT' }, { name: 'Online', type: 'BOOL' }] },
-  EC_MasterStatus:{ label: 'EC_MasterStatus',inputs: [{ name: 'EN', type: 'BOOL' }],                                                                                                                                                                        outputs: [{ name: 'ENO', type: 'BOOL' }, { name: 'State', type: 'INT' }, { name: 'SlaveCount', type: 'INT' }] },
+  // ⚠️ These MUST match public/libraries/ethercat.xml and the structs in
+  // resources/krontek-include/kronethercatmaster.h. This block used to list
+  // EC_Init / EC_Close / EC_ReadPDO / EC_WritePDO / EC_SlaveStatus /
+  // EC_MasterStatus — six names with no XML entry, no C struct and no entry in
+  // any transpiler table. RungEditorNew treats every key here as a valid block
+  // type, so they were declarable and died at COMPILE time with
+  // `unknown type name`; meanwhile the real blocks were missing and
+  // EC_ReadSDO/EC_WriteSDO disagreed with the XML (`Slave` for `SlaveAddress`,
+  // no `ByteSize` input, no `ErrorID` output), which is what VariableManager
+  // uses to type an instance's live output pins.
+  EC_GetMasterState: { label: 'EC_GetMasterState', inputs: [{ name: 'Enable', type: 'BOOL' }],                                                                                                                                                                                                                                  outputs: [{ name: 'Valid', type: 'BOOL' }, { name: 'Error', type: 'BOOL' }, { name: 'ErrorID', type: 'WORD' }, { name: 'State', type: 'BYTE' }, { name: 'Operational', type: 'BOOL' }, { name: 'SlaveCount', type: 'UINT' }] },
+  EC_GetSlaveState:  { label: 'EC_GetSlaveState',  inputs: [{ name: 'Enable', type: 'BOOL' }, { name: 'SlaveAddress', type: 'UINT' }],                                                                                                                                                                                          outputs: [{ name: 'Valid', type: 'BOOL' }, { name: 'Error', type: 'BOOL' }, { name: 'ErrorID', type: 'WORD' }, { name: 'State', type: 'BYTE' }, { name: 'LinkUp', type: 'BOOL' }] },
+  EC_ResetBus:       { label: 'EC_ResetBus',       inputs: [{ name: 'Execute', type: 'BOOL' }],                                                                                                                                                                                                                                 outputs: [{ name: 'Done', type: 'BOOL' }, { name: 'Busy', type: 'BOOL' }, { name: 'Error', type: 'BOOL' }, { name: 'ErrorID', type: 'WORD' }] },
+  EC_ReadSDO:        { label: 'EC_ReadSDO',        inputs: [{ name: 'Execute', type: 'BOOL' }, { name: 'SlaveAddress', type: 'UINT' }, { name: 'Index', type: 'WORD' }, { name: 'SubIndex', type: 'BYTE' }, { name: 'ByteSize', type: 'BYTE' }],                                                                                 outputs: [{ name: 'Done', type: 'BOOL' }, { name: 'Busy', type: 'BOOL' }, { name: 'Error', type: 'BOOL' }, { name: 'ErrorID', type: 'WORD' }, { name: 'Value', type: 'DWORD' }] },
+  EC_WriteSDO:       { label: 'EC_WriteSDO',       inputs: [{ name: 'Execute', type: 'BOOL' }, { name: 'SlaveAddress', type: 'UINT' }, { name: 'Index', type: 'WORD' }, { name: 'SubIndex', type: 'BYTE' }, { name: 'ByteSize', type: 'BYTE' }, { name: 'Value', type: 'DWORD' }],                                               outputs: [{ name: 'Done', type: 'BOOL' }, { name: 'Busy', type: 'BOOL' }, { name: 'Error', type: 'BOOL' }, { name: 'ErrorID', type: 'WORD' }] },
 };
 
 // SVG Path Helper
@@ -970,6 +977,23 @@ const BlockNode = ({ id, data, selected }) => {
             // Literal value: starts with digit, sign, T#, 0x/0b/0o, or true/false — not a variable ref
             const isLiteralVal = cleanVal && !/^[A-Za-z_]/.test(cleanVal);
 
+            // Live value for this pin: the assigned variable, else the pin's own
+            // shadow field. Resolved OUT HERE because whether a badge is drawn at
+            // all now depends on whether a value EXISTS.
+            let pinLiveVal = liveVariables ? liveGet(liveVariables, `prog_${safeProgName}_${baseValName}`) : undefined;
+            if (liveVariables && pinLiveVal === undefined) pinLiveVal = liveGet(liveVariables, `prog__${baseValName}`);
+            if (liveVariables && pinLiveVal === undefined) pinLiveVal = liveVariables[shadowKey];
+            const pinHasLive = pinLiveVal !== undefined;
+            // ⚠️ A pin with no variable on it still HAS a value (its shadow field),
+            // and hiding the badge until something is assigned is what made block
+            // I/O invisible in a running simulation. In an EDITABLE live view
+            // (hot-swap online change) the badge sits ABOVE the input instead of
+            // replacing it — covering the field would swallow clicks and make a
+            // freshly dropped block impossible to wire while the sim runs.
+            const showInBadge = !!liveVariables
+              && (pinHasLive || (data.readOnly ? (!val || valVarDef || hasShadow) : !!(val && (valVarDef || hasShadow))));
+            const inBadgeAbove = !!val || !data.readOnly;
+
             return (
               <div key={handleId} style={{ position: 'relative', display: 'flex', alignItems: 'center', height: 20 }}>
                 {/* External Input Field (outside block, on left) */}
@@ -982,45 +1006,64 @@ const BlockNode = ({ id, data, selected }) => {
                     flexDirection: 'column',
                     alignItems: 'flex-end',
                     pointerEvents: 'auto',
-                    transform: (liveVariables && val && valVarDef) ? 'translateY(8px)' : 'none',
+                    transform: (showInBadge && inBadgeAbove) ? 'translateY(8px)' : 'none',
                     transition: 'transform 0.2s ease'
                   }}>
                     {/* Live value badge (simulation mode) - Positioned above the input if a variable is assigned, or in place of it if not.
                         In EDITABLE live mode (hot-swap online change) the badge never REPLACES an
                         empty pin's input — it would cover the field and swallow clicks, making a
                         freshly dropped block impossible to wire while the sim runs. */}
-                    {(liveVariables && (data.readOnly ? (!val || valVarDef || hasShadow) : !!(val && (valVarDef || hasShadow)))) && (() => {
-                      let varLiveVal = liveGet(liveVariables, `prog_${safeProgName}_${baseValName}`);
-                      if (varLiveVal === undefined) varLiveVal = liveGet(liveVariables, `prog__${baseValName}`);
-                      if (varLiveVal === undefined) varLiveVal = liveVariables[shadowKey];
-                      const hasLive = varLiveVal !== undefined;
+                    {showInBadge && (() => {
+                      const varLiveVal = pinLiveVal;
+                      const hasLive = pinHasLive;
                       const liveStr = hasLive
                         ? (typeof varLiveVal === 'boolean' ? (varLiveVal ? '1' : '0') : (pin.type === 'TIME' ? formatTimeUs(varLiveVal) : String(varLiveVal)))
                         : '---';
+                      // Open the force/pulse dialog for whatever this badge is showing:
+                      // the variable assigned to the pin, else the pin's own shadow field.
+                      const openForceModal = () => {
+                        const cleanedVal = (val || '').replace(/[🌍🏠⊞⊡⊟]/g, '').trim();
+                        const isVarRefBadge = cleanedVal && /^[A-Za-z_]/.test(cleanedVal);
+                        let forceKey = shadowKey;
+                        let forceCurrent = liveVariables?.[shadowKey];
+                        let forceName = `${data.instanceName || data.type}.${pin.name}`;
+                        if (isVarRefBadge) {
+                          const safeVar = cleanedVal.replace(/\s+/g, '_');
+                          const pk = `prog_${safeProgName}_${safeVar}`;
+                          forceKey = liveResolveKey(liveVariables, pk)
+                            || liveResolveKey(liveVariables, `prog__${safeVar}`) || pk;
+                          forceCurrent = liveVariables?.[forceKey];
+                          forceName = cleanedVal;
+                        }
+                        const modalVarType = normalizedPinType === 'TIME' ? 'INT' : (normalizedPinType === 'ANY' ? 'INT' : normalizedPinType);
+                        setForceModal({ liveKey: forceKey, varName: forceName, varType: modalVarType, currentValue: forceCurrent });
+                      };
                       return (
                         <span
+                          title={hasLive && data.onForceWrite ? 'Double-click to write this value online (force / pulse)' : undefined}
+                          // ⚠️ A green badge IS the live value, so double-clicking it writes that
+                          // value online. Gated on onForceWrite (non-null only while something
+                          // is RUNNING) and on a value actually existing — deliberately NOT on
+                          // data.readOnly, which is FALSE during a hot-swap sim and so made the
+                          // force path unreachable exactly where online editing is the point.
+                          // ⚠️ Without stopPropagation the dblclick reaches the canvas's
+                          // onNodeDoubleClick and opens Block Settings instead — the pin input
+                          // below stops it for the same reason.
+                          onDoubleClick={(e) => {
+                            e.stopPropagation();
+                            if (hasLive && data.onForceWrite) { openForceModal(); return; }
+                            // Nothing to force: aim the gesture at the field this badge covers.
+                            const inp = e.currentTarget.parentElement?.querySelector('input');
+                            if (inp && !inp.readOnly) { inp.focus(); inp.select(); }
+                          }}
                           onClick={(e) => {
                             e.stopPropagation();
                             if (!data.readOnly || !data.onForceWrite) return;
-                            const cleanedVal = (val || '').replace(/[🌍🏠⊞⊡⊟]/g, '').trim();
-                            const isVarRefBadge = cleanedVal && /^[A-Za-z_]/.test(cleanedVal);
-                            let forceKey = shadowKey;
-                            let forceCurrent = liveVariables?.[shadowKey];
-                            let forceName = `${data.instanceName || data.type}.${pin.name}`;
-                            if (isVarRefBadge) {
-                              const safeVar = cleanedVal.replace(/\s+/g, '_');
-                              const pk = `prog_${safeProgName}_${safeVar}`;
-                              forceKey = liveResolveKey(liveVariables, pk)
-                                || liveResolveKey(liveVariables, `prog__${safeVar}`) || pk;
-                              forceCurrent = liveVariables?.[forceKey];
-                              forceName = cleanedVal;
-                            }
-                            const modalVarType = normalizedPinType === 'TIME' ? 'INT' : (normalizedPinType === 'ANY' ? 'INT' : normalizedPinType);
-                            setForceModal({ liveKey: forceKey, varName: forceName, varType: modalVarType, currentValue: forceCurrent });
+                            openForceModal();
                           }}
                           style={{
                           position: 'absolute',
-                          top: val ? -15 : 0,
+                          top: inBadgeAbove ? -15 : 0,
                           right: 0,
                           minWidth: 36,
                           fontSize: 9,
@@ -1031,7 +1074,7 @@ const BlockNode = ({ id, data, selected }) => {
                           borderRadius: 2,
                           fontFamily: 'Consolas, monospace',
                           textAlign: 'center',
-                          cursor: data.readOnly && data.onForceWrite ? 'pointer' : 'default',
+                          cursor: hasLive && data.onForceWrite ? 'pointer' : 'default',
                           zIndex: 10,
                           whiteSpace: 'nowrap'
                         }}>
@@ -1158,20 +1201,33 @@ const BlockNode = ({ id, data, selected }) => {
             // Live value lookup for this output pin
             const lv = liveVariables;
             let outLiveVal;
+            // ⚠️ The KEY the value came from, kept so a force-write addresses the same
+            // slot the badge is displaying (§7: a force addresses its slot BY KEY, and
+            // IEC names are case-insensitive — hence liveResolveKey, never the raw name).
+            let outLiveKey = null;
+            let outForceName = `${data.instanceName || data.type}.${pin.name}`;
             if (lv) {
               const safeProgName = (data.parentName || '').trim().replace(/\s+/g, '_');
               const safeInstName = (data.instanceName || '').trim().replace(/\s+/g, '_');
               const assignedVar = val.replace(/[🌍🏠⊞⊡⊟]/g, '').trim();
               if (assignedVar && /^[A-Za-z_]/.test(assignedVar)) {
                 const safeVar = assignedVar.replace(/\s+/g, '_');
-                outLiveVal = liveGet(lv, `prog_${safeProgName}_${safeVar}`);
-                if (outLiveVal === undefined) outLiveVal = liveGet(lv, `prog__${safeVar}`);
+                const k = liveResolveKey(lv, `prog_${safeProgName}_${safeVar}`)
+                  || liveResolveKey(lv, `prog__${safeVar}`);
+                if (k) { outLiveKey = k; outLiveVal = lv[k]; outForceName = assignedVar; }
               }
               if (outLiveVal === undefined && safeInstName) {
-                outLiveVal = lv[`prog_${safeProgName}_out_${safeInstName}_${pin.name}`];
+                const shadow = `prog_${safeProgName}_out_${safeInstName}_${pin.name}`;
+                if (lv[shadow] !== undefined) { outLiveKey = shadow; outLiveVal = lv[shadow]; }
               }
             }
             const hasLive = outLiveVal !== undefined;
+            // Same policy as the input pins: a value that EXISTS is shown, whether
+            // or not a variable was assigned to the pin — an unassigned OUT/Q still
+            // produces one, which is exactly what its shadow field holds.
+            const showOutBadge = !!lv
+              && (hasLive || (data.readOnly ? (!val || outVarDef) : !!(val && outVarDef)));
+            const outBadgeAbove = !!val || !data.readOnly;
             const liveDisplay = hasLive
               ? (typeof outLiveVal === 'boolean'
                 ? (outLiveVal ? '1' : '0')
@@ -1212,13 +1268,13 @@ const BlockNode = ({ id, data, selected }) => {
                     flexDirection: 'column',
                     alignItems: 'flex-start',
                     pointerEvents: 'auto',
-                    transform: (lv && val && outVarDef) ? 'translateY(8px)' : 'none',
+                    transform: (showOutBadge && outBadgeAbove) ? 'translateY(8px)' : 'none',
                     transition: 'transform 0.2s ease'
                   }}>
                     {/* Live value badge (simulation mode) - Positioned above the input if a variable is assigned, or in place of it if not.
                         Same editable-live rule as the input pins: never replace an empty
                         field's input while the canvas is editable (hot-swap online change). */}
-                    {(lv && (data.readOnly ? (!val || outVarDef) : !!(val && outVarDef))) && (() => {
+                    {showOutBadge && (() => {
                       const isErrorPin = ErrorCodeService.getErrorFieldName(pin.name) !== null;
                       const numericVal = hasLive ? Number(outLiveVal) : 0;
                       const errInfo = (isErrorPin && errorCodeService && numericVal !== 0)
@@ -1227,10 +1283,30 @@ const BlockNode = ({ id, data, selected }) => {
                       const isError = isErrorPin && numericVal !== 0;
                       return (
                         <span
-                          title={errInfo ? `[${errInfo.name}] ${errInfo.text}` : undefined}
+                          // Same contract as the input badge: a live value is force-writable
+                          // by double-click whenever something is running, and the dblclick
+                          // must never reach onNodeDoubleClick (Block Settings).
+                          onDoubleClick={(e) => {
+                            e.stopPropagation();
+                            if (hasLive && outLiveKey && data.onForceWrite) {
+                              const t = normalizeEditorPinType(pin.type);
+                              setForceModal({
+                                liveKey: outLiveKey,
+                                varName: outForceName,
+                                varType: (t === 'TIME' || t === 'ANY') ? 'INT' : t,
+                                currentValue: outLiveVal,
+                              });
+                              return;
+                            }
+                            const inp = e.currentTarget.parentElement?.querySelector('input');
+                            if (inp && !inp.readOnly) { inp.focus(); inp.select(); }
+                          }}
+                          title={errInfo ? `[${errInfo.name}] ${errInfo.text}`
+                            : (hasLive && outLiveKey && data.onForceWrite
+                              ? 'Double-click to write this value online (force / pulse)' : undefined)}
                           style={{
                             position: 'absolute',
-                            top: val ? -15 : 0,
+                            top: outBadgeAbove ? -15 : 0,
                             left: 0,
                             minWidth: 36,
                             fontSize: 9,
@@ -1241,7 +1317,13 @@ const BlockNode = ({ id, data, selected }) => {
                             borderRadius: 2,
                             fontFamily: 'Consolas, monospace',
                             textAlign: 'center',
-                            pointerEvents: errInfo ? 'auto' : 'none',
+                            // ⚠️ Click-through by default so the badge never blocks the pin
+                            // field underneath, but it MUST take events when it is actionable
+                            // — an error tooltip, or a live value that can be forced. While
+                            // this was unconditionally 'none' the double-click fell straight
+                            // through to the canvas and opened Block Settings.
+                            pointerEvents: (errInfo || (hasLive && outLiveKey && data.onForceWrite)) ? 'auto' : 'none',
+                            cursor: hasLive && outLiveKey && data.onForceWrite ? 'pointer' : 'default',
                             zIndex: 10,
                             whiteSpace: 'nowrap',
                             cursor: errInfo ? 'help' : 'default'
@@ -1461,7 +1543,25 @@ const RungContainer = ({
     }
   }, [scaleFactor]);
 
-  const createTerminalNodes = useCallback(() => {
+  // ⚠️ ReactFlow hides a node it considers UNMEASURED (`visibility: hidden`
+  // whenever `!node.width || !node.height`), and its `createNodeInternals`
+  // carries `handleBounds` over from the previous internals but NOT the
+  // dimensions. Every node object we build here is brand new, so a rebuild
+  // drops the measured size and the node only comes back if a ResizeObserver
+  // notification arrives for an element whose size did not actually change —
+  // which is exactly the notification a browser is free to skip. That left FB
+  // blocks (and the power terminals) permanently invisible while still present
+  // in `rung.blocks`; a contact survived only because selecting it thickens its
+  // border (29→31 px), and that size change re-triggers a measurement.
+  // So: carry the measured dimensions across every rebuild. A block whose real
+  // size changes is still re-measured by the observer, so this cannot go stale.
+  const carryDimensions = useCallback((node, prevNodes) => {
+    const prev = prevNodes?.find(n => n.id === node.id);
+    if (!prev?.width || !prev?.height) return node;
+    return { ...node, width: prev.width, height: prev.height };
+  }, []);
+
+  const createTerminalNodes = useCallback((prevNodes = []) => {
     // Terminal positions in virtual coordinate system (REFERENCE_WIDTH)
     const rightLineX = REFERENCE_WIDTH - 12;
 
@@ -1484,8 +1584,8 @@ const RungContainer = ({
         selectable: false,
         zIndex: 100
       }
-    ];
-  }, [LEFT_LINE_X, MIDDLE_Y]);
+    ].map(n => carryDimensions(n, prevNodes));
+  }, [LEFT_LINE_X, MIDDLE_Y, carryDimensions]);
 
   const mapBlocksToNodes = useCallback((blocks, selectedMap = {}, draggingMap = {}, prevNodes = []) => {
     // Legacy normalization: if any block exceeds REFERENCE_WIDTH bounds,
@@ -1511,7 +1611,7 @@ const RungContainer = ({
           }
         : (block.position || { x: 30, y: 0 });
 
-      return {
+      return carryDimensions({
         id: block.id,
         type: 'blockNode',
         position,
@@ -1520,7 +1620,10 @@ const RungContainer = ({
           type: block.data.label || block.type,
           values: block.data.values || {},
           onUpdate: (id, val) => onUpdateBlockRef.current(id, val),
-          onForceWrite: (key, val) => onForceWriteRef.current?.(key, val),
+          // ⚠️ Pass `mode` through: the force flag has THREE values (§6 — normal,
+          // FORCE, PULSE) and ForceWriteModal lets the user pick. Dropping the third
+          // argument here silently collapsed every Pulse into a pinned Force.
+          onForceWrite: (key, val, mode) => onForceWriteRef.current?.(key, val, mode),
           variables: variables,
           globalVars: globalVars,
           dataTypes: dataTypes,
@@ -1532,9 +1635,9 @@ const RungContainer = ({
         },
         draggable: !readOnly,
         selected: !!selectedMap[block.id],
-      };
+      }, prevNodes);
     });
-  }, [getBlockHeight, variables, globalVars, dataTypes, parentName, readOnly, hwPortVars, errorCodeService, RUNG_BOUNDS]);
+  }, [getBlockHeight, variables, globalVars, dataTypes, parentName, readOnly, hwPortVars, errorCodeService, RUNG_BOUNDS, carryDimensions]);
 
   const [nodes, setNodes, onNodesChange] = useNodesState([
     ...createTerminalNodes(),
@@ -1707,7 +1810,7 @@ const RungContainer = ({
       }
 
       return [
-        ...createTerminalNodes(),
+        ...createTerminalNodes(prevNodes),
         ...mapBlocksToNodes(rung.blocks, selectedMap, draggingMap, prevNodes)
       ];
     });

@@ -2,6 +2,7 @@ import { getBoardBlockMeta } from '../utils/halBlockMeta';
 import { buildGeneratedDeviceArtifacts } from '../utils/deviceCodegen';
 import { getPortOptions } from '../utils/devicePortMapping';
 import { validateIECAddress } from '../utils/iecAddress';
+import { buildEcVarNames, findEcIssues } from '../utils/ecNaming';
 
 const getBoardFamilyDefine = (boardId) => {
     if (!boardId) return null;
@@ -18,6 +19,9 @@ const getBoardFamilyDefine = (boardId) => {
     if (boardId.startsWith('bpi_')) return 'HAL_BOARD_FAMILY_RPI';
     if (boardId.startsWith('libre_')) return 'HAL_BOARD_FAMILY_RPI';
     if (boardId.startsWith('pine_')) return 'HAL_BOARD_FAMILY_RPI';
+    // Generic Linux targets (industrial PC, VM, unlisted SBC): device-node
+    // peripherals only, same userspace HAL as the RPi.
+    if (boardId.startsWith('generic_linux')) return 'HAL_BOARD_FAMILY_RPI';
     return null;
 };
 
@@ -721,6 +725,55 @@ export const transpileToC = (projectStructure, standardHeaders = [], boardId = n
     EC_PDO_VAR_NAMES.clear();
     (ecCfgEarly.gpiVarNames || []).forEach(n => EC_PDO_VAR_NAMES.add(n));
 
+    // --- ETHERCAT DIAGNOSTIC-FB GATE ---
+    // ⚠️ Every EC_* block is emitted as `EC_x_Call(&inst, &__ec_cfg)`, but
+    // __ec_cfg only exists when the project HAS an EtherCAT bus (it is part of
+    // generateEtherCATConfig's output). A project that used one and then
+    // dropped the bus — or a rung pasted in from another project — produced
+    // `use of undeclared identifier '__ec_cfg'` from clang, pointing at
+    // generated C the user never wrote. Caught here with the real cause.
+    if (!ecCfgEarly.headerExtern) {
+        const ecBlockUsers = [];
+        const scanForEcFbs = (vars, scope) => (vars || []).forEach(v => {
+            if (EC_FB_CFG_PARAM.has((v.type || '').trim())) ecBlockUsers.push(`  • ${scope}.${v.name || '(unnamed)'} : ${v.type}`);
+        });
+        scanForEcFbs(config?.content?.globalVars, 'GLOBAL');
+        (projectStructure.programs || []).forEach(p => scanForEcFbs(p.content?.variables, p.name || '(unnamed program)'));
+        (projectStructure.functionBlocks || []).forEach(fb => scanForEcFbs(fb.content?.variables, fb.name || '(unnamed FB)'));
+        if (ecBlockUsers.length > 0) {
+            throw new Error(
+                `EtherCAT diagnostic block${ecBlockUsers.length > 1 ? 's' : ''} used without an EtherCAT bus (${ecBlockUsers.length}):\n` +
+                `${ecBlockUsers.join('\n')}\n` +
+                `EC_* blocks read the master configuration, so the project needs an EtherCAT bus ` +
+                `(right-click the project tree → add bus), or remove these blocks.`
+            );
+        }
+    }
+
+    // --- AXIS_REF GATE ---
+    // ⚠️ Enabling "Axis" on a slave makes the transpiler emit
+    // `AXIS_REF_Init(&S->Axis1, …)`, but the AXIS_REF itself is a USER global
+    // (§13: the declaration comes from the variable table so programs can write
+    // Axis1.Set.Position). Forget the global and clang reports
+    // `no member named 'Axis1' in 'struct PlcState'` against generated code —
+    // a message that says nothing about the actual mistake.
+    const declaredAxisRefs = new Set(
+        (config?.content?.globalVars || [])
+            .filter(v => (v.type || '').trim().toUpperCase() === 'AXIS_REF')
+            .map(v => (v.name || '').trim().toLowerCase())
+    );
+    const missingAxisRefs = (ecCfgEarly.axisNames || [])
+        .filter(n => !declaredAxisRefs.has(n.toLowerCase()));
+    if (missingAxisRefs.length > 0) {
+        throw new Error(
+            `Axis enabled on ${missingAxisRefs.length} EtherCAT slave${missingAxisRefs.length > 1 ? 's' : ''} ` +
+            `without the matching AXIS_REF global variable:\n` +
+            missingAxisRefs.map(n => `  • ${n} : AXIS_REF`).join('\n') +
+            `\nAdd each one as a GLOBAL variable of type AXIS_REF (Resource editor), ` +
+            `or turn the Axis tab off on that slave.`
+        );
+    }
+
     // --- DIRECT-ADDRESS GATE (runs before any codegen) ---
     // ⚠️ An IEC address is a WIDTH claim (%MX bit / %MW word / %MD dword / …),
     // but nothing downstream re-derives it: the transpiler copies the string
@@ -767,7 +820,7 @@ export const transpileToC = (projectStructure, standardHeaders = [], boardId = n
 #define ABS(x) ((x) < 0 ? -(x) : (x))
 #endif
 
-${boardDefines}${runtimePortHelpers}${customIncludes}${ecCfgEarly.motionIncludes ? ecCfgEarly.motionIncludes + '\n' : ''}extern volatile uint64_t us_tick;
+${boardDefines}${runtimePortHelpers}${customIncludes}${ecCfgEarly.motionIncludes ? ecCfgEarly.motionIncludes + '\n' : ''}${ecCfgEarly.axisLockMacros || '#define KRON_AXIS_LOCK()   ((void)0)\n#define KRON_AXIS_UNLOCK() ((void)0)\n'}extern volatile uint64_t us_tick;
 
 `;
 
@@ -1228,18 +1281,22 @@ ${boardDefines}${runtimePortHelpers}${customIncludes}${ecCfgEarly.motionIncludes
                 : [];
             // Declare shadow tracking globals in header
             shadowVars.forEach(sv => {
-                stateFields.push(`${mapType(sv.type)} ${sv.symbol};`);
+                // An ALIASED shadow (x_TO_STRING) names a field that already
+                // exists — declaring it again would be a duplicate member.
+                const cSym = sv.aliasOf || sv.symbol;
+                if (!sv.aliasOf) stateFields.push(`${mapType(sv.type)} ${sv.symbol};`);
                 const shortKey = sv.symbol.replace(`prog_${progName}_`, '');
+                const svDefault = sv.type === 'STRING' ? '' : 0;
                 variableTable.programs[progName].variables[shortKey] = {
                     type: sv.type,
-                    c_symbol: sv.symbol,
-                    initialValue: 0
+                    c_symbol: cSym,
+                    initialValue: svDefault
                 };
-                const svShmSlot = tryAssignShm(sv.type, sv.symbol);
+                const svShmSlot = tryAssignShm(sv.type, cSym);
                 variableTable.debugDefaults[`prog_${progName}_${shortKey}`] = {
                     type: sv.type,
-                    c_symbol: sv.symbol,
-                    defaultValue: 0,
+                    c_symbol: cSym,
+                    defaultValue: svDefault,
                     ...svShmSlot
                 };
             });
@@ -1462,8 +1519,14 @@ ${boardDefines}${runtimePortHelpers}${customIncludes}${ecCfgEarly.motionIncludes
 
     const mainLoop = generateMainLoop(
         projectStructure, config, boardId, shmEntries.length > 0, execTimeVars,
-        deviceArtifacts.initCode + ecCfg.initCode,
-        ecCfg.cleanupCode + deviceArtifacts.cleanupCode,
+        deviceArtifacts.initCode
+            + (ecCfg.masterInitCode
+                ? `#ifndef PLC_HOTSWAP\n${ecCfg.masterInitCode}#endif /* !PLC_HOTSWAP — the loader-host calls __hs_ec_start() */\n`
+                : '')
+            + (ecCfg.axisInitCode || ''),
+        (ecCfg.cleanupCode
+            ? `#ifndef PLC_HOTSWAP\n${ecCfg.cleanupCode}#endif /* !PLC_HOTSWAP — __hs_ec_stop() closes the bus */\n`
+            : '') + deviceArtifacts.cleanupCode,
         ecCfg.pdoReadCode,
         ecCfg.pdoWriteCode,
         ecCfg.ecThreadCode      || '',
@@ -1511,20 +1574,24 @@ ${boardDefines}${runtimePortHelpers}${customIncludes}${ecCfgEarly.motionIncludes
     // logic .so calls `__hs_*` trampolines instead. We DON'T touch any call
     // site — a macro block in plc.h (after kronhal.h, before the bodies)
     // redirects HAL names to the trampolines; host_glue.c (which defines
-    // PLC_HOST_GLUE) keeps the real names to wrap them. EtherCAT/motion are NOT
-    // yet trampolined — a project using them can't hot-swap their IO (cold
-    // restart), but pure logic + HAL works.
+    // PLC_HOST_GLUE) keeps the real names to wrap them. The EtherCAT master is
+    // host-owned the same way (hostGlueEc); only the MOTION/axis side still
+    // needs a cold restart.
     const halVoidFns = ['KRON_UART_RuntimeInit', 'KRON_UART_RuntimeCleanup'];
     if (boardId) halVoidFns.push('HAL_Init', 'HAL_Cleanup');
     const halCallFns = [...usedHalBlocks].map(t => `${t}_Call`);
+    // The EtherCAT master is host-owned under hot-swap too (generateEtherCATConfig),
+    // so a board-less EtherCAT project still needs a host_glue.c.
+    const ecGlue = ecCfgEarly.hostGlueEc || '';
     let halDefines = '';
     let hostGlue = '';
-    if (halCallFns.length > 0 || boardId) {
+    if (halCallFns.length > 0 || boardId || ecGlue) {
         halDefines += `\n#if defined(PLC_HOTSWAP) && !defined(PLC_HOST_GLUE)\n`;
         halDefines += `/* hot-swap: HAL runs in the loader-host; the logic.so calls these trampolines so device fds survive a swap */\n`;
         halVoidFns.forEach(f => { halDefines += `extern void __hs_${f}(void);\n#define ${f} __hs_${f}\n`; });
         halCallFns.forEach(f => { halDefines += `extern void __hs_${f}(void*);\n#define ${f} __hs_${f}\n`; });
         halDefines += `#endif\n`;
+        if (halCallFns.length === 0 && !boardId) halDefines = '';   // EC-only project: nothing to redirect
 
         const tramp = [
             ...halVoidFns.map(f => `void __hs_${f}(void) { ${f}(); }`),
@@ -1535,7 +1602,8 @@ ${boardDefines}${runtimePortHelpers}${customIncludes}${ecCfgEarly.motionIncludes
             `#include <stdint.h>\n#include <stdbool.h>\n#include <string.h>\n#include <stdlib.h>\n#include <math.h>\n` +
             `${boardDefines}${runtimePortHelpers}${customIncludes}` +
             `extern volatile uint64_t us_tick;\n\n` +
-            `${tramp}\n`;
+            `${tramp}\n` +
+            ecGlue;
     }
 
     const plcStateBlock =
@@ -1656,6 +1724,13 @@ const formatUsDisplay = (us) => {
  * Returns { headerDecl, initCode, cleanupCode, pdoReadCode, pdoWriteCode }
  */
 // Maps KRON_EC_DataType enum names → C scalar types for the GPI struct members
+// ⚠️ Mirrors the #defines in resources/krontek-include/kronethercatmaster.h.
+// Raising one there without raising it here (or vice versa) either rejects a
+// valid project or writes past the end of a fixed array in generated C.
+const KRON_EC_MAX_PDO    = 256;
+const KRON_EC_MAX_SDO    = 64;
+const KRON_EC_MAX_SLAVES = 64;
+
 const KRON_DTYPE_TO_C = {
     'KRON_EC_DTYPE_BOOL':   'bool',
     'KRON_EC_DTYPE_INT8':   'int8_t',
@@ -1670,10 +1745,66 @@ const KRON_DTYPE_TO_C = {
     'KRON_EC_DTYPE_REAL64': 'double',
 };
 
+// CiA402 object sizes, for validating hand-entered SDO Init rows.
+//
+// ⚠️ An SDO written with the WRONG LENGTH is rejected by the drive with an abort
+// ("data type does not match"), and the failure chain that follows explains
+// nothing: PreOP→SafeOP fails, the bus never reaches OP, the slave reports state
+// 0x00 and the recovery loop runs forever — while the editor shows a perfectly
+// healthy project. Observed with 0x6060 (Modes of Operation, INT8) written as
+// 2 bytes: the SDO editor's size is a free <select> that defaults to 2.
+//
+// Only the standard, fixed-width objects are listed. A vendor object is not
+// checked, and this WARNS rather than throwing: an unusual drive may genuinely
+// deviate, and refusing to build would be worse than saying so.
+export const CIA402_SDO_SIZES = {
+    0x6040: 2,  // Controlword                 UINT16
+    0x6041: 2,  // Statusword                  UINT16
+    0x605A: 2,  // Quick stop option code      INT16
+    0x6060: 1,  // Modes of operation          INT8
+    0x6061: 1,  // Modes of operation display  INT8
+    0x6064: 4,  // Position actual value       INT32
+    0x606C: 4,  // Velocity actual value       INT32
+    0x6071: 2,  // Target torque               INT16
+    0x6077: 2,  // Torque actual value         INT16
+    0x607A: 4,  // Target position             INT32
+    0x6080: 4,  // Max motor speed             UINT32
+    0x6081: 4,  // Profile velocity            UINT32
+    0x6083: 4,  // Profile acceleration        UINT32
+    0x6084: 4,  // Profile deceleration        UINT32
+    0x6098: 1,  // Homing method               INT8
+    0x60FF: 4,  // Target velocity             INT32
+    0x60F4: 4,  // Following error actual      INT32
+};
+
+/** Byte width of an SDO Init object, from the authoritative source available.
+ *
+ * ⚠️ The width is NOT the user's to choose — it belongs to the object. The SDO
+ * editor used to offer a free 1/2/4 select defaulting to 2, and a mis-sized
+ * write is ABORTED by the drive with a failure chain that names nothing (see
+ * CIA402_SDO_SIZES). The slave's own ESI declares every object's BitLen, so
+ * that wins; the CiA402 table covers objects the ESI does not expose through a
+ * PDO; only a genuinely unknown vendor object keeps whatever was stored.
+ */
+export const resolveSdoByteSize = (slave, index, subindex = 0, stored = 1) => {
+    const idx = (index || 0) >>> 0;
+    const sub = (subindex || 0) & 0xFF;
+    for (const pdo of (slave?.pdos || [])) {
+        for (const e of (pdo.entries || [])) {
+            if (((e.index || 0) >>> 0) === idx && ((e.subindex || 0) & 0xFF) === sub && e.bitLen > 0) {
+                return { size: Math.max(1, Math.ceil(e.bitLen / 8)), source: 'ESI', dtype: e.dtype || '' };
+            }
+        }
+    }
+    if (CIA402_SDO_SIZES[idx]) return { size: CIA402_SDO_SIZES[idx], source: 'CiA402', dtype: '' };
+    return { size: Math.min(4, Math.max(1, parseInt(stored) || 1)), source: 'stored', dtype: '' };
+};
+
 const generateEtherCATConfig = (buses, busConfigs, globalSimMode = false) => {
     const ecBuses = (buses || []).filter(b => b.type === 'ethercat' && busConfigs?.[b.id]);
     if (ecBuses.length === 0) return {
-        headerDecl: '', headerExtern: '', gpiMacros: '', motionIncludes: '', initCode: '', cleanupCode: '',
+        headerDecl: '', headerExtern: '', gpiMacros: '', motionIncludes: '', cleanupCode: '',
+        masterInitCode: '', axisInitCode: '', hostGlueEc: '',
         pdoReadCode: '', pdoWriteCode: '',
         ecThreadCode: '', ecThreadStartCode: '', ecThreadJoinCode: '',
         halContent: '', gpiVarNames: []
@@ -1685,9 +1816,19 @@ const generateEtherCATConfig = (buses, busConfigs, globalSimMode = false) => {
 
     let initCode = `\n    /* ── EtherCAT Master ── */\n`;
     initCode += `    memset(&__ec_cfg, 0, sizeof(__ec_cfg));\n`;
-    initCode += `    strncpy(__ec_cfg.ifname, ${JSON.stringify((cfg.ifname || 'eth0').slice(0, 63))}, sizeof(__ec_cfg.ifname) - 1);\n`;
+    // ⚠️ The SIMULATION build runs on the developer's PC, whose NIC is virtually
+    // never named like the target's (enp3s0 / enx… vs eth0), so the bus config
+    // carries a SEPARATE ifnameSim. Empty → fall back to the target's ifname.
+    const ecIfname = ((globalSimMode ? (cfg.ifnameSim || cfg.ifname) : cfg.ifname) || 'eth0');
+    initCode += `    strncpy(__ec_cfg.ifname, ${JSON.stringify(ecIfname.slice(0, 63))}, sizeof(__ec_cfg.ifname) - 1);\n`;
     initCode += `    __ec_cfg.cycle_us = ${Math.max(100, parseInt(cfg.cycle_us) || 1000)}U;\n`;
     initCode += `    __ec_cfg.dc_enable = ${cfg.dc_enable ? 'true' : 'false'};\n`;
+    if (slaves.length > KRON_EC_MAX_SLAVES) {
+        throw new Error(
+            `EtherCAT bus has ${slaves.length} slaves but KRON_EC_MAX_SLAVES is ${KRON_EC_MAX_SLAVES} ` +
+            `(kronethercatmaster.h). The generated code would write past the end of __ec_cfg.slaves.`
+        );
+    }
     initCode += `    __ec_cfg.slave_count = ${slaves.length};\n`;
 
     // Collect PDO vars for the Global Process Image struct
@@ -1703,26 +1844,29 @@ const generateEtherCATConfig = (buses, busConfigs, globalSimMode = false) => {
     // Per-slave bridge map: slaveIndex → { axisNo, reads:[{varName,field}], writes:[{varName,field}] }
     const slaveBridges = {};
 
-    const makeUniqueVarName = (rawName, slaveIndex) => {
-        const cleaned = (rawName || '')
-            .replace(/[^A-Za-z0-9_]/g, '_')
-            .replace(/__+/g, '_')
-            .replace(/^_+|_+$/g, '');
-        const base = cleaned || `ec_slave_${slaveIndex + 1}_var`;
-        if (!usedVarNames.has(base)) {
-            usedVarNames.add(base);
-            return base;
-        }
+    // ⚠️ PDO variable names come from utils/ecNaming — the SAME function the
+    // Slave editor uses when it declares the matching globals. This used to be
+    // a private running counter here and another one in the editor, over
+    // different scopes, so any collision made the two disagree: the editor
+    // declared `ec_X_Status` while this emitted `ec_X_Status_2`, and the global
+    // then got a real PlcState/SHM slot instead of the GPI macro — a variable
+    // that read a constant zero with nothing reporting a problem.
+    const ecNameMap = buildEcVarNames(slaves);
 
-        let n = 2;
-        let candidate = `${base}_${n}`;
-        while (usedVarNames.has(candidate)) {
-            n++;
-            candidate = `${base}_${n}`;
-        }
-        usedVarNames.add(candidate);
-        return candidate;
-    };
+    // ⚠️ Hard gate, same class as the IEC-address and array-bounds throws: a
+    // selection the slave will reject (one CoE object mapped through two
+    // alternative PDOs, two mutually exclusive PDOs assigned together, two
+    // entries collapsing onto one variable name) must not become a runtime
+    // that quietly never reaches OP. The editor blocks this at entry; a
+    // hand-edited project file or an older project still arrives here.
+    const ecIssues = findEcIssues(slaves).filter(i => i.level === 'error');
+    if (ecIssues.length > 0) {
+        throw new Error(
+            `Invalid EtherCAT PDO mapping (${ecIssues.length}):\n` +
+            ecIssues.map(i => `  • ${i.message}`).join('\n') +
+            `\nFix the PDO Mapping tab of the affected slave.`
+        );
+    }
 
     slaves.forEach((slave, si) => {
         const safeName = (slave.name || `Slave_${si + 1}`).replace(/\\/g, '\\\\').replace(/"/g, '\\"').slice(0, 63);
@@ -1733,15 +1877,23 @@ const generateEtherCATConfig = (buses, busConfigs, globalSimMode = false) => {
         initCode += `    strncpy(__ec_cfg.slaves[${si}].name, "${safeName}", sizeof(__ec_cfg.slaves[${si}].name) - 1);\n`;
 
         let pdoCount = 0;
-        const safeSlaveName = (slave.name || `Slave_${si + 1}`).replace(/[^A-Za-z0-9_]/g, '_');
-        (slave.pdos || []).forEach(pdo => {
-            (pdo.entries || []).forEach(entry => {
+        (slave.pdos || []).forEach((pdo, pi) => {
+            (pdo.entries || []).forEach((entry, ei) => {
                 if (!entry.selected) return;
-                // Use custom varName if set; otherwise auto-generate like pdoEntriesToGlobalVars
-                const customName = (entry.varName || '').trim();
-                const autoName = `ec_${safeSlaveName}_${(entry.name || 'var')}`;
-                const varName = makeUniqueVarName(customName || autoName, si);
+                const varName = ecNameMap.get(`${si}|${pi}|${ei}`)?.name;
                 if (!varName) return;
+                // ⚠️ pdo_entries is a fixed KRON_EC_MAX_PDO array in
+                // kronethercatmaster.h; without this the generated C writes
+                // past its end, which clang accepts as a warning and the
+                // runtime turns into memory corruption on the first cycle.
+                if (pdoCount >= KRON_EC_MAX_PDO) {
+                    throw new Error(
+                        `EtherCAT slave "${slave.name || `Slave_${si + 1}`}" has more than ` +
+                        `${KRON_EC_MAX_PDO} selected PDO entries — raise KRON_EC_MAX_PDO in ` +
+                        `kronethercatmaster.h or deselect some entries.`
+                    );
+                }
+                usedVarNames.add(varName);
                 const isInput = pdo.direction === 'input';
                 const dir   = isInput ? 'KRON_EC_DIR_INPUT' : 'KRON_EC_DIR_OUTPUT';
                 const dtype = entry.kronDtype || 'KRON_EC_DTYPE_UINT8';
@@ -1811,14 +1963,42 @@ const generateEtherCATConfig = (buses, busConfigs, globalSimMode = false) => {
             pdoMapSdos.push({ index: 0x1C13, subindex: 0, value: txPdoGroups.length, byteSize: 1 });
         }
 
-        const userSdos = (slave.sdos || []);
-        const allSdos = [...pdoMapSdos, ...userSdos].slice(0, 64);
+        // ⚠️ The PDO-mapping SDOs must run BEFORE the user's own startup SDOs
+        // (a drive's 0x6060 Modes of Operation is written into a mapping that
+        // has to exist first), and the total must not silently fall off the end
+        // of the fixed sdo_inits array — the old `.slice(0, 64)` dropped the
+        // USER's commands first, since they were appended last, and said
+        // nothing about it.
+        // ⚠️ The emitted width comes from resolveSdoByteSize, NOT from whatever the
+        // project stored: a project saved before the size became authoritative
+        // still carries the old free-select value, and the resulting SDO abort
+        // costs an afternoon to trace. Corrections are reported, never silent.
+        const userSdos = (slave.sdos || []).map(sdo => {
+            const stored = Math.min(4, Math.max(1, parseInt(sdo.byteSize) || 1));
+            const { size, source, dtype } = resolveSdoByteSize(slave, sdo.index, sdo.subindex, stored);
+            if (size !== stored) {
+                console.warn(
+                    `[transpiler] SDO Init 0x${((sdo.index || 0) >>> 0).toString(16).toUpperCase().padStart(4, '0')}:` +
+                    `${(sdo.subindex || 0) & 0xFF} on slave "${slave.name || `Slave_${si + 1}`}" was stored as ${stored} ` +
+                    `byte(s); emitting ${size} as declared by ${source}${dtype ? ` (${dtype})` : ''}. A mis-sized SDO is ` +
+                    `aborted by the drive and the bus never reaches OP.`);
+            }
+            return { ...sdo, byteSize: size };
+        });
+        const allSdos = [...pdoMapSdos, ...userSdos];
+        if (allSdos.length > KRON_EC_MAX_SDO) {
+            throw new Error(
+                `EtherCAT slave "${slave.name || `Slave_${si + 1}`}" needs ${allSdos.length} startup SDOs ` +
+                `(${pdoMapSdos.length} generated for the PDO mapping + ${userSdos.length} of your own) but ` +
+                `KRON_EC_MAX_SDO is ${KRON_EC_MAX_SDO}. Reduce the selected PDO entries or the SDO Init list.`
+            );
+        }
         allSdos.forEach((sdo, di) => {
             const sidx = (sdo.index || 0) >>> 0;
             initCode += `    __ec_cfg.slaves[${si}].sdo_inits[${di}].index     = 0x${sidx.toString(16).toUpperCase().padStart(4, '0')};\n`;
             initCode += `    __ec_cfg.slaves[${si}].sdo_inits[${di}].subindex  = ${(sdo.subindex || 0) & 0xFF};\n`;
             initCode += `    __ec_cfg.slaves[${si}].sdo_inits[${di}].value     = 0x${((sdo.value || 0) >>> 0).toString(16).toUpperCase().padStart(8, '0')}UL;\n`;
-            initCode += `    __ec_cfg.slaves[${si}].sdo_inits[${di}].byte_size = ${Math.min(4, Math.max(1, parseInt(sdo.byteSize) || 1))};\n`;
+            initCode += `    __ec_cfg.slaves[${si}].sdo_inits[${di}].byte_size = ${Math.min(4, Math.max(1, parseInt(sdo.byteSize) || 1))};\n`;   // resolveSdoByteSize for user rows; generated PDO-mapping SDOs carry their own
         });
         if (allSdos.length > 0) initCode += `    __ec_cfg.slaves[${si}].sdo_count = ${allSdos.length};\n`;
     });
@@ -1872,8 +2052,14 @@ const generateEtherCATConfig = (buses, busConfigs, globalSimMode = false) => {
     // from firing on a global-variable declaration that shares the same name.
     // Linux  : route through the per-scan snapshot pointer (__gpi_snap).
     // Other  : route through the single-buffer alias (__gpi_hw == __gpi).
-    const linuxMacroLines    = uniqueGpiVars.map(v =>
-        `#define ${v.varName.padEnd(36)} (__gpi_snap->_pi_${v.varName})`).join('\n');
+    // ⚠️ On Linux an INPUT resolves through the per-scan snapshot (one consistent
+    // bus image for the whole scan) while an OUTPUT resolves to the single
+    // __gpi_out image. Routing outputs through the snapshot too meant writing
+    // into a buffer the IO_Bus thread was about to recycle — see plc_task_IO_Bus.
+    const linuxMacroLines    = [
+        ...uniqueInputVars.map(v  => `#define ${v.varName.padEnd(36)} (__gpi_snap->_pi_${v.varName})`),
+        ...uniqueOutputVars.map(v => `#define ${v.varName.padEnd(36)} (__gpi_out._pi_${v.varName})`),
+    ].join('\n');
     const nonLinuxMacroLines = uniqueGpiVars.map(v =>
         `#define ${v.varName.padEnd(36)} (__gpi_hw._pi_${v.varName})`).join('\n');
     const gpiMacros = uniqueGpiVars.length === 0 ? '' :
@@ -1918,11 +2104,13 @@ ${gpiStructBody}} KRON_Process_Image;
 extern KRON_Process_Image            __gpi_hw;      /* HW staging \u2014 var_ptr targets  */
 extern KRON_Process_Image            __gpi_buf[2];  /* double buffer                  */
 extern _Atomic(KRON_Process_Image *) __gpi;         /* published front pointer        */
-extern _Thread_local KRON_Process_Image *__gpi_snap; /* per-scan snapshot             */
+extern _Thread_local KRON_Process_Image *__gpi_snap; /* per-scan INPUT snapshot       */
+extern KRON_Process_Image            __gpi_out;     /* logic OUTPUTS \u2014 single image */
 #else /* bare-metal / Windows: single buffer */
 /* \u2500\u2500 Single-buffer fallback \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500 */
 extern KRON_Process_Image __gpi;
-#define __gpi_hw __gpi   /* var_ptr targets the single buffer on non-Linux */
+#define __gpi_hw  __gpi  /* var_ptr targets the single buffer on non-Linux */
+#define __gpi_out __gpi  /* no IO_Bus thread here \u2014 nothing to decouple      */
 #endif /* __linux__ */
 
 #endif /* KRON_HAL_H */
@@ -1978,9 +2166,28 @@ extern KRON_Process_Image __gpi;
         });
     });
 
+    const axisNamesOf = () => axisSlaves.map(({ slave }) =>
+        (slave.axisRef.name || `Axis_${slave.position}`).replace(/[^A-Za-z0-9_]/g, '_'));
+
     let axisInitCode = '';
     if (hasAxes) {
-        axisInitCode += `\n    /* ── Motion Axes ── */\n    memset(&Kron_PI, 0, sizeof(Kron_PI));\n`;
+        // ⚠️ Under hot-swap the bus thread is already running when PLC_Init
+        // executes this (host.c calls __hs_ec_start() BEFORE plc_init_hs()), so
+        // the init of an axis the engine is polling must be atomic against it.
+        axisInitCode += `\n    /* ── Motion Axes ── */\n    KRON_AXIS_LOCK();\n    memset(&Kron_PI, 0, sizeof(Kron_PI));\n`;
+        // ⚠️ An axis is simulated when the ETHERCAT MASTER is stubbed, never
+        // because this is "a simulation build". The local sim drives a real bus
+        // on Linux (KRON_EC_SIM was dropped from the hot-swap build, §13), so
+        // tying AXIS_REF.Simulation to the transpiler's simMode left the bus
+        // real and every axis fake: KronAxis_WriteOutput takes its
+        // `slot == NULL || Simulation || !present` branch, which mirrors
+        // PowerStatus = PowerEnabled and never writes a CiA402 control word —
+        // MC_Power reported Status = TRUE while the drive stayed disabled.
+        // KRON_EC_SIM is defined by exactly the builds whose master is a no-op
+        // (Windows/macOS, or a host without a real libsoem.a — see
+        // host-agent/hotswap.go ecSimFlag and compile.go's plain sim), so it is
+        // the one condition under which a faked axis is the right answer.
+        axisInitCode += `#ifdef KRON_EC_SIM\n    const bool __kron_bus_sim = true;   /* EtherCAT master is a stub */\n#else\n    const bool __kron_bus_sim = false;  /* real SOEM master on this build */\n#endif\n`;
         axisSlaves.forEach(({ slave }, i) => {
             const axisName = (slave.axisRef.name || `Axis_${slave.position}`).replace(/[^A-Za-z0-9_]/g, '_');
             const axisNo   = Math.max(0, parseInt(slave.axisRef.axisNo) || 0);
@@ -1993,7 +2200,10 @@ extern KRON_Process_Image __gpi;
             const cpu = encRes / gRatio;
             // vel_raw_per_unit: drive reports velocity in counts/s — same ratio applies
             const vpu = cpu;
-            const sim = (globalSimMode || slave.axisRef.simMode) ? 'true' : 'false';
+            // The slave's own Simulation checkbox still forces a fake axis outright;
+            // otherwise the decision is the C-level one above.
+            const sim     = slave.axisRef.simMode ? 'true'  : '__kron_bus_sim';
+            const present = slave.axisRef.simMode ? 'false' : '!__kron_bus_sim';
             // AXIS_REF_Init zeroes the struct and sets AxisNo, slot, VelFactor=1, AccFactor=1.
             // The AXIS_REF global is a PlcState field (hot-swap refactor), so it is
             // reached via S-> — this init code lands in PLC_Init (plc.c), where the
@@ -2044,10 +2254,93 @@ extern KRON_Process_Image __gpi;
             if (slave.axisRef.encoderType === 'absolute_mt') {
                 axisInitCode += `    Kron_PI.servo[${axisNo}].enc_multi_turn_bits  = ${parseInt(slave.axisRef.multiTurnBits) || 12}u;\n`;
             }
-            axisInitCode += `    Kron_PI.servo[${axisNo}].present           = !${sim};\n`;
+            axisInitCode += `    Kron_PI.servo[${axisNo}].present           = ${present};\n`;
         });
+        axisInitCode += `    KRON_AXIS_UNLOCK();\n`;
     }
-    initCode += axisInitCode;
+
+    // ── Motion: the axis engine runs in the BUS thread, at the BUS cycle ────
+    // ⚠️ dt MUST equal the rate the engine is really called at — the trajectory
+    // core integrates exactly one dt per call, so "which thread" and "what dt"
+    // are ONE decision. It used to run in the logic task with dt = that task's
+    // interval; measured against the real library, a 10 ms dt made a
+    // jerk-limited move hunt around the target for ever (40 set-velocity sign
+    // flips, ±31 500 counts, Done never set, DiscreteMotion never left) while
+    // the same move at the 500 µs bus cycle lands in a single approach. The
+    // cycle comes from the BUS THAT CARRIES THE AXIS, so a second fieldbus
+    // later brings its own instead of inheriting a scan rate it knows nothing
+    // about.
+    const axisDtSec = (Math.max(100, parseInt(cfg.cycle_us) || 1000) / 1e6).toFixed(9);
+    // The lock must exist before the bus thread does. initCode is the master
+    // init: it runs in PLC_Init for a single-binary build and inside
+    // __hs_ec_start() for hot-swap — both before any pthread_create and before
+    // axisInitCode touches an axis.
+    if (hasAxes) initCode += `    __kron_axis_mu_init();\n`;
+
+    // ⚠️ ONE lock guards every axis, and EVERY entry point takes it.
+    // KronAxis_Submit stores a POINTER to a request living inside the FB
+    // instance into AXIS_REF.Active/Buffer[] with no synchronisation of its own
+    // — kron_axis.c dropped the old cmd_Seq/sts_AckSeq handshake and the
+    // archive is prebuilt, so the interlock has to be added around it: the
+    // engine step below, and every MC_*_Call emitted into a logic task. It also
+    // covers the READ side (AXIS_REF.ActualPosition & co. are 8-byte doubles
+    // that armv7 cannot load atomically, so an unlocked FB read could tear).
+    // PRIO_INHERIT because the holder is usually a logic task while the waiter
+    // is the SCHED_FIFO bus thread.
+    const axisLockMacros = hasAxes
+        ? `#if defined(__linux__)\n` +
+          `#include <pthread.h>\n` +
+          `extern pthread_mutex_t __kron_axis_mu;\n` +
+          `void __kron_axis_mu_init(void);\n` +
+          `#define KRON_AXIS_LOCK()   pthread_mutex_lock(&__kron_axis_mu)\n` +
+          `#define KRON_AXIS_UNLOCK() pthread_mutex_unlock(&__kron_axis_mu)\n` +
+          `#else\n` +
+          `#define KRON_AXIS_LOCK()   ((void)0)\n` +
+          `#define KRON_AXIS_UNLOCK() ((void)0)\n` +
+          `#endif\n`
+        : '';
+    const axisMuDef = hasAxes
+        ? `pthread_mutex_t __kron_axis_mu;\n` +
+          `void __kron_axis_mu_init(void) {\n` +
+          `    pthread_mutexattr_t __a;\n` +
+          `    pthread_mutexattr_init(&__a);\n` +
+          `    pthread_mutexattr_setprotocol(&__a, PTHREAD_PRIO_INHERIT);\n` +
+          `    pthread_mutex_init(&__kron_axis_mu, &__a);\n` +
+          `    pthread_mutexattr_destroy(&__a);\n` +
+          `}\n`
+        : '';
+    // Two definitions of the same step, because the bus thread body is emitted
+    // into BOTH plc.c (single binary, PlcState reachable through the file-scope
+    // S) and host_glue.c (hot-swap, where the thread lives in the loader-host
+    // and PlcState is only reachable through the pointers plc_axis_ptr hands
+    // over at bind time). The thread body itself stays byte-identical.
+    const axisStepDefPlc = hasAxes
+        ? `\n/* One axis-engine scan, run by the IO_Bus thread at the bus cycle. */\n` +
+          `static inline void __kron_axis_step(void) {\n` +
+          `    KRON_AXIS_LOCK();\n` +
+          axisNamesOf().map(a =>
+          `    KronAxis_ReadInput(&S->${a});\n` +
+          `    KronAxis_WriteOutput(&S->${a}, ${axisDtSec});\n`).join('') +
+          `    KRON_AXIS_UNLOCK();\n}\n`
+        : '';
+    const axisStepDefHost = hasAxes
+        ? `\nAXIS_REF *__hs_axis[${axisSlaves.length}] = {0};\n` +
+          `/* Called by the loader-host after every bind — the axis lives in PlcState,\n` +
+          ` * whose field offsets only the generated module knows. */\n` +
+          `void __hs_axis_bind(void *(*getptr)(int)) {\n` +
+          `    KRON_AXIS_LOCK();\n` +
+          `    for (int __i = 0; __i < ${axisSlaves.length}; __i++) __hs_axis[__i] = (AXIS_REF*)getptr(__i);\n` +
+          `    KRON_AXIS_UNLOCK();\n}\n` +
+          `/* One axis-engine scan, run by the IO_Bus thread at the bus cycle. */\n` +
+          `static inline void __kron_axis_step(void) {\n` +
+          `    KRON_AXIS_LOCK();\n` +
+          axisSlaves.map((_, i) =>
+          `    if (__hs_axis[${i}]) { KronAxis_ReadInput(__hs_axis[${i}]); KronAxis_WriteOutput(__hs_axis[${i}], ${axisDtSec}); }\n`).join('') +
+          `    KRON_AXIS_UNLOCK();\n}\n`
+        : '';
+    // ⚠️ axisInitCode is deliberately NOT appended to initCode: the master init
+    // moves into the loader-host under hot-swap (see hostGlueEc below) while the
+    // axis init must stay in PLC_Init — it writes S->‹axis›, i.e. PlcState.
 
     // headerDecl: definitions in plc.c
     // __gpi_snap is initialised to NULL; generateMainLoop sets it via
@@ -2064,16 +2357,33 @@ extern KRON_Process_Image __gpi;
     // pointer and would do nothing.
     const kronPIDecl = '';
     const ncStubs = '';
-    const headerDecl =
-`\n#if defined(__linux__)\n` +
+    // ⚠️ Under PLC_HOTSWAP on Linux these objects are DEFINED BY THE LOADER-HOST
+    // (host_glue.c, see hostGlueEc) and only declared here — SOEM's socket and
+    // the process image must outlive a dlclose. __gpi_snap stays in the logic
+    // module: it is thread-local and re-snapped from __gpi on every scan.
+    const gpiDefs =
 `KRON_Process_Image            __gpi_hw;\n` +
 `KRON_Process_Image            __gpi_buf[2];\n` +
-`_Atomic(KRON_Process_Image *) __gpi = &__gpi_buf[0];\n` +
+`KRON_Process_Image            __gpi_out;\n` +
+`_Atomic(KRON_Process_Image *) __gpi = &__gpi_buf[0];\n`;
+    const headerDecl =
+`\n#if defined(__linux__)\n` +
+`#if defined(PLC_HOTSWAP)\n` +
+`extern KRON_Process_Image            __gpi_hw;\n` +
+`extern KRON_Process_Image            __gpi_buf[2];\n` +
+`extern KRON_Process_Image            __gpi_out;\n` +
+`extern _Atomic(KRON_Process_Image *) __gpi;\n` +
+`extern KRON_EC_Config                __ec_cfg;\n` +
+`#else\n` +
+gpiDefs +
+`KRON_EC_Config __ec_cfg;\n` +
+axisMuDef +
+`#endif\n` +
 `_Thread_local KRON_Process_Image *__gpi_snap = NULL;\n` +
 `#else\n` +
 `KRON_Process_Image __gpi;\n` +
-`#endif\n` +
 `KRON_EC_Config __ec_cfg;\n` +
+`#endif\n` +
 kronPIDecl +
 ncStubs;
 
@@ -2090,9 +2400,23 @@ ncStubs;
 `extern KRON_EC_Config __ec_cfg;\n` +
 '';
 
+    // Member-wise copies for the IO_Bus cycle (see the comment in its body).
+    const gpiOutCopyIn = uniqueOutputVars.length
+        ? uniqueOutputVars.map(v => `        __gpi_hw._pi_${v.varName} = __gpi_out._pi_${v.varName};\n`).join('')
+        : '        /* no RxPDO entries */\n';
+    const gpiInCopyBack = uniqueInputVars.length
+        ? uniqueInputVars.map(v => `        back->_pi_${v.varName} = __gpi_hw._pi_${v.varName};\n`).join('')
+        : '        (void)back;\n';
+
     // SDO background thread + watchdog thread + IO_Bus thread (Linux only)
-    const ecThreadCode = `
-#if defined(__linux__)
+    // The bus threads are emitted TWICE from this one body: into plc.c for the
+    // single-binary build, and into host_glue.c for hot-swap (where they must
+    // live in the host, since a swap unloads the logic module under them).
+    const ecThreadBody = `
+/* plc_stop is DEFINED further down (generateMainLoop emits it with the scan
+ * loop), so this block — emitted before it — needs the extern. In a hot-swap
+ * build the loader-host owns and exports it. */
+extern volatile int plc_stop;
 static void* __ec_sdo_thread(void *arg) {
     (void)arg;
     while (!plc_stop) {
@@ -2102,11 +2426,44 @@ static void* __ec_sdo_thread(void *arg) {
     }
     return NULL;
 }
+/* Bus watchdog.
+ *
+ * \u26a0\ufe0f BACKS OFF instead of hammering. kron_ec_check_state() runs the
+ * recovery path, and a bus that CANNOT come up (rather than one that blipped)
+ * made this retry 10x a second forever: the log filled with an endless
+ * "not OP / recovery failed" pair, and the library's recovery eventually
+ * re-enters its own init and dies with a double free, taking the runtime with
+ * it. A transient drop recovers on the first or second try, so backing off
+ * costs nothing real and turns an unrecoverable bus into ONE actionable line
+ * instead of a crash.
+ *
+ * The advice is deliberately generic: a bus that never reaches OP with DC
+ * enabled, on any drive, is the single most common cause, and the fastest test
+ * a user can run is to turn DC off. */
 static void* __ec_watchdog_thread(void *arg) {
     (void)arg;
+    long __wd_delay_ms = 100;          /* healthy poll rate */
+    int  __wd_fail = 0, __wd_told = 0;
     while (!plc_stop) {
         kron_ec_check_state(&__ec_cfg);
-        struct timespec __ts = { 0, 100000000L }; /* 100 ms */
+        if (__ec_cfg.is_operational) {
+            if (__wd_fail > 0) fprintf(stderr, "[plc] EtherCAT bus back in OP after %d failed attempt(s)\\n", __wd_fail);
+            __wd_fail = 0; __wd_told = 0; __wd_delay_ms = 100;
+        } else {
+            __wd_fail++;
+            /* 100ms -> 200 -> 400 ... capped at 30s. */
+            if (__wd_delay_ms < 30000) __wd_delay_ms *= 2;
+            if (__wd_fail == 5 && !__wd_told) {
+                __wd_told = 1;
+                fprintf(stderr,
+                    "[plc] EtherCAT bus is not in OP after %d recovery attempts - backing off to %ld s between retries.\\n"
+                    "[plc]   The slaves answer but refuse OPERATIONAL. If Distributed Clocks is enabled for this bus,\\n"
+                    "[plc]   turn it off and retry: DC requires the drive's SYNC0 expectations to be met exactly, and a\\n"
+                    "[plc]   mismatch leaves every slave parked in SAFE-OP with no AL error code to explain it.\\n",
+                    __wd_fail, __wd_delay_ms / 1000);
+            }
+        }
+        struct timespec __ts = { __wd_delay_ms / 1000, (__wd_delay_ms % 1000) * 1000000L };
         nanosleep(&__ts, NULL);
     }
     return NULL;
@@ -2116,14 +2473,31 @@ static void* __ec_watchdog_thread(void *arg) {
  * This is the ONLY thread that calls kron_ec_pdo_read / kron_ec_pdo_write.
  * All var_ptr fields in __ec_cfg point into __gpi_hw (the HW staging buffer).
  *
+ * \u26a0\ufe0f INPUTS and OUTPUTS are carried differently, on purpose:
+ *   inputs  \u2014 double-buffered (__gpi_buf[2] behind the __gpi front pointer),
+ *              so every POU in one scan sees one consistent bus image.
+ *   outputs \u2014 written by the logic straight into the single __gpi_out.
+ * The old code ran BOTH through the double buffer, copying *front into the
+ * staging buffer and later overwriting the recycled buffer wholesale
+ * (*back = __gpi_hw). Any output the logic wrote between those two points went
+ * into a buffer that was about to be overwritten, so it was silently dropped \u2014
+ * an output pulse could simply never reach the slave. Outputs need no snapshot:
+ * they are aligned scalars with a single writer each.
+ *
  * Each bus cycle:
- *   1. Identify which of __gpi_buf[0/1] is the current front (logic reads it).
- *   2. Copy *front \u2192 __gpi_hw so the latest logic outputs reach the hardware.
- *   3. kron_ec_pdo_write: transmit __gpi_hw outputs \u2192 slave RxPDOs.
- *   4. kron_ec_pdo_read:  receive slave TxPDOs \u2192 __gpi_hw inputs.
- *   5. Copy __gpi_hw \u2192 *back  (back buffer now has fresh inputs + last outputs).
- *   6. Atomic pointer swap: publish back as the new front (release semantics).
- *      Logic tasks observe the new front at their next scan-cycle boundary. */
+ *   1. Copy the logic's outputs (__gpi_out) into the HW staging buffer.
+ *   2. Axis engine: one trajectory scan per axis, dt = THIS thread's cycle.
+ *   3. Axis write bridge: Kron_PI.servo[n] \u2192 staging (motion owns its objects).
+ *   4. kron_ec_pdo_write: transmit staging outputs \u2192 slave RxPDOs.
+ *   5. kron_ec_pdo_read:  receive slave TxPDOs \u2192 staging inputs.
+ *   6. Axis read bridge: staging \u2192 Kron_PI.servo[n].
+ *   7. Copy the staging INPUTS into the back buffer and publish it (release).
+ *
+ * \u26a0\ufe0f The axis engine lives HERE, not in a logic task: the trajectory core
+ * integrates one dt per call and dt is this thread's period, so the motion
+ * resolution is the fieldbus cycle and not whatever scan rate the program that
+ * declares the MC_* blocks happens to use. The FBs still run in their task and
+ * reach the engine through __kron_axis_mu. */
 static void* plc_task_IO_Bus(void *arg) {
     (void)arg;
     { struct sched_param __sp = { .sched_priority = sched_get_priority_max(SCHED_FIFO) };
@@ -2135,32 +2509,28 @@ static void* plc_task_IO_Bus(void *arg) {
         __next.tv_nsec += __ec_ns;
         while (__next.tv_nsec >= 1000000000L) { __next.tv_sec++; __next.tv_nsec -= 1000000000L; }
 
-        /* Identify front (logic reads) and back (we build next image here) */
         KRON_Process_Image *front = atomic_load_explicit(&__gpi, memory_order_relaxed);
         KRON_Process_Image *back  = (front == &__gpi_buf[0]) ? &__gpi_buf[1] : &__gpi_buf[0];
 
-        /* Step 1-2: Capture latest logic outputs into HW staging, then send to hardware */
-        __gpi_hw = *front;
+        /* Step 1: latest logic outputs \u2192 HW staging */
+${gpiOutCopyIn}${hasAxes ? `\n        /* Step 2: the axis engine \u2014 PLCopen state machine + ONE trajectory scan,\n         * on the feedback this thread read at the end of the previous cycle. */\n        __kron_axis_step();\n\n        /* Step 3: axis outputs override the logic's for the CiA402 objects */\n${ncWriteBridge}` : ''}
+        /* Step 4: transmit */
         kron_ec_pdo_write(&__ec_cfg);
 
-        /* Step 3: Receive hardware inputs into HW staging */
+        /* Step 5: receive */
         kron_ec_pdo_read(&__ec_cfg);
-
-${hasAxes ? `${ncReadBridge}${ncWriteBridge}` : ''}        /* Step 4: Propagate HW-updated staging to the back buffer.
-         * Back buffer now has: fresh hardware inputs + last logic outputs. */
-        *back = __gpi_hw;
-
-        /* Step 5: Atomic pointer swap \u2014 publish back as the new front.
-         * Logic tasks acquire this pointer (memory_order_acquire) at the start
-         * of each scan cycle, ensuring they see all writes above. */
-        atomic_store_explicit(&__gpi, back, memory_order_release);
+${hasAxes ? `\n        /* Step 6: fresh drive feedback \u2192 servo image (the engine consumes it\n         * at step 2 of the NEXT cycle) */\n${ncReadBridge}` : ''}
+        /* Step 7: publish the fresh INPUT image to the logic tasks. Only the
+         * input members are copied \u2014 the buffers' output members are unused. */
+${gpiInCopyBack}        atomic_store_explicit(&__gpi, back, memory_order_release);
 
         clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &__next, NULL);
     }
     return NULL;
 }
-#endif /* __linux__ */
 `;
+    const ecThreadCode =
+        `\n#if defined(__linux__) && !defined(PLC_HOTSWAP)\n` + axisStepDefPlc + ecThreadBody + `#endif /* __linux__ && !PLC_HOTSWAP */\n`;
 
     const ecThreadStartCode =
 `\n    /* EtherCAT background threads + lock-free IO_Bus */\n` +
@@ -2174,8 +2544,59 @@ ${hasAxes ? `${ncReadBridge}${ncWriteBridge}` : ''}        /* Step 4: Propagate 
 `    pthread_join(__ec_wd_tid,  NULL);\n` +
 `    pthread_join(__ec_io_tid,  NULL);\n`;
 
+    // ── Hot-swap: the EtherCAT master belongs to the LOADER-HOST ───────────
+    // ⚠️ SOEM's entire state (the raw socket, ecx_context, the PDO map) is
+    // file-scope data of whichever module links libkronethercatmaster.a. Left in
+    // logic.so it is torn down by every dlclose — and plc_init_hs() runs on the
+    // COLD start ONLY, so the master would never be re-initialised: the bus would
+    // die silently on the first hot reload, with the FBs still reporting OP from
+    // a zeroed __ec_cfg. Emitting the master, the process image and the three bus
+    // threads into host_glue.c (compiled into the loader-host) is the same fix
+    // the HAL got with its __hs_* trampolines. host.c drives it through weakly
+    // referenced __hs_ec_start / __hs_ec_stop.
+    // ⚠️ Linux only — the Windows/macOS sim keeps -DKRON_EC_SIM: SOEM needs npcap
+    // there / a contrib libpcap port, neither of which is bundled.
+    const hostGlueEc =
+`\n/* ── EtherCAT master (hot-swap: host-owned, survives a logic swap) ── */\n` +
+`#if defined(__linux__)\n` +
+`#include <pthread.h>\n#include <time.h>\n#include <stdatomic.h>\n` +
+`#include "kronethercatmaster.h"\n#include "kron_hal.h"\n` +
+(hasAxes ? `#include "kron_pi.h"\n#include "kronmotion.h"\nextern KRON_PROCESS_IMAGE Kron_PI;\n` : '') +
+axisLockMacros +
+axisMuDef +
+`KRON_EC_Config __ec_cfg;\n` +
+gpiDefs +
+axisStepDefHost +
+ecThreadBody +
+`static pthread_t __ec_sdo_tid, __ec_wd_tid, __ec_io_tid;\n` +
+`static int __ec_threads_up = 0;\n` +
+`void __hs_ec_start(void) {\n` +
+initCode +
+`    pthread_create(&__ec_sdo_tid, NULL, __ec_sdo_thread,      NULL);\n` +
+`    pthread_create(&__ec_wd_tid,  NULL, __ec_watchdog_thread, NULL);\n` +
+`    pthread_create(&__ec_io_tid,  NULL, plc_task_IO_Bus,      NULL);\n` +
+`    __ec_threads_up = 1;\n` +
+`}\n` +
+`/* Called by the loader-host AFTER the task threads are joined, so plc_stop is\n` +
+` * already set and the three loops below are on their way out. */\n` +
+`void __hs_ec_stop(void) {\n` +
+`    if (__ec_threads_up) {\n` +
+`        pthread_join(__ec_sdo_tid, NULL);\n` +
+`        pthread_join(__ec_wd_tid,  NULL);\n` +
+`        pthread_join(__ec_io_tid,  NULL);\n` +
+`        __ec_threads_up = 0;\n` +
+`    }\n` +
+cleanupCode +
+`}\n` +
+`#endif /* __linux__ */\n`;
+
     return {
-        headerDecl, headerExtern, gpiMacros, motionIncludes, initCode, cleanupCode,
+        headerDecl, headerExtern, gpiMacros, motionIncludes, axisLockMacros, cleanupCode,
+        // masterInitCode = the bus itself (guarded out of PLC_Init under hot-swap,
+        // where __hs_ec_start runs it); axisInitCode = PlcState writes, always in
+        // PLC_Init. Their ORDER is preserved either way: host.c calls
+        // __hs_ec_start() before plc_init_hs().
+        masterInitCode: initCode, axisInitCode, hostGlueEc,
         pdoReadCode, pdoWriteCode, ecThreadCode, ecThreadStartCode, ecThreadJoinCode,
         halContent,
         // Names of all GPI-macro-backed PDO variables — transpileToC excludes
@@ -2391,7 +2812,14 @@ const generateMainLoop = (projectStructure, config, boardId = null, shmEnabled =
                     tName = `${tName}_${n}`;
                 }
                 usedTaskNames.add(tName);
-                taskGroups.push({ taskName: tName, intervalUs, programs: progs });
+                // SCHED_FIFO priority for this task's scan thread (TaskManager
+                // field). Clamped here, not trusted: it reaches the runtime as a
+                // C literal, and sched_setscheduler rejects anything outside
+                // 1..99 — which would leave the thread at SCHED_OTHER with no
+                // indication why. A project saved before the field existed keeps
+                // the 99 the runtime used to hardcode.
+                const rtPriority = Math.max(1, Math.min(99, Math.round(Number(task.rtPriority) || 99)));
+                taskGroups.push({ taskName: tName, intervalUs, rtPriority, programs: progs });
             }
             progs.forEach(pName => {
                 if (!programTasks.find(pt => pt.name === pName))
@@ -2417,7 +2845,7 @@ const generateMainLoop = (projectStructure, config, boardId = null, shmEnabled =
             const pName = (inst.program || '').trim().replace(/\s+/g, '_');
             const intervalUs = task ? mapIECtoTimeUs(task.interval) : 10000;
             const tKey = inst.task || '__default';
-            if (!legacyTaskMap[tKey]) legacyTaskMap[tKey] = { taskName: tKey.replace(/\s+/g, '_'), intervalUs, programs: [] };
+            if (!legacyTaskMap[tKey]) legacyTaskMap[tKey] = { taskName: tKey.replace(/\s+/g, '_'), intervalUs, rtPriority: 99, programs: [] };
             legacyTaskMap[tKey].programs.push(pName);
             programTasks.push({ name: pName, intervalUs });
         });
@@ -2543,17 +2971,21 @@ const generateMainLoop = (projectStructure, config, boardId = null, shmEnabled =
         ? Math.min(...taskGroups.map(tg => tg.intervalUs))
         : Infinity;
 
-    // ── Motion: the axis engine's two scan phases ───────────────────────────
-    // ⚠️ These MUST run in the same thread as the MC_* function blocks. kron_axis.c
-    // (which replaced kron_nc.c) hands a request POINTER living inside the FB
-    // instance to AXIS_REF.Active / Buffer[] with no lock and no sequence-number
-    // handshake, so a KronAxis_Submit racing KronAxis_WriteOutput corrupts the
-    // queue. The old NC engine had the cmd_Seq/sts_AckSeq protocol precisely so
-    // it could live in the IO_Bus thread; nothing replaces it — do NOT move
-    // these back there.
-    // Which task actually calls the MC_* blocks? An FB instance must be
-    // DECLARED to be called, in ladder and in ST alike, so the program's own
-    // variable list is the reliable signal — no rung/ST parsing needed.
+    // ── Motion: the axis engine's two scan phases (NON-LINUX FALLBACK ONLY) ──
+    // ⚠️ On Linux the engine runs in the IO_Bus thread at the FIELDBUS cycle —
+    // see plc_task_IO_Bus. dt has to equal the rate the core is really called
+    // at, and a logic task's interval is the wrong rate: measured against the
+    // real library, a 10 ms dt makes a jerk-limited move hunt around its target
+    // for ever instead of completing. What made the engine live here before was
+    // that kron_axis.c hands a request POINTER inside the FB instance to
+    // AXIS_REF.Active/Buffer[] with no handshake of its own; that is solved by
+    // __kron_axis_mu, which every entry point on both threads now takes.
+    // Windows/macOS have no IO_Bus thread (EtherCAT is Linux-only here, and
+    // those builds are KRON_EC_SIM anyway), so there the engine still runs in
+    // the owning logic task with dt = that task's interval — simulation only.
+    // Which task is that? An FB instance must be DECLARED to be called, in
+    // ladder and in ST alike, so the program's own variable list is the
+    // reliable signal — no rung/ST parsing needed.
     const motionProgramNames = new Set(
         (projectStructure.programs || [])
             .filter(prog => (prog.content?.variables || [])
@@ -2565,9 +2997,9 @@ const generateMainLoop = (projectStructure, config, boardId = null, shmEnabled =
         .filter(i => i >= 0);
     if (motionTaskIdxs.length > 1) {
         console.warn(`[transpiler] Motion function blocks are called from ${motionTaskIdxs.length} different tasks `
-            + `(${motionTaskIdxs.map(i => taskGroups[i].taskName).join(', ')}). The axis engine can only run in one of `
-            + `them (${taskGroups[motionTaskIdxs[0]].taskName}), so the others submit motion requests from a different `
-            + `thread with no locking — move every program that uses MC_* blocks into a single task.`);
+            + `(${motionTaskIdxs.map(i => taskGroups[i].taskName).join(', ')}). On Linux this is safe — the engine runs `
+            + `in the bus thread and every MC_* call takes __kron_axis_mu — but on a platform with no bus thread `
+            + `(Windows/macOS sim) the engine runs in ${taskGroups[motionTaskIdxs[0]].taskName} only.`);
     }
     // No MC_* program yet: still run the engine (it drives the CiA402 state
     // machine and the feedback path), in the fastest task.
@@ -2585,12 +3017,14 @@ const generateMainLoop = (projectStructure, config, boardId = null, shmEnabled =
         ? (motionDtUs / 1e6).toFixed(9).replace(/0+$/, '0')
         : '0.0';
     const axisReadPhase = motionTaskIdx >= 0
-        ? `    /* Motion: fieldbus image -> axis (actual values, drive status, faults) */\n` +
-          axisNames.map(a => `    KronAxis_ReadInput(&S->${a});\n`).join('')
+        ? `#if !defined(__linux__)   /* no IO_Bus thread here \u2014 engine runs in this task */\n` +
+          axisNames.map(a => `    KronAxis_ReadInput(&S->${a});\n`).join('') +
+          `#endif\n`
         : '';
     const axisWritePhase = motionTaskIdx >= 0
-        ? `    /* Motion: state diagram + one trajectory scan -> fieldbus image */\n` +
-          axisNames.map(a => `    KronAxis_WriteOutput(&S->${a}, ${motionDt});\n`).join('')
+        ? `#if !defined(__linux__)\n` +
+          axisNames.map(a => `    KronAxis_WriteOutput(&S->${a}, ${motionDt});\n`).join('') +
+          `#endif\n`
         : '';
 
     // Per-task SHM pull/sync functions — each task calls its own named version.
@@ -2762,8 +3196,9 @@ const generateMainLoop = (projectStructure, config, boardId = null, shmEnabled =
         const isIoTask = hasEc && (tg.intervalUs === fastestIntervalUs);
         mainSrc += `static void* plc_task_${tg.taskName}(void *arg) {\n`;
         mainSrc += `    (void)arg;\n`;
-        mainSrc += `    { struct sched_param __sp = { .sched_priority = sched_get_priority_max(SCHED_FIFO) };\n`;
-        mainSrc += `      pthread_setschedparam(pthread_self(), SCHED_FIFO, &__sp); }\n`;
+        mainSrc += `    { struct sched_param __sp = { .sched_priority = ${tg.rtPriority || 99} };\n`;
+        mainSrc += `      if (pthread_setschedparam(pthread_self(), SCHED_FIFO, &__sp) != 0)\n`;
+        mainSrc += `          fprintf(stderr, "[plc] task ${tg.taskName}: real-time scheduling unavailable (need CAP_SYS_NICE or RLIMIT_RTPRIO) — timing will jitter\\n"); }\n`;
         mainSrc += `    struct timespec __next;\n`;
         mainSrc += `    clock_gettime(CLOCK_MONOTONIC, &__next);\n`;
         mainSrc += `    while (!plc_stop) {\n`;
@@ -2905,6 +3340,27 @@ const generateMainLoop = (projectStructure, config, boardId = null, shmEnabled =
         mainSrc += `        case ${ti}: return ${tg.intervalUs}UL;\n`;
     });
     mainSrc += `        default: return 0UL;\n    }\n}\n`;
+    // ⚠️ OPTIONAL ABI symbol: the loader-host dlsyms it and falls back to 99
+    // when it is absent, so a logic.so built before this field still swaps into
+    // an older host and vice versa. Adding it to the REQUIRED set would have
+    // made every mismatched pair fail a cold start.
+    mainSrc += `int plc_task_priority(int i) {\n`;
+    mainSrc += `    switch (i) {\n`;
+    taskGroups.forEach((tg, ti) => {
+        mainSrc += `        case ${ti}: return ${tg.rtPriority || 99};\n`;
+    });
+    mainSrc += `        default: return 99;\n    }\n}\n`;
+    // ⚠️ OPTIONAL ABI symbol, same contract as plc_task_priority: the axis
+    // engine runs in the loader-host's bus thread, but AXIS_REF is a PlcState
+    // field whose offset only this module knows. host.c resolves this after
+    // every bind and feeds it to the generated __hs_axis_bind(), so the
+    // pointers can never outlive the arena they came from. Absent = a project
+    // with no axes, or a module built before this existed.
+    if (axisNames.length > 0) {
+        mainSrc += `void* plc_axis_ptr(int i) {\n    switch (i) {\n`;
+        axisNames.forEach((a, i) => { mainSrc += `        case ${i}: return (void*)&S->${a};\n`; });
+        mainSrc += `        default: return 0;\n    }\n}\n`;
+    }
     mainSrc += `void plc_init_hs(void) { PLC_Init(); }\n`;
     mainSrc += `void plc_cleanup_hs(void) { PLC_Cleanup(); }\n`;
     if (shmEnabled) {
@@ -3240,6 +3696,20 @@ const GENERATED_FB_OUTPUT_TYPES = {};
 // Read_System_Time.TIME is a DINT (ms since local midnight), not the IEC TIME
 // duration its name suggests; Gen_Signal.OUT is a REAL where the `OUT` rule
 // yields DINT; and everything not otherwise matched silently defaults to BOOL.
+// ⚠️ Mandatory for every non-BOOL output of an EC_* block, for the same reason
+// MOTION_FB_OUTPUT_TYPES is mandatory for MC_*: getOutputPinType keys off pin
+// NAMES and falls through to BOOL, so ErrorID / State / SlaveCount / Value
+// collapsed to one bit in every path that has no XML customData to fall back on
+// (an agent-authored rung, a project saved before the library carried pins).
+// Types are the struct fields in kronethercatmaster.h.
+const EC_FB_OUTPUT_TYPES = {
+    'EC_GetMasterState': { 'ErrorID': 'WORD', 'State': 'BYTE', 'SlaveCount': 'UINT' },
+    'EC_GetSlaveState':  { 'ErrorID': 'WORD', 'State': 'BYTE' },
+    'EC_ResetBus':       { 'ErrorID': 'WORD' },
+    'EC_ReadSDO':        { 'ErrorID': 'WORD', 'Value': 'DWORD' },
+    'EC_WriteSDO':       { 'ErrorID': 'WORD' },
+};
+
 const SYSTEM_FB_OUTPUT_TYPES = {
     'Read_System_Time':     { 'TIME': 'DINT' },
     'Read_System_Date':     { 'Year': 'INT', 'Month': 'USINT', 'Day': 'USINT', 'Weekday': 'USINT', 'DayOfYear': 'UINT' },
@@ -3277,6 +3747,7 @@ const SYSTEM_FB_OUTPUT_TYPES = {
 const getOutputPinType = (blockType, pinName, customData) => {
     if (['Q', 'Q1', 'QU', 'QD', 'ENO'].includes(pinName)) return 'BOOL';
     if ((blockType === 'UART_Receive' || blockType === 'USB_Receive') && pinName === 'ReceivedLength') return 'UINT';
+    if (EC_FB_OUTPUT_TYPES[blockType]?.[pinName]) return EC_FB_OUTPUT_TYPES[blockType][pinName];
     if (SYSTEM_FB_OUTPUT_TYPES[blockType]?.[pinName]) return SYSTEM_FB_OUTPUT_TYPES[blockType][pinName];
     if (MOTION_FB_OUTPUT_TYPES[blockType]?.[pinName]) return MOTION_FB_OUTPUT_TYPES[blockType][pinName];
     if (GENERATED_FB_OUTPUT_TYPES[blockType]?.[pinName]) return GENERATED_FB_OUTPUT_TYPES[blockType][pinName];
@@ -3301,6 +3772,19 @@ const getOutputPinType = (blockType, pinName, customData) => {
     }
     return 'BOOL';
 };
+
+// IEC type of the debug shadow field behind an INLINE (EN/ENO, stateless)
+// block's data output — ADD, EQ, BAND, INT_TO_REAL, MIN/MAX/LIMIT/SEL/MUX.
+// ⚠️ The math path chooses its int-vs-float form at EMIT time (`useReal`, read
+// off the operand expressions), which this pre-scan cannot see, so every
+// numeric result is held as LREAL: a double carries the whole int32 range
+// exactly, so ONE field type serves both paths and can never truncate a REAL.
+// Comparisons (BOOL), bitwise ops (DWORD) and conversions (the _TO_ suffix)
+// have a fixed result type, so they keep the one getOutputPinType reports.
+const inlineShadowType = (blockType, pinName) =>
+    pinName === 'OUT' && (MATH_FB_BLOCKS.has(blockType) || ['MIN', 'MAX', 'LIMIT', 'SEL', 'MUX'].includes(blockType))
+        ? 'LREAL'
+        : getOutputPinType(blockType, pinName, null);
 
 // Sanitize a block id into a C identifier fragment (edge-memory field names).
 const sanitizeBlockId = (id) => String(id).replace(/[^A-Za-z0-9_]/g, '_');
@@ -3333,19 +3817,39 @@ const collectShadowVars = (rungs, progName) => {
             const type = (b.type || '').trim();
             const data = b.data || {};
             if (type === 'Contact' || type === 'Coil') return;
-            if (isInlineMathType(type)) return; // Inline math — no shadow vars
+            // ⚠️ Inline blocks (ADD, EQ, BAND, X_TO_Y, MIN/MAX/SEL/MUX/LIMIT) are
+            // stateless: their result used to exist ONLY inside the C expression
+            // it fed, so a block whose OUT/Q pin was left unassigned produced a
+            // value nothing could observe. They get a shadow field like every
+            // other block, which is also what forces the expression to be
+            // emitted at all when no variable and no wire consumes it.
+            const inline = isInlineMathType(type);
             const instName = (data.instanceName || type).trim().replace(/\s+/g, '_');
             const outPins = [
-                ...(FB_OUTPUTS[type] || []),
+                // An inline block's ENO IS the rung's power flow, already drawn
+                // on the rail — a slot of its own would double the cost for
+                // nothing.
+                ...(FB_OUTPUTS[type] || []).filter(p => !(inline && p === 'ENO')),
                 ...(data.customData?.content?.variables || [])
                     .filter(v => v.class === 'Output').map(v => v.name)
             ];
             outPins.forEach(pinName => {
                 const sym = `prog_${progName}_out_${instName}_${pinName}`;
-                if (!seen.has(sym)) {
-                    seen.add(sym);
-                    vars.push({ symbol: sym, type: getOutputPinType(type, pinName, data.customData) });
+                if (seen.has(sym)) return;
+                seen.add(sym);
+                if (inline && /_TO_STRING$/.test(type)) {
+                    // The text already lives in this call site's own PlcState
+                    // buffer (strConvSymbol) — a second field would be a stray
+                    // char[64], and `field = KRON_x_TO_STRING(...)` does not even
+                    // compile against an array. Alias the debug key onto it.
+                    vars.push({ symbol: sym, type: 'STRING', aliasOf: strConvSymbol(progName, instName) });
+                    return;
                 }
+                vars.push({
+                    symbol: sym,
+                    type: inline ? inlineShadowType(type, pinName)
+                                 : getOutputPinType(type, pinName, data.customData),
+                });
             });
         });
     });
@@ -4065,6 +4569,14 @@ const FB_INPUT_TYPES = {
     'Debounce':           { 'PT': 'TIME' },
     'Gen_Signal':         { 'MODE': 'USINT', 'PERIOD': 'TIME', 'AMPLITUDE': 'REAL', 'OFFSET': 'REAL' },
 };
+// EtherCAT diagnostics. Without these the non-trigger pins get no writable
+// input shadow var, so — unlike every other FB — a literal typed into
+// SlaveAddress/Index/SubIndex could not be monitored or forced from the editor,
+// and an LD auto-declare on such a pin had no type to work from.
+FB_INPUT_TYPES['EC_GetSlaveState'] = { 'SlaveAddress': 'UINT' };
+FB_INPUT_TYPES['EC_ReadSDO']       = { 'SlaveAddress': 'UINT', 'Index': 'WORD', 'SubIndex': 'BYTE', 'ByteSize': 'BYTE' };
+FB_INPUT_TYPES['EC_WriteSDO']      = { 'SlaveAddress': 'UINT', 'Index': 'WORD', 'SubIndex': 'BYTE', 'ByteSize': 'BYTE', 'Value': 'DWORD' };
+
 // Motion control: all MC_* FBs take Axis: AXIS_REF
 [...MOTION_FB_AXIS_PARAM].forEach(k => { FB_INPUT_TYPES[k] = { 'Axis': 'AXIS_REF' }; });
 // Populate conversion entries for FB_INPUTS (must be after FB_INPUTS definition)
@@ -4705,6 +5217,8 @@ const transpileSTLogics = (code, stdFunctions = {}, parentName = '', category = 
                 }
 
                 const isMotion = MOTION_FB_AXIS_PARAM.has(fbType);
+                // Same interlock as the ladder path — see the note there.
+                const motionLockAt = isMotion ? out.length : -1;
                 let axisExpr = null;
                 // Output captures (`OUT => varname`) are emitted AFTER the Call
                 // so the user reads post-call values.
@@ -4776,6 +5290,8 @@ const transpileSTLogics = (code, stdFunctions = {}, parentName = '', category = 
 
                 if (isMotion) {
                     out += `${indent()}${fbType}_Call(&${cInst}, ${axisExpr || 'NULL'});\n`;
+                    out = out.slice(0, motionLockAt) + `${indent()}KRON_AXIS_LOCK();\n`
+                        + out.slice(motionLockAt) + `${indent()}KRON_AXIS_UNLOCK();\n`;
                 } else if (EC_FB_CFG_PARAM.has(fbType)) {
                     out += `${indent()}${fbType}_Call(&${cInst}, &__ec_cfg);\n`;
                 } else if (stdFunctions[fbType]?.hasTime) {
@@ -5186,6 +5702,17 @@ const transpileLDLogics = (rungs, stdFunctions = {}, parentName = '', category =
                 const inputPins = FB_INPUTS[type] || [];
                 const dataInputPins = inputPins.filter(p => p !== 'EN');
 
+                // Debug shadow for this block's data output — the PlcState field
+                // collectShadowVars declared for it (programs only; a FUNCTION or
+                // FUNCTION_BLOCK has no such field). Writing it is what makes an
+                // inline result observable at all: with no variable on OUT/Q and
+                // no wire out, the expression below otherwise reaches no
+                // statement and the block's value exists nowhere.
+                const dbgInst = (data.instanceName || type).trim().replace(/\s+/g, '_');
+                const dbgOut = (pin) => category === 'program'
+                    ? `S->prog_${parentName}_out_${dbgInst}_${pin}`
+                    : null;
+
                 // Collect argument values from static pin values and wire connections.
                 // ⚠️ `argIsString` rides along because a comparison of text must
                 // become strcmp, not `==` on two `char *` (which tests addresses
@@ -5277,6 +5804,7 @@ const transpileLDLogics = (rungs, stdFunctions = {}, parentName = '', category =
                         out += `    float ${localRout} = 0.0f;\n`;
                         out += `    if (${bOut}) {\n`;
                         out += `        ${localRout} = ${realExpr};\n`;
+                        if (dbgOut('OUT')) out += `        ${dbgOut('OUT')} = ${localRout};\n`;
                         if (outVarCheck && IDENTIFIER_REF_REGEX.test(outVarCheck)) {
                             out += `        ${resolveVar(outVarCheck)} = ${localRout};\n`;
                         }
@@ -5303,6 +5831,7 @@ const transpileLDLogics = (rungs, stdFunctions = {}, parentName = '', category =
                             });
                         }
                         out += `    ${callFn}(&${localVar});\n`;
+                        if (dbgOut('OUT')) out += `    ${dbgOut('OUT')} = ${localVar}.OUT;\n`;
 
                         if (outVarCheck && IDENTIFIER_REF_REGEX.test(outVarCheck)) {
                             out += `    ${resolveVar(outVarCheck)} = ${localVar}.OUT;\n`;
@@ -5389,11 +5918,23 @@ const transpileLDLogics = (rungs, stdFunctions = {}, parentName = '', category =
                     const hasQPin   = (FB_OUTPUTS[type] || []).includes('Q');
                     const isBoolResult = !hasOutPin && !hasQPin;
 
+                    // A conversion to text writes into its own PlcState buffer
+                    // and RETURNS it, so the debug key is an alias of that buffer
+                    // (collectShadowVars) — never an assignment, which would not
+                    // compile against a char[]. What it does need is a statement
+                    // that evaluates the call when nothing else consumes it.
+                    const isToString = /_TO_STRING$/.test(type);
+                    // A text operand makes the result a `char *` (SEL/MUX pass one
+                    // through); the shadow field is numeric, so skip it rather than
+                    // emit an assignment that cannot compile.
+                    const hasTextArg = Object.keys(argIsString).length > 0;
+
                     if (isBoolResult) {
                         out += `    ${bOut} = ${inExpr} && ${resultExpr};\n`;
                     } else if (hasQPin) {
                         // Comparison blocks: power-flow = EN, Q = raw comparison result
                         out += `    ${bOut} = ${inExpr};\n`;
+                        if (dbgOut('Q')) out += `    ${dbgOut('Q')} = ${resultExpr};\n`;
                         const qRaw = data.values?.Q;
                         const qVar = qRaw ? (qRaw + '').replace(/[🌍🏠⊞⊡⊟]/g, '').trim() : '';
                         if (qVar && IDENTIFIER_REF_REGEX.test(qVar)) {
@@ -5404,7 +5945,13 @@ const transpileLDLogics = (rungs, stdFunctions = {}, parentName = '', category =
                         // Assign OUT to target variable
                         const outRaw = data.values?.OUT;
                         const outVar = outRaw ? (outRaw + '').replace(/[🌍🏠⊞⊡⊟]/g, '').trim() : '';
-                        if (outVar && IDENTIFIER_REF_REGEX.test(outVar)) {
+                        const outAssigned = outVar && IDENTIFIER_REF_REGEX.test(outVar);
+                        if (!isToString && !hasTextArg && dbgOut('OUT')) {
+                            out += `    if (${bOut}) { ${dbgOut('OUT')} = ${resultExpr}; }\n`;
+                        } else if (isToString && !outAssigned && category === 'program') {
+                            out += `    if (${bOut}) { (void)(${resultExpr}); }\n`;
+                        }
+                        if (outAssigned) {
                             out += `    if (${bOut}) { ${resolveVar(outVar)} = ${resultExpr}; }\n`;
                         }
                     }
@@ -5438,6 +5985,13 @@ const transpileLDLogics = (rungs, stdFunctions = {}, parentName = '', category =
                 }
 
                 const safeInst = instName.trim().replace(/\s+/g, '_');
+                // ⚠️ A motion FB's pin writes land INSIDE the request the axis
+                // engine may already own (AXIS_REF.Active/Buffer[] hold a pointer
+                // into this very instance, and a buffered command reads its
+                // parameters at activation time — on the bus thread). So the lock
+                // has to span the pin assignments as well as the _Call, not just
+                // the call. Spliced in once the whole block has been emitted.
+                const motionLockAt = MOTION_FB_AXIS_PARAM.has(type) ? out.length : -1;
                 // Step 1: assign static pin values entered in the block's INPUT fields
                 //         Skip output pins — those are written back after the call
                 if (data.values) {
@@ -5568,6 +6122,8 @@ const transpileLDLogics = (rungs, stdFunctions = {}, parentName = '', category =
                         ? `&${resolveVar(axisClean)}`
                         : 'NULL';
                     out += `    ${type}_Call(&${callTarget}, ${axisExpr});\n`;
+                    out = out.slice(0, motionLockAt) + `    KRON_AXIS_LOCK();\n`
+                        + out.slice(motionLockAt) + `    KRON_AXIS_UNLOCK();\n`;
                 } else if (stdFunctions[type]?.hasTime) {
                     if (stdFunctions[type]?.isFB !== false || Object.keys(FB_INPUTS).includes(type)) {
                         out += `    ${type}_Call(&${callTarget}, us_tick);\n`;

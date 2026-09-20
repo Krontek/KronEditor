@@ -3,7 +3,8 @@
  * Opens as a tab when a slave node is clicked in the Project Sidebar.
  */
 import { useState } from 'react';
-import { pdoEntriesToGlobalVars } from '../services/EsiParser';
+import { buildEcVarNames, findEcIssues, ecGlobalVarsForSlave, sanitizeEcIdent } from '../utils/ecNaming';
+import { resolveSdoByteSize } from '../services/CTranspilerService';
 
 const hex = (n, w = 4) => '0x' + (n ?? 0).toString(16).toUpperCase().padStart(w, '0');
 
@@ -28,31 +29,70 @@ const S = {
   chipOut: { background: '#3d0a0a', color: '#ff7675' },
 };
 
-export default function SlaveConfigPage({ slave, onChange, onAddGlobalVars, isRunning = false, esiLibrary = [] }) {
+/* ⚠️ `allSlaves` is the WHOLE bus, not a convenience: PDO variable names are
+ * disambiguated against every selected entry on the bus (see utils/ecNaming),
+ * so a page that only knew its own slave would generate different names than
+ * the transpiler. `slaveIndex` is this slave's position in that array. */
+export default function SlaveConfigPage({ slave, allSlaves = null, slaveIndex = 0, onChange, onAddGlobalVars, isRunning = false, esiLibrary = [] }) {
   const [activeTab, setActiveTab]       = useState('pdo');
   const [showEsiPicker, setShowEsiPicker] = useState(false);
   const [log, setLog]                   = useState('');
+  // Alternative mappings of an already-selected object are noise once the
+  // choice is made, but they must stay REACHABLE (moving an object to another
+  // PDO means selecting its row there), so they are collapsed, not removed.
+  const [hideAlternates, setHideAlternates] = useState(true);
 
   if (!slave) return <div style={{ ...S.root, alignItems: 'center', justifyContent: 'center', color: '#555' }}>No slave selected.</div>;
 
   /* ── Helpers ── */
   const update = (fields) => onChange?.({ ...slave, ...fields });
 
+  /* ⚠️ Selecting an entry can make an ALREADY selected PDO illegal: an ESI
+   * declares alternative mappings with <Exclude>, and assigning two excluded
+   * PDOs to the same sync manager is rejected by the slave — the bus simply
+   * never reaches OP, with nothing in the editor pointing at the cause. So the
+   * conflicting PDO's entries are cleared here, loudly, instead of being left
+   * for the transpiler (which now also refuses them) or the hardware. */
   const togglePdo = (pdoIdx, entryIdx, checked) => {
     const s = JSON.parse(JSON.stringify(slave));
     s.pdos[pdoIdx].entries[entryIdx].selected = checked;
+    if (checked) {
+      const mine = s.pdos[pdoIdx];
+      const cleared = [];
+      s.pdos.forEach((other, oi) => {
+        if (oi === pdoIdx) return;
+        const conflicts =
+          (mine.excludes || []).includes((other.index || 0) >>> 0) ||
+          (other.excludes || []).includes((mine.index || 0) >>> 0);
+        if (!conflicts) return;
+        if (!(other.entries || []).some(e => e.selected)) return;
+        other.entries.forEach(e => { e.selected = false; });
+        cleared.push(hex(other.index));
+      });
+      if (cleared.length) setLog(`Deselected ${cleared.join(', ')} — excluded by ${hex(mine.index)}`);
+    }
     onChange?.(s);
   };
 
   const updateSdo = (sdoIdx, field, value) => {
     const s = JSON.parse(JSON.stringify(slave));
     s.sdos[sdoIdx][field] = value;
+    // ⚠️ The width belongs to the OBJECT, not to the user: point a row at a
+    // different index and its size follows, so a row can never keep the width of
+    // the object it used to address. A mis-sized SDO is aborted by the drive and
+    // the bus silently never reaches OP.
+    if (field === 'index' || field === 'subindex') {
+      const row = s.sdos[sdoIdx];
+      row.byteSize = resolveSdoByteSize(s, row.index, row.subindex, row.byteSize).size;
+    }
     onChange?.(s);
   };
 
   const addSdo = () => {
     const s = JSON.parse(JSON.stringify(slave));
-    s.sdos = [...(s.sdos || []), { index: 0x6040, subindex: 0, value: 6, byteSize: 2, comment: '' }];
+    const seed = { index: 0x6040, subindex: 0, value: 6, comment: '' };
+    seed.byteSize = resolveSdoByteSize(s, seed.index, seed.subindex, 2).size;
+    s.sdos = [...(s.sdos || []), seed];
     onChange?.(s);
   };
 
@@ -107,25 +147,36 @@ export default function SlaveConfigPage({ slave, onChange, onAddGlobalVars, isRu
     setLog(`Imported: ${device.name}`);
   };
 
+  /* The bus this slave belongs to. Names and conflicts are computed over ALL
+   * slaves — see the prop comment above and utils/ecNaming. */
+  const bus     = allSlaves && allSlaves.length ? allSlaves : [slave];
+  const myIndex = allSlaves && allSlaves.length ? slaveIndex : 0;
+  const varNames = buildEcVarNames(bus);
+  const issues   = findEcIssues(bus);
+  const myIssues = issues.filter(i => i.slaveIndex === myIndex);
+  const badKeys  = new Set(issues.flatMap(i => i.keys || []));
+  const rowKey   = (pi, ei) => `${myIndex}|${pi}|${ei}`;
+  // Which PDO already carries each SELECTED object, so the alternative mappings
+  // of that same object can be dimmed instead of looking like duplicates.
+  const objKey   = (e) => `${(e?.index || 0) >>> 0}|${(e?.subindex || 0) & 0xFF}`;
+  const selectedObjectPdo = new Map();
+  (slave.pdos || []).forEach(pdo => (pdo.entries || []).forEach(e => {
+    if (e.selected) selectedObjectPdo.set(objKey(e), hex(pdo.index));
+  }));
+
   const handleAddGlobalVars = () => {
-    const selectedEntries = [];
-    for (const pdo of (slave.pdos || [])) {
-      for (const entry of (pdo.entries || [])) {
-        if (entry.selected) selectedEntries.push({ entry, slaveName: slave.name, direction: pdo.direction });
-      }
-    }
-    if (!selectedEntries.length) { setLog('No PDO entries selected.'); return; }
-    const vars = pdoEntriesToGlobalVars(selectedEntries);
-    const finalVars = vars.map((v, i) => {
-      const custom = selectedEntries[i]?.entry?.varName;
-      return custom ? { ...v, name: custom } : v;
-    });
-    onAddGlobalVars?.(finalVars);
-    setLog(`Added ${finalVars.length} global variable(s)`);
+    if (myIssues.length) { setLog('Fix the PDO mapping problems first.'); return; }
+    const vars = ecGlobalVarsForSlave(bus, myIndex);
+    if (!vars.length) { setLog('No PDO entries selected.'); return; }
+    onAddGlobalVars?.(vars);
+    setLog(`Added ${vars.length} global variable(s)`);
   };
 
   const selectedCount = (slave.pdos || []).reduce((acc, pdo) =>
     acc + (pdo.entries || []).filter(e => e.selected).length, 0);
+
+  const altCount = (slave.pdos || []).reduce((acc, pdo) =>
+    acc + (pdo.entries || []).filter(e => !e.selected && selectedObjectPdo.has(objKey(e))).length, 0);
 
   /* ── Render ── */
   return (
@@ -215,56 +266,111 @@ export default function SlaveConfigPage({ slave, onChange, onAddGlobalVars, isRu
 
           {/* PDO */}
           {activeTab === 'pdo' && (
-            <table style={S.table}>
-              <thead>
-                <tr>
-                  <th style={S.th}>✔</th>
-                  <th style={S.th}>Dir</th>
-                  <th style={S.th}>Index</th>
-                  <th style={S.th}>Sub</th>
-                  <th style={S.th}>Name</th>
-                  <th style={S.th}>Type</th>
-                  <th style={S.th}>IEC Var Name</th>
-                </tr>
-              </thead>
-              <tbody>
-                {(slave.pdos || []).flatMap((pdo, pi) =>
-                  (pdo.entries || []).map((entry, ei) => (
-                    <tr key={`${pi}-${ei}`}>
-                      <td style={S.td}>
-                        <input type="checkbox" checked={!!entry.selected} disabled={isRunning}
-                          onChange={e => togglePdo(pi, ei, e.target.checked)} />
-                      </td>
-                      <td style={S.td}>
-                        <span style={{ ...S.chip, ...(pdo.direction === 'input' ? S.chipIn : S.chipOut) }}>
-                          {pdo.direction === 'input' ? 'IN' : 'OUT'}
-                        </span>
-                      </td>
-                      <td style={{ ...S.td, fontFamily: 'monospace' }}>{hex(entry.index)}</td>
-                      <td style={{ ...S.td, fontFamily: 'monospace' }}>{hex(entry.subindex, 2)}</td>
-                      <td style={S.td}>{entry.name}</td>
-                      <td style={{ ...S.td, color: '#ce9178' }}>{entry.dtype}</td>
-                      <td style={S.td}>
-                        <input style={{ ...S.input, maxWidth: '100%', flex: 'unset', width: '100%' }}
-                          value={entry.varName || ''} disabled={isRunning} placeholder="auto"
-                          onChange={e => {
-                            const s = JSON.parse(JSON.stringify(slave));
-                            s.pdos[pi].entries[ei].varName = e.target.value;
-                            onChange?.(s);
-                          }} />
+            <>
+              {/* ⚠️ Without the PDO column two rows of alternative mappings are
+                  literally indistinguishable — same direction, index, subindex,
+                  name and type — which is what made a device look like it
+                  listed the same variable twice. */}
+              {myIssues.length > 0 && (
+                <div style={{ background: '#3d0a0a', border: '1px solid #7f1d1d', borderRadius: 4,
+                              padding: '7px 10px', marginBottom: 8, color: '#ff8a80', fontSize: 11 }}>
+                  <b>PDO mapping problems ({myIssues.length})</b>
+                  <ul style={{ margin: '5px 0 0 16px', padding: 0 }}>
+                    {myIssues.map((iss, i) => <li key={i} style={{ marginBottom: 2 }}>{iss.message}</li>)}
+                  </ul>
+                </div>
+              )}
+              {altCount > 0 && (
+                <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 6, fontSize: 11, color: '#888' }}>
+                  <label style={{ display: 'flex', alignItems: 'center', gap: 5, cursor: 'pointer' }}>
+                    <input type="checkbox" checked={hideAlternates}
+                      onChange={e => setHideAlternates(e.target.checked)} />
+                    Hide alternative mappings of selected objects ({altCount})
+                  </label>
+                </div>
+              )}
+              <table style={S.table}>
+                <thead>
+                  <tr>
+                    <th style={S.th}>✔</th>
+                    <th style={S.th}>PDO</th>
+                    <th style={S.th}>Dir</th>
+                    <th style={S.th}>Index</th>
+                    <th style={S.th}>Sub</th>
+                    <th style={S.th}>Name</th>
+                    <th style={S.th}>Type</th>
+                    <th style={S.th}>IEC Var Name</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {(slave.pdos || []).flatMap((pdo, pi) =>
+                    (pdo.entries || []).map((entry, ei) => {
+                      const key     = rowKey(pi, ei);
+                      const flagged = badKeys.has(key);
+                      // ⚠️ An ESI lists the SAME CoE object in several ALTERNATIVE
+                      // PDOs (0x6040 in 0x1600/0x1601/0x1602 here), which reads as
+                      // "the import produced duplicates". They are choices, not
+                      // copies, and picking two of them is a hard error
+                      // (findEcIssues 'duplicate-object'), so a row whose object is
+                      // already taken elsewhere is dimmed and says where.
+                      const takenIn = (!entry.selected && selectedObjectPdo.get(objKey(entry))) || null;
+                      if (takenIn && hideAlternates) return null;
+                      const gen     = varNames.get(key);
+                      const raw     = entry.varName || '';
+                      const badName = !!raw.trim() && sanitizeEcIdent(raw) !== raw.trim();
+                      return (
+                        <tr key={`${pi}-${ei}`}
+                            style={flagged ? { background: '#2a1212' } : takenIn ? { opacity: 0.45 } : undefined}
+                            title={takenIn ? `Same object is already selected in PDO ${takenIn} — these are alternative mappings of one object, not two variables.` : undefined}>
+                          <td style={S.td}>
+                            <input type="checkbox" checked={!!entry.selected} disabled={isRunning}
+                              onChange={e => togglePdo(pi, ei, e.target.checked)} />
+                          </td>
+                          <td style={{ ...S.td, fontFamily: 'monospace', color: '#888', whiteSpace: 'nowrap' }}
+                              title={`${pdo.name || ''}${pdo.sm != null ? ` · SM${pdo.sm}` : ''}${(pdo.excludes || []).length ? ` · excludes ${(pdo.excludes || []).map(x => hex(x)).join(', ')}` : ''}`}>
+                            {hex(pdo.index)}{pdo.fixed ? ' 🔒' : ''}
+                          </td>
+                          <td style={S.td}>
+                            <span style={{ ...S.chip, ...(pdo.direction === 'input' ? S.chipIn : S.chipOut) }}>
+                              {pdo.direction === 'input' ? 'IN' : 'OUT'}
+                            </span>
+                          </td>
+                          <td style={{ ...S.td, fontFamily: 'monospace' }}>{hex(entry.index)}</td>
+                          <td style={{ ...S.td, fontFamily: 'monospace' }}>{hex(entry.subindex, 2)}</td>
+                          <td style={S.td}>
+                            {entry.name}
+                            {takenIn && <span style={{ marginLeft: 6, fontSize: 10, color: '#888' }}>· also in {takenIn}</span>}
+                          </td>
+                          <td style={{ ...S.td, color: '#ce9178' }}>{entry.dtype}</td>
+                          <td style={S.td}>
+                            <input
+                              style={{ ...S.input, maxWidth: '100%', flex: 'unset', width: '100%',
+                                       borderColor: (flagged || badName) ? '#c62828' : '#555' }}
+                              value={raw} disabled={isRunning}
+                              placeholder={gen?.auto || 'auto'}
+                              title={badName
+                                ? `Will be emitted as "${sanitizeEcIdent(raw)}"`
+                                : gen ? `Emitted as "${gen.name}"` : 'Select the entry to generate a name'}
+                              onChange={e => {
+                                const s = JSON.parse(JSON.stringify(slave));
+                                s.pdos[pi].entries[ei].varName = e.target.value;
+                                onChange?.(s);
+                              }} />
+                          </td>
+                        </tr>
+                      );
+                    })
+                  )}
+                  {(slave.pdos || []).every(p => !(p.entries || []).length) && (
+                    <tr>
+                      <td colSpan={8} style={{ ...S.td, textAlign: 'center', color: '#555', padding: '20px 0' }}>
+                        No PDO entries. Use "Import from Library" or add device data manually.
                       </td>
                     </tr>
-                  ))
-                )}
-                {(slave.pdos || []).every(p => !(p.entries || []).length) && (
-                  <tr>
-                    <td colSpan={7} style={{ ...S.td, textAlign: 'center', color: '#555', padding: '20px 0' }}>
-                      No PDO entries. Use "Import from Library" or add device data manually.
-                    </td>
-                  </tr>
-                )}
-              </tbody>
-            </table>
+                  )}
+                </tbody>
+              </table>
+            </>
           )}
 
           {/* SDO */}
@@ -299,12 +405,29 @@ export default function SlaveConfigPage({ slave, onChange, onAddGlobalVars, isRu
                             disabled={isRunning} onChange={e => updateSdo(si, 'value', parseInt(e.target.value, 16) || 0)} />
                         </td>
                         <td style={S.td}>
-                          <select style={{ ...S.input, maxWidth: 50 }} value={sdo.byteSize || 1}
-                            disabled={isRunning} onChange={e => updateSdo(si, 'byteSize', parseInt(e.target.value))}>
-                            <option value={1}>1</option>
-                            <option value={2}>2</option>
-                            <option value={4}>4</option>
-                          </select>
+                          {(() => {
+                            // Derived, not chosen. Only an object nobody can size
+                            // (vendor-specific, absent from the ESI and from
+                            // CiA402) still offers the manual select.
+                            const info = resolveSdoByteSize(slave, sdo.index, sdo.subindex, sdo.byteSize);
+                            if (info.source === 'stored') {
+                              return (
+                                <select style={{ ...S.input, maxWidth: 50 }} value={sdo.byteSize || 1}
+                                  title="Unknown object — the ESI does not declare it and it is not a standard CiA402 object, so the size must be entered by hand."
+                                  disabled={isRunning} onChange={e => updateSdo(si, 'byteSize', parseInt(e.target.value))}>
+                                  <option value={1}>1</option>
+                                  <option value={2}>2</option>
+                                  <option value={4}>4</option>
+                                </select>
+                              );
+                            }
+                            return (
+                              <span style={{ fontSize: 11, color: '#888', fontVariantNumeric: 'tabular-nums' }}
+                                title={`Size comes from ${info.source}${info.dtype ? ` (${info.dtype})` : ''} — the object defines it, so it is not editable. A mis-sized SDO is aborted by the drive and the bus never reaches OP.`}>
+                                {info.size}{info.dtype ? ` · ${info.dtype}` : ` · ${info.source}`}
+                              </span>
+                            );
+                          })()}
                         </td>
                         <td style={S.td}>
                           <input style={{ ...S.input, maxWidth: '100%' }} value={sdo.comment || ''}

@@ -395,6 +395,34 @@ func CollectStaticArchives(dir string) []string {
 	return out
 }
 
+// staticArchiveLinkArgs returns every .a in dir ready to put on a link line.
+//
+// ⚠️ The archives have INTER-DEPENDENCIES, and a classic linker scans each one
+// exactly once in command-line order — a member is only pulled in if it
+// resolves an already-undefined symbol. CollectStaticArchives sorts by BYTE
+// value, where an uppercase name sorts before a lowercase one, so
+// libTrajectoryGenerator.a lands ahead of libkron_axis.a: by the time
+// kron_axis.o is pulled in and needs MotionLimitsInit, the archive that has it
+// is long past, and the link dies with an undefined reference. (It stayed
+// hidden while only -fuse-ld=lld paths linked these — LLD registers every
+// archive member up front and does not care about order — and surfaced the
+// moment the axis engine moved into the loader-host, which links with the
+// default linker.) --start-group makes the group order-independent, so no
+// dependency order has to be hand-maintained here as libraries are added.
+//
+// ⚠️ NOT on Mach-O: ld64 rejects the flag outright, and needs no equivalent —
+// it already re-scans archives until nothing new resolves.
+func staticArchiveLinkArgs(dir string, targetDarwin bool) []string {
+	archives := CollectStaticArchives(dir)
+	if len(archives) == 0 || targetDarwin {
+		return archives
+	}
+	out := make([]string, 0, len(archives)+2)
+	out = append(out, "-Wl,--start-group")
+	out = append(out, archives...)
+	return append(out, "-Wl,--end-group")
+}
+
 func filterExisting(paths []string) []string {
 	out := make([]string, 0, len(paths))
 	for _, p := range paths {
@@ -414,8 +442,10 @@ func guessToolchainsRoot() string {
 }
 
 // guessSiblingDir looks for a "resources" or "toolchains" directory in:
-//   cwd, cwd/..  (running from host-agent/ during dev)
-//   exe dir, exe dir/.. (production binary alongside the data dir)
+//
+//	cwd, cwd/..  (running from host-agent/ during dev)
+//	exe dir, exe dir/.. (production binary alongside the data dir)
+//
 // Returns the first match (absolute path) or the bare name as fallback.
 func guessSiblingDir(name string) string {
 	tryAt := func(base string) string {

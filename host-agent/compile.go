@@ -74,8 +74,14 @@ func (s *Server) compileSimulation() (string, string, error) {
 	}
 
 	args := append([]string{}, baseArgs...)
+	// ⚠️ The plain sim gets the SAME bus decision as the hot-swap sim: a
+	// hardcoded -DKRON_EC_SIM here made every axis fake even when the host can
+	// really drive the bus (the axis engine's `Simulation` flag now follows this
+	// define — see CTranspilerService's __kron_bus_sim), so MC_Power reported
+	// Status = TRUE against a drive that never enabled. ecSimFlag falls back to
+	// the stubs whenever SOEM is not genuinely available.
+	args = append(args, ecSimFlag(hostLibDir, resInclude)...)
 	args = append(args,
-		"-DKRON_EC_SIM",
 		"-I", buildDir,
 		"-I", resInclude,
 		"-I", filepath.Join(resInclude, "HAL"),
@@ -107,8 +113,7 @@ func (s *Server) compileSimulation() (string, string, error) {
 		args = append(args, "-static")
 	}
 
-	archives := CollectStaticArchives(hostLibDir)
-	args = append(args, archives...)
+	args = append(args, staticArchiveLinkArgs(hostLibDir, runtime.GOOS == "darwin")...)
 	args = append(args, "-lm")
 	if runtime.GOOS == "darwin" {
 		args = append(args, "-lpthread", "-framework", "CoreFoundation", "-framework", "IOKit")
@@ -209,6 +214,15 @@ func (s *Server) compileForTarget(req *compileForTargetReq) (string, string, err
 		return "", "", fmt.Errorf("Pico (Cortex-M) boards are no longer supported — reselect a Linux board in Board Config")
 	case strings.HasPrefix(req.BoardID, "bb_") && !strings.HasPrefix(req.BoardID, "bb_ai64"):
 		llvmTarget, resourceTarget = "arm-linux-gnueabihf", "arm/armv7"
+	// ⚠️ Generic Linux carries its arch in the ID and must be matched BEFORE
+	// the default: the default is aarch64, so a generic x86_64 or armv7 target
+	// would otherwise cross-build a wrong-arch runtime that only fails on the
+	// device ("cannot execute binary file"). Keep these in step with
+	// serverBinaryForBoard, which switches on the same ids.
+	case req.BoardID == "generic_linux_x64":
+		llvmTarget, resourceTarget = "x86_64-linux-gnu", "x86_64/linux"
+	case req.BoardID == "generic_linux_armv7":
+		llvmTarget, resourceTarget = "arm-linux-gnueabihf", "arm/armv7"
 	default:
 		llvmTarget, resourceTarget = "aarch64-linux-gnu", "arm/aarch64"
 	}
@@ -229,7 +243,8 @@ func (s *Server) compileForTarget(req *compileForTargetReq) (string, string, err
 
 	args := append([]string{}, baseArgs...)
 	args = append(args, "-O3", "-ffunction-sections", "-fdata-sections", "-fuse-ld=lld", "-static", "-Wl,--gc-sections")
-	if strings.HasPrefix(req.BoardID, "bb_") && !strings.HasPrefix(req.BoardID, "bb_ai64") {
+	if (strings.HasPrefix(req.BoardID, "bb_") && !strings.HasPrefix(req.BoardID, "bb_ai64")) ||
+		req.BoardID == "generic_linux_armv7" {
 		args = append(args, "-march=armv7-a")
 	}
 	if req.BoardID == "rpi_5" {
@@ -287,7 +302,7 @@ func (s *Server) compileForTarget(req *compileForTargetReq) (string, string, err
 	for _, l := range s.paths.LLVMTargetLibraryDirs(llvmTarget) {
 		args = append(args, "-L", l)
 	}
-	args = append(args, CollectStaticArchives(libDir)...)
+	args = append(args, staticArchiveLinkArgs(libDir, false)...) // cross target: always Linux
 	args = append(args, "-lm", "-lpthread", "-lrt")
 
 	cmdStr := fmt.Sprintf("%s %s", compiler, strings.Join(args, " "))

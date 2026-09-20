@@ -1,0 +1,53 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  KronSystem — Error Code Catalog
+  Per-block ERR_ID codes for the static-inline blocks in
+  resources/krontek-include/kronsystem.h (CLAUDE.md §14).
+
+  ⚠️ The four values are the KRON_SYS_* constants in that header (lines 63-66):
+      0 KRON_SYS_OK        1 KRON_SYS_ABSENT
+      2 KRON_SYS_OPENFAIL  3 KRON_SYS_IOERR
+  Code 3 does NOT mean the same thing everywhere — for a reader block it is an
+  empty file, for a host-health block a parse failure — so the shared names are
+  reused but the text is overridden per block. Keep this file in step with the
+  header: a catalog that disagrees with the runtime is worse than none.
+
+  These blocks are Linux-only host health / sysfs readers. On Windows and macOS
+  they report ERR_ID = 1 rather than faking a plausible number (§10: a missing
+  peripheral must FAIL, never fake success).
+-->
+<error_codes library="KronSystem">
+
+  <shared>
+    <error code="1" name="KRON_SYS_ABSENT"   text="Not available on this machine." />
+    <error code="2" name="KRON_SYS_OPENFAIL" text="The file could not be opened." />
+    <error code="3" name="KRON_SYS_IOERR"    text="The file opened but could not be read." />
+  </shared>
+
+  <block type="Read_CPU_Temperature">
+    <error code="1" name="KRON_SYS_ABSENT" text="No CPU thermal zone was found — no /sys/class/thermal zone reports a usable temperature, or this is not Linux. TEMP is left at 0.0." />
+    <error code="3" name="KRON_SYS_IOERR"  text="A thermal zone was found but its value could not be read or parsed." />
+  </block>
+
+  <block type="Read_System_Load">
+    <error code="1" name="KRON_SYS_ABSENT" text="/proc/loadavg is not available — this is not Linux. The load outputs are left at 0." />
+    <error code="3" name="KRON_SYS_IOERR"  text="/proc/loadavg was read but did not yield the expected load figures." />
+  </block>
+
+  <block type="Read_Disk_Free">
+    <error code="1" name="KRON_SYS_ABSENT" text="statvfs is not available on this platform (Windows) — the simulation runs, but the disk figures stay 0." />
+    <error code="3" name="KRON_SYS_IOERR"  text="statvfs failed for PATH — the path does not exist, or it is not on a mounted filesystem." />
+  </block>
+
+  <block type="Read_Sys_File">
+    <error code="2" name="KRON_SYS_OPENFAIL" text="PATH does not open as a file: it is missing, it is a directory, or the runtime has no permission to read it. Check the exact path on the target." />
+    <error code="3" name="KRON_SYS_IOERR"    text="The file opened but is empty — VALUE is an empty string. Some sysfs attributes only produce a value once the device is active." />
+  </block>
+
+  <block type="Read_Hwmon">
+    <error code="1" name="KRON_SYS_ABSENT"   text="No hwmon device carries NAME (or this is not Linux). The device is matched by its `name` attribute, not by the hwmonN index — that index is probe order and moves across boots." />
+    <error code="2" name="KRON_SYS_OPENFAIL" text="The device was found but ATTR does not open on it — check the attribute name against `ls /sys/class/hwmon/hwmonN/`." />
+    <error code="3" name="KRON_SYS_IOERR"    text="The attribute opened but is empty — VALUE is an empty string." />
+  </block>
+
+</error_codes>

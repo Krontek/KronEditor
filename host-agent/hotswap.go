@@ -124,6 +124,11 @@ type HotSwapState struct {
 	stopCh chan struct{}
 	done   chan struct{} // closed by the reaper goroutine (the ONLY cmd.Wait caller)
 
+	// Build dir of the RUNNING host. Stop needs it to place stop_request, which
+	// is the only way to stop a privileged runtime an unprivileged agent cannot
+	// signal. Set together with cmd, cleared with it.
+	buildDir string
+
 	// curGen is the generation we are CERTAIN the loader-host is running: the
 	// gen launched at cold start (always 0) and advanced ONLY when a swap is
 	// CONFIRMED "OK". It is never inferred from a directory listing (ambiguous
@@ -142,8 +147,8 @@ func NewHotSwapState() *HotSwapState { return &HotSwapState{} }
 // `done`.
 func (h *HotSwapState) Stop() {
 	h.mu.Lock()
-	cmd, ch, done := h.cmd, h.stopCh, h.done
-	h.cmd, h.pid, h.stopCh, h.done = nil, 0, nil, nil
+	cmd, ch, done, buildDir, pid := h.cmd, h.stopCh, h.done, h.buildDir, h.pid
+	h.cmd, h.pid, h.stopCh, h.done, h.buildDir = nil, 0, nil, nil, ""
 	h.mu.Unlock()
 	if ch != nil {
 		select {
@@ -153,25 +158,41 @@ func (h *HotSwapState) Stop() {
 		}
 	}
 	if cmd != nil && cmd.Process != nil {
-		// SIGTERM first, then a short grace: the loader-host handles it by
-		// unwinding its scan threads and flushing RETAINED variables one last
-		// time (hotswaphost/host.c). Kill is still the fallback — a SIGKILL'd
-		// host just falls back on the periodic flush, and on Windows (where
-		// Signal fails outright) nothing is lost by killing immediately.
-		termed := cmd.Process.Signal(syscall.SIGTERM) == nil
-		if termed && done != nil {
+		// ⚠️ stop_request FIRST, signal second. The runtime runs privileged, so
+		// an unprivileged agent's SIGTERM comes back EPERM and the old
+		// signal-only path could not stop it at all — the file trigger is what
+		// host.c's watch_files_thread polls. Both are graceful: the host unwinds
+		// its scan threads and flushes RETAINED variables one last time.
+		if buildDir != "" {
+			_ = os.WriteFile(stopRequestPath(buildDir), []byte("stop\n"), 0o644)
+		}
+		// Still signalled: faster when it works (a runtime KronServer started as
+		// root, or an unprivileged fallback launch), and harmless when it does not.
+		_ = cmd.Process.Signal(syscall.SIGTERM)
+		if done != nil {
 			select {
 			case <-done:
+				if buildDir != "" {
+					_ = os.Remove(stopRequestPath(buildDir))
+				}
 				return // exited gracefully; nothing left to kill
 			case <-time.After(hotSwapStopGrace):
 			}
 		}
-		_ = cmd.Process.Kill()
+		// Fallbacks, in escalating order of rudeness. Kill is EPERM against a
+		// root child, hence the privileged last resort — which prompts again, so
+		// it is only ever reached after the graceful path has already timed out.
+		if err := cmd.Process.Kill(); err != nil && pid > 0 {
+			_ = privilegedKill(pid)
+		}
 		if done != nil {
 			select {
 			case <-done:
 			case <-time.After(5 * time.Second):
 			}
+		}
+		if buildDir != "" {
+			_ = os.Remove(stopRequestPath(buildDir))
 		}
 	}
 }
@@ -270,7 +291,7 @@ func (s *Server) writeHotSwapVariable(w http.ResponseWriter, req writeVariableRe
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
-func swapResultPath(buildDir string) string { return filepath.Join(buildDir, "swap_result") }
+func swapResultPath(buildDir string) string  { return filepath.Join(buildDir, "swap_result") }
 func swapRequestPath(buildDir string) string { return filepath.Join(buildDir, "swap_request") }
 
 // compileLogic builds logic_<ver>.so from the plc.c already in buildDir. The
@@ -330,13 +351,15 @@ func (s *Server) compileLogic(buildDir string, ver int) (string, string, error) 
 		args = append(args, "-shared")
 	}
 	args = append(args,
-		"-fPIC", "-DPLC_HOTSWAP", "-DKRON_EC_SIM",
+		"-fPIC", "-DPLC_HOTSWAP",
 		"-I", buildDir, "-I", resInclude, "-I", filepath.Join(resInclude, "HAL"),
-		"-I", simInc, "-I", filepath.Join(resInclude, "soem/include"),
+		"-I", simInc,
 	)
+	args = append(args, ecSimFlag(libDir, resInclude)...)
+	args = append(args, soemIncludeArgs(resInclude)...)
 	args = append(args, hostUseLLD()...)
 	args = append(args, "-O2", "-o", tmpSO, plcC)
-	args = append(args, CollectStaticArchives(libDir)...)
+	args = append(args, staticArchiveLinkArgs(libDir, runtime.GOOS == "darwin")...)
 	args = append(args, "-lm")
 	if runtime.GOOS == "windows" {
 		// ⚠️ The Windows equivalent of the host's -rdynamic. A PE DLL cannot
@@ -425,6 +448,7 @@ func (s *Server) compileHost(buildDir string) (string, error) {
 	if curHash != "" {
 		if prev, e := os.ReadFile(hashFile); e == nil && string(prev) == curHash {
 			if _, e := os.Stat(hostBin); e == nil {
+				s.announceEtherCATCaps(buildDir, hostBin)
 				return hostBin, nil
 			}
 		}
@@ -469,11 +493,13 @@ func (s *Server) compileHost(buildDir string) (string, error) {
 			return "", fmt.Errorf("resource paths: %v %v", e1, e2)
 		}
 		simInc := filepath.Join(s.paths.LLVMSysroot("simulation_env"), "include")
-		args = append(args, "-DKRON_EC_SIM",
+		args = append(args,
 			"-I", buildDir, "-I", resInclude, "-I", filepath.Join(resInclude, "HAL"),
-			"-I", simInc, "-I", filepath.Join(resInclude, "soem/include"),
-			glueC)
-		args = append(args, CollectStaticArchives(libDir)...)
+			"-I", simInc)
+		args = append(args, ecSimFlag(libDir, resInclude)...)
+		args = append(args, soemIncludeArgs(resInclude)...)
+		args = append(args, glueC)
+		args = append(args, staticArchiveLinkArgs(libDir, runtime.GOOS == "darwin")...)
 		args = append(args, "-lm")
 	}
 	switch runtime.GOOS {
@@ -494,7 +520,89 @@ func (s *Server) compileHost(buildDir string) (string, error) {
 	if curHash != "" {
 		_ = os.WriteFile(hashFile, []byte(curHash), 0o644)
 	}
+	s.announceEtherCATCaps(buildDir, hostBin)
 	return hostBin, nil
+}
+
+// announceEtherCATCaps grants (or asks the user to grant) the raw-socket rights
+// the loader-host needs, but ONLY for a project that actually drives a bus —
+// the glue exports __hs_ec_start exactly then. Silent for everything else.
+func (s *Server) announceEtherCATCaps(buildDir, hostBin string) {
+	glue, err := os.ReadFile(filepath.Join(buildDir, "host_glue.c"))
+	if err != nil || !bytes.Contains(glue, []byte("__hs_ec_start")) {
+		return
+	}
+	// ⚠️ Only when nothing can launch the runtime privileged. With pkexec or a
+	// sudo askpass available the runtime is root and the agent's own
+	// capabilities buy nothing, so this told the user to run a setcap command
+	// that would not have changed anything — on every single build.
+	if hasPrivilegedLauncher() {
+		return
+	}
+	if msg := grantNetRawCaps(hostBin); msg != "" {
+		s.events.Emit("build-command", "[EtherCAT] "+msg)
+	}
+}
+
+// ecSimFlag decides whether the local SIMULATION talks to a real EtherCAT bus
+// over the developer PC's NIC, or compiles against the header's no-op stubs.
+//
+// ⚠️ It returns -DKRON_EC_SIM unless EVERYTHING the real master needs is present
+// for the HOST target: a libsoem.a that actually exports ecx_init (Build SOEM may
+// never have run — resources/ is gitignored, §4), the kronethercatmaster archive,
+// and the staged SOEM headers. A fresh clone therefore still builds a simulation,
+// it just cannot drive a bus. Linux only: SOEM needs npcap on Windows and a
+// contrib libpcap port on macOS, neither of which is bundled.
+func ecSimFlag(libDir, resInclude string) []string {
+	if runtime.GOOS != "linux" {
+		return []string{"-DKRON_EC_SIM"}
+	}
+	if st, err := os.Stat(filepath.Join(resInclude, "soem", "include")); err != nil || !st.IsDir() {
+		return []string{"-DKRON_EC_SIM"}
+	}
+	if _, err := os.Stat(filepath.Join(libDir, "libkronethercatmaster.a")); err != nil {
+		return []string{"-DKRON_EC_SIM"}
+	}
+	// ⚠️ Presence is not enough — libraries_kron.go builds a STUB-ONLY
+	// libsoem-less archive when the SOEM headers were missing at the time, and
+	// that one links fine but does nothing. The archive's symbol index carries
+	// the exported names verbatim, so scanning the bytes for ecx_init is the
+	// same test compileForTarget makes with nm, minus the dependency on nm
+	// being installed.
+	blob, err := os.ReadFile(filepath.Join(libDir, "libsoem.a"))
+	if err != nil || !bytes.Contains(blob, []byte("ecx_init")) {
+		return []string{"-DKRON_EC_SIM"}
+	}
+	return nil
+}
+
+// grantNetRawCaps best-effort-grants the loader-host the capabilities SOEM's
+// raw packet socket needs, so a real EtherCAT bus works without running the
+// whole editor as root.
+//
+// ⚠️ NEVER fatal: setcap itself needs root, so this usually fails on a normal
+// desktop. The returned string is the instruction the user has to run once —
+// the simulation is started either way, and kron_ec_init just reports the bus
+// as absent (ERR/NOT-OP) instead of pretending it is in OP.
+func grantNetRawCaps(bin string) string {
+	if runtime.GOOS != "linux" {
+		return ""
+	}
+	// Nothing to do: this agent already holds the caps and passes them to every
+	// runtime it spawns through the ambient set, which survives a rebuild of the
+	// binary — unlike file capabilities on the build output.
+	if hasNetRawCaps() {
+		return ""
+	}
+	// Fall back to stamping the freshly built binary. This only succeeds when
+	// setcap needs no privilege escalation (agent already root), and the caps
+	// die with the next rebuild, so the hint below is the real fix.
+	if setcap, err := exec.LookPath("setcap"); err == nil {
+		if _, err := exec.Command(setcap, "cap_net_raw,cap_net_admin+ep", bin).CombinedOutput(); err == nil {
+			return ""
+		}
+	}
+	return netRawGrantHint()
 }
 
 // soemIncludeArgs returns the SOEM -I paths (kronethercatmaster.h pulls in
@@ -558,7 +666,7 @@ func (s *Server) compileLogicForTarget(buildDir, boardID string, ver int) (strin
 	for _, l := range s.paths.LLVMTargetLibraryDirs(llvmTarget) {
 		args = append(args, "-L", l)
 	}
-	args = append(args, CollectStaticArchives(libDir)...)
+	args = append(args, staticArchiveLinkArgs(libDir, false)...) // cross target: always Linux
 	args = append(args, "-lm")
 	if out, err := exec.Command(compiler, args...).CombinedOutput(); err != nil {
 		_ = os.Remove(tmpSO)
@@ -608,7 +716,7 @@ func (s *Server) compileHostForTarget(buildDir, boardID string) (string, error) 
 		for _, l := range s.paths.LLVMTargetLibraryDirs(llvmTarget) {
 			args = append(args, "-L", l)
 		}
-		args = append(args, CollectStaticArchives(libDir)...)
+		args = append(args, staticArchiveLinkArgs(libDir, false)...) // cross target: always Linux
 	}
 	args = append(args, "-o", outFile, "-lm", "-lpthread", "-ldl", "-lrt")
 	if out, err := exec.Command(compiler, args...).CombinedOutput(); err != nil {
@@ -865,8 +973,28 @@ func (s *Server) handleHotSwapRun(w http.ResponseWriter, r *http.Request) {
 	// Clear any stale result from a previous run BEFORE spawning, so a
 	// leftover file can never be misread as THIS run's cold-start outcome.
 	_ = hotswaplib.ClearResultFile(swapResultPath(buildDir))
-	cmd := exec.Command(hostBin, logicSO)
-	cmd.Dir = buildDir // so the host reads ./swap_request (and writes ./swap_result) here
+	// ⚠️ A stale stop_request from a previous run would stop this one within
+	// 10 ms of start-up, which reads as "the host died immediately".
+	_ = os.Remove(stopRequestPath(buildDir))
+	// The runtime always runs privileged (netcaps_linux.go runtimeLaunchCmd) —
+	// the desktop prompts for the password. buildDir is passed as argv[2]
+	// because pkexec's handling of the working directory is not something the
+	// swap protocol should depend on; host.c chdir()s there itself.
+	cmd, launchNote := runtimeLaunchCmd(hostBin, []string{logicSO, buildDir})
+	cmd.Dir = buildDir
+	// ⚠️ The loader-host's stdout/stderr used to go NOWHERE: an unset
+	// Stdout/Stderr means /dev/null in os/exec, so every `[host] …` line and
+	// every `[kronec] …` diagnostic from the EtherCAT master — "No EtherCAT
+	// slaves found", "Could not reach OP state", "PO2SO SDO failed", the PDO
+	// size mismatch report — was discarded. A bus that never came up looked
+	// exactly like a PLC bug, with nothing anywhere to say otherwise.
+	// Tee'd to <buildDir>/runtime.log AND to the Output panel.
+	runtimeLog := s.newRuntimeLogWriter(buildDir)
+	cmd.Stdout = runtimeLog
+	cmd.Stderr = runtimeLog
+	if launchNote != "" {
+		s.events.Emit("runtime-log", map[string]any{"level": "info", "line": launchNote})
+	}
 	if err := cmd.Start(); err != nil {
 		s.hotswap.mu.Unlock()
 		writeError(w, http.StatusInternalServerError, err.Error())
@@ -875,6 +1003,7 @@ func (s *Server) handleHotSwapRun(w http.ResponseWriter, r *http.Request) {
 	stopCh := make(chan struct{})
 	done := make(chan struct{})
 	s.hotswap.cmd = cmd
+	s.hotswap.buildDir = buildDir
 	s.hotswap.pid = cmd.Process.Pid
 	s.hotswap.stopCh = stopCh
 	s.hotswap.done = done
@@ -1100,9 +1229,17 @@ func (s *Server) handleHotSwapSwap(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusConflict, "simulation stopped or restarted while the new logic was compiling — swap aborted")
 		return
 	}
+	// ⚠️ A signal failure is NOT fatal any more. The runtime runs privileged, so
+	// an unprivileged agent's kill(2) returns EPERM every time — and the swap
+	// still happens, because host.c's watch_files_thread polls swap_request
+	// (which was written above). Failing here would have turned every Hot
+	// Reload into "signal failed: operation not permitted" while the swap it
+	// just requested went through underneath. The signal stays as the fast path
+	// for runtimes that can receive it; PollSwapResult below is the real answer
+	// either way, and it reports a swap that genuinely never happened.
 	if sigErr != nil {
-		writeError(w, http.StatusInternalServerError, "signal failed: "+sigErr.Error())
-		return
+		s.events.Emit("runtime-log", map[string]any{"level": "info",
+			"line": "swap signal not deliverable (" + sigErr.Error() + ") — using the swap_request file trigger"})
 	}
 
 	status, detail, perr := hotswaplib.PollSwapResult(resultPath, ver, swapResultTimeout)
@@ -1142,20 +1279,37 @@ func (s *Server) handleHotSwapStop(w http.ResponseWriter, r *http.Request) {
 // hotswapPoller reads the host-owned /dev/shm mirror by offset and streams live
 // variables, identical to the editor's existing simulation-output feed.
 func (s *Server) hotswapPoller(specs []ShmSpec, stop <-chan struct{}) {
-	plan, bufSize := make([]pollSpec, 0, len(specs)), 0
-	for _, sp := range specs {
-		if ps, ok := newMirrorPollSpec(sp.Key, sp.VType, sp.Offset, sp.Size); ok {
-			plan = append(plan, ps)
-			if ps.size > bufSize {
-				bufSize = ps.size
+	// The plan is rebuilt whenever the editor's subscription changes (it names
+	// the POUs on screen, the watch table and the HMI bindings) — see
+	// LiveFilter. Until the first subscription arrives the filter matches
+	// everything, so a run always starts fully observable.
+	var (
+		plan    []pollSpec
+		buf     []byte
+		planGen uint64
+		built   bool
+	)
+	rebuild := func() {
+		gen, match := s.live.Snapshot()
+		bufSize := 0
+		plan = plan[:0]
+		for _, sp := range specs {
+			if !match(sp.Key) {
+				continue
+			}
+			if ps, ok := newMirrorPollSpec(sp.Key, sp.VType, sp.Offset, sp.Size); ok {
+				plan = append(plan, ps)
+				if ps.size > bufSize {
+					bufSize = ps.size
+				}
 			}
 		}
+		// One scratch buffer for the whole plan — see simulationPoller.
+		if bufSize > len(buf) {
+			buf = make([]byte, bufSize)
+		}
+		planGen, built = gen, true
 	}
-	if len(plan) == 0 {
-		return // nothing readable — don't wake up 5 times a second to say so
-	}
-	// One scratch buffer for the whole run — see simulationPoller.
-	buf := make([]byte, bufSize)
 
 	// ⚠️ The mirror is held OPEN across ticks, not re-attached every 200 ms.
 	// The loader-host owns it and it survives a logic swap BY DESIGN (that is
@@ -1183,6 +1337,12 @@ func (s *Server) hotswapPoller(specs []ShmSpec, stop <-chan struct{}) {
 		case <-stop:
 			return
 		case <-ticker.C:
+		}
+		if !built || planGen != s.live.Gen() {
+			rebuild()
+		}
+		if len(plan) == 0 {
+			continue // nothing subscribed — the next tick re-checks
 		}
 		if mirror == nil {
 			m, err := openShmMirror(s.paths.BuildDir(), hotswapShmName, hotswapShmSize, false)

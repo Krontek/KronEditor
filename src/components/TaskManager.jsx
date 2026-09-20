@@ -17,6 +17,12 @@ const parseInterval = (str) => {
 const fmtInterval = (value, unit) => `T#${value}${unit}`;
 
 // ⚠️ Values here are MICROseconds. Both inputs this formats — the runtime's
+// SCHED_FIFO priority bounds (Linux). A task with no stored value predates the
+// field and gets the maximum, matching what the runtime hardcoded before.
+export const RT_PRIORITY_MIN = 1;
+export const RT_PRIORITY_MAX = 99;
+export const DEFAULT_RT_PRIORITY = 99;
+
 // `__exec_us_<prog>` field and the task interval parsed into `ivUs` — are µs
 // (CLAUDE.md §5 "exec-time is MICROseconds"). It used to be `fmtExecNs` and
 // treated its argument as NANOseconds, so every number on the running task card
@@ -53,9 +59,19 @@ export default function TaskManager({
     tasks.forEach(t => t.programs.forEach(p => assignedSet.set(p.program, t.id)));
     const unassigned = programs.filter(p => !assignedSet.has(p.name));
 
+    // SCHED_FIFO priority for this task's scan thread. 99 (the maximum) is the
+    // default because a PLC scan is the reason the machine exists; it is
+    // editable because that ALSO outranks every kernel RT thread, and a task
+    // that overruns its interval at 99 can starve the box. Distinct from
+    // `programs[].priority`, which is only the execution ORDER inside a task.
+    const setRtPriority = (id, v) => {
+        const n = Math.max(RT_PRIORITY_MIN, Math.min(RT_PRIORITY_MAX, Math.round(Number(v) || DEFAULT_RT_PRIORITY)));
+        update(tasks.map(t => t.id === id ? { ...t, rtPriority: n } : t));
+    };
+
     const addTask = () => {
         const id = `task_${Date.now()}`;
-        update([...tasks, { id, name: `Task${tasks.length + 1}`, interval: 'T#10ms', programs: [] }]);
+        update([...tasks, { id, name: `Task${tasks.length + 1}`, interval: 'T#10ms', rtPriority: DEFAULT_RT_PRIORITY, programs: [] }]);
     };
 
     const deleteTask = (id) => update(tasks.filter(t => t.id !== id));
@@ -210,6 +226,21 @@ export default function TaskManager({
                                         <option value="ms">ms</option>
                                         <option value="s">s</option>
                                     </select>
+                                </div>
+
+                                {/* Real-time priority of this task's scan thread */}
+                                <div style={{ display: 'flex', alignItems: 'center', gap: 5 }}>
+                                    <span
+                                        style={{ fontSize: 10, color: '#666', marginRight: 2, textTransform: 'uppercase', letterSpacing: '0.06em' }}
+                                        title={t('messages.rtPriorityHelp') || 'SCHED_FIFO priority of this task\'s scan thread (1-99, higher runs first). 99 also outranks kernel real-time threads.'}
+                                    >{t('messages.rtPriority') || 'RT prio'}</span>
+                                    <input
+                                        type="number" min={RT_PRIORITY_MIN} max={RT_PRIORITY_MAX}
+                                        value={task.rtPriority ?? DEFAULT_RT_PRIORITY}
+                                        disabled={isRunning}
+                                        onChange={e => setRtPriority(task.id, e.target.value)}
+                                        style={{ width: 46, background: '#1e1e1e', border: '1px solid #3a3a3a', borderRadius: 3, color: '#ccc', fontSize: 12, padding: '3px 6px', textAlign: 'right', outline: 'none', MozAppearance: 'textfield' }}
+                                    />
                                 </div>
 
                                 <button

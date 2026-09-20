@@ -66,6 +66,8 @@
  * -------------------------------------------------------------------------*/
 #if defined(_WIN32)
 #include <windows.h>
+#include <direct.h>          /* _chdir — main() moves to the build dir itself */
+#define chdir _chdir
 #define PLC_SWAP_EVENT_NAME "Local\\kron_plc_swap"
 typedef HMODULE plc_module_t;
 static plc_module_t plc_dlopen(const char *p)              { return LoadLibraryA(p); }
@@ -113,6 +115,8 @@ static void plc_sleep_until(const struct timespec *deadline) {
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/mman.h>
+#include <sys/stat.h>   /* watch_files_thread (file swap/stop triggers) */
+#include <sched.h>      /* per-task SCHED_FIFO priority */
 typedef void *plc_module_t;
 static plc_module_t plc_dlopen(const char *p)              { return dlopen(p, RTLD_NOW | RTLD_GLOBAL); }
 static void        *plc_dlsym(plc_module_t h, const char *n) { return dlsym(h, n); }
@@ -217,6 +221,24 @@ static void plc_sleep_until(const struct timespec *deadline) {
 #endif /* __APPLE__ */
 #endif
 
+/* ── EtherCAT master hooks (host_glue.c, Linux only) ──────────────────────
+ * The generated glue owns __ec_cfg, the process image and the three bus
+ * threads so SOEM's socket survives a dlclose of the logic module. Weak
+ * references: a project with no EtherCAT bus emits no glue at all, and a
+ * Windows/macOS build never emits these (the sim stays -DKRON_EC_SIM there).
+ * ⚠️ Start BEFORE plc_init_hs() — the generated PLC_Init assumes the bus is
+ * already up when it initialises the axes. */
+#if defined(__linux__)
+__attribute__((weak)) void __hs_ec_start(void);
+__attribute__((weak)) void __hs_ec_stop(void);
+/* The axis engine runs in the glue's bus thread (dt = the fieldbus cycle), but
+ * every AXIS_REF is a PlcState field whose offset only the logic module knows.
+ * After each bind we hand the module's plc_axis_ptr over so the glue can cache
+ * the pointers; both halves are optional, so a project with no axes and an
+ * older logic.so both just skip it. */
+__attribute__((weak)) void __hs_axis_bind(void *(*getptr)(int));
+#endif
+
 volatile uint64_t us_tick = 0;   /* owned + exported for the logic.so */
 volatile int plc_stop = 0;
 /* The /dev/shm mirror (force flags + monitored values). Host-owned so it
@@ -231,6 +253,10 @@ static plc_module_t   g_handle;
 static void          *g_state;
 static body_fn        g_body[MAXT];
 static unsigned long  g_interval[MAXT];
+/* SCHED_FIFO priority per task, from the optional plc_task_priority export.
+ * 99 is the value the runtime hardcoded before the field existed, so a logic.so
+ * without the symbol keeps behaving exactly as it did. */
+static int            g_prio[MAXT];
 static int            g_ntask;
 
 /* The layout hash of the FIRST successfully bound .so (cold start). Every
@@ -273,6 +299,46 @@ static void *swap_event_thread(void *arg) {
 }
 #else
 static void on_usr1(int s) { (void)s; g_swap_req = 1; }
+
+/* ⚠️ A privileged host cannot be signalled by the unprivileged agent that
+ * spawned it (kill(2) compares uids, so SIGUSR1/SIGTERM come back EPERM), and
+ * the whole online-change and stop paths hang off exactly those two signals.
+ * So both also have a file trigger, polled here:
+ *
+ *   swap_request  — the agent REWRITES it per swap and nothing ever deletes it,
+ *                   so existence means nothing; the trigger is a CHANGE. The
+ *                   baseline is taken at startup, or a leftover request from
+ *                   the previous run would swap the moment the host comes up.
+ *   stop_request  — created by the agent, removed by the host on the way out,
+ *                   so plain existence is the right test.
+ *
+ * The signals stay installed: a runtime started by KronServer (already root)
+ * still gets them, and they are the faster path when they work. */
+static void *watch_files_thread(void *arg) {
+    (void)arg;
+    struct stat st;
+    long long seen_sec = -1, seen_nsec = -1, seen_size = -1;
+    if (stat("./swap_request", &st) == 0) {
+        seen_sec = (long long)st.st_mtime; seen_nsec = (long long)st.st_mtim.tv_nsec; seen_size = (long long)st.st_size;
+    }
+    while (!plc_stop) {
+        struct timespec ts = { 0, 10 * 1000 * 1000 };   /* 10 ms */
+        nanosleep(&ts, NULL);
+        if (stat("./swap_request", &st) == 0) {
+            long long sec = (long long)st.st_mtime, nsec = (long long)st.st_mtim.tv_nsec, size = (long long)st.st_size;
+            if (sec != seen_sec || nsec != seen_nsec || size != seen_size) {
+                seen_sec = sec; seen_nsec = nsec; seen_size = size;
+                g_swap_req = 1;
+            }
+        }
+        if (stat("./stop_request", &st) == 0) {
+            remove("./stop_request");
+            plc_stop = 1;
+            return NULL;
+        }
+    }
+    return NULL;
+}
 /* Graceful stop, so the scan threads unwind and the retain flush below runs.
  * The agent gives us a short grace period before SIGKILL (hotswap.go Stop). */
 static void on_term(int s) { (void)s; plc_stop = 1; }
@@ -305,6 +371,41 @@ static int parse_gen_from_path(const char *path) {
  * half-written file). This is the ONLY way the Go side learns whether a swap
  * actually applied — it must never delete an old/new .so based on anything
  * other than reading this back. */
+/* ── Running privileged ────────────────────────────────────────────────────
+ * The agent launches this host through pkexec, so it runs as root while the
+ * agent stays the desktop user. Everything the host CREATES would then be
+ * root-owned, and the agent could no longer read the live-value mirror or
+ * clear swap_result. Hand those back to the user who asked for the run.
+ *
+ * ⚠️ The uid comes from the environment pkexec/sudo set, never from the file
+ * system: PKEXEC_UID is the authenticated caller, SUDO_UID the sudo one. With
+ * neither (a host started as root directly) there is nobody to hand them to,
+ * so the chown is skipped rather than guessed. */
+#if !defined(_WIN32)
+static uid_t hs_owner_uid(void) {
+    const char *e = getenv("PKEXEC_UID");
+    if (!e || !*e) e = getenv("SUDO_UID");
+    if (!e || !*e) return (uid_t)-1;
+    long v = strtol(e, NULL, 10);
+    return (v > 0) ? (uid_t)v : (uid_t)-1;
+}
+static void hs_give_to_owner(const char *path) {
+    if (geteuid() != 0) return;
+    uid_t u = hs_owner_uid();
+    if (u == (uid_t)-1) return;
+    (void)chown(path, u, (gid_t)-1);   /* mode stays 0600: owner-only, as before */
+}
+static void hs_give_fd_to_owner(int fd) {
+    if (geteuid() != 0) return;
+    uid_t u = hs_owner_uid();
+    if (u == (uid_t)-1) return;
+    (void)fchown(fd, u, (gid_t)-1);
+}
+#else
+#define hs_give_to_owner(p)    ((void)0)
+#define hs_give_fd_to_owner(f) ((void)0)
+#endif
+
 static void write_swap_result(const char *status, int gen, const char *detail) {
     FILE *f = fopen("./swap_result.tmp", "w");
     if (!f) return;
@@ -319,6 +420,10 @@ static void write_swap_result(const char *status, int gen, const char *detail) {
     MoveFileExA("./swap_result.tmp", "./swap_result", MOVEFILE_REPLACE_EXISTING);
 #else
     rename("./swap_result.tmp", "./swap_result");
+    /* The agent truncates this file before every swap (ClearResultFile); a
+     * root-owned 0644 would make that fail and every later swap would read the
+     * previous outcome. */
+    hs_give_to_owner("./swap_result");
 #endif
 }
 
@@ -336,6 +441,7 @@ static int resolve_and_bind(void *h) {
     void          (*bind)(void*)        = (void(*)(void*))             plc_dlsym(h, "plc_bind");
     int           (*tcount)(void)       = (int(*)(void))              plc_dlsym(h, "plc_task_count");
     unsigned long (*tiv)(int)           = (unsigned long(*)(int))     plc_dlsym(h, "plc_task_interval_us");
+    int           (*tprio)(int)         = (int(*)(int))               plc_dlsym(h, "plc_task_priority");
     unsigned long long (*lhash)(void)   = (unsigned long long(*)(void)) plc_dlsym(h, "plc_state_layout_hash");
     if (!ssize || !bind || !tcount || !tiv || !lhash) return RB_ERR_SYMBOL;
 
@@ -368,9 +474,25 @@ static int resolve_and_bind(void *h) {
         if (!b) return RB_ERR_SYMBOL;
         g_body[i] = b;
         g_interval[i] = tiv(i);
+        /* Optional: absent in a logic.so built before the field. Re-read on
+         * every bind, like the interval, so a priority edit swaps live (the
+         * thread applies it on its next scan). */
+        g_prio[i] = tprio ? tprio(i) : 99;
+        if (g_prio[i] < 1 || g_prio[i] > 99) g_prio[i] = 99;
     }
     g_ntask = n;
     bind(g_state);   /* adopt the SAME arena — preserves all state across swaps */
+#if defined(__linux__)
+    /* ⚠️ AFTER bind(): plc_axis_ptr dereferences the module's file-scope S, which
+     * bind() has just pointed at the live arena. Re-done on every swap so the
+     * glue never holds a pointer produced by a module that is about to be
+     * dlclose'd — the arena itself does not move, and a layout change is already
+     * refused above, so the values are in fact stable. */
+    {
+        void *(*axptr)(int) = (void*(*)(int))plc_dlsym(h, "plc_axis_ptr");
+        if (__hs_axis_bind && axptr) __hs_axis_bind(axptr);
+    }
+#endif
     /* Optional (NULL when the project retains nothing). Re-resolved on every
      * bind: the pointer must never outlive the module it came from. */
     g_retain_save = (int(*)(void))plc_dlsym(h, "plc_retain_save");
@@ -494,6 +616,15 @@ static void *monitor_thread(void *arg) {
 
 static void *task_thread(void *arg) {
     int idx = (int)(intptr_t)arg;
+#if defined(__linux__)
+    /* ⚠️ The scan threads never asked for real-time scheduling at all: only the
+     * legacy single-binary build and the EtherCAT IO_Bus thread did, so a
+     * hot-swap runtime — the default local sim AND what Build & Send deploys —
+     * ran its PLC tasks at ordinary desktop priority even as root. The priority
+     * is per task (TaskManager), re-read every scan so a swap can change it,
+     * and the syscall is made only when it actually differs. */
+    int cur_prio = -1;
+#endif
     struct timespec next; clock_gettime(CLOCK_MONOTONIC, &next);
     while (!plc_stop) {
         /* ⚠️ Accumulate the period in 64-bit and split it into whole seconds +
@@ -503,6 +634,20 @@ static void *task_thread(void *arg) {
          * -1294967296, pushing the deadline BACKWARD, so plc_sleep_until saw
          * delta_ns <= 0, never slept, and the task ran flat out. Measured on
          * Windows: (long)(3000000 * 1000UL) == -1294967296. */
+#if defined(__linux__)
+        if (g_prio[idx] != cur_prio) {
+            struct sched_param sp; sp.sched_priority = g_prio[idx];
+            if (pthread_setschedparam(pthread_self(), SCHED_FIFO, &sp) == 0) {
+                cur_prio = g_prio[idx];
+            } else {
+                /* Reported once per priority value, not once per scan. */
+                if (cur_prio != -2) fprintf(stderr,
+                    "[host] task %d: SCHED_FIFO prio %d refused — real-time scheduling unavailable "
+                    "(need root or CAP_SYS_NICE); timing will jitter\n", idx, g_prio[idx]);
+                cur_prio = -2;
+            }
+        }
+#endif
         long long period_ns = (long long)g_interval[idx] * 1000LL;
         next.tv_sec  += (time_t)(period_ns / 1000000000LL);
         next.tv_nsec += (long)(period_ns % 1000000000LL);
@@ -525,7 +670,32 @@ static void *task_thread(void *arg) {
 }
 
 int main(int argc, char **argv) {
-    if (argc < 2) { fprintf(stderr, "usage: %s logic.so\n", argv[0]); return 1; }
+    if (argc < 2) { fprintf(stderr, "usage: %s logic.so [workdir]\n", argv[0]); return 1; }
+    /* ⚠️ Every control file below is opened relative to the cwd ("./swap_request",
+     * "./swap_result", retain.dat, and on macOS the shm mirror itself), which
+     * used to be guaranteed by the agent's cmd.Dir. A privileged launch goes
+     * through pkexec, whose treatment of the working directory is not something
+     * to bet the swap protocol on, so the agent now passes the build dir
+     * explicitly and we move there ourselves. */
+    /* ⚠️ Resolve the module path BEFORE moving: a relative argv[1] is relative
+     * to the cwd we were STARTED in, and dlopen'ing it after the chdir fails
+     * with a bare "cannot open shared object file" that points at nothing.
+     * (The agent passes an absolute path today; this keeps a hand-run host and
+     * any future caller honest.) */
+    static char logic_abs[2048];
+    if (argc >= 3 && argv[2] && argv[2][0]) {
+        if (argv[1][0] != '/' && !(argv[1][0] && argv[1][1] == ':')) {
+            char cwd[1024];
+            if (getcwd(cwd, sizeof cwd) &&
+                (size_t)snprintf(logic_abs, sizeof logic_abs, "%s/%s", cwd, argv[1]) < sizeof logic_abs) {
+                argv[1] = logic_abs;
+            }
+        }
+        if (chdir(argv[2]) != 0) {
+            fprintf(stderr, "chdir(%s) failed\n", argv[2]);
+            return 1;
+        }
+    }
 #if defined(_WIN32)
     /* Auto-reset named event; created here (not by the agent) so the agent's
      * OpenEvent succeeds only once the host is genuinely up. */
@@ -536,6 +706,9 @@ int main(int argc, char **argv) {
     signal(SIGUSR1, on_usr1);
     signal(SIGTERM, on_term);
     signal(SIGINT,  on_term);
+    /* File triggers beside the signals — the only ones that reach a privileged
+     * host from the unprivileged agent. See watch_files_thread. */
+    { pthread_t t; pthread_create(&t, NULL, watch_files_thread, NULL); pthread_detach(t); }
 #endif
 
     /* ⚠️ EVERY cold-start failure below must write a swap_result before
@@ -614,6 +787,7 @@ int main(int argc, char **argv) {
          * local account for free. */
         int fd = open(mirror_path(shm_name()), O_CREAT | O_RDWR, 0600);
         if (fd >= 0) {
+            hs_give_fd_to_owner(fd);   /* privileged run: the agent still reads it */
             if (ftruncate(fd, (off_t)sz) == 0) {
                 void *m = mmap(NULL, sz, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
                 if (m != MAP_FAILED) __plc_shm = (unsigned char *)m;
@@ -623,6 +797,11 @@ int main(int argc, char **argv) {
 #else
         int fd = shm_open(shm_name(), O_CREAT | O_RDWR, 0600); /* see the mode note above */
         if (fd >= 0) {
+            /* ⚠️ Without this the whole live-value stream dies under a
+             * privileged run: root creates /dev/shm/<name> 0600 root:root and
+             * the agent's open() gets EACCES — the sim looks alive with every
+             * variable frozen at zero. */
+            hs_give_fd_to_owner(fd);
             if (ftruncate(fd, (off_t)sz) == 0) {
                 void *m = mmap(NULL, sz, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
                 if (m != MAP_FAILED) __plc_shm = (unsigned char *)m;
@@ -635,6 +814,9 @@ int main(int argc, char **argv) {
     }
 
     if (sinit) sinit();      /* cold init ONCE */
+#if defined(__linux__)
+    if (__hs_ec_start) __hs_ec_start();   /* EtherCAT master + bus threads */
+#endif
     if (pinit) pinit();      /* PLC_Init (HAL etc.) */
 
     printf("[host] started: %s  tasks=%d  state=%lu bytes\n", argv[1], g_ntask, ssize());
@@ -651,6 +833,11 @@ int main(int argc, char **argv) {
     for (int i = 0; i < g_ntask; i++) pthread_create(&th[i], NULL, task_thread, (void *)(intptr_t)i);
     for (int i = 0; i < g_ntask; i++) pthread_join(th[i], NULL);
     if (rt_started) pthread_join(rt, NULL);
+#if defined(__linux__)
+    /* After the task joins: plc_stop is set, so the bus loops are already
+     * unwinding — this only joins them and closes the master. */
+    if (__hs_ec_stop) __hs_ec_stop();
+#endif
 
     /* Final flush on a graceful stop — captures whatever changed since the last
      * periodic write. On a SIGKILL (or a power cut) this never runs, which is

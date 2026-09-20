@@ -625,6 +625,7 @@ const boardIcon = (family) => {
   if (family === 'Banana Pi') return { icon: '🍌', bg: 'linear-gradient(135deg, #f9a825, #b57800)' };
   if (family === 'Libre Computer') return { icon: '🥔', bg: 'linear-gradient(135deg, #6d4c41, #452c24)' };
   if (family === 'Pine64') return { icon: '🌲', bg: 'linear-gradient(135deg, #33691e, #1e4212)' };
+  if (family === 'Generic Linux') return { icon: '🐧', bg: 'linear-gradient(135deg, #455a64, #263238)' };
   return { icon: '🦴', bg: 'linear-gradient(135deg, #546e7a, #37474f)' };
 };
 

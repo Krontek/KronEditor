@@ -52,6 +52,10 @@ const EC_STATES = [
 /* ── Default master config (no slaves — slaves live in busConfig.slaves) ─── */
 const defaultMasterConfig = () => ({
   ifname:       'eth0',
+  // ⚠️ The local simulation runs the SAME SOEM master on this PC, whose NIC is
+  // virtually never named like the target's — hence a separate name. Empty
+  // falls back to ifname (CTranspilerService.generateEtherCATConfig).
+  ifnameSim:    '',
   cycle_us:     1000,
   dc_enable:    false,
   target_state: 'op',
@@ -126,7 +130,23 @@ export default function EtherCATEditor({ busConfig, onChange, isRunning = false 
               {netIfaces.map(iface => <option key={iface} value={iface} />)}
             </datalist>
             <span style={{ color: '#555', fontSize: 10 }}>
-              {netIfaces.length > 0 ? netIfaces.join(', ') : 'eth0, enp2s0 …'}
+              on the target board
+            </span>
+          </div>
+
+          <div style={S.row}>
+            <span style={S.label}>Simulation Interface</span>
+            <input
+              style={S.input}
+              list="net-ifaces-list"
+              value={config.ifnameSim || ''}
+              disabled={isRunning}
+              placeholder={config.ifname || 'eth0'}
+              onChange={e => update({ ...config, ifnameSim: e.target.value })}
+            />
+            <span style={{ color: '#555', fontSize: 10 }}>
+              this PC {netIfaces.length > 0 ? `— ${netIfaces.join(', ')}` : ''}
+              {config.ifnameSim ? '' : ' (empty → same as above)'}
             </span>
           </div>
 

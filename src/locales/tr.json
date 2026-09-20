@@ -75,7 +75,15 @@
         "dragDrop": "Sürükleyip Bırak",
         "blockCount": "{{count}} blok",
         "howItWorks": "Nasıl çalışır",
-        "standardLibraries": "Standart Kütüphaneler"
+        "standardLibraries": "Standart Kütüphaneler",
+        "blockInformation": "Bilgi",
+        "errorCodes": "Hata kodları",
+        "code": "ID",
+        "meaning": "Anlamı",
+        "noErrorCodes": "Bu blok kendine ait bir hata bildirmez.",
+        "errorCodesUndocumented": "Bu blok için kataloglanmış hata kodu yok.",
+        "noPins": "Bu öğenin veri pini yok — doğrudan güç hattı üzerinde durur.",
+        "noBlockInfo": "Bu öğe için başka bilgi yok."
     },
     "actions": {
         "add": "Ekle",

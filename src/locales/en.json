@@ -75,7 +75,15 @@
         "dragDrop": "Drag & Drop",
         "blockCount": "{{count}} blocks",
         "howItWorks": "How it works",
-        "standardLibraries": "Standard Libraries"
+        "standardLibraries": "Standard Libraries",
+        "blockInformation": "Info",
+        "errorCodes": "Error codes",
+        "code": "ID",
+        "meaning": "Meaning",
+        "noErrorCodes": "This block reports no error of its own.",
+        "errorCodesUndocumented": "No error codes are catalogued for this block.",
+        "noPins": "This element has no data pins — it sits directly on the power rail.",
+        "noBlockInfo": "No further information for this element."
     },
     "actions": {
         "add": "Add",

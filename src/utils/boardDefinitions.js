@@ -1011,6 +1011,84 @@ export const BOARD_FAMILIES = [
         ],
       },
     ]
+  },
+  // ── Generic Linux ───────────────────────────────────────────────────────
+  // A project that targets "any Linux box" rather than a specific SBC: an
+  // industrial PC, a VM, a custom carrier board, or an SBC not listed above.
+  //
+  // ⚠️ NO pinout / pinLayout on purpose — the header is unknown, and
+  // BoardConfigPage renders a diagram only for a known pinLayout, so these
+  // boards simply show no pin map instead of an RPi one that is a lie.
+  // For the same reason `interfaces` carries only the DEVICE-NODE peripherals
+  // (I2C/SPI/UART/CAN/USB, all overridable per port in Board Config); GPIO,
+  // PWM and ADC are omitted because their numbering is SoC-specific and the
+  // shared RPi HAL would silently drive a different pad (CLAUDE.md §10).
+  //
+  // ⚠️ The arch is in the ID, not a config field: compile.go and
+  // deploy_ssh.go both switch on the board id, so one "generic_linux" entry
+  // would have to guess a triple. Three explicit ids keep both honest.
+  {
+    name: 'Generic Linux',
+    icon: '🐧',
+    boards: [
+      {
+        id: 'generic_linux_x64',
+        name: 'Generic Linux (x86_64)',
+        cpu: 'Any x86-64 CPU (industrial PC, VM, embedded x86)',
+        arch: 'x86_64',
+        ram: 'Host-defined',
+        storage: 'Host-defined',
+        connectivity: 'Host-defined',
+        gpio: 0,
+        usb: 'Host-defined',
+        display: 'Host-defined',
+        interfaces: ['I2C', 'SPI', 'UART', 'CAN', 'USB'],
+        usbPorts: [
+          { id: 'USB_0', type: 'USB', connector: 'Host' },
+          { id: 'USB_1', type: 'USB', connector: 'Host' },
+          { id: 'USB_2', type: 'USB', connector: 'Host' },
+          { id: 'USB_3', type: 'USB', connector: 'Host' },
+        ],
+      },
+      {
+        id: 'generic_linux_arm64',
+        name: 'Generic Linux (ARM64)',
+        cpu: 'Any aarch64 SoC',
+        arch: 'aarch64',
+        ram: 'Host-defined',
+        storage: 'Host-defined',
+        connectivity: 'Host-defined',
+        gpio: 0,
+        usb: 'Host-defined',
+        display: 'Host-defined',
+        interfaces: ['I2C', 'SPI', 'UART', 'CAN', 'USB'],
+        usbPorts: [
+          { id: 'USB_0', type: 'USB', connector: 'Host' },
+          { id: 'USB_1', type: 'USB', connector: 'Host' },
+          { id: 'USB_2', type: 'USB', connector: 'Host' },
+          { id: 'USB_3', type: 'USB', connector: 'Host' },
+        ],
+      },
+      {
+        id: 'generic_linux_armv7',
+        name: 'Generic Linux (ARMv7 hard-float)',
+        cpu: 'Any 32-bit ARMv7 SoC',
+        arch: 'armv7',
+        ram: 'Host-defined',
+        storage: 'Host-defined',
+        connectivity: 'Host-defined',
+        gpio: 0,
+        usb: 'Host-defined',
+        display: 'Host-defined',
+        interfaces: ['I2C', 'SPI', 'UART', 'CAN', 'USB'],
+        usbPorts: [
+          { id: 'USB_0', type: 'USB', connector: 'Host' },
+          { id: 'USB_1', type: 'USB', connector: 'Host' },
+          { id: 'USB_2', type: 'USB', connector: 'Host' },
+          { id: 'USB_3', type: 'USB', connector: 'Host' },
+        ],
+      },
+    ]
   }
 ];
 

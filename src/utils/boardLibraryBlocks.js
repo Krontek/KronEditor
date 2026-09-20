@@ -71,6 +71,13 @@ const BOARD_CHANNELS = {
   // all 40 pins are GPIO/I2C/SPI/UART/I2S. Deliberately no ADC key.
   pine_rock64:       { PWM: 2, SPI: 1, I2C: 2, UART: 2, USB: 3 },
   pine_rockpro64:    { PWM: 2, SPI: 2, I2C: 4, UART: 4, USB: 4 },
+  // Generic Linux — no known pin header, so ⚠️ deliberately NO PWM/ADC key
+  // (a key here MINTS BLOCKS, and those are pin-numbering dependent). The
+  // counts below are how many device-node channels the Board Config offers;
+  // each one's /dev path is overridable per port.
+  generic_linux_x64:   { SPI: 2, I2C: 4, UART: 4, CAN: 2, USB: 4 },
+  generic_linux_arm64: { SPI: 2, I2C: 4, UART: 4, CAN: 2, USB: 4 },
+  generic_linux_armv7: { SPI: 2, I2C: 4, UART: 4, CAN: 2, USB: 4 },
 };
 
 // ─── Block templates per interface ──────────────────────────────────────────

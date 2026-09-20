@@ -1,17 +1,21 @@
 import React, { useState, useEffect } from 'react';
 import { useTranslation } from 'react-i18next';
 import { getBlockNotes } from '../utils/blockNotes';
+import { errorCodeService } from '../services/ErrorCodeService';
 const BlockSettingsModal = ({ isOpen, onClose, blockData, onSave, blockConfig, variables = [], globalVars = [] }) => {
     const { t } = useTranslation();
     const [instanceName, setInstanceName] = useState('');
     const [executionControl, setExecutionControl] = useState(false);
     const [subType, setSubType] = useState('');
+    // 'pins' = the I/O type table only; 'info' = everything else about the block.
+    const [activeTab, setActiveTab] = useState('pins');
 
     useEffect(() => {
         if (isOpen && blockData) {
             setInstanceName(blockData.instanceName || (blockData.type === 'Contact' ? (blockData.values?.var || '') : (blockData.values?.coil || '')));
             setExecutionControl(!!blockData.executionControl);
             setSubType(blockData.subType || (blockData.type === 'Contact' ? 'NO' : 'Normal'));
+            setActiveTab('pins');
         }
     }, [isOpen, blockData]);
 
@@ -102,7 +106,7 @@ const BlockSettingsModal = ({ isOpen, onClose, blockData, onSave, blockConfig, v
                 background: '#252526',
                 padding: '20px',
                 borderRadius: '8px',
-                width: '400px',
+                width: '470px',
                 border: '1px solid #444',
                 boxShadow: '0 4px 6px rgba(0,0,0,0.3)',
                 color: '#fff'
@@ -184,58 +188,136 @@ const BlockSettingsModal = ({ isOpen, onClose, blockData, onSave, blockConfig, v
                     </div>
                 )}
 
-                {/* Information Table (Only for Function Blocks) */}
-                {isFunctionBlock && (
-                    <div style={{ marginBottom: '20px' }}>
-                        <h4 style={{ fontSize: '12px', color: '#888', textTransform: 'uppercase', marginBottom: '10px' }}>
-                            {t('common.pinInformation')}
-                        </h4>
-                        <div style={{ background: '#1e1e1e', padding: '10px', borderRadius: '4px', fontSize: '12px' }}>
-                            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '10px', marginBottom: '5px', fontWeight: 'bold' }}>
-                                <span>{t('common.pin')}</span>
-                                <span>{t('common.type')}</span>
-                            </div>
-                            {(executionControl ? config.inputs : config.inputs.filter(p => p.name !== 'EN')).map((pin, i) => (
-                                <div key={`in_${i}`} style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '10px', borderTop: '1px solid #333', padding: '4px 0' }}>
-                                    <span style={{ color: '#4CAF50' }}>{pin.name} (In)</span>
-                                    <span>{pin.type}</span>
-                                </div>
-                            ))}
-                            {(executionControl ? config.outputs : config.outputs.filter(p => p.name !== 'ENO')).map((pin, i) => (
-                                <div key={`out_${i}`} style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '10px', borderTop: '1px solid #333', padding: '4px 0' }}>
-                                    <span style={{ color: '#FF5722' }}>{pin.name} (Out)</span>
-                                    <span>{pin.type}</span>
-                                </div>
-                            ))}
-                        </div>
-                    </div>
-                )}
-
-                {/* How it works — behaviour notes for the block (subType- and
-                    EN-aware; library blocks fall back to their XML description) */}
+                {/* ── Tabbed reference ────────────────────────────────────────
+                    Tab 1 is ONLY the pin/type table; everything else the user
+                    might need about the block — how it behaves and every error
+                    code it can raise — lives in tab 2, so the common case (what
+                    goes on which pin) stays one glance away. */}
                 {(() => {
                     const notes = getBlockNotes({ ...blockData, subType, executionControl }, t);
-                    if (!notes) return null;
+                    const errors = isFunctionBlock ? errorCodeService.getBlockErrors(blockData.type) : [];
+                    const errNote = isFunctionBlock ? errorCodeService.getBlockNote(blockData.type) : '';
+                    const documented = isFunctionBlock && errorCodeService.isDocumented(blockData.type);
+                    const visibleInputs = executionControl ? config.inputs : config.inputs.filter(p => p.name !== 'EN');
+                    const visibleOutputs = executionControl ? config.outputs : config.outputs.filter(p => p.name !== 'ENO');
+
+                    const tabBtn = (id, label) => (
+                        <button
+                            key={id}
+                            onClick={() => setActiveTab(id)}
+                            style={{
+                                flex: 1,
+                                padding: '7px 10px',
+                                background: activeTab === id ? '#1e1e1e' : 'transparent',
+                                border: 'none',
+                                borderBottom: `2px solid ${activeTab === id ? '#0d47a1' : 'transparent'}`,
+                                color: activeTab === id ? '#fff' : '#888',
+                                fontSize: '12px',
+                                fontWeight: activeTab === id ? 'bold' : 'normal',
+                                cursor: 'pointer',
+                                textTransform: 'uppercase',
+                                letterSpacing: '0.05em',
+                            }}
+                        >{label}</button>
+                    );
+
+                    const panel = {
+                        background: '#1e1e1e', padding: '10px', borderRadius: '0 0 4px 4px',
+                        fontSize: '12px', maxHeight: '230px', overflowY: 'auto',
+                    };
+
                     return (
                         <div style={{ marginBottom: '20px' }}>
-                            <h4 style={{ fontSize: '12px', color: '#888', textTransform: 'uppercase', marginBottom: '10px' }}>
-                                {t('common.howItWorks')}
-                            </h4>
-                            <div style={{
-                                background: '#1e1e1e',
-                                border: '1px solid #333',
-                                borderLeft: '3px solid #0d47a1',
-                                padding: '10px',
-                                borderRadius: '4px',
-                                fontSize: '12px',
-                                color: '#bbb',
-                                lineHeight: 1.55,
-                                whiteSpace: 'pre-wrap',
-                                maxHeight: '140px',
-                                overflowY: 'auto'
-                            }}>
-                                {notes}
+                            <div style={{ display: 'flex', borderBottom: '1px solid #333' }}>
+                                {tabBtn('pins', t('common.pinInformation') || 'Pins')}
+                                {tabBtn('info', t('common.blockInformation') || 'Info')}
                             </div>
+
+                            {activeTab === 'pins' ? (
+                                <div style={panel}>
+                                    {(visibleInputs.length + visibleOutputs.length) === 0 ? (
+                                        <div style={{ color: '#777' }}>
+                                            {t('common.noPins') || 'This element has no data pins — it sits directly on the power rail.'}
+                                        </div>
+                                    ) : (
+                                        <>
+                                            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '10px', marginBottom: '5px', fontWeight: 'bold' }}>
+                                                <span>{t('common.pin')}</span>
+                                                <span>{t('common.type')}</span>
+                                            </div>
+                                            {visibleInputs.map((pin, i) => (
+                                                <div key={`in_${i}`} style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '10px', borderTop: '1px solid #333', padding: '4px 0' }}>
+                                                    <span style={{ color: '#4CAF50' }}>{pin.name} (In)</span>
+                                                    <span>{pin.type}</span>
+                                                </div>
+                                            ))}
+                                            {visibleOutputs.map((pin, i) => (
+                                                <div key={`out_${i}`} style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '10px', borderTop: '1px solid #333', padding: '4px 0' }}>
+                                                    <span style={{ color: '#FF5722' }}>{pin.name} (Out)</span>
+                                                    <span>{pin.type}</span>
+                                                </div>
+                                            ))}
+                                        </>
+                                    )}
+                                </div>
+                            ) : (
+                                <div style={panel}>
+                                    {/* Behaviour — subType- and EN-aware; library blocks fall
+                                        back to their XML description. */}
+                                    {notes && (
+                                        <div style={{ marginBottom: errors.length || errNote ? '14px' : 0 }}>
+                                            <div style={{ fontSize: '11px', color: '#888', textTransform: 'uppercase', marginBottom: '6px', letterSpacing: '0.05em' }}>
+                                                {t('common.howItWorks')}
+                                            </div>
+                                            <div style={{ borderLeft: '3px solid #0d47a1', paddingLeft: '8px', color: '#bbb', lineHeight: 1.55, whiteSpace: 'pre-wrap' }}>
+                                                {notes}
+                                            </div>
+                                        </div>
+                                    )}
+
+                                    {/* Error codes. ⚠️ An ErrorID is a bare number on the
+                                        rung; this table is where it acquires a meaning — and it
+                                        is readable BEFORE a run, unlike the live badge tooltip. */}
+                                    {isFunctionBlock && (
+                                        <div>
+                                            <div style={{ fontSize: '11px', color: '#888', textTransform: 'uppercase', marginBottom: '6px', letterSpacing: '0.05em' }}>
+                                                {t('common.errorCodes') || 'Error codes'}
+                                            </div>
+                                            {errors.length > 0 ? (
+                                                <>
+                                                    <div style={{ display: 'grid', gridTemplateColumns: '38px 1fr', gap: '8px', fontWeight: 'bold', marginBottom: '4px' }}>
+                                                        <span>{t('common.code') || 'ID'}</span>
+                                                        <span>{t('common.meaning') || 'Meaning'}</span>
+                                                    </div>
+                                                    {errors.map(err => (
+                                                        <div key={err.code} style={{ display: 'grid', gridTemplateColumns: '38px 1fr', gap: '8px', borderTop: '1px solid #333', padding: '5px 0' }}>
+                                                            <span style={{ color: '#ff5252', fontFamily: 'Consolas, monospace', fontWeight: 'bold' }}>{err.code}</span>
+                                                            <span>
+                                                                {err.name && (
+                                                                    <span style={{ color: '#ffab40', fontFamily: 'Consolas, monospace' }}>{err.name}</span>
+                                                                )}
+                                                                {err.text && (
+                                                                    <span style={{ color: '#bbb', lineHeight: 1.5 }}>{err.name ? ' — ' : ''}{err.text}</span>
+                                                                )}
+                                                            </span>
+                                                        </div>
+                                                    ))}
+                                                </>
+                                            ) : (
+                                                <div style={{ color: '#777', lineHeight: 1.5 }}>
+                                                    {errNote || (documented
+                                                        ? (t('common.noErrorCodes') || 'This block reports no error of its own.')
+                                                        : (t('common.errorCodesUndocumented') || 'No error codes are catalogued for this block.'))}
+                                                </div>
+                                            )}
+                                        </div>
+                                    )}
+
+                                    {!notes && !isFunctionBlock && (
+                                        <div style={{ color: '#777' }}>{t('common.noBlockInfo') || 'No further information for this element.'}</div>
+                                    )}
+                                </div>
+                            )}
                         </div>
                     );
                 })()}

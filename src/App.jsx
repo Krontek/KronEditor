@@ -2,6 +2,7 @@ import React, { useState, useEffect, useCallback, useMemo } from 'react';
 import { lazy, Suspense } from 'react';
 const EtherCATEditor = lazy(() => import('./components/EtherCATEditor'));
 import SlaveConfigPage from './components/SlaveConfigPage';
+import { hasVarNamed } from './utils/iecNames';
 import EditorPane from './components/EditorPane';
 import Toolbox from './components/Toolbox';
 import AiAgentPanel from './components/AiAgentPanel';
@@ -173,9 +174,10 @@ const variableTableSignature = (struct) => {
 const udtSignature = (struct) => JSON.stringify(struct?.dataTypes || []);
 
 // Board + EtherCAT/bus config — these don't live in PlcState at all, but
-// changing them requires rebuilding the LOADER-HOST binary itself (HAL
-// trampolines compiled into host_glue.c), which a logic-only `swap` can
-// never do regardless of what the PlcState hash says.
+// changing them requires rebuilding the LOADER-HOST binary itself (the HAL
+// trampolines AND the EtherCAT master + bus threads are compiled into
+// host_glue.c), which a logic-only `swap` can never do regardless of what the
+// PlcState hash says.
 const ioEcSignature = (boardId, buses, busConfigs) =>
   JSON.stringify({ boardId, buses: buses || [], busConfigs: busConfigs || {} });
 
@@ -592,7 +594,9 @@ function App() {
                 stopStreamRef.current = plcClientRef.current.streamVars(
                   (vars) => { Object.assign(liveVarsRef.current, vars); liveVarsDirtyRef.current = true; },
                   (err) => addLog('error', categorize(ERROR_CATEGORY.RUNTIME, `Stream error: ${err.message}`)),
+                  liveSubRef.current,
                 );
+                appliedSubSigRef.current = JSON.stringify(liveSubRef.current);
               }
             } else if (!status.running && isRunningRef.current && !isSimulationModeRef.current) {
               // Runtime stopped externally (e.g. crash) — reflect in editor.
@@ -666,6 +670,9 @@ function App() {
 
   // hasUnsaved: true whenever project content changes since last save/load
   const hasUnsavedRef = React.useRef(false);
+  // Offer the EtherCAT raw-socket grant at most once per session — a user who
+  // said no must be able to keep simulating without a dialog on every start.
+  const ecCapsOfferedRef = React.useRef(false);
   const isLoadingProjectRef = React.useRef(false); // suppresses change tracking during load
   useEffect(() => {
     if (isLoadingProjectRef.current) return;
@@ -914,8 +921,8 @@ function App() {
   const activeSlave = useMemo(() => {
     for (const bus of buses) {
       const slaves = busConfigs[bus.id]?.slaves || [];
-      const slave = slaves.find(s => s.id === activeId);
-      if (slave) return { busId: bus.id, slave };
+      const idx = slaves.findIndex(s => s.id === activeId);
+      if (idx >= 0) return { busId: bus.id, slave: slaves[idx], slaves, slaveIndex: idx };
     }
     return null;
   }, [activeId, buses, busConfigs]);
@@ -924,10 +931,18 @@ function App() {
     const configResource = projectStructure.resources.find(r => r.type === 'RESOURCE_EDITOR');
     if (!configResource) return;
     const existing = configResource.content.globalVars || [];
-    const existingNames = new Set(existing.map(v => v.name));
-    const toAdd = vars
-      .filter(v => !existingNames.has(v.name))
-      .map(v => ({ id: `gv_ec_${Date.now()}_${Math.random().toString(36).slice(2)}`, name: v.name, type: v.type, initialValue: '', comment: v.comment || '' }));
+    // ⚠️ IEC identifiers are CASE-INSENSITIVE (utils/iecNames): an exact-match
+    // Set let `ec_Drive_Status` and `EC_Drive_Status` both through, which is
+    // two PlcState fields collapsing onto one name — the duplicate-variable
+    // corruption. Accumulates as we go so a batch cannot self-duplicate either.
+    const accepted = [...existing];
+    const toAdd = [];
+    vars.forEach(v => {
+      if (hasVarNamed(accepted, v.name)) return;
+      const row = { id: `gv_ec_${Date.now()}_${Math.random().toString(36).slice(2)}`, name: v.name, type: v.type, initialValue: '', comment: v.comment || '' };
+      accepted.push(row);
+      toAdd.push(row);
+    });
     if (!toAdd.length) return;
     setProjectStructure(prev => ({
       ...prev,
@@ -1100,6 +1115,14 @@ function App() {
         addLog('info', typeof msg.data === 'string' ? msg.data : JSON.stringify(msg.data));
       } else if (msg.topic === 'build-command') {
         addLog('info', `Build command: ${typeof msg.data === 'string' ? msg.data : JSON.stringify(msg.data)}`);
+      } else if (msg.topic === 'runtime-log') {
+        // ⚠️ The spawned runtime's own output, already filtered and
+        // de-duplicated by the agent (runtimelog.go): trouble arrives as
+        // warning/error so it lands in those tabs instead of burying the
+        // Messages list, and routine chatter never leaves runtime.log at all.
+        // It is NOT a "Build command" — that label was simply wrong.
+        const level = msg.data?.level === 'error' ? 'error' : msg.data?.level === 'warning' ? 'warning' : 'info';
+        addLog(level, `Runtime: ${msg.data?.line ?? ''}`);
       } else if (msg.topic === 'library-update-progress' || msg.topic === 'server-update-progress') {
         addLog('info', String(msg.data));
       }
@@ -1123,6 +1146,76 @@ function App() {
     }, 500);
     return () => clearInterval(syncId);
   }, [isRunning]);
+
+  // --- Live subscription: stream only what is being looked at -------------
+  // Every variable of every program used to be decoded and pushed on every
+  // tick, of which the editor could display a handful. The subscription is the
+  // union of the OPEN POU tabs, the watch table, the globals and the HMI
+  // bindings, expressed as key PREFIXES plus a few explicit names — a POU's
+  // keys all share `prog_<Name>_` and every global shares `prog__`, so this
+  // stays a few hundred bytes instead of thousands of names.
+  // ⚠️ `prog__` also covers the per-program exec-time keys (`prog____exec_us_*`),
+  // which the output panel shows regardless of which POU is open.
+  const liveSubSig = JSON.stringify((() => {
+    const prefixes = new Set(['prog__']);
+    const names = new Set();
+    const pous = [
+      ...(projectStructure.programs || []),
+      ...(projectStructure.functionBlocks || []),
+      ...(projectStructure.functions || []),
+    ];
+    openTabs.forEach(t => {
+      const pou = pous.find(p => p.id === t.id);
+      if (pou?.name) prefixes.add(`prog_${pou.name.trim().replace(/\s+/g, '_')}_`);
+    });
+    (watchTable || []).forEach(e => { if (e.liveKey) names.add(e.liveKey); });
+    // The local sim feeds the HMI server from liveVariables, so an unsubscribed
+    // widget binding would freeze the HMI, not just the editor.
+    (hmiLayout?.pages || []).forEach(pg => (pg.components || []).forEach(c => {
+      const expr = (c?.props?.variable || '').trim();
+      if (!expr) return;
+      const dot = expr.indexOf('.');
+      if (dot > 0) {
+        names.add(`prog_${expr.slice(0, dot).trim().replace(/\s+/g, '_')}_${expr.slice(dot + 1).trim().replace(/\s+/g, '_')}`);
+      } else {
+        names.add(`prog__${expr.replace(/\s+/g, '_')}`);
+      }
+    }));
+    return { prefixes: [...prefixes].sort(), names: [...names].sort() };
+  })());
+  // ⚠️ Keyed off the SIGNATURE, not the objects it was built from: those change
+  // on every keystroke in the editor, and a remote subscription change costs an
+  // SSE reconnect.
+  const liveSubscription = useMemo(() => JSON.parse(liveSubSig), [liveSubSig]);
+  const liveSubRef = React.useRef(liveSubscription);
+  // Signature the ACTIVE remote stream was opened with — a connection's
+  // subscription is fixed for its lifetime, so a change means a reconnect.
+  const appliedSubSigRef = React.useRef(null);
+
+  useEffect(() => {
+    liveSubRef.current = liveSubscription;
+    if (!isRunning) return;
+    // Values that are no longer streamed must go: left in place they would
+    // freeze at their last-seen value and read as live.
+    const matches = (k) => liveSubscription.names.includes(k)
+      || liveSubscription.prefixes.some(pre => k.startsWith(pre));
+    const kept = {};
+    Object.entries(liveVarsRef.current).forEach(([k, v]) => { if (matches(k)) kept[k] = v; });
+    liveVarsRef.current = kept;
+    liveVarsDirtyRef.current = true;
+
+    if (isSimulationMode) {
+      host.liveSubscribe(liveSubscription.prefixes, liveSubscription.names).catch(() => {});
+    } else if (plcClientRef.current && stopStreamRef.current && appliedSubSigRef.current !== liveSubSig) {
+      stopStreamRef.current();
+      stopStreamRef.current = plcClientRef.current.streamVars(
+        (vars) => { Object.assign(liveVarsRef.current, vars); liveVarsDirtyRef.current = true; },
+        (err) => addLog('error', categorize(ERROR_CATEGORY.RUNTIME, `Stream error: ${err.message}`)),
+        liveSubscription,
+      );
+      appliedSubSigRef.current = liveSubSig;
+    }
+  }, [liveSubSig, liveSubscription, isRunning, isSimulationMode, addLog]);
 
   useEffect(() => {
     const stop = host.streamEvents((msg) => {
@@ -1271,7 +1364,9 @@ function App() {
 
   const handleOpen = async () => {
     try {
-      const picked = await openFile({ accept: '.xml' });
+      // adopt: this is THE project file — only a project open may become the
+      // in-place Save target (an ESI/other import must never hijack it).
+      const picked = await openFile({ accept: '.xml', adopt: true });
       if (!picked) return;
       processFileContent(picked.content, picked.path);
     } catch (error) {
@@ -1405,10 +1500,57 @@ function App() {
     }
   };
 
+  // A local simulation of an EtherCAT project opens a REAL raw socket on this
+  // PC's NIC (CLAUDE.md §13), which needs CAP_NET_RAW/CAP_NET_ADMIN on the host
+  // agent. Without them the bus simply never reaches OP — nothing crashes, the
+  // axes just sit there — so the editor has to say so BEFORE the user spends an
+  // hour hunting a drive that "won't enable".
+  //
+  // ⚠️ Never blocks the run and never throws: a project may well be simulated
+  // logic-only, and the agent may be an old build with no such endpoint.
+  const offerEtherCATCaps = async () => {
+    if (ecCapsOfferedRef.current) return;
+    if (!(buses || []).some(b => b.type === 'ethercat' && busConfigs?.[b.id])) return;
+    let health;
+    try { health = await host.health(); } catch { return; }
+    // `etherCATCaps` is absent on an older agent, and false is meaningless off
+    // Linux (no npcap/pcap there — the bus is stubbed either way).
+    if (health?.platform !== 'linux' || health?.etherCATCaps !== false) return;
+    // ⚠️ And meaningless whenever the agent can start the runtime through
+    // pkexec: that runtime is root, so it opens the raw socket on its own and
+    // the agent's own capabilities buy nothing. Offering the grant there asked
+    // for a password to fix a problem that does not exist. The setcap route is
+    // the FALLBACK path only — see netcaps_linux.go runtimeLaunchCmd.
+    if (health?.privilegedLauncher !== false) return;
+    ecCapsOfferedRef.current = true;
+    addLog('warning', t('logs.ethercatCapsMissing') ||
+      'EtherCAT: the agent lacks raw-socket rights (CAP_NET_RAW), so the bus will not reach OP and no drive will enable.');
+    const yes = await ask(
+      t('messages.ethercatCapsAsk') ||
+      'This project drives a real EtherCAT bus, but the host agent does not have permission to open a raw network socket.\n\n' +
+      'Grant it now? Your desktop will ask for your password once; the editor then has to be restarted.',
+      { title: t('messages.ethercatCapsTitle') || 'EtherCAT permission', type: 'warning' }
+    );
+    if (!yes) {
+      addLog('info', 'EtherCAT: continuing without bus access — the simulation runs, the drives stay disabled.');
+      return;
+    }
+    try {
+      const res = await host.grantEtherCATCaps();
+      if (res?.granted) addLog('success', `EtherCAT: ${res.message || 'permission granted'} — restart the editor to drive the bus.`);
+      else addLog('error', `EtherCAT: ${res?.message || res?.error || 'permission was not granted'}`);
+    } catch (err) {
+      addLog('error', `EtherCAT: ${err?.message || err}`);
+    }
+  };
+
   const handleToggleSimulation = async () => {
     // Simulation Mode is allowed even while a PLC is connected — Build & Send is
     // disabled for the duration instead (re-enabled when Simulation goes OFF).
-    if (isRunning) {
+    // Toggling Simulation OFF while it runs IS the stop control: the Start/Stop
+    // buttons are disabled in simulation mode (ON auto-starts the run), so this
+    // path stops it. Only a REMOTE run still blocks the toggle.
+    if (isRunning && !isSimulationMode) {
       addLog('warning', t('logs.stopExecutionFirst') || 'Please stop execution before toggling simulation mode.');
       return;
     }
@@ -1416,6 +1558,7 @@ function App() {
     const nextMode = !isSimulationMode;
 
     if (nextMode) {
+      await offerEtherCATCaps();
       setCompileBusy('sim');
       addLog('info', t('logs.compilingSimulationTranspile') || 'Compiling Project for Simulation (C Transpilation)...');
       try {
@@ -1490,6 +1633,7 @@ function App() {
         setCompileBusy(null);
       }
     } else {
+      if (isRunning) await handleStopExecution();
       setIsSimulationMode(false);
       addLog('info', t('logs.simulationDisabled') || 'Simulation Mode Disabled.');
       liveVarsRef.current = {};
@@ -1501,14 +1645,21 @@ function App() {
   };
 
   const handleStartExecution = async () => {
-    if (!isSimulationMode && !(isDeployed && !isDirty && isPlcConnected)) {
+    // Simulation is driven by the Simulation toggle alone (ON auto-runs, OFF
+    // stops), so Start/Stop are disabled in simulation mode. Guard it here too:
+    // the Ctrl+X shortcut bypasses every button's disabled state.
+    if (isSimulationMode) {
+      if (isRunning) addLog('warning', 'Simulation is running — turn Simulation OFF to stop it.');
+      else await runSimulationNow();
+      return;
+    }
+
+    if (!(isDeployed && !isDirty && isPlcConnected)) {
       addLog('warning', 'Cannot start. Enable Simulation Mode or Build & Send to PLC first.');
       return;
     }
 
-    if (isSimulationMode) {
-      await runSimulationNow();
-    } else if (isDeployed && !isDirty && isPlcConnected) {
+    {
       // Remote execution via ConnectRPC (server streaming — no polling)
       try {
         // Reuse existing client if already connected.
@@ -1516,6 +1667,11 @@ function App() {
           plcClientRef.current = new PLCClient(plcAddress);
         }
         const client = plcClientRef.current;
+
+        // ⚠️ Snapshot BEFORE the run starts: the live subscription prunes
+        // liveVarsRef down to what is on screen as soon as isRunning flips, and
+        // the pin literals below may belong to a POU nobody has open.
+        const preStartVars = { ...liveVarsRef.current };
 
         addLog('success', 'Connecting to PLC...');
         await client.start();
@@ -1525,7 +1681,7 @@ function App() {
 
         // Auto force-write literal-valued FB input shadow variables so the PLC
         // runtime sees the user-specified defaults from the block pin inputs.
-        const shadowWrites = Object.entries(liveVarsRef.current)
+        const shadowWrites = Object.entries(preStartVars)
           .filter(([k, v]) =>
             remoteVarKeysRef.current.includes(k) &&
             k.includes('_in_') &&
@@ -1547,7 +1703,9 @@ function App() {
             (err) => {
               addLog('error', categorize(ERROR_CATEGORY.RUNTIME, `Stream error: ${err.message}`));
             },
+            liveSubRef.current,
           );
+          appliedSubSigRef.current = JSON.stringify(liveSubRef.current);
         }
       } catch (err) {
         addLog('error', categorize(ERROR_CATEGORY.RUNTIME, `Failed to start PLC: ${err.message || err}`));
@@ -2966,8 +3124,8 @@ function App() {
             <button
               className={`tb-btn tb-text ${isSimulationMode ? 'tb-toggle-on' : 'tb-toggle-off'}`}
               onClick={handleToggleSimulation}
-              disabled={isRunning || !!compileBusy}
-              title={simCompiling ? 'Compiling simulation…' : 'Toggle Simulation Mode'}
+              disabled={!!compileBusy || (isRunning && !isSimulationMode)}
+              title={simCompiling ? 'Compiling simulation…' : isSimulationMode && isRunning ? 'Turn Simulation OFF (stops the run)' : 'Toggle Simulation Mode'}
             >
               {simCompiling ? <span className="tb-spinner" /> : <FlaskIcon />}
               <span>{simCompiling ? 'Compiling…' : 'Simulation'}</span>
@@ -2981,16 +3139,16 @@ function App() {
             <button
               className="tb-btn tb-icon tb-run"
               onClick={handleStartExecution}
-              disabled={isRunning || (!isSimulationMode && !(isDeployed && !isDirty && isPlcConnected))}
-              title={t('actions.start') || 'Start'}
+              disabled={isSimulationMode || isRunning || !(isDeployed && !isDirty && isPlcConnected)}
+              title={isSimulationMode ? 'Simulation runs with the Simulation toggle' : (t('actions.start') || 'Start')}
             >
               <PlayIcon />
             </button>
             <button
               className="tb-btn tb-icon tb-stop"
               onClick={handleStopExecution}
-              disabled={!isRunning}
-              title={t('actions.stop') || 'Stop'}
+              disabled={!isRunning || isSimulationMode}
+              title={isSimulationMode ? 'Turn Simulation OFF to stop' : (t('actions.stop') || 'Stop')}
             >
               <StopIcon />
             </button>
@@ -3100,6 +3258,8 @@ function App() {
                   <SlaveConfigPage
                     key={activeSlave.slave.id}
                     slave={activeSlave.slave}
+                    allSlaves={activeSlave.slaves}
+                    slaveIndex={activeSlave.slaveIndex}
                     onChange={(updated) => handleUpdateSlave(activeSlave.busId, activeSlave.slave.id, updated)}
                     onAddGlobalVars={handleAddGlobalVarsFromBus}
                     isRunning={isRunning || isSimulationMode}

@@ -56,6 +56,16 @@ func serverBinaryForBoard(boardID string) (resourceTarget, binaryName string, er
 		return "", "", fmt.Errorf("Pico boards are no longer supported — reselect a Linux board in Board Config")
 	case strings.HasPrefix(boardID, "bb_") && !strings.HasPrefix(boardID, "bb_ai64"):
 		return "arm/armv7", "plc-agent_linux_armv7", nil
+	// ⚠️ Generic Linux: the arch lives in the ID. generic_linux_x64 would fall
+	// through to the amd64 default correctly, but the other two would NOT —
+	// they are neither "bb_" nor in aarch64BoardPrefixes. Spelling all three
+	// out keeps this switch readable next to compile.go's twin.
+	case boardID == "generic_linux_armv7":
+		return "arm/armv7", "plc-agent_linux_armv7", nil
+	case boardID == "generic_linux_arm64":
+		return "arm/aarch64", "plc-agent_linux_arm64", nil
+	case boardID == "generic_linux_x64":
+		return "x86_64/linux", "plc-agent_linux_amd64", nil
 	case isAarch64:
 		return "arm/aarch64", "plc-agent_linux_arm64", nil
 	default:

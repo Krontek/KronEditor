@@ -717,10 +717,48 @@ func (s *Server) saveUpload(r *http.Request, dest string, executable bool) error
 	return nil
 }
 
-// handleSSEVars pushes all variable values every streamInterval (50 ms)
-// via Server-Sent Events. Used by Tauri/WebKit clients where fetch
-// streaming is buffered end-to-end. Cadence is intentionally fixed —
-// this is the editor stream, not the user-tunable /api/v1/stream.
+// streamVarMatcher builds the per-connection name filter for /stream/vars from
+// the query string: `p` is a comma-separated list of key PREFIXES (a POU's keys
+// all share `prog_<Name>_`, every global shares `prog__`) and `v` a list of
+// explicit names. Both absent — an older editor, or a client that wants the lot
+// — means no filter at all, so the endpoint stays backward compatible.
+func streamVarMatcher(q url.Values) func(string) bool {
+	split := func(raw string) []string {
+		out := make([]string, 0, 8)
+		for _, part := range strings.Split(raw, ",") {
+			if part = strings.TrimSpace(part); part != "" {
+				out = append(out, part)
+			}
+		}
+		return out
+	}
+	prefixes := split(q.Get("p"))
+	nameList := split(q.Get("v"))
+	if len(prefixes) == 0 && len(nameList) == 0 {
+		return nil
+	}
+	names := make(map[string]struct{}, len(nameList))
+	for _, n := range nameList {
+		names[n] = struct{}{}
+	}
+	return func(key string) bool {
+		if _, ok := names[key]; ok {
+			return true
+		}
+		for _, p := range prefixes {
+			if strings.HasPrefix(key, p) {
+				return true
+			}
+		}
+		return false
+	}
+}
+
+// handleSSEVars pushes variable values every streamInterval (50 ms) via
+// Server-Sent Events. Used by Tauri/WebKit clients where fetch streaming is
+// buffered end-to-end. Cadence is intentionally fixed — this is the editor
+// stream, not the user-tunable /api/v1/stream. WHICH variables it carries is
+// the client's call (see streamVarMatcher); with no filter it is all of them.
 func (s *Server) handleSSEVars(w http.ResponseWriter, r *http.Request) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
@@ -732,7 +770,8 @@ func (s *Server) handleSSEVars(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Connection", "keep-alive")
 	w.Header().Set("X-Accel-Buffering", "no") // disable nginx buffering
 
-	slog.Info("SSE stream started", "remote", r.RemoteAddr)
+	match := streamVarMatcher(r.URL.Query())
+	slog.Info("SSE stream started", "remote", r.RemoteAddr, "filtered", match != nil)
 	ticker := time.NewTicker(streamInterval)
 	heartbeat := time.NewTicker(25 * time.Second)
 	defer ticker.Stop()
@@ -749,7 +788,7 @@ func (s *Server) handleSSEVars(w http.ResponseWriter, r *http.Request) {
 			}
 			flusher.Flush()
 		case <-ticker.C:
-			vars, err := s.ipc.ReadAllVariables()
+			vars, err := s.ipc.ReadVariablesFiltered(match)
 			if err != nil {
 				continue
 			}

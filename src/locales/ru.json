@@ -75,7 +75,15 @@
         "dragDrop": "Перетащить",
         "blockCount": "{{count}} блоков",
         "howItWorks": "Как это работает",
-        "standardLibraries": "Стандартные библиотеки"
+        "standardLibraries": "Стандартные библиотеки",
+        "blockInformation": "Инфо",
+        "errorCodes": "Коды ошибок",
+        "code": "ID",
+        "meaning": "Значение",
+        "noErrorCodes": "Этот блок не сообщает о собственных ошибках.",
+        "errorCodesUndocumented": "Для этого блока коды ошибок не описаны.",
+        "noPins": "У этого элемента нет пинов данных.",
+        "noBlockInfo": "Нет дополнительной информации."
     },
     "actions": {
         "add": "Добавить",

@@ -64,6 +64,14 @@ export class HostClient {
     return _get(this._p('/api/host/build-dir'));
   }
 
+  // Ask the agent to stamp ITSELF with CAP_NET_RAW/CAP_NET_ADMIN through the
+  // desktop's polkit prompt, so a local simulation can open SOEM's raw socket.
+  // The rights apply at the agent's next exec — the caller has to tell the user
+  // to restart. `health().etherCATCaps` reports the current state.
+  async grantEtherCATCaps() {
+    return _post(this._p('/api/host/grant-ethercat-caps'), {});
+  }
+
   // ── file I/O ──────────────────────────────────────────────────────────────
   async writePlcFiles({ header, source, variableTable, hal }) {
     return _post(this._p('/api/host/write-plc-files'), { header, source, variableTable, hal });
@@ -130,6 +138,12 @@ export class HostClient {
   // after a browser reload (the sim + its poller outlive the tab). → {running, pid}
   async simStatus() {
     return _get(this._p('/api/host/sim-status'));
+  }
+  // Narrow what the running simulation's poller reads and streams. `prefixes`
+  // are live-key prefixes (`prog_<Prog>_`, `prog__` for globals), `names`
+  // explicit keys; both empty restores "everything".
+  async liveSubscribe(prefixes = [], names = []) {
+    return _post(this._p('/api/host/live-subscribe'), { prefixes, names });
   }
   // mode: 'force' (hold every scan, default) or 'pulse' (apply for one scan,
   // then the logic resumes) — only meaningful for the hot-swap simulation.

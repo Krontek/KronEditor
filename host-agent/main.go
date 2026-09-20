@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"runtime"
 	"strings"
 	"syscall"
 	"time"
@@ -36,6 +37,7 @@ type Server struct {
 	ollama         *OllamaState
 	hotswap        *HotSwapState
 	anthropicOAuth *AnthropicOAuthState
+	live           *LiveFilter
 }
 
 func main() {
@@ -53,11 +55,13 @@ func main() {
 		hmi:            NewHmiState(),
 		ollama:         NewOllamaState(),
 		hotswap:        NewHotSwapState(),
+		live:           NewLiveFilter(),
 		anthropicOAuth: NewAnthropicOAuthState(paths.AppDataDir),
 	}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/host/health", srvState.handleHealth)
+	mux.HandleFunc("/api/host/grant-ethercat-caps", srvState.handleGrantEtherCATCaps)
 	mux.HandleFunc("/api/host/build", handleBuild) // generic compile (PoC, kept)
 
 	// File I/O
@@ -79,6 +83,7 @@ func main() {
 	mux.HandleFunc("/api/host/sim-status", srvState.handleSimStatus)
 	mux.HandleFunc("/api/host/write-variable", srvState.handleWriteVariable)
 	mux.HandleFunc("/api/host/plc-variables", srvState.handlePlcVariables) // SSE
+	mux.HandleFunc("/api/host/live-subscribe", srvState.handleLiveSubscribe)
 
 	// Deploy
 	mux.HandleFunc("/api/host/check-server-status", srvState.handleCheckServerStatus)
@@ -114,10 +119,10 @@ func main() {
 	mux.HandleFunc("/api/host/hotswap/run", srvState.handleHotSwapRun)
 	mux.HandleFunc("/api/host/hotswap/swap", srvState.handleHotSwapSwap)
 	mux.HandleFunc("/api/host/hotswap/stop", srvState.handleHotSwapStop)
-	mux.HandleFunc("/api/host/hotswap/target-build", srvState.handleHotSwapTargetBuild)     // cross-compile host+logic.so for the field
-	mux.HandleFunc("/api/host/hotswap/target-logic", srvState.handleHotSwapTargetLogic)     // recompile logic.so for an online change
-	mux.HandleFunc("/api/host/hotswap/target-deploy", srvState.handleHotSwapTargetDeploy)   // upload runtime.bin(host)+variables+logic.so to KronServer
-	mux.HandleFunc("/api/host/hotswap/deploy-swap", srvState.handleHotSwapDeploySwap)       // push logic.so to KronServer + swap
+	mux.HandleFunc("/api/host/hotswap/target-build", srvState.handleHotSwapTargetBuild)   // cross-compile host+logic.so for the field
+	mux.HandleFunc("/api/host/hotswap/target-logic", srvState.handleHotSwapTargetLogic)   // recompile logic.so for an online change
+	mux.HandleFunc("/api/host/hotswap/target-deploy", srvState.handleHotSwapTargetDeploy) // upload runtime.bin(host)+variables+logic.so to KronServer
+	mux.HandleFunc("/api/host/hotswap/deploy-swap", srvState.handleHotSwapDeploySwap)     // push logic.so to KronServer + swap
 
 	// HMI
 	mux.HandleFunc("/api/host/start-hmi-server", srvState.handleStartHmiServer)
@@ -204,7 +209,42 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		"toolchainsRoot": s.paths.ToolchainsRoot,
 		"appDataDir":     s.paths.AppDataDir,
 		"buildDir":       s.paths.BuildDir(),
+		// Whether a locally spawned runtime can open SOEM's raw socket — the
+		// difference between "the EtherCAT bus never reaches OP" and a real bug.
+		// `platform` goes with it: the caps are a Linux concept, and off Linux
+		// the local sim never drives a real bus, so the editor must not offer to
+		// "fix" a false here.
+		"etherCATCaps": hasNetRawCaps(),
+		"platform":     runtime.GOOS,
+		// Whether a runtime can be started with a password prompt (pkexec), which
+		// is the normal path and gives it root outright. Only when this is FALSE
+		// does granting capabilities to the agent buy anything — otherwise the
+		// editor would nag about a permission the runtime never needed.
+		"privilegedLauncher": hasPrivilegedLauncher(),
 	})
+}
+
+// handleGrantEtherCATCaps stamps THIS agent binary with the raw-socket caps via
+// the desktop's polkit prompt, so a user never has to find a terminal to drive a
+// real EtherCAT bus. Refused while something is running: file caps only apply at
+// the next exec, and the restart that follows would orphan a live runtime.
+func (s *Server) handleGrantEtherCATCaps(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "POST only")
+		return
+	}
+	s.sim.mu.Lock()
+	simRunning := s.sim.cmd != nil
+	s.sim.mu.Unlock()
+	s.hotswap.mu.Lock()
+	hsRunning := s.hotswap.cmd != nil
+	s.hotswap.mu.Unlock()
+	if simRunning || hsRunning {
+		writeError(w, http.StatusConflict, "Stop the simulation first — the editor has to restart for the new rights to apply.")
+		return
+	}
+	granted, msg := grantNetRawCapsInteractive()
+	writeJSON(w, http.StatusOK, map[string]any{"ok": granted, "granted": granted, "message": msg})
 }
 
 func writeJSON(w http.ResponseWriter, status int, body any) {

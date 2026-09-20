@@ -66,9 +66,19 @@ export const esiDtypeToIEC = (dtype) => {
 
 /* ── XML helpers ─────────────────────────────────────────────────────────── */
 
+/**
+ * Text of a DIRECT child element.
+ *
+ * ⚠️ This deliberately does NOT use querySelector: that searches the whole
+ * subtree in document order, so `txt(txPdoEl, 'Name')` on a <TxPdo> without its
+ * own <Name> returned the first ENTRY's name and the PDO was labelled after one
+ * of the objects inside it. Every tag this parser reads is a direct child.
+ */
 function txt(el, tag) {
-  const c = el?.querySelector?.(tag) ?? el?.getElementsByTagName?.(tag)?.[0];
-  return c?.textContent?.trim() ?? '';
+  for (const child of el?.children ?? []) {
+    if (child.tagName === tag || child.localName === tag) return child.textContent?.trim() ?? '';
+  }
+  return '';
 }
 
 function attr(el, name) {
@@ -106,8 +116,14 @@ function parseStartupSdos(deviceEl) {
 
   for (const cmd of children(initCmds, 'InitCmd')) {
     const transition = txt(cmd, 'Transition');
-    /* Only include PS (PRE-OP → SAFE-OP) or SI, IP startup commands */
-    if (transition && !['PS','PI','SI','IP'].includes(transition.toUpperCase())) continue;
+    /* ⚠️ PS (PRE-OP → SAFE-OP) ONLY. kron_ec_init replays sdo_inits once, in
+     * PRE-OP, right before requesting SAFE-OP — that is what a PS command is
+     * for. IP/PI commands belong to the INIT↔PRE-OP transition (mailbox setup)
+     * and SI to an error recovery path; replaying them as PS writes objects the
+     * slave has already configured and some drives abort the whole startup
+     * list on the first such SDO. A command with no Transition at all is the
+     * ESI's way of saying "startup list", so it is kept. */
+    if (transition && transition.toUpperCase() !== 'PS') continue;
 
     const indexStr   = txt(cmd, 'Index')    || attr(cmd, 'Index');
     const subStr     = txt(cmd, 'SubIndex') || attr(cmd, 'SubIndex');
@@ -118,17 +134,23 @@ function parseStartupSdos(deviceEl) {
     const subindex = parseNum(subStr);
     if (!index) continue;
 
-    /* Data is a hex string, e.g. "01000000" (little-endian) */
-    let value    = 0;
-    let byteSize = 1;
+    /* ⚠️ <Data> is a LITTLE-ENDIAN byte string (ETG.2000): "01000000" is the
+     * value 1 in a 4-byte object, not 0x01000000. Reading it as one big hex
+     * number — which is what parseInt(hex, 16) does — byte-swapped every SDO
+     * imported from an ESI and nothing downstream could notice, because a
+     * plausible-looking number reached the drive. */
+    let value     = 0;
+    let byteSize  = 1;
+    let truncated = false;
     if (dataStr) {
-      const hex = dataStr.replace(/\s/g, '');
-      byteSize  = Math.max(1, hex.length / 2);
-      byteSize  = Math.min(byteSize, 4);
-      value     = parseInt(hex.slice(0, 8), 16) || 0;
+      const bytes = (dataStr.replace(/\s/g, '').match(/../g) || []);
+      byteSize  = Math.min(4, Math.max(1, bytes.length));
+      truncated = bytes.length > 4;   /* KRON_EC_SDO.value is uint32 */
+      value     = bytes.slice(0, 4).reverse()
+        .reduce((acc, b) => (acc * 256) + (parseInt(b, 16) || 0), 0) >>> 0;
     }
 
-    sdos.push({ index, subindex, value, byteSize, comment, transition });
+    sdos.push({ index, subindex, value, byteSize, comment, transition, truncated });
   }
   return sdos;
 }
@@ -142,6 +164,15 @@ function parsePdoGroup(pdoEls, direction) {
     const pdoName  = txt(pdo, 'Name') || `PDO_${pdoIndex.toString(16).toUpperCase()}`;
     const fixed    = attr(pdo, 'Fixed') === '1' || attr(pdo, 'Fixed') === 'true';
     const mandatory= attr(pdo, 'Mandatory') === '1';
+    /* Sync-manager assignment. ⚠️ Sharing an Sm does NOT make two PDOs
+     * alternatives — an EL1008 publishes eight single-entry TxPdos on Sm 3 that
+     * all coexist. Exclusivity is stated explicitly, one <Exclude> per PDO
+     * index that must not be assigned together with this one. */
+    const smStr    = attr(pdo, 'Sm');
+    const sm       = smStr === '' ? null : parseNum(smStr);
+    const excludes = children(pdo, 'Exclude')
+      .map(ex => parseNum(ex.textContent?.trim()))
+      .filter(n => n > 0);
 
     const entries = [];
     for (const entry of children(pdo, 'Entry')) {
@@ -168,7 +199,7 @@ function parsePdoGroup(pdoEls, direction) {
         name:     entryName || `Entry_${index.toString(16).toUpperCase()}_${subindex}`,
       });
     }
-    pdos.push({ index: pdoIndex, name: pdoName, direction, fixed, mandatory, entries });
+    pdos.push({ index: pdoIndex, name: pdoName, direction, fixed, mandatory, sm, excludes, entries });
   }
   return pdos;
 }
@@ -249,49 +280,8 @@ export function parseEsiXml(xmlString) {
   return devices;
 }
 
-/**
- * Generate a list of suggested global variables from a set of selected PDO entries.
- *
- * @param {object[]} selectedEntries - Array of { entry, slaveName, direction }
- * @param {string}   prefix          - Optional prefix for variable names
- * @returns {{ name: string, type: string, direction: string, comment: string }[]}
- */
-export function pdoEntriesToGlobalVars(selectedEntries, prefix = 'ec') {
-  const usedNames = new Set();
-  const makeUniqueName = (rawName) => {
-    const base = (rawName || 'ec_var')
-      .replace(/[^A-Za-z0-9_]/g, '_')
-      .replace(/__+/g, '_')
-      .replace(/^_+|_+$/g, '');
-    const root = base || 'ec_var';
-    if (!usedNames.has(root)) {
-      usedNames.add(root);
-      return root;
-    }
-    let n = 2;
-    let candidate = `${root}_${n}`;
-    while (usedNames.has(candidate)) {
-      n += 1;
-      candidate = `${root}_${n}`;
-    }
-    usedNames.add(candidate);
-    return candidate;
-  };
-
-  return selectedEntries.map(({ entry, slaveName, direction }) => {
-    const safeSlave = (slaveName || 'slave').replace(/[^A-Za-z0-9_]/g, '_');
-    const safeName  = (entry.name || 'var').replace(/[^A-Za-z0-9_]/g, '_');
-    const autoName  = `${prefix}_${safeSlave}_${safeName}`;
-    const varName   = makeUniqueName(autoName);
-    return {
-      name:      varName,
-      type:      entry.iecType || 'USINT',
-      direction, /* 'input' | 'output' */
-      kronDtype: entry.kronDtype,
-      index:     entry.index,
-      subindex:  entry.subindex,
-      bitLen:    entry.bitLen,
-      comment:   `EtherCAT ${direction}: ${slaveName} ${entry.name}`,
-    };
-  });
-}
+/* NOTE: variable-name generation for selected PDO entries lives in
+ * `src/utils/ecNaming.js` — shared verbatim with the transpiler. It used to be
+ * a second, independent implementation here (pdoEntriesToGlobalVars) whose
+ * collision counter had a different scope than the transpiler's, so the two
+ * silently disagreed on a name the moment anything collided. */
