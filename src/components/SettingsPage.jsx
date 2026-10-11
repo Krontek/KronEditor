@@ -17,7 +17,7 @@ const KRON_REPOS = [
     'KronEthercatMaster',
 ];
 
-const SettingsPage = ({ theme, setTheme, editorSettings, setEditorSettings, selectedBoard, plcAddress, setPlcAddress, sshUser: sshUserProp, setSshUser: setSshUserProp, sshPort: sshPortProp, setSshPort: setSshPortProp, apiPassword, setApiPassword, isPlcConnected, setConnectionEnabled, esiLibrary = [], onLoadEsiFile, projectStructure, buses, busConfigs }) => {
+const SettingsPage = ({ theme, setTheme, editorSettings, setEditorSettings, selectedBoard, plcAddress, setPlcAddress, sshUser: sshUserProp, setSshUser: setSshUserProp, sshPort: sshPortProp, setSshPort: setSshPortProp, apiPassword, setApiPassword, isPlcConnected, setConnectionEnabled, esiLibrary = [], onLoadEsiFile, onDeleteEsiFile, projectStructure, buses, busConfigs }) => {
     const { t, i18n } = useTranslation();
     const [activeTab, setActiveTab] = useState('general');
     const [isUpdating, setIsUpdating] = useState(false);
@@ -441,6 +441,7 @@ const SettingsPage = ({ theme, setTheme, editorSettings, setEditorSettings, sele
 
     const [esiLoadError, setEsiLoadError] = useState(null);
     const [esiLoadLog, setEsiLoadLog] = useState('');
+    const [esiDeleting, setEsiDeleting] = useState(null);
 
     const handleLoadEsiFileClick = async () => {
         setEsiLoadError(null);
@@ -452,6 +453,30 @@ const SettingsPage = ({ theme, setTheme, editorSettings, setEditorSettings, sele
             setEsiLoadLog(`Loaded: ${picked.name}`);
         } catch (e) {
             setEsiLoadError('Error: ' + (e.message || e));
+        }
+    };
+
+    // Removing an ESI is destructive and off-screen from the buses that used it,
+    // so it confirms — and says plainly what is NOT affected, since the obvious
+    // fear is that it breaks slaves already placed on a bus. It does not: a
+    // slave keeps its own copy of the PDO/SDO data in the project file.
+    const handleDeleteEsi = async (file, deviceCount) => {
+        setEsiLoadError(null);
+        setEsiLoadLog('');
+        const ok = window.confirm(
+            `Remove "${file}" from the ESI library?\n\n` +
+            `${deviceCount} device${deviceCount === 1 ? '' : 's'} will no longer be offered when adding a slave. ` +
+            `Slaves already placed on a bus keep working — the project stores its own copy of their PDO and SDO data.\n\n` +
+            `The file is deleted from disk. Re-import it to get it back.`);
+        if (!ok) return;
+        setEsiDeleting(file);
+        try {
+            await onDeleteEsiFile?.(file);
+            setEsiLoadLog(`Removed: ${file}`);
+        } catch (e) {
+            setEsiLoadError('Error: ' + (e.message || e));
+        } finally {
+            setEsiDeleting(null);
         }
     };
 
@@ -1138,18 +1163,43 @@ const SettingsPage = ({ theme, setTheme, editorSettings, setEditorSettings, sele
                             {esiLibrary.length === 0 ? (
                                 <div style={{ color: '#555', fontSize: '12px', padding: '8px 0' }}>No ESI files loaded yet.</div>
                             ) : (
-                                esiLibrary.map((dev, i) => (
-                                    <div key={i} style={{
-                                        padding: '6px 0',
-                                        borderBottom: i < esiLibrary.length - 1 ? '1px solid #2a2a2a' : 'none',
-                                        display: 'flex', flexDirection: 'column', gap: 2
+                                /* Grouped BY FILE, because that is the unit that can be removed:
+                                   one ESI commonly declares several devices and they live or die
+                                   together. */
+                                Object.entries(esiLibrary.reduce((acc, dev) => {
+                                    const f = dev._esiFile || '(unknown file)';
+                                    (acc[f] = acc[f] || []).push(dev);
+                                    return acc;
+                                }, {})).map(([file, devs], gi, all) => (
+                                    <div key={file} style={{
+                                        padding: '8px 0',
+                                        borderBottom: gi < all.length - 1 ? '1px solid #2a2a2a' : 'none'
                                     }}>
-                                        <span style={{ color: '#9cdcfe', fontSize: '12px', fontWeight: 'bold' }}>{dev.name}</span>
-                                        <span style={{ color: '#555', fontSize: '11px' }}>
-                                            {dev.vendorName} · VID:0x{(dev.vendorId ?? 0).toString(16).toUpperCase().padStart(4,'0')}
-                                            · PC:0x{(dev.productCode ?? 0).toString(16).toUpperCase().padStart(4,'0')}
-                                            {dev._esiFile && <> · <span style={{ color: '#444' }}>{dev._esiFile}</span></>}
-                                        </span>
+                                        <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 4 }}>
+                                            <span style={{ color: '#888', fontSize: '11px', flex: 1 }}>{file}</span>
+                                            {onDeleteEsiFile && (
+                                                <button
+                                                    title={`Remove ${file} from the library`}
+                                                    onClick={() => handleDeleteEsi(file, devs.length)}
+                                                    disabled={esiDeleting === file}
+                                                    style={{
+                                                        padding: '2px 10px', background: 'transparent', color: '#f44747',
+                                                        border: '1px solid #5a2a2a', borderRadius: '3px',
+                                                        cursor: esiDeleting === file ? 'default' : 'pointer', fontSize: '11px'
+                                                    }}>
+                                                    {esiDeleting === file ? 'Removing…' : 'Remove'}
+                                                </button>
+                                            )}
+                                        </div>
+                                        {devs.map((dev, i) => (
+                                            <div key={i} style={{ padding: '3px 0 3px 10px', display: 'flex', flexDirection: 'column', gap: 2 }}>
+                                                <span style={{ color: '#9cdcfe', fontSize: '12px', fontWeight: 'bold' }}>{dev.name}</span>
+                                                <span style={{ color: '#555', fontSize: '11px' }}>
+                                                    {dev.vendorName} · VID:0x{(dev.vendorId ?? 0).toString(16).toUpperCase().padStart(4,'0')}
+                                                    · PC:0x{(dev.productCode ?? 0).toString(16).toUpperCase().padStart(4,'0')}
+                                                </span>
+                                            </div>
+                                        ))}
                                     </div>
                                 ))
                             )}

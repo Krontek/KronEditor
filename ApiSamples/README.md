@@ -15,6 +15,7 @@ takes those flags.
 | `02_stream_snapshot.py` | `/api/v1/stream` SSE. Reports snapshots/s vs changes/s — the gap is aliasing. |
 | `03_ring_capture.py` | `/api/v1/stream/ring` lossless capture, with decimation vs real loss kept apart. Optional CSV. |
 | `Onemotorcontrol.py` | Larger tkinter GUI: write-side demo (force-write, runtime start/stop, AutoRun, cadence). |
+| `advisor_control.py` | tkinter sliders for the advisor boat project: `%MD52` drive / `%MD56` rudder, -100..+100, with RC-switch status. |
 | `ml0_ring_viewer.py` | tkinter viewer for N variables from `%ML0` over the capture ring. |
 | `ml0_sequence_check.py` | Correctness trial: does the ring really deliver **every** scan, in order? |
 | `test_*.py` | Offline tests of the decoders — synthetic frames, no device needed. |

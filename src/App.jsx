@@ -38,7 +38,7 @@ import { useTranslation } from 'react-i18next';
 import { exportProjectToXml, importProjectFromXml } from './services/XmlService';
 import { libraryService } from './services/LibraryService'; // Import Service
 import { errorCodeService } from './services/ErrorCodeService';
-import { loadAllEsiDevices, saveEsiFile } from './services/EsiLibraryService';
+import { loadAllEsiDevices, saveEsiFile, deleteEsiFile } from './services/EsiLibraryService';
 import { openFile, saveFile, ask, readTextFile, writeTextFile, clearActiveFileHandle, registerPathPicker } from './services/browserFs';
 import SavePathModal from './components/SavePathModal';
 import { transpileToC, validateProjectST } from './services/CTranspilerService';
@@ -957,6 +957,16 @@ function App() {
   // Called from SettingsPage: save ESI file to library and reload device list
   const handleLoadEsiFile = useCallback(async (filename, content) => {
     await saveEsiFile(filename, content);
+    const devices = await loadAllEsiDevices();
+    setEsiLibrary(devices);
+  }, []);
+
+  // Called from SettingsPage: drop one ESI file and reload the device list.
+  // ⚠️ Slaves already placed on a bus keep the PDO/SDO data they were created
+  // with — the project stores its own copy — so removing the file only takes
+  // the device out of the "add from library" list.
+  const handleDeleteEsiFile = useCallback(async (filename) => {
+    await deleteEsiFile(filename);
     const devices = await loadAllEsiDevices();
     setEsiLibrary(devices);
   }, []);
@@ -3295,6 +3305,7 @@ function App() {
                       setConnectionEnabled={setConnectionEnabled}
                       esiLibrary={esiLibrary}
                       onLoadEsiFile={handleLoadEsiFile}
+                      onDeleteEsiFile={handleDeleteEsiFile}
                       projectStructure={projectStructure}
                       buses={buses}
                       busConfigs={busConfigs}

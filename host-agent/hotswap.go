@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"hash"
 	"net/http"
 	"os"
 	"os/exec"
@@ -391,8 +392,9 @@ func (s *Server) compileLogic(buildDir string, ver int) (string, string, error) 
 // swap) and exported via -rdynamic; the host is then board-specific and is
 // rebuilt whenever HAL/board/IO changes (a cold-restart case anyway).
 // hostInputsHash captures everything that determines the local loader-host
-// binary: the embedded loader source (changes when the host-agent is upgraded)
-// and host_glue.c (changes with the project's HAL usage). It is the cache key
+// binary: the embedded loader source (changes when the host-agent is upgraded),
+// host_glue.c (changes with the project's HAL usage) and — whenever that glue
+// makes the host link them — the static archives themselves. It is the cache key
 // for plc_host so a stale binary from an earlier build/version is never reused
 // (an old loader that doesn't write the cold-start swap_result would otherwise
 // make every sim start time out with "cold-start outcome unknown").
@@ -427,13 +429,39 @@ func hostLinkRecipe() string {
 	}
 }
 
-func hostInputsHash(buildDir string) string {
+// mixStaticArchives folds every .a in libDir into h, by name and by CONTENT.
+// Content rather than mtime: it matches the rest of this cache key, and a
+// checkout or a restore that preserves timestamps must not be able to hide a
+// different library.
+func mixStaticArchives(h hash.Hash, libDir string) {
+	for _, a := range CollectStaticArchives(libDir) {
+		h.Write([]byte(filepath.Base(a)))
+		if b, err := os.ReadFile(a); err == nil {
+			h.Write(b)
+		}
+	}
+}
+
+func (s *Server) hostInputsHash(buildDir string) string {
 	h := sha256.New()
 	h.Write([]byte(hotswapHostC))
 	h.Write([]byte(hostLinkRecipe()))
 	if b, err := os.ReadFile(filepath.Join(buildDir, "host_glue.c")); err == nil {
 		h.Write([]byte("glue"))
 		h.Write(b)
+		// ⚠️ The STATIC ARCHIVES are inputs to this binary too, and leaving them
+		// out made a rebuilt library invisible: the host links them only when
+		// host_glue.c exists, but then it carries the EtherCAT master AND (since
+		// the axis engine moved into the bus thread) the whole motion stack —
+		// KronAxis_Submit included. A logic swap recompiles only logic.so, whose
+		// MC_*_Call / KronAxis_* are undefined symbols bound to the HOST, so a
+		// fixed libkron_axis.a took effect nowhere while every timestamp said the
+		// build was fresh. Hashing CONTENT, not mtime, matches the rest of this
+		// key and survives a checkout that restores timestamps. Mirrors the link
+		// condition exactly, so a project with no glue keeps its old key.
+		if libDir, e := s.paths.ResourceTargetLibDir(hostResourceTarget()); e == nil {
+			mixStaticArchives(h, libDir)
+		}
 	}
 	return hex.EncodeToString(h.Sum(nil))
 }
@@ -443,7 +471,7 @@ func (s *Server) compileHost(buildDir string) (string, error) {
 	// Cache on the CONTENT of the loader inputs, not mere existence — otherwise a
 	// plc_host built by an older host-agent (before the cold-start-result ABI, or
 	// with different HAL trampolines) is reused forever.
-	curHash := hostInputsHash(buildDir)
+	curHash := s.hostInputsHash(buildDir)
 	hashFile := hostBin + ".hash"
 	if curHash != "" {
 		if prev, e := os.ReadFile(hashFile); e == nil && string(prev) == curHash {

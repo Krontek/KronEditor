@@ -40,6 +40,20 @@ export async function listEsiFiles() {
   }
 }
 
+/**
+ * Removes one ESI file from the library.
+ *
+ * ⚠️ Deletion is per FILE, not per device: one ESI commonly declares several
+ * devices, and they live or die together. Callers name the file (a device's
+ * `_esiFile`), never a device.
+ */
+export async function deleteEsiFile(filename) {
+  const dir = await esiDir();
+  const safe = String(filename).replace(/[^a-zA-Z0-9._-]/g, '_');
+  if (!safe || safe === '.' || safe === '..') throw new Error('invalid ESI filename');
+  await host.deleteFile(`${dir}/${safe}`);
+}
+
 /** Loads and parses all ESI files from the library. Returns flat device array. */
 export async function loadAllEsiDevices() {
   try {

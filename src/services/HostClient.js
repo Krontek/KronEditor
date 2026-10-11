@@ -88,6 +88,10 @@ export class HostClient {
   async writeFile(path, content) {
     return _post(this._p('/api/host/write-file'), { path, content });
   }
+  // Only succeeds inside the agent's app-data dir — see handleDeleteFile.
+  async deleteFile(path) {
+    return _post(this._p('/api/host/delete-file'), { path });
+  }
   async listDir(path) {
     const j = await _post(this._p('/api/host/list-dir'), { path });
     return j.entries || [];
