@@ -6,6 +6,7 @@ import (
 	"crypto/subtle"
 	"encoding/hex"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"sync"
 	"time"
@@ -152,6 +153,18 @@ func (ss *SessionStore) Delete(token string) {
 	ss.mu.Unlock()
 }
 
+// Clear revokes every session (credentials changed: a token issued under the
+// old password or user set must not outlive it).
+func (ss *SessionStore) Clear() {
+	ss.mu.Lock()
+	n := len(ss.sessions)
+	ss.sessions = make(map[string]*Session)
+	ss.mu.Unlock()
+	if n > 0 {
+		slog.Info("Sessions revoked after a credential change", "count", n)
+	}
+}
+
 func (ss *SessionStore) cleanupLoop() {
 	for range time.Tick(15 * time.Minute) {
 		ss.mu.Lock()
@@ -177,15 +190,30 @@ func NewUserStore() *UserStore {
 	return &UserStore{users: make(map[string]*User)}
 }
 
-// LoadUsers replaces all users (called when new HMI config is deployed).
-func (us *UserStore) LoadUsers(users []User) {
-	us.mu.Lock()
-	defer us.mu.Unlock()
-	us.users = make(map[string]*User, len(users))
+// LoadUsers replaces all users (called when new HMI config is deployed) and
+// reports whether the credential set actually changed (a user added, removed,
+// re-roled or given a new password). Callers revoke sessions only then, so a
+// Build & Send that redeploys the same users does not log every operator out.
+func (us *UserStore) LoadUsers(users []User) (changed bool) {
+	next := make(map[string]*User, len(users))
 	for i := range users {
 		u := users[i]
-		us.users[u.Username] = &u
+		next[u.Username] = &u
 	}
+	us.mu.Lock()
+	defer us.mu.Unlock()
+	changed = len(next) != len(us.users)
+	if !changed {
+		for name, u := range next {
+			old, ok := us.users[name]
+			if !ok || old.Role != u.Role || old.PasswordHash != u.PasswordHash || old.Salt != u.Salt {
+				changed = true
+				break
+			}
+		}
+	}
+	us.users = next
+	return changed
 }
 
 func (us *UserStore) Authenticate(username, password string) (*User, bool) {

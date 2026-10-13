@@ -38,6 +38,8 @@ Releases/
 # need no libkron*.a rebuild) — not pulled from the Krontek libraries repo, so a
 # fresh clone must get it or every project using its blocks fails to compile.
 !/resources/krontek-include/kronsystem.h
+# EXCEPTION: the header-area CLAUDE.md (Build Libraries replaces only *.h and HAL/).
+!/resources/krontek-include/CLAUDE.md
 
 # Backend Artifacts
 bin/

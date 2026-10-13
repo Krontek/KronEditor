@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/binary"
 	"io"
 	"net/http"
@@ -9,15 +10,19 @@ import (
 	"time"
 )
 
-// readFrame reads one /stream/ring frame from r, returning stride_N, dropped,
-// and the decoded (seq,payload) records.
+// ringFrame is one decoded /stream/ring v2 frame.
 type ringFrame struct {
+	version uint16
 	strideN uint32
 	dropped uint64
-	recs    []struct {
-		seq     uint64
-		payload []byte
-	}
+	epoch   uint64
+	recs    []ringFrameRec
+}
+
+type ringFrameRec struct {
+	seq     uint64
+	scan    uint32
+	payload []byte
 }
 
 func readRingFrame(r io.Reader) (*ringFrame, error) {
@@ -30,20 +35,21 @@ func readRingFrame(r io.Reader) (*ringFrame, error) {
 		return nil, err
 	}
 	f := &ringFrame{}
-	count := binary.LittleEndian.Uint32(body[0:4])
-	f.strideN = binary.LittleEndian.Uint32(body[4:8])
-	f.dropped = binary.LittleEndian.Uint64(body[8:16])
-	off := 16
+	f.version = binary.LittleEndian.Uint16(body[0:2])
+	hdrLen := int(binary.LittleEndian.Uint16(body[2:4]))
+	count := binary.LittleEndian.Uint32(body[4:8])
+	f.strideN = binary.LittleEndian.Uint32(body[8:12])
+	f.dropped = binary.LittleEndian.Uint64(body[12:20])
+	f.epoch = binary.LittleEndian.Uint64(body[20:28])
+	off := hdrLen
 	for i := uint32(0); i < count; i++ {
 		seq := binary.LittleEndian.Uint64(body[off:])
 		plen := int(binary.LittleEndian.Uint16(body[off+10:]))
+		scan := binary.LittleEndian.Uint32(body[off+12:])
 		payload := make([]byte, plen)
-		copy(payload, body[off+12:off+12+plen])
-		f.recs = append(f.recs, struct {
-			seq     uint64
-			payload []byte
-		}{seq, payload})
-		off += 12 + plen
+		copy(payload, body[off+16:off+16+plen])
+		f.recs = append(f.recs, ringFrameRec{seq: seq, scan: scan, payload: payload})
+		off += 16 + plen
 	}
 	return f, nil
 }
@@ -80,7 +86,7 @@ func TestRingStreamEndToEndNoLoss(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(am.handleRingStream))
 	defer srv.Close()
 
-	resp, err := http.Get(srv.URL)
+	resp, err := http.Get(srv.URL + "?v=2")
 	if err != nil {
 		t.Fatalf("GET: %v", err)
 	}
@@ -100,9 +106,15 @@ func TestRingStreamEndToEndNoLoss(t *testing.T) {
 			t.Fatalf("read frame after %d recs: %v", got, err)
 		}
 		lastDropped = f.dropped
+		if f.version != ringFrameVersion {
+			t.Fatalf("frame version %d, want %d", f.version, ringFrameVersion)
+		}
 		for _, rec := range f.recs {
 			if !first && rec.seq != prev+1 {
 				t.Fatalf("seq gap: %d -> %d (a value was lost)", prev, rec.seq)
+			}
+			if rec.scan != uint32(rec.seq*3) {
+				t.Fatalf("seq %d: scan %d, want %d (scan counter not carried)", rec.seq, rec.scan, uint32(rec.seq*3))
 			}
 			first, prev = false, rec.seq
 			got++
@@ -228,7 +240,7 @@ func TestRingControllerRecoversFromAStrideBurst(t *testing.T) {
 }
 
 // TestRingWireBytesPerSecMatchesTheControllersUnit guards the unit mismatch:
-// D is measured over whole frames, so P must include the 12-byte per-record
+// D is measured over whole frames, so P must include the 16-byte per-record
 // stream header. Payload-only understated production 2.5x for an 8-byte var.
 func TestRingWireBytesPerSecMatchesTheControllersUnit(t *testing.T) {
 	name := "kron_test_wirerate"
@@ -241,8 +253,8 @@ func TestRingWireBytesPerSecMatchesTheControllersUnit(t *testing.T) {
 	defer rc.Close()
 
 	payloadOnly := rc.ProducedBytesPerSec() // 8 B / 10 us  = 800 KB/s
-	wire := rc.WireBytesPerSec()            // 20 B / 10 us = 2.0 MB/s
-	if want := (8.0 + 12.0) / 10 * 1e6; wire != want {
+	wire := rc.WireBytesPerSec()            // 24 B / 10 us = 2.4 MB/s
+	if want := (8.0 + 16.0) / 10 * 1e6; wire != want {
 		t.Fatalf("WireBytesPerSec = %v, want %v", wire, want)
 	}
 	if wire <= payloadOnly {
@@ -253,3 +265,110 @@ func TestRingWireBytesPerSecMatchesTheControllersUnit(t *testing.T) {
 		t.Fatalf("ProducedBytesPerSec changed meaning: %v, want %v", payloadOnly, want)
 	}
 }
+
+// A client connecting after an idle period starts at full fidelity, not at the
+// stride a previous (maybe congested) session left behind.
+func TestRingControllerResetsStrideAfterIdle(t *testing.T) {
+	name := "kron_test_resetn"
+	p := newRingProducer(t, name, 24, 128, []ringTask{{PeriodUs: 100, PayloadLen: 8, TaskID: 0}})
+	defer p.close()
+	rc, err := OpenRing(name)
+	if err != nil {
+		t.Fatalf("OpenRing: %v", err)
+	}
+	defer rc.Close()
+	ctl := newRingController(rc)
+	id := ctl.register()
+	ctl.mu.Lock()
+	ctl.n = 512
+	ctl.mu.Unlock()
+	ctl.unregister(id)
+	// Reconnect inside one control tick: the loop must still be the only one.
+	id2 := ctl.register()
+	defer ctl.unregister(id2)
+	if got := rc.StrideN(); got != 1 {
+		t.Fatalf("stride after reconnect = %d, want 1", got)
+	}
+	ctl.mu.Lock()
+	running := ctl.running
+	ctl.mu.Unlock()
+	if !running {
+		t.Fatal("controller loop not marked running after reconnect")
+	}
+}
+
+// A v1 client must get a clear 400, not a stream it would misparse.
+func TestRingStreamRequiresV2(t *testing.T) {
+	am := &APIManager{shmName: "kron_test_v2req"}
+	srv := httptest.NewServer(http.HandlerFunc(am.handleRingStream))
+	defer srv.Close()
+	resp, err := http.Get(srv.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status %d, want 400", resp.StatusCode)
+	}
+}
+
+// Frame v2 byte layout: header fields at fixed offsets, header_len lets a
+// client skip fields a later version adds, scan rides in every record.
+func TestAppendRingFrameV2Layout(t *testing.T) {
+	recs := []RingRecord{
+		{Seq: 7, TaskID: 2, Scan: 0xDEADBEEF, Payload: []byte{1, 2, 3}},
+		{Seq: 8, TaskID: 0, Scan: 5, Payload: nil},
+	}
+	b := appendRingFrame([]byte{0xAA}, recs, 4, 9, 0x0102030405060708)
+	if b[0] != 0xAA {
+		t.Fatal("prefix clobbered")
+	}
+	b = b[1:]
+	if got := binary.LittleEndian.Uint32(b[0:4]); int(got) != len(b)-4 {
+		t.Fatalf("frame_len %d, body %d", got, len(b)-4)
+	}
+	f, err := readRingFrame(bytesReader(b))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if f.version != 2 || f.strideN != 4 || f.dropped != 9 || f.epoch != 0x0102030405060708 {
+		t.Fatalf("header: %+v", f)
+	}
+	if binary.LittleEndian.Uint16(b[6:8]) != ringFrameHeaderLen || ringFrameHeaderLen != 28 {
+		t.Fatalf("header_len %d", binary.LittleEndian.Uint16(b[6:8]))
+	}
+	if len(f.recs) != 2 || f.recs[0].scan != 0xDEADBEEF || string(f.recs[0].payload) != "\x01\x02\x03" || f.recs[1].seq != 8 {
+		t.Fatalf("records: %+v", f.recs)
+	}
+}
+
+// An epoch change must reach the client at once as an EMPTY frame carrying the
+// new epoch, so it re-fetches /ring/info before the new layout's records.
+func TestRingStreamAnnouncesEpochChange(t *testing.T) {
+	name := "kron_test_epoch"
+	p := newRingProducer(t, name, 24, 256, []ringTask{{PeriodUs: 100, PayloadLen: 8, TaskID: 0}})
+	defer p.close()
+	am := &APIManager{shmName: name}
+	srv := httptest.NewServer(http.HandlerFunc(am.handleRingStream))
+	defer srv.Close()
+	resp, err := http.Get(srv.URL + "?v=2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("status %d", resp.StatusCode)
+	}
+	time.Sleep(20 * time.Millisecond) // let the handler record the first epoch
+	old := binary.LittleEndian.Uint64(p.mem[offEpoch:])
+	p.relayout(24, []ringTask{{PeriodUs: 100, PayloadLen: 8, TaskID: 0}})
+	f, err := readRingFrame(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if f.epoch == old {
+		t.Fatalf("first frame after relayout still carries epoch %d", old)
+	}
+}
+
+func bytesReader(b []byte) io.Reader { return bytes.NewReader(b) }

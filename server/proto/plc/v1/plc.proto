@@ -37,7 +37,14 @@ message StopResponse {}
 message WriteVarRequest {
   string name  = 1;
   // value holds a bool, number, or string matching the variable's IEC type.
+  // Send 64-bit integers (LINT/ULINT/LWORD) as DECIMAL STRINGS: a protobuf
+  // Value number is a double and loses every integer above 2^53.
   google.protobuf.Value value = 2;
+  // mode: "force" (default — write once and hold), "pulse" (write once, the
+  // logic owns the value from the same scan) or "unforce" (release the hold;
+  // a non-null value is also written once). The call returns only after the
+  // runtime has applied the command (force-write mailbox, SHM layout v2).
+  string mode = 3;
 }
 
 message WriteVarResponse {}

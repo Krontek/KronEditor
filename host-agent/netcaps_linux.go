@@ -16,7 +16,7 @@ package main
 // them without any file capabilities of its own, and the sim keeps running as
 // the user (no sudo), which matters because a root-spawned runtime would own a
 // 0600 shm mirror the agent could not read and would not take the hot-swap
-// SIGUSR1 (see CLAUDE.md §6).
+// SIGUSR1 (see host-agent/CLAUDE.md).
 
 import (
 	"context"

@@ -30,13 +30,13 @@ def info_for(vtype="int64", size=8, name="Var0"):
     }
 
 
-def frame(values, start_seq, stride_n=1, dropped=0, seq_step=1):
-    """Pack (seq, value) records into one frame body (after frame_len)."""
-    body = struct.pack("<IIQ", len(values), stride_n, dropped)
+def frame(values, start_seq, stride_n=1, dropped=0, seq_step=1, epoch=1):
+    """Pack (seq, value) records into one v2 frame body (after frame_len)."""
+    body = struct.pack("<HHIIQQ", 2, 28, len(values), stride_n, dropped, epoch)
     seq = start_seq
     for v in values:
         payload = struct.pack("<q", v)
-        body += struct.pack("<QHH", seq, TASK_ID, len(payload)) + payload
+        body += struct.pack("<QHHI", seq, TASK_ID, len(payload), seq) + payload
         seq += seq_step
     return body
 
@@ -114,24 +114,36 @@ class TestSequenceCheck(unittest.TestCase):
         """Records from a second task interleave; they must be counted in
         total_records and seq continuity but never in the value steps."""
         c = checker()
-        body = struct.pack("<IIQ", 4, 1, 0)
+        body = struct.pack("<HHIIQQ", 2, 28, 4, 1, 0, 1)
         for seq, task, val in ((0, TASK_ID, 7), (1, 9, 999), (2, TASK_ID, 8), (3, 9, 999)):
             payload = struct.pack("<q", val)
-            body += struct.pack("<QHH", seq, task, len(payload)) + payload
+            body += struct.pack("<QHHI", seq, task, len(payload), seq) + payload
         c._apply_frame(body)
         self.assertEqual(c.total_records, 4)
         self.assertEqual(c.var_samples, 2)
         self.assertEqual(c.anomaly_count, 0)
         self.assertEqual(dict(c.step_hist), {1: 1})
 
-    def test_attach_backlog_is_not_counted_as_a_streaming_drop(self):
-        """The first frame's `dropped` is pre-attach ring history, not our loss."""
+    def test_first_frame_drops_are_real_loss(self):
+        """dropped_total counts from 0 for THIS connection (the server starts at
+        the producer's current position), so drops already present in the FIRST
+        frame are loss too. Subtracting them as an "attach backlog" hid it."""
         c = checker()
-        c._apply_frame(frame([1, 2], 0, dropped=50_000))
-        c._apply_frame(frame([3, 4], 2, dropped=50_000))
+        c._apply_frame(frame([1, 2], 0, dropped=3))
+        c._apply_frame(frame([3, 4], 2, dropped=3))
         sev, headline, _ = c.verdict()
-        self.assertEqual(c.attach_backlog, 50_000)
-        self.assertEqual(sev, "ok", headline)
+        self.assertEqual(sev, "bad", headline)
+
+    def test_epoch_change_restarts_the_check(self):
+        """A Build & Send restarts the counter and the server resyncs its
+        cursor: neither jump is loss, and the layout is re-resolved."""
+        c = checker()
+        c._apply_frame(frame([100, 101, 102], 50, epoch=1))
+        c._apply_frame(frame([0, 1], 9000, epoch=2))   # boundary frame
+        self.assertTrue(c._relayout)
+        c._relayout = False
+        c._apply_frame(frame([2, 3, 4], 9002, epoch=2))
+        self.assertEqual((c.anomaly_count, c.seq_gaps, c.restarts), (0, 0, 1))
 
     def test_drifting_stride_does_not_fabricate_anomalies(self):
         """Regression: the server re-tunes the stride every 100 ms. Steps that

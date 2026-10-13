@@ -42,6 +42,8 @@ from tkinter import ttk
 import urllib.request
 import urllib.error
 
+from kron_client import ring_frame_header, iter_ring_records
+
 # Variable type name (from the deployed variable table) -> struct format + size.
 TYPE_FMT = {
     "bool": ("?", 1), "int8": ("b", 1), "uint8": ("B", 1),
@@ -106,8 +108,8 @@ class SequenceChecker(threading.Thread):
         self.total_records = 0      # records of ALL tasks
         self.var_samples = 0        # samples of the tracked variable
         self.seq_gaps = 0
-        self.dropped_total = 0
-        self.attach_backlog = None  # ring history lapped BEFORE we attached
+        self.dropped_total = 0      # server-side loss on THIS connection (all real)
+        self.restarts = 0           # runtime epochs seen after the first
         self.stride_n = 1
         self.stride_changes = 0
 
@@ -122,6 +124,8 @@ class SequenceChecker(threading.Thread):
         # ---- reader-private ----
         self._expect_seq = None
         self._prev_value = None
+        self._epoch = None
+        self._relayout = False
         self._prev_stride = None
         self._stride_window = collections.deque(maxlen=64)  # strides recently in play
         self._task_cols = {}        # task_id -> [(name, fmt, size), ...]
@@ -157,7 +161,8 @@ class SequenceChecker(threading.Thread):
                 self._dump = open(self.dump_path, "w", buffering=1 << 20)
                 self._dump.write(f"# seq\t{self.var_name}\n")
 
-            req = urllib.request.Request(self.base + "/api/v1/stream/ring",
+            # ?v=2: frame format v2 (version, epoch, per-record scan counter).
+            req = urllib.request.Request(self.base + "/api/v1/stream/ring?v=2",
                                          headers={"Authorization": "Bearer " + token})
             self._resp = urllib.request.urlopen(req, timeout=10)
             with self.lock:
@@ -172,6 +177,12 @@ class SequenceChecker(threading.Thread):
                 if not body:
                     break
                 self._apply_frame(body)
+                if self._relayout:
+                    # Build & Send / restart: the counter starts over and the
+                    # payload layout may differ — resolve it again.
+                    self._relayout = False
+                    if not self._resolve_layout(self._ring_info(token)):
+                        break
         except urllib.error.HTTPError as e:
             detail = " — the agent on the device is stale (no /api/v1/ring routes); \
 rebuild with server/build.sh and redeploy" if e.code == 404 else ""
@@ -248,8 +259,22 @@ rebuild with server/build.sh and redeploy" if e.code == 404 else ""
     # ---- the actual test --------------------------------------------------
 
     def _apply_frame(self, body):
-        count, stride_n, dropped = struct.unpack_from("<IIQ", body, 0)
-        off = 16
+        hdr = ring_frame_header(body)
+        count, stride_n, dropped = hdr["count"], hdr["stride_n"], hdr["dropped_total"]
+        if self._epoch is not None and hdr["epoch"] != self._epoch:
+            # A new runtime generation: the counter restarted and the server
+            # resynced its cursor, so neither the value step nor the seq jump
+            # across this boundary is loss. Re-resolve before decoding more.
+            self._epoch = hdr["epoch"]
+            self._expect_seq = None
+            self._prev_value = None
+            self._relayout = True
+            with self.lock:
+                self.restarts += 1
+                self.flow.append(("warn", f"runtime restarted (epoch {hdr['epoch']}) — "
+                                          f"layout re-fetched, continuity check restarted"))
+            return
+        self._epoch = hdr["epoch"]
         want_task, fmt, size, poff = self._var
         vfmt = "<" + fmt
 
@@ -257,11 +282,7 @@ rebuild with server/build.sh and redeploy" if e.code == 404 else ""
         seq_gaps = 0
         new_anoms = []
 
-        for _ in range(count):
-            seq, task_id, plen = struct.unpack_from("<QHH", body, off)
-            payload_at = off + 12
-            off = payload_at + plen
-
+        for seq, task_id, _scan, payload_at, plen in iter_ring_records(body, hdr):
             # 1) TRANSPORT check: the ring's own sequence must be contiguous.
             if self._expect_seq is not None and seq != self._expect_seq:
                 seq_gaps += 1
@@ -315,8 +336,6 @@ rebuild with server/build.sh and redeploy" if e.code == 404 else ""
             self.var_samples += len(values)
             self.seq_gaps += seq_gaps
             self.dropped_total = dropped
-            if self.attach_backlog is None:
-                self.attach_backlog = dropped
             if self._prev_stride is not None and self._prev_stride != stride_n:
                 self.stride_changes += 1
                 self.flow.append(("warn", f"stride_N changed {self._prev_stride} -> {stride_n} "
@@ -368,7 +387,9 @@ rebuild with server/build.sh and redeploy" if e.code == 404 else ""
                 return "idle", "not started", ""
             if self.var_samples < 2:
                 return "idle", "waiting for data…", ""
-            stream_drops = self.dropped_total - (self.attach_backlog or 0)
+            # Counted from 0 for this connection: there is no attach backlog
+            # to subtract (subtracting the first frame's value hid real loss).
+            stream_drops = self.dropped_total
             anoms, gaps, stride = self.anomaly_count, self.seq_gaps, self.stride_n
             steps = dict(self.step_hist)
             name = self.var_name

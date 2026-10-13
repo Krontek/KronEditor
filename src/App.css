@@ -240,6 +240,41 @@ body {
   to { transform: rotate(360deg); }
 }
 
+/* FORCED (n) — "forces are active" warning in the toolbar (CODESYS-style).
+   Solid orange + a slow pulse: it must be impossible to miss. */
+.tb-btn.kron-forced-indicator {
+  margin-left: 8px;
+  background: #ff9800;
+  border-color: #ffb74d;
+  color: #1a1a1a;
+  font-weight: 800;
+  letter-spacing: 0.04em;
+  animation: kron-forced-pulse 1.6s ease-in-out infinite;
+}
+.tb-btn.kron-forced-indicator:hover {
+  background: #ffa726;
+  color: #000;
+}
+.kron-forced-indicator-f {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 15px;
+  height: 15px;
+  border: 1.5px solid #d50000;
+  border-radius: 2px;
+  background: #fff3e0;
+  color: #d50000;
+  font-size: 11px;
+  font-weight: 900;
+  font-family: Consolas, "Cascadia Code", monospace;
+  line-height: 1;
+}
+@keyframes kron-forced-pulse {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(255, 152, 0, 0.75); }
+  50%      { box-shadow: 0 0 0 4px rgba(255, 152, 0, 0); }
+}
+
 /* Agent "thinking / working" animated dots */
 .agent-think-dots {
   display: inline-flex;

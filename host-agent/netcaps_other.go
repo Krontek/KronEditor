@@ -26,7 +26,7 @@ func stopRequestPath(buildDir string) string { return filepath.Join(buildDir, "s
 func privilegedKill(pid int) error { return fmt.Errorf("not supported on this OS") }
 
 // ⚠️ Every symbol netcaps_linux.go exports needs a twin here or the
-// GOOS=windows / GOOS=darwin builds break (CLAUDE.md §4). Both of these are
+// GOOS=windows / GOOS=darwin builds break (CLAUDE.md). Both of these are
 // reachable from platform-independent code: hasPrivilegedLauncher from
 // announceEtherCATCaps and /api/host/health, grantNetRawCapsInteractive from
 // the grant endpoint. false is the honest answer — there is no pkexec/sudo

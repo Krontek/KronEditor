@@ -81,7 +81,7 @@ func TestRingBytesForRespectsFloorAndHardCap(t *testing.T) {
 	}
 	// No /proc/meminfo (dev host) and a huge rate: the absolute cap applies.
 	if got := ringBytesFor(50, 0, 1e12); got != ringMaxBytes {
-		t.Fatalf("bytes = %d, want the hard cap %d", got, ringMaxBytes)
+		t.Fatalf("bytes = %d, want the hard cap %d", got, uint64(ringMaxBytes))
 	}
 	// pct out of range is clamped, never trusted verbatim
 	if ringBytesFor(500, 1<<30, 1e12) != ringBytesFor(ringMaxRAMPercent, 1<<30, 1e12) {

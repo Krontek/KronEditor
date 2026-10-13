@@ -13,12 +13,14 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
 
 	"github.com/krontek/hotswaplib"
+	"github.com/krontek/hotswaplib/shmcmd"
 )
 
 // hotswap.go — live ("online change") PLC logic update for the local simulation.
@@ -69,12 +71,82 @@ const hotswapShmSize = 65536
 // generous headroom over the sub-100ms cost typically observed.
 const swapResultTimeout = 5 * time.Second
 
+// privilegedColdStartTimeout replaces swapResultTimeout for the COLD START of a
+// runtime launched through pkexec/sudo.
+// ⚠️ That budget starts at cmd.Start(), i.e. BEFORE the password dialog, so a
+// user who took more than 5 s to type their password had the run declared
+// "cold-start outcome unknown" and the host killed. A host that dies (dialog
+// dismissed, wrong password) still ends the wait at once through `done`.
+const privilegedColdStartTimeout = 90 * time.Second
+
 // hotSwapStopGrace is how long Stop waits after SIGTERM for the loader-host to
 // unwind on its own (scan threads exit on their next boundary, then the retain
 // flusher writes a final snapshot) before falling back to SIGKILL. Kept short:
 // a Stop must stay snappy, and everything but the last <=1s of retained values
 // is already on disk from the periodic flush.
 const hotSwapStopGrace = 1500 * time.Millisecond
+
+// hotSwapStopGraceMax caps stopGraceFor: host.c sleeps in <= 50 ms slices, so
+// a long task interval no longer delays a stop by itself — only a scan body
+// that is still running does, and Stop must not hang behind a wedged one.
+const hotSwapStopGraceMax = 10 * time.Second
+
+// stopGraceFor is the SIGTERM/stop_request grace for the host running in
+// buildDir: at least hotSwapStopGrace, and at least the longest task interval
+// (+ 500 ms margin) when variables.json says what that is, so a host mid-scan
+// on a slow task still reaches its final retain flush before the SIGKILL.
+func stopGraceFor(buildDir string) time.Duration {
+	grace := hotSwapStopGrace
+	b, err := os.ReadFile(filepath.Join(buildDir, "variables.json"))
+	if err != nil {
+		return grace
+	}
+	var vt struct {
+		Tasks []struct {
+			IntervalUs float64 `json:"interval_us"`
+		} `json:"tasks"`
+	}
+	if json.Unmarshal(b, &vt) != nil {
+		return grace
+	}
+	for _, t := range vt.Tasks {
+		if d := time.Duration(t.IntervalUs)*time.Microsecond + 500*time.Millisecond; d > grace {
+			grace = d
+		}
+	}
+	if grace > hotSwapStopGraceMax {
+		grace = hotSwapStopGraceMax
+	}
+	return grace
+}
+
+// hostPidPath is where host.c records its OWN pid (see readHostPid).
+func hostPidPath(buildDir string) string { return filepath.Join(buildDir, "plc_host.pid") }
+
+// readHostPid returns the loader-host's pid from its pid file, or 0.
+//
+// ⚠️ Under `sudo` cmd.Process is SUDO, not the host, so privilegedKill(cmd pid)
+// SIGKILLed sudo and orphaned the root host (still holding the bus and the shm
+// mirror). The host writes its own pid; on Linux it is only trusted while
+// /proc/<pid>/cmdline still names the host binary, so a recycled pid from a
+// stale file is never killed.
+func readHostPid(buildDir string) int {
+	b, err := os.ReadFile(hostPidPath(buildDir))
+	if err != nil {
+		return 0
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(b)))
+	if err != nil || pid <= 1 {
+		return 0
+	}
+	if runtime.GOOS == "linux" {
+		cl, err := os.ReadFile("/proc/" + strconv.Itoa(pid) + "/cmdline")
+		if err != nil || !bytes.Contains(cl, []byte(hostBinName())) {
+			return 0
+		}
+	}
+	return pid
+}
 
 // windowsStaticRuntimeFlag links the mingw runtime (winpthreads above all)
 // STATICALLY into the local-sim loader-host and logic module.
@@ -138,6 +210,14 @@ type HotSwapState struct {
 	// (PingPongGeneration(curGen)). Guarded by swapMu (the whole swap holds it)
 	// and set under mu at run.
 	curGen int
+
+	// runGen counts loader-host runs (bumped under mu at every run): the
+	// force-write mailbox mapping belongs to ONE run, since each cold start
+	// recreates the mirror.
+	runGen uint64
+	// ackTimeout bounds a force-write's wait for the runtime's ack; derived
+	// from the built variable table's slowest task.
+	ackTimeout time.Duration
 }
 
 func NewHotSwapState() *HotSwapState { return &HotSwapState{} }
@@ -177,14 +257,20 @@ func (h *HotSwapState) Stop() {
 					_ = os.Remove(stopRequestPath(buildDir))
 				}
 				return // exited gracefully; nothing left to kill
-			case <-time.After(hotSwapStopGrace):
+			case <-time.After(stopGraceFor(buildDir)):
 			}
 		}
 		// Fallbacks, in escalating order of rudeness. Kill is EPERM against a
 		// root child, hence the privileged last resort — which prompts again, so
 		// it is only ever reached after the graceful path has already timed out.
+		// It targets the HOST's own pid when known (see readHostPid): cmd's pid
+		// may be sudo's, and killing that leaves the host running.
 		if err := cmd.Process.Kill(); err != nil && pid > 0 {
-			_ = privilegedKill(pid)
+			target := pid
+			if hp := readHostPid(buildDir); hp > 0 {
+				target = hp
+			}
+			_ = privilegedKill(target)
 		}
 		if done != nil {
 			select {
@@ -225,20 +311,67 @@ func buildShmSpecs(variableTableJSON string) []ShmSpec {
 	return specs
 }
 
-// writeHotSwapVariable writes a variable into the hot-swap loader-host's
-// /dev/shm mirror (the DEFAULT sim runtime). The generated plc_shm_pull only
-// copies a slot into PlcState when its force flag is set (and plc_shm_sync
-// skips forced slots), so a bare value write would be a no-op — value + flag
-// together are exactly what KronServer's WriteVar does on the target.
+// mailboxWriter is the agent's ONE writer handle on the running loader-host's
+// force-write mailbox. One per process on purpose: the mailbox serialises its
+// writers with an in-process mutex, so two handles would let two requests
+// claim the same sequence number.
 //
-// req.Mode picks the flag value: "force" (default) writes flag 1 so the value
-// is re-injected every scan (held constant); "pulse" writes flag 2 so the value
-// is applied for a SINGLE scan — plc_shm_pull auto-clears a pulse flag right
-// after applying it, so the logic resumes from the injected value (e.g. a
-// counter seeded to 0 counts up again next scan).
+// mu is held across a whole Post (post + ack wait). That serialises writes to
+// the local sim completely, which costs at most a scan per queued write and is
+// what keeps the mapping alive while a post uses it: the mapping is only ever
+// replaced (a new run) under the same lock. It is never taken while holding
+// HotSwapState.mu — the Alive probe below takes that one.
+type mailboxWriter struct {
+	mu     sync.Mutex
+	mirror *shmMirror
+	mbox   *shmcmd.Mailbox
+	gen    uint64 // HotSwapState.runGen the mapping belongs to
+}
+
+// shmAckTimeout sizes the force-write ack timeout from variables.json (its
+// shm_layout.max_task_interval_us, else the tasks' interval_us).
+func shmAckTimeout(variableTableJSON string) time.Duration {
+	var vt struct {
+		ShmLayout *struct {
+			MaxTaskIntervalUs int64 `json:"max_task_interval_us"`
+		} `json:"shm_layout"`
+		Tasks []struct {
+			IntervalUs int64 `json:"interval_us"`
+		} `json:"tasks"`
+	}
+	if err := json.Unmarshal([]byte(variableTableJSON), &vt); err != nil {
+		return shmcmd.DefaultTimeout
+	}
+	var maxUs int64
+	if vt.ShmLayout != nil {
+		maxUs = vt.ShmLayout.MaxTaskIntervalUs
+	}
+	for _, t := range vt.Tasks {
+		if t.IntervalUs > maxUs {
+			maxUs = t.IntervalUs
+		}
+	}
+	return shmcmd.TimeoutFor(maxUs)
+}
+
+// writeHotSwapVariable posts a force-write command into the hot-swap
+// loader-host's mirror (the DEFAULT sim runtime) and answers only after the
+// runtime APPLIED it — the same mailbox protocol KronServer uses on target
+// (hotswaplib/shmcmd; SHM layout v2).
+//
+// ⚠️ It used to store the value into the slot and then set the flag byte. A
+// plc_shm_sync between the two stores overwrote the new value, the flag then
+// pinned the OLD one, and the editor was told it worked. Nothing here touches
+// a slot or a flag any more: the runtime owns both.
+//
+// req.Mode: "force" (default, hold every scan), "pulse" (write once, the logic
+// resumes from it on the same scan — e.g. a counter seeded to 0 counts on) or
+// "unforce" (release; a non-empty value is also written once).
 func (s *Server) writeHotSwapVariable(w http.ResponseWriter, req writeVariableReq) {
 	s.hotswap.mu.Lock()
 	running := s.hotswap.cmd != nil
+	runGen := s.hotswap.runGen
+	timeout := s.hotswap.ackTimeout
 	var spec ShmSpec
 	found := false
 	for _, sp := range s.hotswap.specs {
@@ -249,7 +382,7 @@ func (s *Server) writeHotSwapVariable(w http.ResponseWriter, req writeVariableRe
 	}
 	s.hotswap.mu.Unlock()
 	if !running {
-		writeError(w, http.StatusBadRequest, "No simulation running")
+		writeError(w, http.StatusConflict, "No simulation running")
 		return
 	}
 	if !found {
@@ -257,42 +390,141 @@ func (s *Server) writeHotSwapVariable(w http.ResponseWriter, req writeVariableRe
 		return
 	}
 	if isTextType(spec.VType) {
-		// plc_shm_sync rewrites a text slot every scan regardless of the force
-		// flag, and plc_shm_pull never copies one back (a PLC STRING is a
-		// `char *` the runtime does not own). A write would look accepted and
-		// vanish on the next scan, so refuse it here instead.
+		// plc_shm_sync rewrites a text slot every scan, and the runtime never
+		// copies one back (no pull path for text — a 64-byte value cannot be
+		// applied atomically, and the mailbox answers PLC_MB_ST_READ_ONLY).
 		writeError(w, http.StatusBadRequest, "STRING variables are read-only: "+req.Name)
 		return
 	}
-	data, ok := encodeValue(spec.VType, req.Value)
-	if !ok {
-		writeError(w, http.StatusBadRequest, fmt.Sprintf("Cannot encode %q as %s", req.Value, spec.VType))
-		return
-	}
-	m, err := openShmMirror(s.paths.BuildDir(), hotswapShmName, hotswapShmSize, true)
+	op, err := shmcmd.ParseOp(req.Mode)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "open shm mirror: "+err.Error())
+		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	defer m.Close()
-	if err := m.WriteAt(data, int64(spec.Offset)); err != nil {
-		writeError(w, http.StatusInternalServerError, fmt.Sprintf("shm write at 0x%x: %v", spec.Offset, err))
+	if spec.ForceOff < shmcmd.ForceFlagsBase || spec.ForceOff >= shmcmd.MailboxBase {
+		writeError(w, http.StatusBadRequest, fmt.Sprintf("%s has no force slot (force_flag_offset %d) — rebuild the simulation", req.Name, spec.ForceOff))
 		return
 	}
-	if spec.ForceOff > 0 {
-		flag := byte(1) // FORCE — held every scan
-		if req.Mode == "pulse" {
-			flag = 2 // PULSE — applied once, then plc_shm_pull auto-clears it
-		}
-		if err := m.WriteAt([]byte{flag}, int64(spec.ForceOff)); err != nil {
-			writeError(w, http.StatusInternalServerError, fmt.Sprintf("shm force flag at 0x%x: %v", spec.ForceOff, err))
+	var data []byte
+	if op != shmcmd.OpUnforce || strings.TrimSpace(req.Value) != "" {
+		var ok bool
+		if data, ok = encodeValue(spec.VType, req.Value); !ok {
+			writeError(w, http.StatusBadRequest, fmt.Sprintf("Cannot encode %q as %s", req.Value, spec.VType))
 			return
 		}
+	}
+
+	if status, err := s.postHotSwapCommand(runGen, timeout, shmcmd.Command{
+		Index: uint32(spec.ForceOff - shmcmd.ForceFlagsBase),
+		Op:    op,
+		Value: data,
+	}); err != nil {
+		writeError(w, status, err.Error())
+		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
-func swapResultPath(buildDir string) string  { return filepath.Join(buildDir, "swap_result") }
+// postHotSwapCommand posts one mailbox command into the running loader-host's
+// mirror through the agent's single writer handle (see mailboxWriter) and
+// waits for the runtime's ack. On failure it returns the HTTP status to answer.
+func (s *Server) postHotSwapCommand(runGen uint64, timeout time.Duration, cmd shmcmd.Command) (int, error) {
+	mw := &s.mbWriter
+	mw.mu.Lock()
+	defer mw.mu.Unlock()
+	if mw.mbox == nil || mw.gen != runGen {
+		if mw.mirror != nil {
+			mw.mirror.Close()
+			mw.mirror, mw.mbox = nil, nil
+		}
+		m, err := openShmMirror(s.paths.SimBuildDir(), hotswapShmName, hotswapShmSize, true)
+		if err != nil {
+			return http.StatusConflict, fmt.Errorf("simulation mirror not available yet: %w", err)
+		}
+		mb, err := shmcmd.New(m.Bytes())
+		if err != nil {
+			m.Close()
+			return http.StatusInternalServerError, err
+		}
+		mw.mirror, mw.mbox, mw.gen = m, mb, runGen
+	}
+	alive := func() bool {
+		s.hotswap.mu.Lock()
+		defer s.hotswap.mu.Unlock()
+		return s.hotswap.cmd != nil && s.hotswap.runGen == runGen
+	}
+	if err := mw.mbox.Post(cmd, shmcmd.WaitOptions{Timeout: timeout, Alive: alive}); err != nil {
+		return shmcmd.HTTPStatus(err), err
+	}
+	return http.StatusOK, nil
+}
+
+// handleHotSwapClearForces releases EVERY force of the running hot-swap sim —
+// the local twin of KronServer's ClearAllForces: one CLEAR_ALL mailbox
+// command, answered after the runtime applied it (the runtime owns the flags).
+//
+//	POST /api/host/hotswap/clear-forces
+func (s *Server) handleHotSwapClearForces(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "POST required")
+		return
+	}
+	s.hotswap.mu.Lock()
+	running := s.hotswap.cmd != nil
+	runGen := s.hotswap.runGen
+	timeout := s.hotswap.ackTimeout
+	s.hotswap.mu.Unlock()
+	if !running {
+		writeError(w, http.StatusConflict, "No simulation running")
+		return
+	}
+	if status, err := s.postHotSwapCommand(runGen, timeout, shmcmd.Command{Op: shmcmd.OpClearAll}); err != nil {
+		writeError(w, status, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+func swapResultPath(buildDir string) string { return filepath.Join(buildDir, "swap_result") }
+
+// writeBuildInputs writes the transpiler's outputs into buildDir.
+//
+// ⚠️ An EMPTY host_glue.c / kron_hal.h means "this project has none" and the
+// file is REMOVED. Skipping the write instead left the PREVIOUS project's glue
+// in place, and compileHost links host_glue.c whenever it exists — so a project
+// without a bus still started the last project's EtherCAT master. plc.c / plc.h
+// / variables.json are always sent, and an empty one is still just skipped.
+func writeBuildInputs(buildDir string, files map[string]string) error {
+	for name, content := range files {
+		path := filepath.Join(buildDir, name)
+		if content == "" {
+			if name == "host_glue.c" || name == "kron_hal.h" {
+				if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+					return err
+				}
+			}
+			continue
+		}
+		if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// writeFileAtomic writes via a temp file + rename, so a reader polling the path
+// (host.c's watch_files_thread) only ever sees the old or the complete new file.
+func writeFileAtomic(path string, data []byte) error {
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, data, 0o644); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	return nil
+}
 func swapRequestPath(buildDir string) string { return filepath.Join(buildDir, "swap_request") }
 
 // compileLogic builds logic_<ver>.so from the plc.c already in buildDir. The
@@ -577,7 +809,7 @@ func (s *Server) announceEtherCATCaps(buildDir, hostBin string) {
 //
 // ⚠️ It returns -DKRON_EC_SIM unless EVERYTHING the real master needs is present
 // for the HOST target: a libsoem.a that actually exports ecx_init (Build SOEM may
-// never have run — resources/ is gitignored, §4), the kronethercatmaster archive,
+// never have run — resources/ is gitignored, CLAUDE.md), the kronethercatmaster archive,
 // and the staged SOEM headers. A fresh clone therefore still builds a simulation,
 // it just cannot drive a bus. Linux only: SOEM needs npcap on Windows and a
 // contrib libpcap port on macOS, neither of which is bundled.
@@ -647,28 +879,15 @@ func soemIncludeArgs(resInclude string) []string {
 	return out
 }
 
-// targetTriples maps a board to (llvmTarget, resourceTarget), mirroring
-// compileForTarget. Linux ARM targets only (hot-swap needs dlopen).
-func targetTriples(boardID string) (string, string, error) {
-	switch {
-	// Legacy-project guard — rpi_pico boards were removed from the board list.
-	case strings.HasPrefix(boardID, "rpi_pico"):
-		return "", "", fmt.Errorf("Pico boards are no longer supported — reselect a Linux board in Board Config")
-	case strings.HasPrefix(boardID, "bb_") && !strings.HasPrefix(boardID, "bb_ai64"):
-		return "arm-linux-gnueabihf", "arm/armv7", nil
-	default:
-		return "aarch64-linux-gnu", "arm/aarch64", nil
-	}
-}
-
 // compileLogicForTarget cross-compiles logic_<ver>.so for the deployed target.
 // Used for both the initial deploy (ver 0) and every online change. Caller
 // decides ver and owns cleanup, same contract as compileLogic.
 func (s *Server) compileLogicForTarget(buildDir, boardID string, ver int) (string, error) {
-	llvmTarget, resourceTarget, err := targetTriples(boardID)
+	bt, err := boardTargetFor(boardID) // shared with compileForTarget — see compile.go
 	if err != nil {
 		return "", err
 	}
+	llvmTarget, resourceTarget := bt.llvmTarget, bt.resourceTarget
 	resInclude, err := s.paths.ResourceTargetIncludeDir(resourceTarget)
 	if err != nil {
 		return "", err
@@ -685,6 +904,7 @@ func (s *Server) compileLogicForTarget(buildDir, boardID string, ver int) (strin
 	tmpSO := hotswaplib.TempGenerationPath(buildDir, ver) // atomic install — see compileLogic
 	args := append([]string{}, baseArgs...)
 	args = append(args, "-shared", "-fPIC", "-DPLC_HOTSWAP", "-O2", "-ffunction-sections", "-fdata-sections", "-fuse-ld=lld")
+	args = append(args, bt.flags...)
 	for _, inc := range sysIncs {
 		args = append(args, "-isystem", inc)
 	}
@@ -711,10 +931,11 @@ func (s *Server) compileLogicForTarget(buildDir, boardID string, ver int) (strin
 // runtime.bin for the target. DYNAMIC (-rdynamic, not -static) so it can dlopen
 // logic.so and so logic.so resolves us_tick / HAL trampolines from it.
 func (s *Server) compileHostForTarget(buildDir, boardID string) (string, error) {
-	llvmTarget, resourceTarget, err := targetTriples(boardID)
+	bt, err := boardTargetFor(boardID) // shared with compileForTarget — see compile.go
 	if err != nil {
 		return "", err
 	}
+	llvmTarget, resourceTarget := bt.llvmTarget, bt.resourceTarget
 	resInclude, err := s.paths.ResourceTargetIncludeDir(resourceTarget)
 	if err != nil {
 		return "", err
@@ -734,6 +955,7 @@ func (s *Server) compileHostForTarget(buildDir, boardID string) (string, error) 
 	outFile := filepath.Join(buildDir, "runtime.bin")
 	args := append([]string{}, baseArgs...)
 	args = append(args, "-O2", "-rdynamic", "-fuse-ld=lld")
+	args = append(args, bt.flags...)
 	for _, inc := range sysIncs {
 		args = append(args, "-isystem", inc)
 	}
@@ -776,22 +998,21 @@ func (s *Server) handleHotSwapTargetBuild(w http.ResponseWriter, r *http.Request
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	buildDir := s.paths.BuildDir()
-	if err := os.MkdirAll(buildDir, 0o755); err != nil {
+	if _, err := boardTargetFor(req.BoardID); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	buildDir, err := s.paths.PrepareTargetBuildDir(req.BoardID)
+	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	for name, content := range map[string]string{
+	if err := writeBuildInputs(buildDir, map[string]string{
 		"plc.h": req.Header, "plc.c": req.Source,
 		"variables.json": req.VariableTable, "kron_hal.h": req.HAL, "host_glue.c": req.HostGlue,
-	} {
-		if content == "" {
-			continue
-		}
-		if err := os.WriteFile(filepath.Join(buildDir, name), []byte(content), 0o644); err != nil {
-			writeError(w, http.StatusInternalServerError, err.Error())
-			return
-		}
+	}); err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
 	}
 	// Cold build = fresh process start downstream: reset to generation 0,
 	// wiping any leftover logic_*.so from a previous session (decision: reset
@@ -830,7 +1051,11 @@ func (s *Server) handleHotSwapTargetLogic(w http.ResponseWriter, r *http.Request
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	buildDir := s.paths.BuildDir()
+	buildDir, err := s.paths.PrepareTargetBuildDir(req.BoardID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
 	if req.Source != "" {
 		_ = os.WriteFile(filepath.Join(buildDir, "plc.c"), []byte(req.Source), 0o644)
 	}
@@ -869,12 +1094,17 @@ func (s *Server) handleHotSwapDeploySwap(w http.ResponseWriter, r *http.Request)
 	}
 	var req struct {
 		ServerAddr string `json:"serverAddr"`
+		BoardID    string `json:"boardId"` // optional; empty = most recent target build
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	buildDir := s.paths.BuildDir()
+	buildDir, err := s.paths.ResolveTargetBuildDir(req.BoardID)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
 	_, logicPath, ok := hotswaplib.DiscoverGeneration(buildDir)
 	if !ok {
 		writeError(w, http.StatusBadRequest, "no logic.so built yet — call target-build/target-logic first")
@@ -936,24 +1166,18 @@ func (s *Server) handleHotSwapBuild(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	buildDir := s.paths.BuildDir()
+	buildDir := s.paths.SimBuildDir()
 	if err := os.MkdirAll(buildDir, 0o755); err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	files := map[string]string{
+	if err := writeBuildInputs(buildDir, map[string]string{
 		"plc.h": req.Header, "plc.c": req.Source,
 		"variables.json": req.VariableTable, "kron_hal.h": req.HAL,
 		"host_glue.c": req.HostGlue, // HAL trampolines (empty if the project uses no HAL)
-	}
-	for name, content := range files {
-		if content == "" {
-			continue
-		}
-		if err := os.WriteFile(filepath.Join(buildDir, name), []byte(content), 0o644); err != nil {
-			writeError(w, http.StatusInternalServerError, err.Error())
-			return
-		}
+	}); err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
 	}
 	if _, err := s.compileHost(buildDir); err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
@@ -971,6 +1195,7 @@ func (s *Server) handleHotSwapBuild(w http.ResponseWriter, r *http.Request) {
 	}
 	s.hotswap.mu.Lock()
 	s.hotswap.specs = buildShmSpecs(req.VariableTable)
+	s.hotswap.ackTimeout = shmAckTimeout(req.VariableTable)
 	s.hotswap.mu.Unlock()
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "logic": logicSO})
 }
@@ -980,7 +1205,7 @@ func (s *Server) handleHotSwapRun(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusMethodNotAllowed, "POST required")
 		return
 	}
-	buildDir := s.paths.BuildDir()
+	buildDir := s.paths.SimBuildDir()
 	hostBin := filepath.Join(buildDir, hostBinName())
 	logicSO := hotswaplib.GenerationPath(buildDir, 0)
 	if _, err := os.Stat(hostBin); err != nil {
@@ -994,6 +1219,7 @@ func (s *Server) handleHotSwapRun(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "alreadyRunning": true, "pid": s.hotswap.pid})
 		return
 	}
+	s.hotswap.runGen++ // invalidates the force-write mailbox mapping of the previous run
 	// Fresh mirror each run. This MUST happen after the already-running
 	// early-return above: the poller opens the mirror by path each tick, so
 	// removing it while a host is live would silently kill the live stream.
@@ -1004,6 +1230,8 @@ func (s *Server) handleHotSwapRun(w http.ResponseWriter, r *http.Request) {
 	// ⚠️ A stale stop_request from a previous run would stop this one within
 	// 10 ms of start-up, which reads as "the host died immediately".
 	_ = os.Remove(stopRequestPath(buildDir))
+	// A pid file left by a host that was SIGKILLed must not name this run's.
+	_ = os.Remove(hostPidPath(buildDir))
 	// The runtime always runs privileged (netcaps_linux.go runtimeLaunchCmd) —
 	// the desktop prompts for the password. buildDir is passed as argv[2]
 	// because pkexec's handling of the working directory is not something the
@@ -1072,7 +1300,11 @@ func (s *Server) handleHotSwapRun(w http.ResponseWriter, r *http.Request) {
 	// declaring "started" — a fresh run that can't even bind logic_0.so
 	// (e.g. a stale/mismatched build) exits almost immediately; without this
 	// poll that would look identical to a normal successful start.
-	status, detail, perr := awaitColdStart(buildDir, done)
+	coldTimeout := swapResultTimeout
+	if strings.HasPrefix(launchNote, "privileged") { // runtimeLaunchCmd's pkexec/sudo notes
+		coldTimeout = privilegedColdStartTimeout
+	}
+	status, detail, perr := awaitColdStart(buildDir, done, coldTimeout)
 	if perr != nil {
 		// ⚠️ Read the process state BEFORE Stop(). A host that died on its own
 		// says WHY through its exit status — the only signal left when it never
@@ -1150,14 +1382,14 @@ func describeExit(st *os.ProcessState) string {
 // threads to join), so treating "process gone" as failure would misreport a
 // successful cold start. The file is the truth; the process state only bounds
 // how long we wait for it.
-func awaitColdStart(buildDir string, done <-chan struct{}) (status, detail string, err error) {
+func awaitColdStart(buildDir string, done <-chan struct{}, timeout time.Duration) (status, detail string, err error) {
 	type result struct {
 		status, detail string
 		err            error
 	}
 	ch := make(chan result, 1) // buffered: the poller must never block once we stop reading
 	go func() {
-		st, det, e := hotswaplib.PollSwapResult(swapResultPath(buildDir), 0, swapResultTimeout)
+		st, det, e := hotswaplib.PollSwapResult(swapResultPath(buildDir), 0, timeout)
 		ch <- result{st, det, e}
 	}()
 	select {
@@ -1184,7 +1416,7 @@ func (s *Server) handleHotSwapSwap(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	buildDir := s.paths.BuildDir()
+	buildDir := s.paths.SimBuildDir()
 	s.hotswap.mu.Lock()
 	pid := s.hotswap.pid
 	s.hotswap.mu.Unlock()
@@ -1234,7 +1466,9 @@ func (s *Server) handleHotSwapSwap(w http.ResponseWriter, r *http.Request) {
 	// outcome from a PREVIOUS attempt can never be misattributed to this one.
 	resultPath := swapResultPath(buildDir)
 	_ = hotswaplib.ClearResultFile(resultPath)
-	if err := os.WriteFile(swapRequestPath(buildDir), []byte(logicSO+"\n"), 0o644); err != nil {
+	// ⚠️ Atomic (tmp + rename): host.c's watcher polls this file every 10 ms
+	// and a plain WriteFile can be observed half-written.
+	if err := writeFileAtomic(swapRequestPath(buildDir), []byte(logicSO+"\n")); err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -1357,6 +1591,9 @@ func (s *Server) hotswapPoller(specs []ShmSpec, stop <-chan struct{}) {
 		}
 	}()
 
+	hasFlags := specsHaveFlags(specs)
+	var ft forcedTracker
+
 	time.Sleep(150 * time.Millisecond)
 	ticker := time.NewTicker(200 * time.Millisecond)
 	defer ticker.Stop()
@@ -1369,11 +1606,11 @@ func (s *Server) hotswapPoller(specs []ShmSpec, stop <-chan struct{}) {
 		if !built || planGen != s.live.Gen() {
 			rebuild()
 		}
-		if len(plan) == 0 {
+		if len(plan) == 0 && !hasFlags {
 			continue // nothing subscribed — the next tick re-checks
 		}
 		if mirror == nil {
-			m, err := openShmMirror(s.paths.BuildDir(), hotswapShmName, hotswapShmSize, false)
+			m, err := openShmMirror(s.paths.SimBuildDir(), hotswapShmName, hotswapShmSize, false)
 			if err != nil {
 				continue // mirror not up yet
 			}
@@ -1387,9 +1624,21 @@ func (s *Server) hotswapPoller(specs []ShmSpec, stop <-chan struct{}) {
 				anyOK = true
 			}
 		}
-		if anyOK {
-			s.events.Emit("simulation-output", map[string]any{"vars": vars})
-			broadcastPlcVars(vars)
+		// The forced set covers EVERY variable, whatever the subscription.
+		forced, flagsOK := readForcedKeys(mirror.ReadAt, specs)
+		if anyOK || flagsOK {
+			ev := map[string]any{"vars": vars}
+			if flagsOK {
+				if f, send := ft.next(forced, time.Now()); send {
+					ev[forcedEventKey] = f
+				}
+			}
+			if len(vars) > 0 || ev[forcedEventKey] != nil {
+				s.events.Emit("simulation-output", ev)
+			}
+			if len(vars) > 0 {
+				broadcastPlcVars(vars)
+			}
 			continue
 		}
 		mirror.Close()

@@ -47,7 +47,7 @@ trap cleanup EXIT
 rm -rf "$TMP"
 mkdir -p "$APPDIR/usr/bin" "$SHARE" "$CACHE"
 
-# Single source of truth for the version: package.json (§4 of CLAUDE.md).
+# Single source of truth for the version: package.json (CLAUDE.md).
 VERSION="$(node -p "require('$ROOT/package.json').version")"
 
 # ⚠️ Serialise the Vite build. Both scripts emit into the SAME dist/ tree, so

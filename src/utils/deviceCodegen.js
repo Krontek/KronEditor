@@ -34,7 +34,8 @@ const mapType = (iecType) => {
     WORD: 'uint16_t',
     DWORD: 'uint32_t',
     LWORD: 'uint64_t',
-    TIME: 'uint32_t',
+    TIME: 'int64_t',
+    LTIME: 'int64_t',
     STRING: 'char*',
   };
   return typeMap[(iecType || '').toUpperCase()] || iecType;

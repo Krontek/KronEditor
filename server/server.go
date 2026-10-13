@@ -32,12 +32,14 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"time"
 
 	connect "connectrpc.com/connect"
 	"encoding/json"
+	"github.com/krontek/hotswaplib"
 	"golang.org/x/net/http2"
 	"golang.org/x/net/http2/h2c"
 	plcv1connect "plc-agent/gen/plc/v1/plcv1connect"
@@ -86,7 +88,8 @@ type Server struct {
 	ipc     *IPCManager
 	pm      *ProcessManager
 	hmi     *HMIManager
-	rtMu    sync.Mutex // guards rtCfg
+	api     *APIManager // owns the shared capture-ring consumer (see SizeRingSegment)
+	rtMu    sync.Mutex  // guards rtCfg
 	rtCfg   RuntimeConfig
 	mux     *http.ServeMux
 	httpSrv *http.Server
@@ -144,6 +147,7 @@ func (s *Server) registerRoutes() {
 
 	// REST API for addressed variables (external access: Python, SCADA, HMI).
 	api := NewAPIManager(s.ipc, s, s.cfg.ShmName)
+	s.api = api
 	RegisterAPIRoutes(s.mux, api)
 }
 
@@ -221,7 +225,9 @@ func (s *Server) applyHMIPort(port uint16) {
 	mux := http.NewServeMux()
 	RegisterHMIRoutesAtRoot(mux, s.hmi)
 	srv := &http.Server{
-		Handler:     mux,
+		// Same Origin policy as the agent port (corsMiddleware): this listener
+		// is the one operators expose most widely.
+		Handler:     hmiOriginGuard(mux),
 		ReadTimeout: 60 * time.Second,
 		IdleTimeout: 120 * time.Second,
 	}
@@ -328,7 +334,31 @@ func (s *Server) handleDeployRuntime(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	slog.Info("runtime.bin uploaded successfully", "dest", dest)
+	s.dropStaleLogicSlots()
 	jsonOK(w, map[string]string{"status": "ok", "path": dest})
+}
+
+// dropStaleLogicSlots removes every logic_*.so and swap_result after a new
+// runtime.bin lands.
+//
+// ⚠️ spawnRuntime decides "hot-swap loader-host vs plain binary" purely from
+// the presence of a logic_<n>.so, so a plain Build & Send onto a device that
+// once ran a hot-swap deploy started the NEW self-contained runtime.bin with a
+// stale logic path as its argument (and polled for a cold-start result it
+// would never write). The upload itself carries no marker, but cleaning here
+// is unambiguous anyway: the ONLY flow that wants logic slots after a runtime
+// upload — the host agent's hot-swap target deploy — always follows it with
+// POST /deploy/logic?cold=1, which wipes every slot and installs logic_0.so
+// itself. A loader-host that is still running keeps its unlinked module
+// mapped, so removing the file does not disturb it.
+func (s *Server) dropStaleLogicSlots() {
+	deployLogicMu.Lock()
+	defer deployLogicMu.Unlock()
+	if err := hotswaplib.CleanupExcept(s.cfg.DeployDir, -1); err != nil {
+		slog.Warn("failed to remove stale logic slots", "err", err)
+	}
+	_ = hotswaplib.ClearResultFile(filepath.Join(s.cfg.DeployDir, "swap_result"))
+	s.pm.ForgetLogicGenerations()
 }
 
 func (s *Server) handleDeployVariableTable(w http.ResponseWriter, r *http.Request) {
@@ -337,16 +367,31 @@ func (s *Server) handleDeployVariableTable(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	dest := filepath.Join(s.cfg.DeployDir, "variable_table.json")
-	if err := s.saveUpload(r, dest, false); err != nil {
+	// Validate the TEMP file before it replaces the deployed one: a rejected
+	// table used to be renamed into place first, so the agent kept serving the
+	// old table from memory while the file on disk — rehydrated at the next
+	// agent start — was the broken one.
+	var parsed *parsedVariableTable
+	var parseErr error
+	err := s.saveUploadChecked(r, dest, false, func(tmp string) error {
+		data, rerr := os.ReadFile(tmp)
+		if rerr != nil {
+			return rerr
+		}
+		parsed, parseErr = s.ipc.ParseVariableTable(data)
+		return parseErr
+	})
+	if err != nil {
+		if parseErr != nil {
+			slog.Error("rejected variable table", "err", parseErr)
+			http.Error(w, "failed to parse table: "+parseErr.Error(), http.StatusUnprocessableEntity)
+			return
+		}
 		slog.Error("failed to save variable_table.json", "err", err)
 		http.Error(w, "failed to save file: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
-	if err := s.ipc.LoadVariableTable(dest); err != nil {
-		slog.Error("failed to parse variable table", "err", err)
-		http.Error(w, "failed to parse table: "+err.Error(), http.StatusUnprocessableEntity)
-		return
-	}
+	s.ipc.ApplyVariableTable(parsed)
 	count := s.ipc.VariableCount()
 	slog.Info("variable_table.json loaded", "dest", dest, "variables", count)
 	jsonOK(w, map[string]any{"status": "ok", "path": dest, "variable_count": count})
@@ -423,6 +468,9 @@ func (s *Server) loadStoredVariableTable() {
 			"path", path, "err", err)
 		return
 	}
+	// Whatever force flags survived in /dev/shm were set against this same
+	// table, so the first start after an agent restart must keep them.
+	s.ipc.MarkTableStarted()
 	slog.Info("variable_table.json loaded on startup",
 		"path", path, "variables", s.ipc.VariableCount())
 }
@@ -437,7 +485,7 @@ func (s *Server) saveRuntimeConfig() error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(s.runtimeConfigPath(), data, 0644)
+	return writeFileAtomic(s.runtimeConfigPath(), data, 0644)
 }
 
 // AutoRunEnabled returns whether autorun is configured. Used by main.go at
@@ -607,7 +655,13 @@ func (s *Server) StartRuntime() (int, error) {
 // Best-effort: a failure must not block starting the runtime.
 func (s *Server) SizeRingSegment() {
 	bytes, _, _, _, _ := s.resolvedRingBytes()
-	if err := createRingSegment(s.cfg.ShmName, bytes); err != nil {
+	resize := func() error { return createRingSegment(s.cfg.ShmName, bytes) }
+	if s.api != nil {
+		// Through the shared consumer, never a bare ftruncate: it may have the
+		// segment mapped, and a shrink under a live mapping is a SIGBUS.
+		resize = func() error { return s.api.resizeRing(bytes) }
+	}
+	if err := resize(); err != nil {
 		slog.Warn("Failed to pre-size capture ring; runtime will use its default",
 			"err", err, "bytes", bytes)
 		return
@@ -680,6 +734,13 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 
 // saveUpload writes raw bytes from HTTP body to disk atomically.
 func (s *Server) saveUpload(r *http.Request, dest string, executable bool) error {
+	return s.saveUploadChecked(r, dest, executable, nil)
+}
+
+// saveUploadChecked is saveUpload with a validation step run on the complete
+// temp file BEFORE the rename: if check fails the temp file is removed and the
+// previously deployed file stays untouched.
+func (s *Server) saveUploadChecked(r *http.Request, dest string, executable bool, check func(tmp string) error) error {
 	if err := os.MkdirAll(filepath.Dir(dest), 0755); err != nil {
 		return fmt.Errorf("failed to create directory: %w", err)
 	}
@@ -709,11 +770,62 @@ func (s *Server) saveUpload(r *http.Request, dest string, executable bool) error
 		os.Remove(tmp)
 		return fmt.Errorf("failed to set permissions: %w", err)
 	}
+	if check != nil {
+		if err := check(tmp); err != nil {
+			os.Remove(tmp)
+			return err
+		}
+	}
 	if err := os.Rename(tmp, dest); err != nil {
 		os.Remove(tmp)
 		return fmt.Errorf("atomic move failed: %w", err)
 	}
 	slog.Debug("File saved", "dest", dest, "bytes", written)
+	return nil
+}
+
+// writeFileAtomic replaces path with data via temp file + fsync + rename, so a
+// power cut mid-write (routine on a PLC) leaves either the old file or the new
+// one — never a truncated config that silently resets AutoRun, or an HMI
+// layout that drops every user. The temp file lives in the same directory so
+// the rename stays on one filesystem.
+func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return err
+	}
+	f, err := os.CreateTemp(dir, "."+filepath.Base(path)+".tmp-*")
+	if err != nil {
+		return err
+	}
+	tmp := f.Name()
+	fail := func(err error) error {
+		f.Close()
+		os.Remove(tmp)
+		return err
+	}
+	if err := f.Chmod(perm); err != nil {
+		return fail(err)
+	}
+	if _, err := f.Write(data); err != nil {
+		return fail(err)
+	}
+	if err := f.Sync(); err != nil {
+		return fail(err)
+	}
+	if err := f.Close(); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	// Best effort: persist the directory entry too.
+	if d, err := os.Open(dir); err == nil {
+		_ = d.Sync()
+		d.Close()
+	}
 	return nil
 }
 
@@ -754,6 +866,36 @@ func streamVarMatcher(q url.Values) func(string) bool {
 	}
 }
 
+// forcedStreamKey is the reserved /stream/vars key carrying the forced set:
+// a JSON array of variable names (sorted), e.g. "__forced": ["prog__x"]. No
+// variable can collide with it — every table name starts with "prog_".
+const forcedStreamKey = "__forced"
+
+// forcedResendEvery bounds how stale a client's forced set can be if it missed
+// a change event (the key is otherwise sent only when the set changes).
+const forcedResendEvery = 2 * time.Second
+
+// forcedTracker decides when a stream carries the forced set: on the first
+// event of a connection (so a fresh or reconnected client learns it), whenever
+// it changes (an empty list included — that is how a client learns the last
+// force was released) and at least every forcedResendEvery.
+type forcedTracker struct {
+	last     []string
+	sent     bool
+	lastSent time.Time
+}
+
+func (t *forcedTracker) next(cur []string, now time.Time) ([]string, bool) {
+	if t.sent && slices.Equal(cur, t.last) && now.Sub(t.lastSent) < forcedResendEvery {
+		return nil, false
+	}
+	if cur == nil {
+		cur = []string{}
+	}
+	t.last, t.sent, t.lastSent = cur, true, now
+	return cur, true
+}
+
 // handleSSEVars pushes variable values every streamInterval (50 ms) via
 // Server-Sent Events. Used by Tauri/WebKit clients where fetch streaming is
 // buffered end-to-end. Cadence is intentionally fixed — this is the editor
@@ -771,6 +913,7 @@ func (s *Server) handleSSEVars(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("X-Accel-Buffering", "no") // disable nginx buffering
 
 	match := streamVarMatcher(r.URL.Query())
+	var ft forcedTracker
 	slog.Info("SSE stream started", "remote", r.RemoteAddr, "filtered", match != nil)
 	ticker := time.NewTicker(streamInterval)
 	heartbeat := time.NewTicker(25 * time.Second)
@@ -792,6 +935,17 @@ func (s *Server) handleSSEVars(w http.ResponseWriter, r *http.Request) {
 			if err != nil {
 				continue
 			}
+			// The editor parses this with JSON.parse (doubles): a 64-bit
+			// integer past 2^53 travels as a decimal string instead.
+			for k, v := range vars {
+				vars[k] = jsonSafe64(v)
+			}
+			// The forced set ignores the subscription on purpose: the
+			// editor's force list must show EVERY forced variable, not
+			// only the ones on screen.
+			if forced, send := ft.next(s.ipc.ForcedVariables(false), time.Now()); send {
+				vars[forcedStreamKey] = forced
+			}
 			data, err := json.Marshal(vars)
 			if err != nil {
 				continue
@@ -804,7 +958,17 @@ func (s *Server) handleSSEVars(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// jsonOK marshals BEFORE writing anything, so an unencodable value becomes a
+// 500 with a reason instead of a 200 with an empty body (the encoder used to
+// fail after the status line was already committed, and a client could not
+// tell "no variables" from "the response broke").
 func jsonOK(w http.ResponseWriter, v any) {
+	data, err := json.Marshal(v)
+	if err != nil {
+		slog.Error("JSON response encoding failed", "err", err)
+		jsonError(w, http.StatusInternalServerError, "response encoding failed: "+err.Error())
+		return
+	}
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(v)
+	_, _ = w.Write(append(data, '\n'))
 }

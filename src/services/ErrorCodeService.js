@@ -113,7 +113,7 @@ export class ErrorCodeService {
    * ⚠️ The toolbox mints ONE block per hardware CHANNEL (PWM0, UART1_Send,
    * I2C0_Read …) while the catalog documents the generic HAL block they all
    * dispatch to (HAL_PWM, HAL_UART_Send, HAL_I2C_Read) — the channel is a
-   * dispatch detail and the error codes are identical (CLAUDE.md §10). lookup()
+   * dispatch detail and the error codes are identical (resources/krontek-include/CLAUDE.md). lookup()
    * was an exact Map.get with no normalisation, so all 17 HAL entries were
    * unreachable from the editor; only the three channel-less GPIO blocks
    * matched, by luck.

@@ -17,6 +17,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"syscall"
+	"time"
 	"unsafe"
 )
 
@@ -44,15 +45,22 @@ const (
 	recOffSeq        = 0
 	recOffTaskID     = 8
 	recOffPayloadLen = 10
+	recOffScan       = 12 // v2: producer's per-task scan counter (low 32 bits); v1: reserved 0
 	recOffPayload    = 16
 
 	ringSeqEmpty = ^uint64(0) // 0xFFFF...  slot never written
 
-	// wireRecordHeaderBytes is the per-record header the stream handler emits:
-	// u64 seq + u16 task_id + u16 payload_len. Deliberately NOT recOffPayload —
-	// the ring slot header (16 B, stride-aligned) and the wire header (12 B) are
-	// different layouts that only happen to be close in size.
-	wireRecordHeaderBytes = 12
+	// wireRecordHeaderBytes is the per-record header the stream handler emits
+	// (frame v2): u64 seq + u16 task_id + u16 payload_len + u32 scan. It equals
+	// recOffPayload only by coincidence — the slot header is a ring layout, the
+	// wire header a stream layout; keep them separate constants.
+	wireRecordHeaderBytes = 16
+
+	// ringStuckTimeout bounds how long a drain waits on ONE unpublished slot
+	// while LATER sequences are already claimed. A producer killed between its
+	// fetch_add and its seq store, or a slot punched by Reclaim (reads back 0),
+	// never publishes — without this the stream stalls on it for ever.
+	ringStuckTimeout = 100 * time.Millisecond
 )
 
 // ringTask mirrors one task_table entry.
@@ -155,8 +163,76 @@ func (rc *RingConsumer) syncLocked() {
 	}
 	if err := rc.parseHeader(); err == nil {
 		rc.parsedEpoch = ep
-		rc.freedSeq = 0 // new generation: write_seq restarted at 0
+		// New generation: forget the reclaim cursor. write_seq does NOT restart
+		// (it continues monotonically across restarts, see RING_FORMAT.md);
+		// Reclaim re-derives its lower bound from write_seq - nslots anyway.
+		rc.freedSeq = 0
 	}
+}
+
+// Resize (re)sizes the ring segment to `bytes` while this consumer has it
+// mapped. KronServer pre-sizes the segment before every runtime start
+// (createRingSegment via the pre-start hook) and the shared consumer stays
+// mapped across restarts.
+//
+// ⚠️ A SHRINK under a live mapping is a SIGBUS: every page past the new EOF
+// faults on the next touch, and a fault inside the Go runtime kills the whole
+// agent. So the truncate happens under rc.mu (no drain can be mid-read), the
+// mapping is cut down to the new size, and the parsed layout is INVALIDATED
+// (nslots = 0) — the header still describes the old, larger segment until the
+// new runtime rewrites it and bumps epoch, at which point syncLocked re-parses
+// and validates it against the new mapping. A grow (or no change) leaves the
+// mapping alone: the old layout stays fully inside it, and the epoch bump
+// remaps to the new size as usual.
+func (rc *RingConsumer) Resize(bytes uint64) error {
+	rc.mu.Lock()
+	defer rc.mu.Unlock()
+	if err := createRingSegment(rc.shmName(), bytes); err != nil {
+		return err
+	}
+	if rc.mem == nil || bytes >= uint64(len(rc.mem)) {
+		return nil
+	}
+	// bytes < len(rc.mem) from here, so it fits an int even on 32-bit ARM.
+	// Our fd may name an older inode than the path (a producer that unlinked and
+	// recreated the segment): truncate it too, so the remap below is sized
+	// against the file actually mapped.
+	var st syscall.Stat_t
+	if err := syscall.Fstat(rc.fd, &st); err == nil && int64(bytes) < st.Size {
+		_ = syscall.Ftruncate(rc.fd, int64(bytes))
+	}
+	_ = syscall.Munmap(rc.mem)
+	rc.mem = nil
+	rc.invalidateLocked()
+	nm, err := syscall.Mmap(rc.fd, 0, int(bytes), syscall.PROT_READ|syscall.PROT_WRITE, syscall.MAP_SHARED)
+	if err != nil {
+		return fmt.Errorf("remap ring after resize: %w", err)
+	}
+	rc.mem = nm
+	return nil
+}
+
+// invalidateLocked drops the parsed layout so Drain/Reclaim touch no slot until
+// the next epoch re-parses a header that fits the mapping. parsedEpoch is kept:
+// the runtime's epoch bump is exactly the signal to re-parse.
+func (rc *RingConsumer) invalidateLocked() {
+	rc.nslots = 0
+	rc.recordStride = 0
+	rc.tasks = nil
+	rc.freedSeq = 0
+}
+
+// shmName recovers the base shm name from the segment path.
+func (rc *RingConsumer) shmName() string {
+	const prefix, suffix = "/dev/shm/", "_ring"
+	name := rc.path
+	if len(name) > len(prefix) && name[:len(prefix)] == prefix {
+		name = name[len(prefix):]
+	}
+	if len(name) > len(suffix) && name[len(name)-len(suffix):] == suffix {
+		name = name[:len(name)-len(suffix)]
+	}
+	return name
 }
 
 // Reclaim releases (punches holes in) the tmpfs pages of records already consumed
@@ -165,6 +241,12 @@ func (rc *RingConsumer) syncLocked() {
 // current content is both already-read (seq < minReadSeq) AND not yet overwritten
 // (seq > write_seq - nslots); the producer re-faults a punched page when it laps
 // back to write there. Call off the real-time path (~100 ms controller tick).
+//
+// ⚠️ `w` is a SNAPSHOT taken before a punch that can take a while on a large
+// ring, and the producer keeps advancing meanwhile. A slot that was "oldest but
+// still ours" at the snapshot may be rewritten with fresh data while we punch
+// it, and a punched fresh record reads back as a hole (lost). reclaimMargin
+// keeps a quarter of the ring between the punch range and the write cursor.
 func (rc *RingConsumer) Reclaim(minReadSeq uint64) {
 	rc.mu.Lock()
 	defer rc.mu.Unlock()
@@ -174,9 +256,10 @@ func (rc *RingConsumer) Reclaim(minReadSeq uint64) {
 	nslots := uint64(rc.nslots)
 	w := rc.loadU64(offWriteSeq)
 	lo := rc.freedSeq
-	// never punch a slot the producer may have already overwritten with fresh data
-	if w >= nslots {
-		if minSafe := w - nslots + 1; lo < minSafe {
+	// never punch a slot the producer may have already overwritten with fresh
+	// data, nor one it can reach before the punch completes
+	if minSafe := w + nslots/4 + 1; minSafe > nslots {
+		if minSafe -= nslots; lo < minSafe {
 			lo = minSafe
 		}
 	}
@@ -228,6 +311,11 @@ func (rc *RingConsumer) ReclaimAll() {
 func (rc *RingConsumer) u32(off int) uint32 { return binary.LittleEndian.Uint32(rc.mem[off:]) }
 func (rc *RingConsumer) u16(off int) uint16 { return binary.LittleEndian.Uint16(rc.mem[off:]) }
 
+// mapped reports whether [off, off+n) lies inside the current mapping. The
+// header accessors are reachable while the mapping is being replaced (Resize),
+// and an out-of-range read must answer 0, not panic the handler.
+func (rc *RingConsumer) mapped(off, n int) bool { return off >= 0 && off+n <= len(rc.mem) }
+
 func (rc *RingConsumer) parseHeader() error {
 	if len(rc.mem) < ringHeaderBytes {
 		return fmt.Errorf("ring smaller than header")
@@ -259,13 +347,45 @@ func (rc *RingConsumer) parseHeader() error {
 
 // atomic accessors into the mmap. Header fields are 8-aligned by layout.
 func (rc *RingConsumer) loadU64(off int) uint64 {
+	if !rc.mapped(off, 8) {
+		return 0
+	}
 	return atomic.LoadUint64((*uint64)(unsafe.Pointer(&rc.mem[off])))
 }
 func (rc *RingConsumer) loadU32(off int) uint32 {
+	if !rc.mapped(off, 4) {
+		return 0
+	}
 	return atomic.LoadUint32((*uint32)(unsafe.Pointer(&rc.mem[off])))
 }
 func (rc *RingConsumer) storeU32(off int, v uint32) {
+	if !rc.mapped(off, 4) {
+		return
+	}
 	atomic.StoreUint32((*uint32)(unsafe.Pointer(&rc.mem[off])), v)
+}
+
+// copyPayload copies a slot payload with 8-byte ATOMIC loads when the payload
+// is 8-aligned (RING_FORMAT.md: header 256, record_stride = align8(...), payload
+// at +16 — so it always is for a real producer). A plain copy may be split into
+// arbitrary byte accesses racing the producer's stores; whole-word atomic loads
+// at least never tear a naturally aligned 8-byte value, and the write_seq
+// re-check in Drain discards a record whose slot was reclaimed meanwhile. The
+// last word may read past payload_len, which stays inside the slot because
+// record_stride is a multiple of 8. Unaligned layouts (test producers only)
+// fall back to copy().
+func (rc *RingConsumer) copyPayload(dst []byte, off, slotEnd int) {
+	n := len(dst)
+	if off%8 != 0 || off+(n+7)/8*8 > slotEnd {
+		copy(dst, rc.mem[off:off+n])
+		return
+	}
+	var w [8]byte
+	for i := 0; i < n; i += 8 {
+		v := atomic.LoadUint64((*uint64)(unsafe.Pointer(&rc.mem[off+i])))
+		binary.LittleEndian.PutUint64(w[:], v)
+		copy(dst[i:], w[:])
+	}
 }
 
 // All accessors below lock rc.mu because syncLocked may re-mmap rc.mem when the
@@ -275,6 +395,19 @@ func (rc *RingConsumer) WriteSeq() uint64 {
 	defer rc.mu.Unlock()
 	return rc.loadU64(offWriteSeq)
 }
+
+// Version is the producer's ring header version (1, or 2 = scan counter in
+// every record). 0 while the layout is invalid.
+func (rc *RingConsumer) Version() uint32 {
+	rc.mu.Lock()
+	defer rc.mu.Unlock()
+	rc.syncLocked()
+	if rc.nslots == 0 || !rc.mapped(offVersion, 4) {
+		return 0
+	}
+	return rc.u32(offVersion)
+}
+
 func (rc *RingConsumer) Epoch() uint64 {
 	rc.mu.Lock()
 	defer rc.mu.Unlock()
@@ -351,20 +484,53 @@ func (rc *RingConsumer) WireBytesPerSec() float64 {
 	return bps
 }
 
-// RingRecord is one drained sample. Payload aliases the ring; copy if retained.
+// RingRecord is one drained sample. Payload is a private copy. Scan is the
+// producer's scan counter for that task (0 from a v1 producer).
 type RingRecord struct {
+	Scan    uint32
 	Seq     uint64
 	TaskID  uint16
 	Payload []byte
 }
 
+// RingCursor is one stream client's position in the ring plus the state the
+// stuck-slot guard needs across drains. The zero value starts at seq 0.
+type RingCursor struct {
+	ReadSeq uint64
+
+	stuckSeq   uint64    // the unpublished slot we are waiting on
+	stuckSince time.Time // when we first saw stuckSeq unpublished (zero = none)
+}
+
+// Reset repositions the cursor (connect, epoch change) and forgets any wait.
+func (c *RingCursor) Reset(seq uint64) {
+	*c = RingCursor{ReadSeq: seq}
+}
+
 // Drain reads records with sequence in [readSeq, write_seq). It returns the new
-// readSeq to pass next time, how many records were lost to overwrite (lapping),
-// and appends up to maxRecords freshly-read records to dst.
-//
-// A record whose slot.seq != expected is treated as "producer mid-write" and
-// stops the drain (retry next tick); this never blocks.
+// readSeq to pass next time, how many records were lost, and appends up to
+// maxRecords freshly-read records to dst. It keeps no state between calls, so
+// the stuck-slot guard is inactive — stream handlers use DrainCursor.
 func (rc *RingConsumer) Drain(readSeq uint64, dst []RingRecord, maxRecords int) (uint64, uint64, []RingRecord) {
+	cur := RingCursor{ReadSeq: readSeq}
+	dropped, dst := rc.DrainCursor(&cur, dst, maxRecords, time.Now())
+	return cur.ReadSeq, dropped, dst
+}
+
+// DrainCursor drains from cur.ReadSeq, advancing it, and returns how many
+// records were LOST (never delivered) plus dst with up to maxRecords records
+// appended. Every way a record can be lost is counted — `dropped` is the
+// client's only honest signal that the stream has a hole:
+//   - lapped before we got there (write_seq - readSeq > nslots);
+//   - overwritten under us (slot.seq > s: the slot already holds a later lap);
+//   - torn: the slot's next occupant (s + nslots) was CLAIMED while we copied
+//     it, so the bytes may mix two records — discarded;
+//   - stuck: slot s stayed unpublished for ringStuckTimeout while later
+//     sequences were already claimed (crashed producer, punched slot).
+//
+// An unpublished slot that is the NEWEST claimed one is a producer mid-write:
+// the drain stops there and retries next tick. Never blocks.
+func (rc *RingConsumer) DrainCursor(cur *RingCursor, dst []RingRecord, maxRecords int, now time.Time) (uint64, []RingRecord) {
 	// Hold the lock for the whole drain: syncLocked may re-mmap rc.mem (runtime
 	// restart / resize), and the record loop reads rc.mem directly. ≤5 clients at
 	// a 5 ms cadence, so the contention is negligible.
@@ -374,11 +540,12 @@ func (rc *RingConsumer) Drain(readSeq uint64, dst []RingRecord, maxRecords int) 
 	stride := rc.recordStride
 	nslots := uint64(rc.nslots)
 	if stride <= recOffPayload || nslots == 0 {
-		return readSeq, 0, dst
+		return 0, dst
 	}
+	readSeq := cur.ReadSeq
 	w := rc.loadU64(offWriteSeq)
 	if w <= readSeq {
-		return readSeq, 0, dst
+		return 0, dst
 	}
 	var dropped uint64
 	if w-readSeq > nslots {
@@ -393,26 +560,48 @@ func (rc *RingConsumer) Drain(readSeq uint64, dst []RingRecord, maxRecords int) 
 		base := ringHeaderBytes + int(s%nslots)*stride
 		ss := rc.loadU64(base + recOffSeq)
 		if ss != s {
-			// ss < s: not yet written (producer mid-write) → stop and retry.
-			// ss > s: already overwritten → this position lapped; skip forward.
-			if ss > s {
+			if ss > s && ss != ringSeqEmpty {
+				// Already overwritten by a later lap: this record is gone.
+				dropped++
 				readSeq = s + 1
 				continue
 			}
-			break
+			// Unpublished (ss < s, a hole reading 0, or a legacy 0xFF.. fill).
+			if w > s+1 {
+				if cur.stuckSince.IsZero() || cur.stuckSeq != s {
+					cur.stuckSeq, cur.stuckSince = s, now
+				} else if now.Sub(cur.stuckSince) >= ringStuckTimeout {
+					dropped++
+					readSeq = s + 1
+					cur.stuckSince = time.Time{}
+					continue
+				}
+			}
+			break // producer mid-write → retry next tick
 		}
+		cur.stuckSince = time.Time{}
 		taskID := rc.u16(base + recOffTaskID)
+		scan := rc.u32(base + recOffScan) // read BEFORE the torn-read check, like the rest
 		plen := int(rc.u16(base + recOffPayloadLen))
 		if plen > stride-recOffPayload {
 			plen = stride - recOffPayload
 		}
 		payload := make([]byte, plen)
-		copy(payload, rc.mem[base+recOffPayload:base+recOffPayload+plen])
-		dst = append(dst, RingRecord{Seq: s, TaskID: taskID, Payload: payload})
+		rc.copyPayload(payload, base+recOffPayload, base+stride)
+		// ⚠️ Torn-read check, AFTER the copy: once seq s+nslots is claimed the
+		// producer may be rewriting this very slot, so what we copied can be
+		// half of each record. Discard it rather than deliver a plausible lie.
+		if w2 := rc.loadU64(offWriteSeq); w2 > s+nslots {
+			dropped++
+			readSeq = s + 1
+			continue
+		}
+		dst = append(dst, RingRecord{Seq: s, TaskID: taskID, Scan: scan, Payload: payload})
 		got++
 		readSeq = s + 1
 	}
-	return readSeq, dropped, dst
+	cur.ReadSeq = readSeq
+	return dropped, dst
 }
 
 // Close unmaps and closes the segment.

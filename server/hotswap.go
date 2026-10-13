@@ -67,11 +67,13 @@ func (s *Server) handleDeployLogic(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Query().Get("cold") == "1" {
 		_ = hotswaplib.CleanupExcept(s.cfg.DeployDir, -1) // remove every stale slot
 		_ = hotswaplib.ClearResultFile(filepath.Join(s.cfg.DeployDir, "swap_result"))
+		s.pm.ForgetLogicGenerations()
 		gen = 0
 	} else if cur := s.pm.ConfirmedGen(); cur >= 0 {
 		gen = hotswaplib.PingPongGeneration(cur)
 	} else {
 		_ = hotswaplib.CleanupExcept(s.cfg.DeployDir, -1)
+		s.pm.ForgetLogicGenerations()
 		gen = 0
 	}
 

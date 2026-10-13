@@ -153,7 +153,7 @@ const defaultModelFor = (providerId) => PROVIDERS.find((p) => p.id === providerI
 //
 // ⚠️ **Every entry MUST carry Ollama's `tools` capability.** The agent is a
 // tool-calling loop, so a model without a native tool API falls back to
-// text-mining recovery (§8) and produces plausible-looking nonsense rather
+// text-mining recovery (src/CLAUDE.md) and produces plausible-looking nonsense rather
 // than an honest failure. That is why the old `codellama:7b` entry is gone
 // instead of merely being labelled — check the badge on
 // https://ollama.com/search?c=tools before adding a model here.
@@ -508,7 +508,33 @@ function providerSafeMessages(msgs) {
     }
     cleaned.push(m);
   }
-  msgs = cleaned;
+  //  (c) PAIR every tool call with a result. History is saved before a turn's
+  //      tools run, so Stop / cancel / the turn limit / a failed next request
+  //      left an assistant tool call with no `tool` message — a 400 on
+  //      Anthropic/OpenAI/Gemini that repeated on every later send (the
+  //      conversation was bricked, across reloads). Missing results get a
+  //      "not executed" stub; a `tool` message answering no call is dropped.
+  const paired = [];
+  for (let i = 0; i < cleaned.length; i++) {
+    const m = cleaned[i];
+    if (m.role === 'tool') continue; // consumed below, or orphaned
+    paired.push(m);
+    const calls = m.role === 'assistant' ? (m.toolCalls || []) : [];
+    if (!calls.length) continue;
+    const results = new Map();
+    let j = i + 1;
+    for (; j < cleaned.length && cleaned[j].role === 'tool'; j++) {
+      if (!results.has(cleaned[j].toolCallId)) results.set(cleaned[j].toolCallId, cleaned[j]);
+    }
+    for (const c of calls) {
+      paired.push(results.get(c.id) || {
+        role: 'tool', toolCallId: c.id, name: c.name,
+        content: 'NOT EXECUTED — the run was stopped before this tool call ran.',
+      });
+    }
+    i = j - 1;
+  }
+  msgs = paired;
 
   // ── Pass 2: demote synthesized (text-mined) tool calls ────────────────────
   const synthIds = new Set();
@@ -577,7 +603,7 @@ function cleanToolArgs(raw) {
 // ROOT FOLDER and every path is resolved inside it — the host agent itself does
 // not sandbox (see files.go), so this scope check is the whole guard. It is a
 // UI-side guard by design: it stops the MODEL from wandering, not a hostile
-// process, which the same-machine trust model (§12) already assumes away.
+// process, which the same-machine trust model (CLAUDE.md) already assumes away.
 
 const FS_PERM_KEY = 'aiAgentFsAccess';
 const DEFAULT_FS_PERM = { enabled: false, root: '', allowWrite: false };
@@ -1039,6 +1065,10 @@ export default function AiAgentPanel({
   // async loop always sees the latest without re-render races.
   const convoRef = useRef((loadConvo() || {}).convo || []);
   const workingRef = useRef(projectStructure);
+  // The App tree as it was when the agent last committed (pre-commit). Lets a
+  // new turn tell "App hasn't re-rendered our commit yet" (psRef still equals
+  // this) from "the USER edited since" (psRef differs from both).
+  const preCommitPsRef = useRef(null);
   const psRef = useRef(projectStructure);
   useEffect(() => { psRef.current = projectStructure; }, [projectStructure]);
 
@@ -1327,7 +1357,7 @@ export default function AiAgentPanel({
   // grant. Returns the { result } / { error } blob the executor unwraps as
   // `args.__fs` — errors come back as tool errors (the model can read them and
   // ask the user for permission) rather than as thrown exceptions.
-  const runFsTool = async (name, args) => {
+  const runFsTool = async (name, args, opts = {}) => {
     const perm = fsPermRef.current;
     if (!perm.enabled || !perm.root) {
       return { error: 'file access is not granted. The user must enable it with the 📁 button in the agent panel — tell them so instead of retrying.' };
@@ -1365,6 +1395,13 @@ export default function AiAgentPanel({
       }
       // write_file
       const content = String(args.content ?? '');
+      if (opts.dryRun) {
+        return {
+          result: { path: r.path, pendingApproval: true },
+          note: `💾 Will write ${r.path} (${content.length} chars) if the proposal is approved`,
+          deferred: { path: args.path, content },
+        };
+      }
       await host.writeFile(r.path, content);
       return { result: { path: r.path, written: content.length }, note: `💾 Wrote ${r.path} (${content.length} chars)` };
     } catch (e) {
@@ -1516,7 +1553,13 @@ export default function AiAgentPanel({
 
     // Dry-run every call in order, chaining mutations through a working copy so
     // composed diffs (e.g. add_variable then set_st_code) are computed correctly.
+    // ⚠️ Start from the user's tree if they edited since our last commit —
+    // chaining workingRef blindly made the next commit overwrite those edits.
+    if (psRef.current !== workingRef.current && psRef.current !== preCommitPsRef.current) {
+      workingRef.current = psRef.current;
+    }
     let working = workingRef.current;
+    const turnBase = working;
     const steps = [];
     // Weak models routinely omit (or garble) the `pou` field on a local-scope
     // variable/code call even right after create_pou — so the var never lands
@@ -1610,13 +1653,22 @@ export default function AiAgentPanel({
       // in the thread — a file the agent touched must never be invisible.
       if (FS_TOOL_NAMES.has(tc.name)) {
         setActivity(tc.name === 'write_file' ? 'writing a file' : 'reading local files');
-        const fs = await runFsTool(tc.name, args);
+        // ⚠️ MANUAL mode: a write is a change like any other and waits for
+        // Approve — it used to hit the disk during the dry run, so Reject (or
+        // Stop) could not undo it. Only the permission/path checks run now.
+        const deferWrite = tc.name === 'write_file' && agentModeRef.current !== 'auto';
+        const fs = await runFsTool(tc.name, args, { dryRun: deferWrite });
         args.__fs = fs;
         pushView({ role: 'note', text: fs.error ? `🚫 ${tc.name} ${args.path || ''} — ${fs.error}` : fs.note });
         setActivity('applying');
       }
       if (controller.signal.aborted) break;
-      const res = applyToolCall(working, tc.name, args);
+      let res = applyToolCall(working, tc.name, args);
+      if (res.ok && args.__fs?.deferred) {
+        const d = args.__fs.deferred;
+        res = { ok: true, mutation: true, next: working, fileWrite: d,
+          summary: `Write ${d.path} (${d.content.length} chars)` };
+      }
       if (res.mutation && res.ok) {
         working = res.next;
         // Track the most recently touched POU so later calls in this turn that
@@ -1638,7 +1690,9 @@ export default function AiAgentPanel({
     if (!hasMutations) {
       // Reads / errors only — feed results back and keep going automatically.
       const toolMsgs = steps.map(toolResultMessage);
-      runTurn([...convoRef.current, ...toolMsgs], turn + 1, gen);
+      convoRef.current = [...convoRef.current, ...toolMsgs]; // results land in history now, not on the next reply
+
+      runTurn(convoRef.current, turn + 1, gen);
       return;
     }
 
@@ -1649,12 +1703,14 @@ export default function AiAgentPanel({
       setMessages((m) => [...m, { id: viewId, role: 'proposal', steps, status: 'approved' }]);
       commitTurn(steps, working);
       const toolMsgs = steps.map((s) => toolResultMessage({ ...s, outcome: 'applied' }));
-      runTurn([...convoRef.current, ...toolMsgs], turn + 1, gen);
+      convoRef.current = [...convoRef.current, ...toolMsgs]; // results land in history now, not on the next reply
+
+      runTurn(convoRef.current, turn + 1, gen);
       return;
     }
     // MANUAL mode: pause for approval. dryStruct is the fully-composed result.
     setMessages((m) => [...m, { id: viewId, role: 'proposal', steps, status: 'pending' }]);
-    setPending({ steps, dryStruct: working, viewId, turn });
+    setPending({ steps, dryStruct: working, base: turnBase, viewId, turn });
     setRunning(false);
     // liveVariables is deliberately NOT a dep: everything live is read through
     // liveRef/liveBufRef above. As a dep it rebuilt this callback ~2x/second for
@@ -1667,7 +1723,17 @@ export default function AiAgentPanel({
 
   // Commit a turn's composed result into the live project and push it online if
   // a hot-swap session is active. Shared by AUTO mode and manual approval.
+  // ⚠️ Reached from runTurn, a useCallback whose deps don't include this — so
+  // the App callbacks are read through refs refreshed every render, never from
+  // the closure of the render that created runTurn.
+  const onHotSwapRef = useRef(onHotSwap);
+  onHotSwapRef.current = onHotSwap;
+  const onAppliedRef = useRef(onApplied);
+  onAppliedRef.current = onApplied;
   const commitTurn = (steps, dryStruct) => {
+    const onApplied = onAppliedRef.current;
+    const onHotSwap = onHotSwapRef.current;
+    preCommitPsRef.current = psRef.current;
     setProjectStructure && setProjectStructure(dryStruct);
     workingRef.current = dryStruct;
     const touched = affectedPOUs(steps);
@@ -1676,7 +1742,8 @@ export default function AiAgentPanel({
     onApplied && onApplied(touched, { structure: dryStruct, focus: focusTarget(steps) });
     // If a hot-swap session is live, push the change online (App decides
     // whether a swap is possible or a cold restart is needed).
-    onHotSwap && onHotSwap(touched);
+    // The committed tree goes along: App's state hasn't re-rendered yet.
+    onHotSwap && onHotSwap(touched, { structure: dryStruct });
   };
 
   // Open the permission popover, pre-filling the folder: the current grant, else
@@ -1771,13 +1838,39 @@ export default function AiAgentPanel({
     send(text);
   }, [askRequest]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  const resolvePending = (approved) => {
+  const resolvePending = async (approved) => {
     if (!pending) return;
-    const { steps, dryStruct, viewId, turn } = pending;
-    if (approved) commitTurn(steps, dryStruct);
+    const { steps, base, viewId, turn } = pending;
+    let { dryStruct } = pending;
+    setPending(null);
+    if (approved && psRef.current !== base) {
+      // ⚠️ The user edited the project while the proposal waited. Committing
+      // dryStruct would silently overwrite those edits, so REPLAY the approved
+      // steps on the current tree; if one no longer applies, refuse the lot.
+      let cur = psRef.current;
+      for (const st of steps) {
+        if (!(st.res?.mutation && st.res.ok) || st.res.fileWrite) continue;
+        const r = applyToolCall(cur, st.tc.name, st.args);
+        if (!r.ok) {
+          approved = false;
+          pushView({ role: 'note', text: `⚠ Not applied — the project changed while this proposal waited and "${st.tc.name}" no longer applies (${r.error}). Ask again to redo it on the current project.` });
+          break;
+        }
+        if (r.mutation) cur = r.next;
+      }
+      if (approved) dryStruct = cur;
+    }
+    if (approved) {
+      for (const st of steps) {
+        if (!st.res?.fileWrite) continue;
+        const fs = await runFsTool('write_file', { path: st.res.fileWrite.path, content: st.res.fileWrite.content });
+        pushView({ role: 'note', text: fs.error ? `🚫 write_file ${st.res.fileWrite.path} — ${fs.error}` : fs.note });
+        if (fs.error) st.res = { ok: false, error: fs.error };
+      }
+      commitTurn(steps, dryStruct);
+    }
     setViewStatus(viewId, approved ? 'approved' : 'rejected');
     const toolMsgs = steps.map((s) => toolResultMessage({ ...s, outcome: approved ? 'applied' : 'rejected' }));
-    setPending(null);
     // ⚠️ The loop RESUMES here, so the run state has to come back on. Without
     // this the agent kept working after an approval while the UI showed nothing
     // running and offered no Stop button. The clock restarts from the resume
@@ -1787,7 +1880,9 @@ export default function AiAgentPanel({
     setRunning(true);
     setRunStartedAt(Date.now());
     setActivity('thinking');
-    runTurn([...convoRef.current, ...toolMsgs], turn + 1, ++runGenRef.current);
+    convoRef.current = [...convoRef.current, ...toolMsgs]; // results land in history now, not on the next reply
+
+    runTurn(convoRef.current, turn + 1, ++runGenRef.current);
   };
 
   // One answer to the current ask_user question. Advances to the next question,
@@ -1816,7 +1911,9 @@ export default function AiAgentPanel({
     setRunning(true);
     setRunStartedAt(Date.now());
     setActivity('thinking');
-    runTurn([...convoRef.current, ...toolMsgs], turn + 1, ++runGenRef.current);
+    convoRef.current = [...convoRef.current, ...toolMsgs]; // results land in history now, not on the next reply
+
+    runTurn(convoRef.current, turn + 1, ++runGenRef.current);
   };
 
   // Abandoning a question ends the run — the model cannot proceed without it,

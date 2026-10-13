@@ -3,6 +3,8 @@ import { lazy, Suspense } from 'react';
 const EtherCATEditor = lazy(() => import('./components/EtherCATEditor'));
 import SlaveConfigPage from './components/SlaveConfigPage';
 import { hasVarNamed } from './utils/iecNames';
+import { ForcedContext } from './components/common/ForcedMarker';
+import { splitForcedPayload, nextForcedSet, EMPTY_FORCED } from './utils/forcedVars';
 import EditorPane from './components/EditorPane';
 import Toolbox from './components/Toolbox';
 import AiAgentPanel from './components/AiAgentPanel';
@@ -78,6 +80,9 @@ const fetchWithTimeout = (url, options = {}, timeoutMs = 20000) => {
 // only ever deal with one type. This keeps the mental model simple: "everything
 // is rungs; pick the language per rung."
 const RUNG_POU_CATEGORIES = ['programs', 'functionBlocks', 'functions'];
+// Block types declared by public/libraries/ethercat.xml — removed from every
+// rung when the EtherCAT master is deleted (they need its `__ec_cfg`).
+const ETHERCAT_BLOCK_TYPES = new Set(['EC_GetMasterState', 'EC_GetSlaveState', 'EC_ReadSDO', 'EC_WriteSDO', 'EC_ResetBus']);
 const normalizePouToRungs = (item) => {
   if (!item || !item.content) return item;
   if (item.type === 'ST') {
@@ -480,6 +485,32 @@ function App() {
   const plcClientRef = React.useRef(null);   // PLCClient instance
   const stopStreamRef = React.useRef(null);  // cancel fn returned by streamVars()
   const remoteVarKeysRef = React.useRef([]);
+  // Every key the target has STREAMED — it streams its own deployed variable
+  // table, so each one has an SHM slot. remoteVarKeysRef is filled only by a
+  // Build & Send in this browser session; after a reload it is empty and
+  // gating force-writes on it alone silently dropped every one of them.
+  const remoteStreamedKeysRef = React.useRef(new Set());
+  // FB INPUT-pin shadow keys of the last Build & Send (debugDefaults.isPinShadow).
+  const remotePinShadowInKeysRef = React.useRef(new Set());
+  // The FORCED set (live keys whose value a force holds), from the reserved
+  // `__forced` key both runtimes stream (utils/forcedVars). Never a variable:
+  // it is split off before anything reaches liveVariables.
+  const [forcedSet, setForcedSet] = useState(EMPTY_FORCED);
+  const forcedSetRef = React.useRef(EMPTY_FORCED);
+  useEffect(() => { forcedSetRef.current = forcedSet; }, [forcedSet]);
+  const applyForcedList = React.useCallback((list) => {
+    // A late event after Stop must not resurrect the set the stop cleared;
+    // a missed one costs at most the 2 s periodic resend.
+    if (!list || !isRunningRef.current) return;
+    setForcedSet(prev => nextForcedSet(prev, list));
+  }, []);
+  const onRemoteVars = React.useCallback((payload) => {
+    const { vars, forced } = splitForcedPayload(payload);
+    applyForcedList(forced);
+    Object.assign(liveVarsRef.current, vars);
+    for (const k of Object.keys(vars)) remoteStreamedKeysRef.current.add(k);
+    liveVarsDirtyRef.current = true;
+  }, [applyForcedList]);
 
   // Persist settings
   useEffect(() => {
@@ -524,12 +555,13 @@ function App() {
     document.body.style.cursor = busy ? 'progress' : '';
     return () => { document.body.style.cursor = ''; };
   }, [compileBusy, isRunning]);
-  // Publish "local hot-swap sim is active" so ForceWriteModal can offer the
-  // Pulse (one-scan) write mode without threading isSimulationMode through every
-  // force entry point (watch table, ladder canvas, ST editor). Pulse only works
-  // in the local sim; a remote PLC always force-writes.
+  // Publish "a runtime is live" so ForceWriteModal can offer the Pulse write
+  // mode without threading the run state through every force entry point
+  // (watch table, ladder canvas, ST editor). Since the force-write mailbox
+  // (SHM layout v2) a remote PLC supports Pulse too, not only the local sim; a
+  // KronServer predating it refuses the `mode` field loudly.
   useEffect(() => {
-    window.__kronSimActive = isRunning && isSimulationMode;
+    window.__kronSimActive = isRunning;
     return () => { window.__kronSimActive = false; };
   }, [isRunning, isSimulationMode]);
 
@@ -592,7 +624,7 @@ function App() {
               // powered-off target reconnects forever without delivering data.
               if (!plcClientRef.current.isStreamHealthy) {
                 stopStreamRef.current = plcClientRef.current.streamVars(
-                  (vars) => { Object.assign(liveVarsRef.current, vars); liveVarsDirtyRef.current = true; },
+                  onRemoteVars,
                   (err) => addLog('error', categorize(ERROR_CATEGORY.RUNTIME, `Stream error: ${err.message}`)),
                   liveSubRef.current,
                 );
@@ -724,39 +756,30 @@ function App() {
     if (confirmed) {
       const removedBus = buses.find(b => b.id === busId);
 
-      // If removing an EtherCAT master, strip all EC_* blocks from every program's rungs
+      // If removing an EtherCAT master, strip the EtherCAT library blocks from
+      // every rung POU — functions included, the transpiler compiles their rungs
+      // too. Matched by the EXACT library types (ethercat.xml), never an `EC_`
+      // prefix: that also deleted a user POU legitimately named `EC_Something`.
       if (removedBus?.type === 'ethercat') {
-        setProjectStructure(prev => ({
-          ...prev,
-          programs: prev.programs.map(prog => {
-            if (!prog.content?.rungs) return prog;
-            const cleanedRungs = prog.content.rungs.map(rung => ({
+        const isEcBlock = (b) => ETHERCAT_BLOCK_TYPES.has(b.type);
+        const cleanPou = (pou) => {
+          if (!pou.content?.rungs) return pou;
+          const rungs = pou.content.rungs.map(rung => {
+            const blocks = (rung.blocks || []).filter(b => !isEcBlock(b));
+            const kept = new Set(blocks.map(b => b.id));
+            return {
               ...rung,
-              blocks: (rung.blocks || []).filter(b => !b.type?.startsWith('EC_')),
-              connections: (rung.connections || []).filter(conn => {
-                const remaining = new Set((rung.blocks || [])
-                  .filter(b => !b.type?.startsWith('EC_'))
-                  .map(b => b.id));
-                return remaining.has(conn.source) && remaining.has(conn.target);
-              }),
-            }));
-            return { ...prog, content: { ...prog.content, rungs: cleanedRungs } };
-          }),
-          functionBlocks: prev.functionBlocks.map(fb => {
-            if (!fb.content?.rungs) return fb;
-            const cleanedRungs = fb.content.rungs.map(rung => ({
-              ...rung,
-              blocks: (rung.blocks || []).filter(b => !b.type?.startsWith('EC_')),
-              connections: (rung.connections || []).filter(conn => {
-                const remaining = new Set((rung.blocks || [])
-                  .filter(b => !b.type?.startsWith('EC_'))
-                  .map(b => b.id));
-                return remaining.has(conn.source) && remaining.has(conn.target);
-              }),
-            }));
-            return { ...fb, content: { ...fb.content, rungs: cleanedRungs } };
-          }),
-        }));
+              blocks,
+              connections: (rung.connections || []).filter(c => kept.has(c.source) && kept.has(c.target)),
+            };
+          });
+          return { ...pou, content: { ...pou.content, rungs } };
+        };
+        setProjectStructure(prev => {
+          const next = { ...prev };
+          for (const cat of RUNG_POU_CATEGORIES) next[cat] = (prev[cat] || []).map(cleanPou);
+          return next;
+        });
       }
 
       setBuses(prev => prev.filter(b => b.id !== busId));
@@ -1179,6 +1202,10 @@ function App() {
       if (pou?.name) prefixes.add(`prog_${pou.name.trim().replace(/\s+/g, '_')}_`);
     });
     (watchTable || []).forEach(e => { if (e.liveKey) names.add(e.liveKey); });
+    // Forced variables stay subscribed wherever they live, so the Force list
+    // can show their CURRENT value (the forced set itself ignores the
+    // subscription). Changes rarely: only when a force is set or released.
+    forcedSet.forEach(k => names.add(k));
     // The local sim feeds the HMI server from liveVariables, so an unsubscribed
     // widget binding would freeze the HMI, not just the editor.
     (hmiLayout?.pages || []).forEach(pg => (pg.components || []).forEach(c => {
@@ -1219,7 +1246,7 @@ function App() {
     } else if (plcClientRef.current && stopStreamRef.current && appliedSubSigRef.current !== liveSubSig) {
       stopStreamRef.current();
       stopStreamRef.current = plcClientRef.current.streamVars(
-        (vars) => { Object.assign(liveVarsRef.current, vars); liveVarsDirtyRef.current = true; },
+        onRemoteVars,
         (err) => addLog('error', categorize(ERROR_CATEGORY.RUNTIME, `Stream error: ${err.message}`)),
         liveSubscription,
       );
@@ -1232,6 +1259,9 @@ function App() {
       if (!msg || msg.topic !== 'simulation-output') return;
       try {
         const parsed = typeof msg.data === 'string' ? JSON.parse(msg.data) : msg.data;
+        // The forced set rides BESIDE vars (never inside — the agent also
+        // feeds vars to the HMI server). Absent = unchanged.
+        if (parsed && Array.isArray(parsed.__forced)) applyForcedList(parsed.__forced);
         if (parsed.vars) {
           Object.assign(liveVarsRef.current, parsed.vars);
           liveVarsDirtyRef.current = true;
@@ -1246,7 +1276,14 @@ function App() {
       }
     });
     return () => stop();
-  }, [addLog, t]);
+  }, [addLog, t, applyForcedList]);
+
+  // Nothing runs → nothing is forced as far as the editor can tell: covers
+  // Stop, a crash, a dropped remote stream (it clears isRunning) and a
+  // project switch. A re-attached stream re-sends the set on its first event.
+  useEffect(() => {
+    if (!isRunning) setForcedSet(EMPTY_FORCED);
+  }, [isRunning]);
 
   // --- Re-attach to a local simulation left running by a previous session ---
   // The simulation runs as a separate host-agent process with its own /proc
@@ -1307,7 +1344,42 @@ function App() {
   // Keep ref up-to-date so onCloseRequested handler can call it without stale closure
   useEffect(() => { handleSaveRef.current = handleSave; }, [handleSave]);
 
-  const handleNewProject = useCallback(() => {
+  // ⚠️ Switching projects must DETACH from whatever runs. Close/Open used to
+  // reset only UI state: the privileged loader-host kept running orphaned
+  // (simulation-output kept filling liveVarsRef, and the next Run treated
+  // `alreadyRunning` as success, so the OLD logic ran under the NEW project),
+  // and a freshly opened project showed the previous program's live values
+  // under same-named keys. A local simulation is stopped; a remote PLC is a
+  // real device and keeps running — only our stream to it is dropped.
+  const isLocalSimRunning = () => (isRunningRef.current && isSimulationModeRef.current) || hotSwapActiveRef.current;
+  const detachRuntimeForProjectSwitch = async () => {
+    if (isLocalSimRunning()) {
+      await host.hotswapStop().catch((err) => addLog('error', categorize(ERROR_CATEGORY.RUNTIME, `Failed to stop simulation: ${err.message || err}`)));
+      host.stopHmiServer().catch(() => {});
+      addLog('info', 'Simulation stopped (project switched).');
+    }
+    hotSwapActiveRef.current = false;
+    layoutSigRef.current = null;
+    runStructSnapRef.current = null;
+    setIsHotSwap(false);
+    setPendingOnlineChange(false);
+    setIsSimulationMode(false);
+    setIsRunning(false);
+    if (stopStreamRef.current) { stopStreamRef.current(); stopStreamRef.current = null; }
+    remoteVarKeysRef.current = [];
+    remoteStreamedKeysRef.current = new Set();
+    remotePinShadowInKeysRef.current = new Set();
+    liveVarsRef.current = {};
+    setLiveVariables({});
+    setForcedSet(EMPTY_FORCED);
+  };
+  // Opening a project replaces the running one's UI — say so before stopping it.
+  const confirmStopSimForSwitch = () => !isLocalSimRunning() ||
+    window.confirm('The simulation is running. Opening another project will STOP it. Continue?');
+
+  const handleNewProject = useCallback(async () => {
+    if (!confirmStopSimForSwitch()) return;
+    await detachRuntimeForProjectSwitch();
     // Show board selection first, then create project
     setPendingNewProject(true);
     setIsBoardModalOpen(true);
@@ -1343,6 +1415,7 @@ function App() {
     });
 
     if (confirmation) {
+      await detachRuntimeForProjectSwitch();
       hasUnsavedRef.current = false;
       setIsProjectOpen(false);
       setProjectStructure(defaultProjectStructure);
@@ -1376,8 +1449,10 @@ function App() {
     try {
       // adopt: this is THE project file — only a project open may become the
       // in-place Save target (an ESI/other import must never hijack it).
+      if (!confirmStopSimForSwitch()) return;
       const picked = await openFile({ accept: '.xml', adopt: true });
       if (!picked) return;
+      await detachRuntimeForProjectSwitch();
       processFileContent(picked.content, picked.path);
     } catch (error) {
       console.error(error);
@@ -1410,6 +1485,7 @@ function App() {
         return;
       }
       const xml = await resp.text();
+      await detachRuntimeForProjectSwitch();
       // Load with a display label, then clear the path so Save → Save As.
       processFileContent(xml, `${plcAddress} (target)`);
       setCurrentFilePath(null);
@@ -1426,7 +1502,7 @@ function App() {
       if (result) {
         // Fold any legacy LD/ST POUs into the unified rung model on load.
         const newStructure = normalizeProjectToRungs(result.projectStructure);
-        const { boardId, plcAddress: savedAddr, sshUser: savedSshUser, sshPort: savedSshPort, apiPassword: savedApiPassword, autoRun: savedAutoRun } = result;
+        const { boardId, plcAddress: savedAddr, sshUser: savedSshUser, sshPort: savedSshPort, apiPassword: savedApiPassword, apiPasswordRedacted, autoRun: savedAutoRun } = result;
         // Ensure Configuration Resource Exists
         if (!newStructure.resources || newStructure.resources.length === 0) {
           newStructure.resources = [
@@ -1476,7 +1552,11 @@ function App() {
           setSshPort(savedSshPort);
           localStorage.setItem('sshPort', savedSshPort);
         }
-        setApiPassword(savedApiPassword || 'krontek');
+        // `??`, not `||`: '' is a deliberately disabled API; only a file with no
+        // attribute at all (older project) gets the default.
+        // A copy pulled from the target carries no password (redacted at
+        // Build & Send) — keep the one this editor already has.
+        if (!apiPasswordRedacted) setApiPassword(savedApiPassword ?? 'krontek');
         if (savedAutoRun !== undefined) {
           setAutoRun(savedAutoRun);
         }
@@ -1511,7 +1591,7 @@ function App() {
   };
 
   // A local simulation of an EtherCAT project opens a REAL raw socket on this
-  // PC's NIC (CLAUDE.md §13), which needs CAP_NET_RAW/CAP_NET_ADMIN on the host
+  // PC's NIC (host-agent/CLAUDE.md), which needs CAP_NET_RAW/CAP_NET_ADMIN on the host
   // agent. Without them the bus simply never reaches OP — nothing crashes, the
   // axes just sit there — so the editor has to say so BEFORE the user spends an
   // hour hunting a drive that "won't enable".
@@ -1694,7 +1774,10 @@ function App() {
         const shadowWrites = Object.entries(preStartVars)
           .filter(([k, v]) =>
             remoteVarKeysRef.current.includes(k) &&
-            k.includes('_in_') &&
+            // ONLY real FB input-pin shadows, by the transpiler's flag. The old
+            // `k.includes('_in_')` also matched user variables (`in_speed`, a
+            // program `X_in_Y`) and FORCE-pinned them on the real PLC.
+            remotePinShadowInKeysRef.current.has(k) &&
             v !== 0 && v !== false && v !== null && v !== undefined
           )
           .map(([k, v]) => client.writeVar(k, v).catch((e) => {
@@ -1705,11 +1788,7 @@ function App() {
         // Start server-streaming subscription (server pushes every 50 ms).
         if (remoteVarKeysRef.current.length > 0) {
           stopStreamRef.current = client.streamVars(
-            (vars) => {
-              // vars is a plain JS object: { varName: value, ... }
-              Object.assign(liveVarsRef.current, vars);
-              liveVarsDirtyRef.current = true;
-            },
+            onRemoteVars,
             (err) => {
               addLog('error', categorize(ERROR_CATEGORY.RUNTIME, `Stream error: ${err.message}`));
             },
@@ -1761,33 +1840,90 @@ function App() {
     }
   };
 
-  // mode: 'force' (hold, default) or 'pulse' (apply for one scan). Pulse is only
-  // wired for the local hot-swap sim; a remote PLC always force-writes.
-  const handleForceWrite = useCallback(async (key, value, mode = 'force') => {
-    if (!isRunning) return;
+  // mode: 'force' (hold, default), 'pulse' (write once, the logic owns it from
+  // the same scan) or 'unforce' (release the hold; a non-null value is also
+  // written once). Both the local sim and a remote PLC support all three now:
+  // every write goes through the runtime's force-write mailbox and resolves
+  // only after the runtime APPLIED it (SHM layout v2).
+  //
+  // ⚠️ Writes are SERIALISED PER KEY (a promise chain): a momentary HMI button
+  // sends force TRUE on press and unforce FALSE on release, and two requests in
+  // flight may complete in either order — a release overtaken by its own press
+  // would leave the bit forced TRUE.
+  const forceChainsRef = React.useRef(new Map());
+  const handleForceWrite = useCallback((key, value, mode = 'force') => {
+    if (!isRunning) return Promise.resolve();
+    const chains = forceChainsRef.current;
+    const prev = chains.get(key) || Promise.resolve();
+    const next = prev.then(() => doForceWrite(key, value, mode));
+    chains.set(key, next);
+    next.finally(() => { if (chains.get(key) === next) chains.delete(key); });
+    return next;
+  }, [isRunning, isSimulationMode, addLog]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const doForceWrite = async (key, value, mode) => {
     if (plcClientRef.current && !isSimulationMode) {
       const normalizedValue = (() => {
+        if (value === null || value === undefined) return null;
         if (typeof value !== 'string') return value;
         const trimmed = value.trim();
         if (trimmed === '') return value;
         if (/^(true|false)$/i.test(trimmed)) return trimmed.toLowerCase() === 'true';
+        // ⚠️ A LINT/ULINT/LWORD beyond ±2^53 stays a DECIMAL STRING: Number()
+        // would round it, and KronServer parses the string form exactly.
+        if (/^[-+]?\d+$/.test(trimmed) && !Number.isSafeInteger(Number(trimmed))) return trimmed;
         const asNumber = Number(trimmed);
         return Number.isFinite(asNumber) ? asNumber : value;
       })();
 
-      // Remote force write — skip FB instance variables (no SHM slot)
-      if (!remoteVarKeysRef.current.includes(key)) return;
-      plcClientRef.current.writeVar(key, normalizedValue).catch((e) => {
+      // Remote force write — only keys with an SHM slot on the target (FB
+      // instance objects have none). Say so instead of dropping it silently.
+      // A key the target reports FORCED has a slot by definition (the force
+      // list unforces variables that may not be on screen).
+      if (!remoteVarKeysRef.current.includes(key) && !remoteStreamedKeysRef.current.has(key)
+          && !forcedSetRef.current.has(key)) {
+        addLog('warning', `Force write skipped for '${key}': the target has no slot for it (not streamed by the deployed program — Build & Send may be needed).`);
+        return;
+      }
+      try {
+        await plcClientRef.current.writeVar(key, normalizedValue, mode);
+        if (mode === 'unforce') addLog('info', `Released '${key}' — the program controls it again.`);
+      } catch (e) {
         addLog('error', categorize(ERROR_CATEGORY.RUNTIME, `Force write failed for '${key}': ${e.message}`));
-      });
+      }
     } else {
       try {
         await host.writeVariable(key, value, mode);
+        if (mode === 'unforce') addLog('info', `Released '${key}' — the program controls it again.`);
       } catch (err) {
         addLog('error', categorize(ERROR_CATEGORY.RUNTIME, `Force write failed for '${key}': ${err.message || err}`));
       }
     }
-  }, [isRunning, isSimulationMode, addLog]);
+  };
+
+  // Unforce All (Force list): ONE command that releases every force — the
+  // remote ClearAllForces, or the local sim's CLEAR_ALL mailbox command.
+  const handleUnforceAll = useCallback(async () => {
+    if (!isRunning) return;
+    try {
+      if (plcClientRef.current && !isSimulationMode) {
+        await plcClientRef.current.clearAllForces();
+      } else {
+        await host.hotswapClearForces();
+      }
+      addLog('info', t('forces.unforceAllDone'));
+    } catch (e) {
+      addLog('error', categorize(ERROR_CATEGORY.RUNTIME, t('forces.unforceAllFailed', { error: e?.message || e })));
+    }
+  }, [isRunning, isSimulationMode, addLog, t]);
+
+  // The FORCED indicator opens the Force list tab (and makes sure the output
+  // panel is tall enough to show it).
+  const [outputTabRequest, setOutputTabRequest] = useState(null);
+  const openForceList = useCallback(() => {
+    setOutputTabRequest({ tab: 'forces', n: Date.now() });
+    setLayout(prev => (prev.consoleHeight < 140 ? { ...prev, consoleHeight: 220 } : prev));
+  }, []);
 
   // Auto-start/stop local HMI server when simulation runs
   useEffect(() => {
@@ -1812,7 +1948,9 @@ function App() {
       try {
         const writes = await host.pollHmiWrites();
         if (Array.isArray(writes)) {
-          writes.forEach((w) => handleForceWrite(w.key, w.value));
+          // In arrival order; handleForceWrite chains per key, so a press
+          // and its release can never overtake each other.
+          writes.forEach((w) => handleForceWrite(w.key, w.value, w.mode || 'force'));
         }
       } catch (_) {}
     }, 200);
@@ -1965,13 +2103,13 @@ function App() {
       // the outer catch below is now reached only by these steps, so it is
       // safe to label unconditionally as a deploy failure.
       addLog('info', `Deploying to ${plcAddress}...`);
-      await host.deployToServer(plcAddress);
+      await host.deployToServer(plcAddress, selectedBoard);
       addLog('success', `Deployed to ${plcAddress}.`);
 
       // Send the project source file so it can be pulled back later
       // ("Pull from Target"). A failure here fails the whole Build & Send.
       addLog('info', 'Sending project file...');
-      const projectXml = exportProjectToXml(projectStructure, selectedBoard, { plcAddress, sshUser, sshPort, apiPassword, autoRun }, buses, busConfigs, watchTable, hmiLayout);
+      const projectXml = exportProjectToXml(projectStructure, selectedBoard, { plcAddress, sshUser, sshPort, apiPasswordRedacted: true, autoRun }, buses, busConfigs, watchTable, hmiLayout);
       const postProjectFile = () => fetchWithTimeout(`http://${plcAddress}/deploy/project-file`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/xml' },
@@ -2047,13 +2185,17 @@ function App() {
       if (cCode.variableTable && cCode.variableTable.debugDefaults) {
         let initialLiveVars = {};
         const remoteKeys = [];
+        const pinShadowIn = new Set();
         Object.entries(cCode.variableTable.debugDefaults).forEach(([liveKey, info]) => {
           initialLiveVars[liveKey] = info.defaultValue;
           if (info.offset !== undefined) remoteKeys.push(liveKey);
+          if (info.isPinShadow && info.pinDir === 'in') pinShadowIn.add(liveKey);
         });
+        remotePinShadowInKeysRef.current = pinShadowIn;
         liveVarsRef.current = initialLiveVars;
         setLiveVariables(initialLiveVars);
         remoteVarKeysRef.current = remoteKeys;
+        remoteStreamedKeysRef.current = new Set(); // a new table replaces the old slots
       }
     } catch (err) {
       // transpile and cross-compile already returned above on failure — only
@@ -2640,7 +2782,7 @@ function App() {
         // Build & Send's self-contained-binary path and deliberately never
         // uploads a logic.so) — uploads runtime.bin(loader-host) + variables +
         // logic_0.so (cold, generation 0) as one atomic sequence.
-        await host.hotswapTargetDeploy(plcAddress);
+        await host.hotswapTargetDeploy(plcAddress, selectedBoard);
         hotSwapActiveRef.current = false;       // field mode (not local sim)
         setIsHotSwap(true);
         setFieldHotSwap(true);
@@ -2696,7 +2838,13 @@ function App() {
   // AND the C-level layout-hash rejection path (the loader-host's rollback),
   // so a refused reload always surfaces as an actionable dialog — never only
   // as a log line that is easy to miss while the OLD logic keeps running.
-  const offerSimRestart = useCallback(async (reasonText) => {
+  // ⚠️ Both take the structure to apply EXPLICITLY. The agent commits with
+  // setProjectStructure(dryStruct) and calls in the SAME tick, so this
+  // closure's `projectStructure` (and even projectStructureRef, refreshed in an
+  // effect) is still the PRE-commit tree — the old code compiled, swapped,
+  // bypassed the layout check (old vs old) and logged "applied".
+  const offerSimRestart = useCallback(async (reasonText, structure) => {
+    const ps = structure ?? projectStructureRef.current;
     if (!window.confirm(`${reasonText}\n\nRestart the SIMULATION with the new code now?\n\nValues of variables that exist in BOTH versions (counters, timers, flags) are carried over, so the program resumes from its current state. Brand-new variables/FB instances start at their initial values.\n\nCancel keeps the OLD code running; the edit stays in the project.`)) {
       addLog('warning', `Not applied — ${reasonText} The old code keeps running; the edit is kept in the project.`);
       return;
@@ -2719,7 +2867,7 @@ function App() {
       // instead of falling into the generic "Simulation restart failed" catch.
       var cCode;
       try {
-        cCode = transpileToC(projectStructure, standardHeaders, selectedBoard, true, buses, busConfigs);
+        cCode = transpileToC(ps, standardHeaders, selectedBoard, true, buses, busConfigs);
       } catch (err) {
         addLog('error', categorize(ERROR_CATEGORY.TRANSPILE, err.message || err));
         return;
@@ -2738,7 +2886,7 @@ function App() {
       }
       setCompileBusy(null);
       await runSimulationNow(); // refreshes layoutSigRef via its own snapshot
-      runStructSnapRef.current = projectStructure;
+      runStructSnapRef.current = ps;
       setPendingOnlineChange(false);
       let carried = 0;
       const newDefaults = cCode.variableTable?.debugDefaults || {};
@@ -2754,7 +2902,9 @@ function App() {
         //    only adds transient mixing before the first call settles them.
         // Real state lives in bare vars + FB struct members (keys with a dot,
         // e.g. prog_X_CTU0.CV) which never match this pattern.
-        if (!key.includes('.') && /_(?:in|out)_/.test(key)) continue;
+        // Identified by the transpiler's flag — a name regex also caught user
+        // variables like `in_start` and silently reset them on every restart.
+        if (newDefaults[key]?.isPinShadow) continue;
         const v = preserved[key];
         if (v === null || v === undefined || typeof v === 'object') continue; // composites/NaN
         try { await host.writeVariable(key, v, 'pulse'); carried++; } catch { /* type changed / no slot — skip */ }
@@ -2769,7 +2919,8 @@ function App() {
     }
   }, [projectStructure, selectedBoard, buses, busConfigs, addLog, runSimulationNow]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  const handleAgentHotSwap = useCallback(async (touchedPous) => {
+  const handleAgentHotSwap = useCallback(async (touchedPous, opts) => {
+    const ps = opts?.structure ?? projectStructureRef.current;
     const what = (touchedPous || []).join(', ') || 'logic';
     // A layout-changing edit (task table / variable table / UDTs / board-EC
     // config) is NOT hot-reloadable — it needs a cold restart. KEEP the edit
@@ -2780,7 +2931,7 @@ function App() {
     // through regardless (see layoutSignature's comment).
     const layoutReasons = layoutSignatureDiff(
       layoutSigRef.current,
-      layoutSigRef.current && layoutSignature(projectStructure, selectedBoard, buses, busConfigs)
+      layoutSigRef.current && layoutSignature(ps, selectedBoard, buses, busConfigs)
     );
     if (layoutReasons.length > 0) {
       const why = layoutReasons.join('; ');
@@ -2788,7 +2939,7 @@ function App() {
       // offer it right here instead of leaving only a log line (which read as
       // "applied" while the OLD logic silently kept running after the rollback).
       if (hotSwapActiveRef.current) {
-        await offerSimRestart(`This change is NOT hot-reloadable — ${why}.`);
+        await offerSimRestart(`This change is NOT hot-reloadable — ${why}.`, ps);
         return;
       }
       // FIELD (real PLC): never auto-restart hardware — keep the explicit path.
@@ -2804,7 +2955,7 @@ function App() {
         }
         let cCode;
         try {
-          cCode = transpileToC(projectStructure, standardHeaders, selectedBoard, true, buses, busConfigs);
+          cCode = transpileToC(ps, standardHeaders, selectedBoard, true, buses, busConfigs);
         } catch (err) {
           addLog('error', categorize(ERROR_CATEGORY.TRANSPILE, err.message || err));
           return;
@@ -2821,7 +2972,7 @@ function App() {
           // the same restart offer instead of a log-only error the user won't
           // see — the local sim only.
           if (/LAYOUT|TASKCOUNT/i.test(msg)) {
-            await offerSimRestart('The running program\'s memory layout or task table differs from this change (the safety check rejected the live swap and rolled back — the OLD logic is still running).');
+            await offerSimRestart('The running program\'s memory layout or task table differs from this change (the safety check rejected the live swap and rolled back — the OLD logic is still running).', ps);
             return;
           }
           // Anything else here is the edited code failing to compile (the
@@ -2831,7 +2982,7 @@ function App() {
           return;
         }
         addLog('success', `Hot reload applied (sim): ${what}`);
-        runStructSnapRef.current = projectStructure; // this structure is now what runs
+        runStructSnapRef.current = ps; // this structure is now what runs
         setPendingOnlineChange(false);
       } else if (fieldHotSwap && isPlcConnected && plcAddress) {
         if (!window.confirm(`The PLC at ${plcAddress} is RUNNING.\n\nThis applies your change LIVE as an online change — the logic is swapped without stopping the runtime, so outputs may change immediately on real hardware (timers/counters/latches are preserved).\n\nChanged: ${what}\n\nApply to the live PLC now?`)) {
@@ -2840,7 +2991,7 @@ function App() {
         }
         let cCode;
         try {
-          cCode = transpileToC(projectStructure, standardHeaders, selectedBoard, false, buses, busConfigs);
+          cCode = transpileToC(ps, standardHeaders, selectedBoard, false, buses, busConfigs);
         } catch (err) {
           addLog('error', categorize(ERROR_CATEGORY.TRANSPILE, err.message || err));
           return;
@@ -2856,13 +3007,13 @@ function App() {
           return;
         }
         try {
-          await host.hotswapDeploySwap(plcAddress);
+          await host.hotswapDeploySwap(plcAddress, selectedBoard);
         } catch (err) {
           addLog('error', categorize(ERROR_CATEGORY.DEPLOY, `Hot-swap apply failed (a layout change needs a full redeploy): ${err?.message || err}`));
           return;
         }
         addLog('success', `Online change applied to target: ${what}`);
-        runStructSnapRef.current = projectStructure; // this structure is now what runs
+        runStructSnapRef.current = ps; // this structure is now what runs
         setPendingOnlineChange(false);
       }
     } catch (e) {
@@ -2959,6 +3110,7 @@ function App() {
   };
 
   return (
+    <ForcedContext.Provider value={forcedSet}>
     <div style={{ 
       display: 'flex', 
       flexDirection: 'column', 
@@ -3162,6 +3314,20 @@ function App() {
             >
               <StopIcon />
             </button>
+
+            {/* FORCED (n): CODESYS-style "forces are active" warning — values are
+                held, not computed. Impossible to miss on purpose; opens the
+                Force list (Output panel), where each force can be released. */}
+            {isRunning && forcedSet.size > 0 && (
+              <button
+                className="tb-btn tb-text kron-forced-indicator"
+                onClick={openForceList}
+                title={t('forces.indicatorTitle', { count: forcedSet.size })}
+              >
+                <span className="kron-forced-indicator-f">F</span>
+                <span>{t('forces.indicator', { count: forcedSet.size })}</span>
+              </button>
+            )}
 
             {/* ── Right-aligned group: status ──────────────────────────── */}
             <div style={{ flex: 1 }} />
@@ -3423,6 +3589,9 @@ function App() {
                   projectStructure={projectStructure}
                   errorCodeService={errorCodeService}
                   onAskAgent={askAgentAbout}
+                  forcedSet={forcedSet}
+                  onUnforceAll={isRunning ? handleUnforceAll : null}
+                  tabRequest={outputTabRequest}
                 />
               </div>
 
@@ -3595,6 +3764,7 @@ function App() {
       />
 
     </div>
+    </ForcedContext.Provider>
   );
 }
 

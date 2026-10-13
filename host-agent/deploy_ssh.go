@@ -145,11 +145,12 @@ func (s *Server) handleDeployServerToTarget(w http.ResponseWriter, r *http.Reque
 	remoteDir := home + "/plc"
 	remoteBin := remoteDir + "/plc-agent"
 
-	// sudo prefix: root or empty password → no sudo. Otherwise pipe the password
-	// into `sudo -S`. Single quotes in the password are shell-escaped.
-	sudo := ""
+	// Privilege: root or an empty password → run as-is. Otherwise every
+	// privileged step goes through `sudo -S` with the password on the SSH
+	// session's STDIN (see remotePriv) — never on a command line.
+	sudo := remotePriv{}
 	if req.Username != "root" && req.Password != "" {
-		sudo = "echo '" + strings.ReplaceAll(req.Password, "'", `'\''`) + "' | sudo -S "
+		sudo = remotePriv{useSudo: true, password: req.Password}
 	}
 
 	progress("Stopping existing plc-agent...")
@@ -203,7 +204,7 @@ func (s *Server) handleDeployServerToTarget(w http.ResponseWriter, r *http.Reque
 			return
 		}
 		progress("Starting plc-agent (systemd)...")
-		if out, err := sshRun(client, sudo+"systemctl restart plc-agent"); err != nil {
+		if out, err := sudo.run(client, sudo.prefix()+"systemctl restart plc-agent"); err != nil {
 			writeError(w, http.StatusBadGateway, "systemctl restart failed: "+err.Error()+"\n"+out)
 			return
 		}
@@ -242,18 +243,24 @@ func (s *Server) handleDeployServerToTarget(w http.ResponseWriter, r *http.Reque
 	}
 
 	// Did not come up — gather init-system-aware diagnostics for the user.
-	var diagCmd string
+	var diag string
 	if systemd {
-		diagCmd = fmt.Sprintf(
+		diag = sshRunLogged(client, fmt.Sprintf(
 			"systemctl status plc-agent 2>&1 | head -30; echo '---'; "+
-				"journalctl -u plc-agent -n 20 2>&1; echo '---'; tail -20 %s/plc-agent.log 2>&1", remoteDir)
+				"journalctl -u plc-agent -n 20 2>&1; echo '---'; tail -20 %s/plc-agent.log 2>&1", remoteDir),
+			progress, "diagnostics collection")
 	} else {
-		diagCmd = fmt.Sprintf(
+		// Exactly ONE sudo in this line, so the password on stdin reaches it.
+		out, err := sudo.run(client, fmt.Sprintf(
 			"{ ps -ef 2>/dev/null || ps; } | grep -E 'plc-agent(-supervisor)?' | grep -v grep; echo '---'; "+
 				"command -v crontab >/dev/null 2>&1 && %scrontab -l 2>&1 | grep plc-agent; echo '---'; "+
-				"tail -40 %s/plc-agent.log 2>&1", sudo, remoteDir)
+				"tail -40 %s/plc-agent.log 2>&1", sudo.prefix(), remoteDir))
+		if err != nil {
+			progress(fmt.Sprintf("warning: diagnostics collection failed: %v", err))
+		}
+		diag = out
 	}
-	if diag := strings.TrimSpace(sshRunLogged(client, diagCmd, progress, "diagnostics collection")); diag != "" {
+	if diag := strings.TrimSpace(diag); diag != "" {
 		progress("Agent did not start. Diagnostics:\n" + diag)
 	}
 	writeError(w, http.StatusBadGateway, "Server deployed but agent did not respond after 10s: "+lastErr)
@@ -266,11 +273,19 @@ const sshRunTimeout = 30 * time.Second
 // sshRun runs one command and returns its combined stdout+stderr plus any
 // error (session failure, non-zero exit, or timeout).
 func sshRun(client *ssh.Client, cmd string) (string, error) {
+	return sshRunInput(client, cmd, "")
+}
+
+// sshRunInput is sshRun with the session's stdin fed from `stdin` ("" = none).
+func sshRunInput(client *ssh.Client, cmd, stdin string) (string, error) {
 	sess, err := client.NewSession()
 	if err != nil {
 		return "", fmt.Errorf("ssh session: %w", err)
 	}
 	defer sess.Close()
+	if stdin != "" {
+		sess.Stdin = strings.NewReader(stdin)
+	}
 	type result struct {
 		out []byte
 		err error
@@ -330,26 +345,69 @@ const killPatternPrologue = "#!/bin/sh\n" +
 	"  done\n" +
 	"}\n"
 
-// runStagedScript uploads body to remotePath and executes it (under sudo when
-// given), so no script has to survive nested shell quoting.
-func runStagedScript(client *ssh.Client, sudo, remotePath, body string) (string, error) {
-	return sshRun(client, fmt.Sprintf(
-		"cat > %[1]s << 'KRONSTAGED'\n%[2]sKRONSTAGED\nchmod +x %[1]s && %[3]ssh %[1]s",
-		remotePath, body, sudo))
+// remotePriv runs remote steps with root rights when the login user is not
+// root.
+//
+// ⚠️ The sudo password travels on the SSH session's STDIN, never on a command
+// line. The old prefix `echo '<pw>' | sudo -S ` put it in /proc/<pid>/cmdline
+// (readable by every local account while the step ran), and a step that read
+// stdin itself got the password instead: the crontab install piped root's
+// crontab into `echo` — wiping it — and fed the password to `crontab -`.
+// An empty `-p` prompt keeps it out of captured output. A step that needs stdin of
+// its own must be a staged script (runStagedScript).
+type remotePriv struct {
+	useSudo  bool
+	password string
+}
+
+// prefix is the prefix for ONE privileged command. It carries no secret.
+func (p remotePriv) prefix() string {
+	if !p.useSudo {
+		return ""
+	}
+	return "sudo -S -p '' "
+}
+
+// stdin is what the session's stdin carries: the password line, or nothing.
+func (p remotePriv) stdin() string {
+	if !p.useSudo {
+		return ""
+	}
+	return p.password + "\n"
+}
+
+// run executes cmd with the password on stdin. ⚠️ Only ONE `sudo -S` per call
+// can consume that line — chain privileged commands in a staged script
+// instead (a sudo timestamp cache is not guaranteed to exist).
+func (p remotePriv) run(client *ssh.Client, cmd string) (string, error) {
+	return sshRunInput(client, cmd, p.stdin())
+}
+
+// runStagedScript uploads body to remotePath and executes it as a whole (under
+// sudo when given), so no script has to survive nested shell quoting and all
+// the privileged commands in it share ONE password exchange.
+// ⚠️ The script itself runs with stdin from /dev/null: with a NOPASSWD rule or
+// a cached timestamp sudo never reads the password line, and any command in
+// the script that reads stdin would otherwise receive it.
+func runStagedScript(client *ssh.Client, sudo remotePriv, remotePath, body string) (string, error) {
+	return sudo.run(client, fmt.Sprintf(
+		"cat > %[1]s << 'KRONSTAGED'\n%[2]sKRONSTAGED\nchmod +x %[1]s && %[3]ssh -c 'exec sh \"$1\" </dev/null' kron-staged %[1]s",
+		remotePath, body, sudo.prefix()))
 }
 
 // installSystemdUnit writes /etc/systemd/system/plc-agent.service and enables it.
 // Restart=always keeps the agent up across crashes.
-func installSystemdUnit(client *ssh.Client, sudo, remoteBin, remoteDir string) (string, error) {
+func installSystemdUnit(client *ssh.Client, sudo remotePriv, remoteBin, remoteDir string) (string, error) {
 	unit := fmt.Sprintf("[Unit]\nDescription=PLC Agent (KronServer)\nAfter=network.target\n\n"+
 		"[Service]\nExecStart=%s -addr :7070 -deploy-dir %s -shm-name plc_runtime -shm-size 65536\n"+
 		"Restart=always\nRestartSec=3\nWorkingDirectory=%s\nUser=root\n\n"+
 		"[Install]\nWantedBy=multi-user.target\n", remoteBin, remoteDir, remoteDir)
-	cmd := fmt.Sprintf(
-		"cat > /tmp/plc-agent.service << 'UNIT'\n%sUNIT\n"+
-			"%[2]scp /tmp/plc-agent.service /etc/systemd/system/plc-agent.service && "+
-			"%[2]ssystemctl daemon-reload && %[2]ssystemctl enable plc-agent", unit, sudo)
-	return sshRun(client, cmd)
+	// One staged script, so the three privileged steps share ONE sudo (see
+	// remotePriv.run — a second `sudo -S` would find stdin already drained).
+	body := "#!/bin/sh\n" +
+		"cat > /etc/systemd/system/plc-agent.service << 'UNIT'\n" + unit + "UNIT\n" +
+		"systemctl daemon-reload && systemctl enable plc-agent\n"
+	return runStagedScript(client, sudo, remoteDir+"/plc-systemd-install.sh", body)
 }
 
 // supervisorBody is the supervisor script text (split out so it can be
@@ -451,8 +509,7 @@ func probeBootCaps(client *ssh.Client) bootCaps {
 // installed only when the target is known to EXECUTE it at boot
 // (probeBootCaps) AND a read-back confirms the hook is in place: both of the
 // bugs this replaced reported success while doing nothing.
-func installBootHook(client *ssh.Client, sudo, remoteDir string, progress func(string)) string {
-	sup := remoteDir + "/plc-agent-supervisor.sh"
+func installBootHook(client *ssh.Client, sudo remotePriv, remoteDir string, progress func(string)) string {
 	caps := probeBootCaps(client)
 	var installed []string
 
@@ -474,8 +531,7 @@ func installBootHook(client *ssh.Client, sudo, remoteDir string, progress func(s
 
 	// 2. @reboot crontab entry (Alpine/OpenWRT/anything shipping cron).
 	if caps.crontab {
-		cmd := fmt.Sprintf("( %[2]scrontab -l 2>/dev/null | grep -v plc-agent-supervisor ; echo '@reboot %[1]s >/dev/null 2>&1' ) | %[2]scrontab -", sup, sudo)
-		if out, err := sshRun(client, cmd); err == nil {
+		if out, err := installCronHook(client, sudo, remoteDir); err == nil {
 			progress("Autostart: @reboot crontab entry installed.")
 			installed = append(installed, "cron @reboot")
 		} else {
@@ -502,6 +558,26 @@ func installBootHook(client *ssh.Client, sudo, remoteDir string, progress func(s
 		return "none"
 	}
 	return strings.Join(installed, " + ")
+}
+
+// cronHookBody is the staged script that installs the @reboot entry (split out
+// so a test can exercise it without an SSH connection). ⚠️ The whole
+// read-filter-append-write runs INSIDE one script under sudo: the old one-liner
+// prefixed each crontab with `echo '<pw>' | sudo -S`, so `crontab -l` printed
+// into echo's ignored stdin and `crontab -` installed an empty table or the
+// password — root's crontab was wiped on every deploy. Read back like the other
+// hooks (host-agent/CLAUDE.md): a missing entry is an error, never "installed".
+func cronHookBody(remoteDir string) string {
+	return "#!/bin/sh\n" +
+		"LINE='@reboot " + remoteDir + "/plc-agent-supervisor.sh >/dev/null 2>&1'\n" +
+		"{ crontab -l 2>/dev/null | grep -v plc-agent-supervisor; echo \"$LINE\"; } | crontab - || " +
+		"{ echo 'crontab write failed'; exit 1; }\n" +
+		"crontab -l 2>/dev/null | grep -qF \"$LINE\" || { echo '@reboot entry did not stick'; exit 1; }\n" +
+		"exit 0\n"
+}
+
+func installCronHook(client *ssh.Client, sudo remotePriv, remoteDir string) (string, error) {
+	return runStagedScript(client, sudo, remoteDir+"/plc-cron-hook.sh", cronHookBody(remoteDir))
 }
 
 // initdHookBody is the /etc/init.d/S99plc-agent text (split out so a test can
@@ -536,7 +612,7 @@ func initdHookBody(remoteDir string) string {
 // runlevel directories (Yocto/Debian sysvinit run the rc<N>.d S* symlinks, NOT
 // every init.d file), symlinks it there too. It read-back-verifies and returns
 // an error when the hook is not in place.
-func installInitdHook(client *ssh.Client, sudo, remoteDir, rcDir string) (string, error) {
+func installInitdHook(client *ssh.Client, sudo remotePriv, remoteDir, rcDir string) (string, error) {
 	body := "#!/bin/sh\n" +
 		"cat > /etc/init.d/S99plc-agent << 'INITD'\n" + initdHookBody(remoteDir) + "INITD\n" +
 		"chmod +x /etc/init.d/S99plc-agent\n"
@@ -553,7 +629,7 @@ func installInitdHook(client *ssh.Client, sudo, remoteDir, rcDir string) (string
 // ⚠️ Insertion uses awk, NOT sed's `0,/re/` first-match address: that is a GNU
 // extension BusyBox sed rejects, so the old one-line edit failed on every
 // BusyBox image while the deploy still reported "rc.local entry installed".
-func installRcLocalHook(client *ssh.Client, sudo, remoteDir string) (string, error) {
+func installRcLocalHook(client *ssh.Client, sudo remotePriv, remoteDir string) (string, error) {
 	body := "#!/bin/sh\n" +
 		"LINE='" + remoteDir + "/plc-agent-supervisor.sh >/dev/null 2>&1 &'\n" +
 		"[ -f /etc/rc.local ] || printf '#!/bin/sh\\nexit 0\\n' > /etc/rc.local\n" +
@@ -572,7 +648,7 @@ func installRcLocalHook(client *ssh.Client, sudo, remoteDir string) (string, err
 
 // startSupervisorScript (re)launches the supervisor detached so it survives our
 // SSH disconnect.
-func startSupervisorScript(client *ssh.Client, sudo, remoteDir string) (string, error) {
+func startSupervisorScript(client *ssh.Client, sudo remotePriv, remoteDir string) (string, error) {
 	sup := remoteDir + "/plc-agent-supervisor.sh"
 	body := killPatternPrologue +
 		"killpat plc-agent-supervisor\n" +

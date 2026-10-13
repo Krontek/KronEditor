@@ -38,7 +38,7 @@ func (s *Server) handleCompileSimulation(w http.ResponseWriter, r *http.Request)
 }
 
 func (s *Server) compileSimulation() (string, string, error) {
-	buildDir := s.paths.BuildDir()
+	buildDir := s.paths.SimBuildDir()
 	plcC := filepath.Join(buildDir, "plc.c")
 	outFile := filepath.Join(buildDir, simBin)
 
@@ -181,7 +181,15 @@ func (s *Server) handleCompileForTarget(w http.ResponseWriter, r *http.Request) 
 }
 
 func (s *Server) compileForTarget(req *compileForTargetReq) (string, string, error) {
-	buildDir := s.paths.BuildDir()
+	bt, err := boardTargetFor(req.BoardID)
+	if err != nil {
+		return "", "", err
+	}
+	// Per-board target dir, never the local sim's (see Paths.SimBuildDir).
+	buildDir, err := s.paths.PrepareTargetBuildDir(req.BoardID)
+	if err != nil {
+		return "", "", err
+	}
 
 	if err := os.WriteFile(filepath.Join(buildDir, "plc.h"), []byte(req.Header), 0o644); err != nil {
 		return "", "", err
@@ -205,27 +213,7 @@ func (s *Server) compileForTarget(req *compileForTargetReq) (string, string, err
 	}
 	outFile := filepath.Join(buildDir, binName)
 
-	var llvmTarget, resourceTarget string
-	switch {
-	// Legacy-project guard: rpi_pico boards were removed (no Linux userspace).
-	// Without this a stale saved project would fall through to the aarch64
-	// default and silently build a wrong-arch binary.
-	case strings.HasPrefix(req.BoardID, "rpi_pico"):
-		return "", "", fmt.Errorf("Pico (Cortex-M) boards are no longer supported — reselect a Linux board in Board Config")
-	case strings.HasPrefix(req.BoardID, "bb_") && !strings.HasPrefix(req.BoardID, "bb_ai64"):
-		llvmTarget, resourceTarget = "arm-linux-gnueabihf", "arm/armv7"
-	// ⚠️ Generic Linux carries its arch in the ID and must be matched BEFORE
-	// the default: the default is aarch64, so a generic x86_64 or armv7 target
-	// would otherwise cross-build a wrong-arch runtime that only fails on the
-	// device ("cannot execute binary file"). Keep these in step with
-	// serverBinaryForBoard, which switches on the same ids.
-	case req.BoardID == "generic_linux_x64":
-		llvmTarget, resourceTarget = "x86_64-linux-gnu", "x86_64/linux"
-	case req.BoardID == "generic_linux_armv7":
-		llvmTarget, resourceTarget = "arm-linux-gnueabihf", "arm/armv7"
-	default:
-		llvmTarget, resourceTarget = "aarch64-linux-gnu", "arm/aarch64"
-	}
+	llvmTarget, resourceTarget := bt.llvmTarget, bt.resourceTarget
 
 	resInclude, err := s.paths.ResourceTargetIncludeDir(resourceTarget)
 	if err != nil {
@@ -243,16 +231,7 @@ func (s *Server) compileForTarget(req *compileForTargetReq) (string, string, err
 
 	args := append([]string{}, baseArgs...)
 	args = append(args, "-O3", "-ffunction-sections", "-fdata-sections", "-fuse-ld=lld", "-static", "-Wl,--gc-sections")
-	if (strings.HasPrefix(req.BoardID, "bb_") && !strings.HasPrefix(req.BoardID, "bb_ai64")) ||
-		req.BoardID == "generic_linux_armv7" {
-		args = append(args, "-march=armv7-a")
-	}
-	if req.BoardID == "rpi_5" {
-		args = append(args, `-DKRON_GPIO_CHIP="/dev/gpiochip4"`)
-	}
-	if strings.HasPrefix(req.BoardID, "jetson_orin") || strings.HasPrefix(req.BoardID, "jetson_agx_orin") {
-		args = append(args, "-DKRON_JETSON_ORIN=1")
-	}
+	args = append(args, bt.flags...)
 
 	needsEC := strings.Contains(req.Source, "kron_ec_init(") ||
 		strings.Contains(req.Source, "kron_ec_pdo_read(") ||
@@ -308,11 +287,66 @@ func (s *Server) compileForTarget(req *compileForTargetReq) (string, string, err
 	cmdStr := fmt.Sprintf("%s %s", compiler, strings.Join(args, " "))
 	s.events.Emit("build-command", cmdStr)
 
+	// ⚠️ This overwrites runtime.bin, the SAME path the field hot-swap build
+	// writes its loader-host to — so the "hotswap-host" marker beside it must go
+	// with it, or handleHotSwapTargetDeploy's guard would pass this plain
+	// self-contained binary off as a loader-host. Removed before the compile,
+	// since a failed link may already have truncated the old file.
+	if binName == "runtime.bin" {
+		_ = os.Remove(filepath.Join(buildDir, "runtime.bin.kind"))
+	}
+
 	out, runErr := exec.Command(compiler, args...).CombinedOutput()
 	if runErr != nil {
 		return "", string(out), fmt.Errorf("clang cross-compilation failed: %v", runErr)
 	}
 	return outFile, string(out), nil
+}
+
+// boardTarget is everything a board id decides about a cross build.
+type boardTarget struct {
+	llvmTarget     string   // clang --target triple
+	resourceTarget string   // resources/<…> key (lib/*.a, server/)
+	flags          []string // board-specific compile flags (arch, HAL defines)
+}
+
+// boardTargetFor is the ONE board → triple (+flags) mapping for every target
+// build: Build & Send (compileForTarget) AND the field hot-swap loader-host +
+// logic.so (hotswap.go). ⚠️ It used to exist twice, and the hot-swap copy had
+// no generic_linux cases, so generic_linux_x64/_armv7 fell through to the
+// aarch64 default and shipped a wrong-arch runtime that only failed on the
+// device — while Build & Send for the same board was correct.
+// ⚠️ Generic Linux carries its arch in the ID and must be matched BEFORE the
+// default (aarch64). Keep these in step with serverBinaryForBoard
+// (deploy_ssh.go), which switches on the same ids.
+func boardTargetFor(boardID string) (boardTarget, error) {
+	var bt boardTarget
+	armv7 := false
+	switch {
+	// Legacy-project guard: rpi_pico boards were removed (no Linux userspace).
+	// Without this a stale saved project would fall through to the aarch64
+	// default and silently build a wrong-arch binary.
+	case strings.HasPrefix(boardID, "rpi_pico"):
+		return bt, fmt.Errorf("Pico (Cortex-M) boards are no longer supported — reselect a Linux board in Board Config")
+	case strings.HasPrefix(boardID, "bb_") && !strings.HasPrefix(boardID, "bb_ai64"):
+		bt.llvmTarget, bt.resourceTarget, armv7 = "arm-linux-gnueabihf", "arm/armv7", true
+	case boardID == "generic_linux_x64":
+		bt.llvmTarget, bt.resourceTarget = "x86_64-linux-gnu", "x86_64/linux"
+	case boardID == "generic_linux_armv7":
+		bt.llvmTarget, bt.resourceTarget, armv7 = "arm-linux-gnueabihf", "arm/armv7", true
+	default:
+		bt.llvmTarget, bt.resourceTarget = "aarch64-linux-gnu", "arm/aarch64"
+	}
+	if armv7 {
+		bt.flags = append(bt.flags, "-march=armv7-a")
+	}
+	if boardID == "rpi_5" {
+		bt.flags = append(bt.flags, `-DKRON_GPIO_CHIP="/dev/gpiochip4"`)
+	}
+	if strings.HasPrefix(boardID, "jetson_orin") || strings.HasPrefix(boardID, "jetson_agx_orin") {
+		bt.flags = append(bt.flags, "-DKRON_JETSON_ORIN=1")
+	}
+	return bt, nil
 }
 
 // ── shared LLVM arg builders ────────────────────────────────────────────────

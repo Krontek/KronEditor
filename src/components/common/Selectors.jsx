@@ -4,7 +4,7 @@ import ReactDOM from 'react-dom';
 export const ELEMENTARY_TYPES = [
     'BOOL', 'SINT', 'INT', 'DINT', 'LINT',
     'USINT', 'UINT', 'UDINT', 'ULINT',
-    'REAL', 'LREAL', 'TIME', 'DATE', 'TOD', 'DT',
+    'REAL', 'LREAL', 'TIME', 'LTIME', 'DATE', 'TOD', 'DT',
     'STRING', 'WSTRING', 'BYTE', 'WORD', 'DWORD', 'LWORD'
 ];
 

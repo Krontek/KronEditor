@@ -149,10 +149,13 @@ export class HostClient {
   async liveSubscribe(prefixes = [], names = []) {
     return _post(this._p('/api/host/live-subscribe'), { prefixes, names });
   }
-  // mode: 'force' (hold every scan, default) or 'pulse' (apply for one scan,
-  // then the logic resumes) — only meaningful for the hot-swap simulation.
+  // mode: 'force' (hold every scan, default), 'pulse' (write once, the logic
+  // resumes from it on the same scan) or 'unforce' (release; a non-null value
+  // is also written once). Resolves only after the runtime applied it.
   async writeVariable(name, value, mode = 'force') {
-    return _post(this._p('/api/host/write-variable'), { name, value: String(value), mode });
+    return _post(this._p('/api/host/write-variable'), {
+      name, value: value === null || value === undefined ? '' : String(value), mode,
+    });
   }
 
   /**
@@ -204,8 +207,10 @@ export class HostClient {
     const j = await _post(this._p('/api/host/check-server-status'), { serverAddr });
     return j.status;
   }
-  async deployToServer(serverAddr) {
-    const j = await _post(this._p('/api/host/deploy-to-server'), { serverAddr });
+  // boardId picks the per-board target build dir (build/target/<board>); the
+  // agent falls back to the last target build when it is omitted.
+  async deployToServer(serverAddr, boardId) {
+    const j = await _post(this._p('/api/host/deploy-to-server'), { serverAddr, boardId });
     return j.message || 'Deployed';
   }
   async deployServerToTarget(payload) {
@@ -366,6 +371,12 @@ export class HostClient {
     return _post(this._p('/api/host/hotswap/stop'), {});
   }
 
+  // Release EVERY force of the running local hot-swap sim (one CLEAR_ALL
+  // mailbox command; resolves after the runtime applied it).
+  async hotswapClearForces() {
+    return _post(this._p('/api/host/hotswap/clear-forces'), {});
+  }
+
   // Field hot-swap (deployed KronServer target)
   /** Cross-compile the loader-host (runtime.bin) + logic_0.so for the target board. */
   async hotswapTargetBuild({ header, source, variableTable, hal, hostGlue, boardId }) {
@@ -381,12 +392,12 @@ export class HostClient {
    * atomic sequence. Deliberately separate from deployToServer (the plain
    * Build & Send path) so the two binary shapes can never be conflated.
    */
-  async hotswapTargetDeploy(serverAddr) {
-    return _post(this._p('/api/host/hotswap/target-deploy'), { serverAddr });
+  async hotswapTargetDeploy(serverAddr, boardId) {
+    return _post(this._p('/api/host/hotswap/target-deploy'), { serverAddr, boardId });
   }
   /** Push the latest logic.so to a deployed KronServer and trigger a live swap. */
-  async hotswapDeploySwap(serverAddr) {
-    return _post(this._p('/api/host/hotswap/deploy-swap'), { serverAddr });
+  async hotswapDeploySwap(serverAddr, boardId) {
+    return _post(this._p('/api/host/hotswap/deploy-swap'), { serverAddr, boardId });
   }
 
   // ── EtherCAT ──────────────────────────────────────────────────────────────

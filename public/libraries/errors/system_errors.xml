@@ -2,7 +2,7 @@
 <!--
   KronSystem — Error Code Catalog
   Per-block ERR_ID codes for the static-inline blocks in
-  resources/krontek-include/kronsystem.h (CLAUDE.md §14).
+  resources/krontek-include/kronsystem.h (src/services/CLAUDE.md).
 
   ⚠️ The four values are the KRON_SYS_* constants in that header (lines 63-66):
       0 KRON_SYS_OK        1 KRON_SYS_ABSENT
@@ -13,7 +13,7 @@
   header: a catalog that disagrees with the runtime is worse than none.
 
   These blocks are Linux-only host health / sysfs readers. On Windows and macOS
-  they report ERR_ID = 1 rather than faking a plausible number (§10: a missing
+  they report ERR_ID = 1 rather than faking a plausible number (resources/krontek-include/CLAUDE.md: a missing
   peripheral must FAIL, never fake success).
 -->
 <error_codes library="KronSystem">

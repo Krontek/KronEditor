@@ -23,8 +23,10 @@
 export const IEC_TYPE_PREFIX = {
   'BOOL': 'X', 'BYTE': 'B', 'SINT': 'B', 'USINT': 'B',
   'INT': 'W', 'UINT': 'W', 'WORD': 'W',
-  'DINT': 'D', 'UDINT': 'D', 'DWORD': 'D', 'REAL': 'D', 'TIME': 'D',
+  'DINT': 'D', 'UDINT': 'D', 'DWORD': 'D', 'REAL': 'D',
   'LINT': 'L', 'ULINT': 'L', 'LWORD': 'L', 'LREAL': 'L',
+  // TIME/LTIME are signed 64-bit microseconds (kronstandard.h) — 8 bytes.
+  'TIME': 'L', 'LTIME': 'L',
 };
 
 // Human-readable width per size prefix, used only to explain a mismatch.

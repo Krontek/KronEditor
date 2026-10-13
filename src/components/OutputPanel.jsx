@@ -1,9 +1,13 @@
 import { useState, useRef, useEffect, useCallback } from 'react';
 import { createPortal } from 'react-dom';
 import ForceWriteModal from './common/ForceWriteModal';
+import ForcedMarker from './common/ForcedMarker';
+import { useTranslation } from 'react-i18next';
+import { EMPTY_FORCED, isKeyForced, displayNameForKey } from '../utils/forcedVars';
 import { ErrorCodeService } from '../services/ErrorCodeService';
 import { findVarByName } from '../utils/iecNames';
 import { ERROR_CATEGORY } from '../utils/errorFormat';
+import { formatTimeUs, isTimeType } from '../utils/plcStandards';
 
 const LOG_COLORS = {
     info:    '#c8c8c8',
@@ -435,8 +439,16 @@ const OutputPanel = ({
     projectStructure = null,
     errorCodeService = null,
     onAskAgent = null,
+    forcedSet = EMPTY_FORCED,
+    onUnforceAll = null,
+    tabRequest = null,
 }) => {
+    const { t } = useTranslation();
     const [activeTab, setActiveTab] = useState('messages');
+    // A caller (the toolbar's FORCED indicator) can bring a tab to the front.
+    useEffect(() => {
+        if (tabRequest?.tab) setActiveTab(tabRequest.tab);
+    }, [tabRequest]);
     const [forceModal, setForceModal] = useState(null);
     const [editingId, setEditingId] = useState(null);
     const [editValue, setEditValue] = useState('');
@@ -492,7 +504,24 @@ const OutputPanel = ({
         { key: 'warnings', label: 'Warnings', badge: filtered.warnings.length, badgeColor: '#e5a64a' },
         { key: 'errors',   label: 'Errors',   badge: filtered.errors.length,   badgeColor: '#f14c4c' },
         { key: 'watch',    label: 'Watchtable', badge: watchTable.length,       badgeColor: '#007acc' },
+        { key: 'forces',   label: t('forces.tab'), badge: isRunning ? forcedSet.size : 0, badgeColor: '#ff6d00' },
     ];
+    const isLogTab = ['messages', 'warnings', 'errors'].includes(activeTab);
+
+    // Force list rows: every forced key, with a display name and its declared
+    // type when the project knows it (the force dialog needs the type).
+    const pouNames = [
+        ...(projectStructure?.programs || []),
+        ...(projectStructure?.functionBlocks || []),
+    ].map(p => p.name);
+    const forcedRows = isRunning ? [...forcedSet].sort().map(key => {
+        const display = displayNameForKey(key, pouNames);
+        let { varType } = resolveExpression(display, projectStructure);
+        // An FB pin / struct member is not in any variable table — a BOOL
+        // value still tells the dialog which editor to show.
+        if (!varType && typeof liveVariables?.[key] === 'boolean') varType = 'BOOL';
+        return { key, display, varType };
+    }) : [];
 
     const getLiveVal = (liveKey) => {
         if (!liveVariables || !liveKey) return undefined;
@@ -502,12 +531,9 @@ const OutputPanel = ({
     const formatVal = (val, type) => {
         if (val === null || val === undefined) return '---';
         if (typeof val === 'boolean') return val ? 'TRUE' : 'FALSE';
-        if (type === 'TIME') {
-            const us = Number(val);
-            if (us >= 1000000 && us % 1000000 === 0) return `${us / 1000000}s`;
-            if (us >= 1000 && us % 1000 === 0) return `${us / 1000}ms`;
-            return `${us}µs`;
-        }
+        // TIME/LTIME: signed 64-bit µs; a value beyond ±2^53 arrives as a
+        // decimal string, which formatTimeUs keeps exact.
+        if (isTimeType(type)) return formatTimeUs(val);
         return String(val);
     };
 
@@ -606,6 +632,30 @@ const OutputPanel = ({
                         </button>
                     )}
 
+                    {/* Unforce all — Force list tab only */}
+                    {activeTab === 'forces' && (
+                        <button
+                            onClick={() => onUnforceAll && onUnforceAll()}
+                            disabled={!onUnforceAll || forcedRows.length === 0}
+                            title={t('forces.unforceAllTitle')}
+                            style={{
+                                background: onUnforceAll && forcedRows.length ? '#4a1d00' : 'transparent',
+                                border: `1px solid ${onUnforceAll && forcedRows.length ? '#ff6d00' : '#3a3a3a'}`,
+                                borderRadius: 3,
+                                color: onUnforceAll && forcedRows.length ? '#ffab40' : '#555',
+                                fontSize: 10,
+                                fontWeight: 700,
+                                padding: '2px 10px',
+                                cursor: onUnforceAll && forcedRows.length ? 'pointer' : 'default',
+                                letterSpacing: '0.04em',
+                                textTransform: 'uppercase',
+                                whiteSpace: 'nowrap',
+                            }}
+                        >
+                            {t('forces.unforceAll')}
+                        </button>
+                    )}
+
                     {/* Add variable button — watch tab only */}
                     {activeTab === 'watch' && (
                         <div style={{ position: 'relative' }} ref={addBtnRef}>
@@ -653,7 +703,7 @@ const OutputPanel = ({
             </div>
 
             {/* ── Log content ── */}
-            {activeTab !== 'watch' && (
+            {isLogTab && (
                 <div style={{
                     flex: 1,
                     overflowY: 'auto',
@@ -841,6 +891,14 @@ const OutputPanel = ({
                                                 }}>
                                                     {isInvalid ? '? invalid' : displayVal}
                                                 </span>
+                                                {isRunning && isKeyForced(forcedSet, entry.liveKey) && (
+                                                    <ForcedMarker onClick={onForceWrite ? () => setForceModal({
+                                                        liveKey: entry.liveKey,
+                                                        displayName: entry.displayName,
+                                                        varType: entry.varType,
+                                                        currentValue: val,
+                                                    }) : undefined} />
+                                                )}
                                             </td>
                                             <td style={{ padding: '3px 4px', textAlign: 'center' }}>
                                                 <button
@@ -877,6 +935,96 @@ const OutputPanel = ({
                                                         lineHeight: 1,
                                                     }}
                                                 >✕</button>
+                                            </td>
+                                        </tr>
+                                    );
+                                })}
+                            </tbody>
+                        </table>
+                    )}
+                </div>
+            )}
+
+            {activeTab === 'forces' && (
+                <div style={{ flex: 1, overflowY: 'auto' }}>
+                    {forcedRows.length === 0 ? (
+                        <div style={{
+                            display: 'flex',
+                            flexDirection: 'column',
+                            alignItems: 'center',
+                            justifyContent: 'center',
+                            height: '100%',
+                            gap: 8,
+                            color: '#555',
+                            fontFamily: '"Consolas", "Cascadia Code", monospace',
+                            fontSize: 12,
+                            padding: '0 16px',
+                            textAlign: 'center',
+                        }}>
+                            <ForcedMarker style={{ opacity: 0.35, marginLeft: 0 }} />
+                            <span style={{ fontStyle: 'italic', fontSize: 11 }}>
+                                {isRunning ? t('forces.empty') : t('forces.notRunning')}
+                            </span>
+                            {isRunning && (
+                                <span style={{ fontSize: 10, color: '#444' }}>{t('forces.emptyHint')}</span>
+                            )}
+                        </div>
+                    ) : (
+                        <table style={{
+                            width: '100%',
+                            borderCollapse: 'collapse',
+                            fontSize: 12,
+                            color: '#ccc',
+                            fontFamily: '"Consolas", "Cascadia Code", monospace',
+                        }}>
+                            <thead>
+                                <tr style={{ background: '#1a1a1a', position: 'sticky', top: 0, zIndex: 1 }}>
+                                    <th style={{ padding: '5px 10px', borderBottom: '1px solid #2a2a2a', textAlign: 'left', fontWeight: '600', color: '#555', fontSize: 10, letterSpacing: '0.07em', textTransform: 'uppercase' }}>{t('forces.colVariable')}</th>
+                                    <th style={{ padding: '5px 10px', borderBottom: '1px solid #2a2a2a', textAlign: 'left', fontWeight: '600', color: '#555', fontSize: 10, letterSpacing: '0.07em', textTransform: 'uppercase' }}>{t('tables.type', 'Type')}</th>
+                                    <th style={{ padding: '5px 10px', borderBottom: '1px solid #2a2a2a', textAlign: 'left', fontWeight: '600', color: '#555', fontSize: 10, letterSpacing: '0.07em', textTransform: 'uppercase' }}>{t('forces.colValue')}</th>
+                                    <th style={{ padding: '5px 4px', borderBottom: '1px solid #2a2a2a', width: 90 }}></th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                {forcedRows.map(row => {
+                                    const val = liveVariables ? liveVariables[row.key] : undefined;
+                                    const hasVal = val !== undefined;
+                                    return (
+                                        <tr key={row.key} style={{ borderBottom: '1px solid #1e1e1e', background: 'rgba(255,23,68,0.05)' }}>
+                                            <td style={{ padding: '3px 10px', color: '#7eb8f7', whiteSpace: 'nowrap' }} title={row.key}>
+                                                {row.display}
+                                            </td>
+                                            <td style={{ padding: '3px 10px', color: '#b07040', whiteSpace: 'nowrap' }}>
+                                                {row.varType || '—'}
+                                            </td>
+                                            <td style={{ padding: '3px 10px', whiteSpace: 'nowrap' }}>
+                                                <span style={{ color: hasVal ? '#4ec9b0' : '#555', fontWeight: hasVal ? 700 : 400 }}>
+                                                    {hasVal ? formatVal(val, row.varType) : '---'}
+                                                </span>
+                                                <ForcedMarker onClick={onForceWrite ? () => setForceModal({
+                                                    liveKey: row.key,
+                                                    displayName: row.display,
+                                                    varType: row.varType,
+                                                    currentValue: val,
+                                                }) : undefined} />
+                                            </td>
+                                            <td style={{ padding: '3px 6px', textAlign: 'right' }}>
+                                                <button
+                                                    title={t('forces.unforceTitle')}
+                                                    disabled={!onForceWrite}
+                                                    onClick={() => onForceWrite && onForceWrite(row.key, null, 'unforce')}
+                                                    style={{
+                                                        background: 'transparent',
+                                                        border: '1px solid #ff6d00',
+                                                        borderRadius: 3,
+                                                        color: '#ffab40',
+                                                        fontSize: 10,
+                                                        fontWeight: 700,
+                                                        padding: '1px 8px',
+                                                        cursor: onForceWrite ? 'pointer' : 'default',
+                                                        whiteSpace: 'nowrap',
+                                                    }}
+                                                >{t('forces.unforce')}</button>
                                             </td>
                                         </tr>
                                     );

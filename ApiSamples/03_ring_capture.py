@@ -12,9 +12,16 @@ different things:
                      uniformly spaced. Not loss; the effective sample period is
                      task period_us x stride_N.
     seq gaps         records the transport never delivered. This is real loss.
-    dropped_total    ring-overwrite loss. The FIRST frame's value is attach
-                     backlog (produced before you connected); only later
-                     increases mean the consumer could not keep up.
+    dropped_total    records the server could not deliver (lapped, overwritten,
+                     torn or stuck slots), counted from 0 for THIS connection.
+                     Every unit of it is loss — the server starts at the
+                     producer's current position, so there is no "attach
+                     backlog" to subtract (doing so used to hide real loss).
+
+Frames are wire format v2 (?v=2): each carries the runtime `epoch`; a change
+(Build & Send / restart) makes the client re-fetch /api/v1/ring/info, and each
+record carries the producer's scan counter (consecutive records of a task
+differ by stride_N).
 
 Two things must be current on the device: a ring-enabled runtime (a normal
 Build & Send) and a ring-capable KronServer. A 404 on /api/v1/ring/info means
@@ -56,28 +63,33 @@ def main():
     if args.csv:
         csv = open(args.csv, "w")
         header = [v["name"] for t in layout["tasks"] for v in t["vars"]]
-        csv.write("seq,task_id," + ",".join(header) + "\n")
+        csv.write("seq,task_id,scan," + ",".join(header) + "\n")
 
     records = gaps = 0
     expected = None
-    first_dropped = None
     dropped = 0
+    epochs = 0
     strides = set()
     started = time.monotonic()
 
     try:
         for frame in client.stream_ring_frames(layout, timeout=args.seconds + 10):
             strides.add(frame["stride_n"])
-            if first_dropped is None:
-                first_dropped = frame["dropped_total"]   # attach backlog, not loss
-            dropped = frame["dropped_total"] - first_dropped
-            for seq, task_id, values in frame["records"]:
+            dropped = frame["dropped_total"]              # ALL of it is loss
+            if frame["epoch_changed"]:
+                # Restart / Build & Send: the server resynced to the new run's
+                # write position, so the seq jump is not loss; the layout was
+                # re-fetched (CSV columns follow the ORIGINAL layout).
+                epochs += 1
+                expected = None
+                print(f"runtime epoch changed -> {frame['epoch']} (layout re-fetched)")
+            for seq, task_id, values, scan in frame["records"]:
                 if expected is not None and seq != expected:
                     gaps += seq - expected
                 expected = seq + 1
                 records += 1
                 if csv:
-                    csv.write(f"{seq},{task_id}," +
+                    csv.write(f"{seq},{task_id},{scan}," +
                               ",".join(str(v) for v in values.values()) + "\n")
             if time.monotonic() - started >= args.seconds:
                 break
@@ -89,9 +101,8 @@ def main():
     print(f"{records} records in {elapsed:.2f} s = {records / elapsed:,.0f} scans/s")
     print(f"stride_N seen: {sorted(strides)}"
           f"{'  (decimated — not loss)' if max(strides or [1]) > 1 else ''}")
-    print(f"seq gaps: {gaps}   ring-overwrite loss after attach: {dropped}")
-    if first_dropped:
-        print(f"(attach backlog at connect: {first_dropped} records — expected, ignore)")
+    print(f"seq gaps: {gaps}   records dropped by the server: {dropped}"
+          f"{f'   runtime restarts seen: {epochs}' if epochs else ''}")
     if csv:
         print(f"wrote {args.csv}")
     return 0

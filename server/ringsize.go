@@ -139,6 +139,12 @@ func ringBytesFor(pct float64, memAvailable uint64, producedBytesPerSec float64)
 // runtime adopts it (the runtime only ftruncates when it finds the segment
 // smaller than one header+record). Safe to call before each runtime (re)start —
 // the previous runtime is already stopped by then.
+//
+// ⚠️ The previous RUNTIME is stopped, but KronServer's own shared ring consumer
+// may still have the segment mapped (a stream client stays attached across a
+// restart). Shrinking a mapped file is a SIGBUS on the next touch past the new
+// EOF, which kills the whole agent — so callers go through
+// APIManager.resizeRing / RingConsumer.Resize, never straight here.
 func createRingSegment(shmName string, bytes uint64) error {
 	path := "/dev/shm/" + shmName + "_ring"
 	fd, err := syscall.Open(path, syscall.O_RDWR|syscall.O_CREAT, 0660)

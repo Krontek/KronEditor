@@ -96,7 +96,7 @@ trap cleanup EXIT
 rm -rf "$TMP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources" "$CACHE"
 
-# Single source of truth for the version: package.json (§4 of CLAUDE.md).
+# Single source of truth for the version: package.json (CLAUDE.md).
 VERSION="$(node -p "require('$ROOT/package.json').version")"
 
 # ⚠️ Serialise the Vite build, same reason as the other two scripts: all three
@@ -124,7 +124,7 @@ echo "==> 3/7 Resources"
 ditto "$ROOT/resources" "$APP/Contents/Resources/resources"
 
 # ⚠️ The Krontek static archives are per-ABI and the macOS ones are NOT in the
-# repo — CLAUDE.md §1 makes building .a files the user's job. Without them the
+# repo — CLAUDE.md makes building .a files the user's job. Without them the
 # artifact still Builds & Sends to a PLC (that links the bundled Linux
 # archives), but LOCAL SIMULATION cannot link and fails at the last step.
 DARWIN_LIBS_OK=1

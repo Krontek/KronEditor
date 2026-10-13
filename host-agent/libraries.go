@@ -57,7 +57,7 @@ type libTarget struct {
 // ⚠️ TWO deliberate differences from the Tauri original:
 //
 //  1. The three arm/CortexM/M{0,4,7} bare-metal targets are GONE. Cortex-M
-//     boards were removed from the product (CLAUDE.md §9: the whole runtime
+//     boards were removed from the product (CLAUDE.md: the whole runtime
 //     assumes a Linux userspace, so such a board could only ever simulate),
 //     and neither targetResourceKey nor llvmCompileBaseArgs knows arm-none-eabi
 //     any more. The stale resources/arm-none-eabi-m*/ trees are left untouched.
@@ -260,7 +260,7 @@ func copyTree(src, dst string) error {
 
 // compileObjects compiles each source to an object file in objDir and returns
 // the object paths. Compilation is parallel across sources: the bundled clang
-// is ~242 MB and its cold load dominates each invocation (CLAUDE.md §6), so a
+// is ~242 MB and its cold load dominates each invocation (host-agent/CLAUDE.md), so a
 // serial matrix of 5 targets × N sources spends most of its wall clock in
 // process startup.
 func (s *Server) compileObjects(

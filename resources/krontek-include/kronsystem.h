@@ -727,13 +727,13 @@ static inline void Hour_Meter_Call(Hour_Meter *inst)
  * The edge requirement is the point — a level-triggered version would be held
  * happy by a stuck-true signal, which is the failure it exists to catch.
  * ET counts up from the last kick and stops climbing once it reaches PT.
- * A PT of 0 disables the watchdog (EXPIRED stays false).
+ * A PT of 0 or below disables the watchdog (EXPIRED stays false).
  */
 typedef struct {
     bool     KICK;         /* rising edge feeds the dog — power flow (input)  */
-    uint32_t PT;           /* timeout, microseconds (IEC TIME)       (input)  */
+    int64_t  PT;           /* timeout, microseconds (IEC TIME)       (input)  */
     bool     EXPIRED;      /* no kick within PT                      (output) */
-    uint32_t ET;           /* since the last kick, capped at PT      (output) */
+    int64_t  ET;           /* since the last kick, capped at PT      (output) */
     uint64_t __last_us;    /* monotonic reading of the last kick               */
     bool     __prev_kick;  /* previous scan's KICK, for the edge               */
     bool     __primed;     /* false until the first call has run               */
@@ -765,11 +765,11 @@ static inline void Watchdog_Call(Watchdog *inst)
         return;
     }
 
-    if (inst->PT == 0) { inst->ET = 0; inst->EXPIRED = false; return; }
+    if (inst->PT <= 0) { inst->ET = 0; inst->EXPIRED = false; return; }
 
     d = now - inst->__last_us;
     if (d >= (uint64_t)inst->PT) { inst->ET = inst->PT; inst->EXPIRED = true; }
-    else                         { inst->ET = (uint32_t)d; inst->EXPIRED = false; }
+    else                         { inst->ET = (int64_t)d; inst->EXPIRED = false; }
 }
 
 /*===========================================================================
@@ -987,17 +987,20 @@ static inline void Read_Disk_Free_Call(Read_Disk_Free *inst)
  * device with no error at all. The block scans hwmonN/name for the requested
  * name instead, and re-scans whenever the attribute stops opening.
  *
- * String pins. IEC STRING maps to `char *` in the generated C. The transpiler
- * assigns an input pin from a literal (or a STRING variable) every scan before
- * the call, so the pointer is valid whenever the block reads it, including
- * right after a hot-swap. VALUE is an in-struct BUFFER, not a pointer, so it
- * lives as long as the instance does; Read_Hwmon keeps its own COPY of NAME
- * for the same reason, and detects a changed literal by comparing text.
+ * String pins. An IEC STRING VARIABLE is a value in the generated C — a
+ * `kron_string_t` (char[KRON_STRING_LEN] = 64, a static assert in plc.h keeps
+ * it equal to KRON_SYS_TEXT_LEN) that every assignment COPIES into. These
+ * blocks' INPUT pins stay `const char *`: the transpiler re-points them at a
+ * literal or a STRING variable every scan before the call, so the pointer is
+ * valid whenever the block reads it, including right after a hot-swap. VALUE
+ * is an in-struct BUFFER, not a pointer, so it lives as long as the instance
+ * does and is copied into the variable wired to it; Read_Hwmon keeps its own
+ * COPY of NAME for the same reason, and detects a changed literal by
+ * comparing text.
  *
- * ⚠️ STRING has no IEC_TYPE_SIZES entry, so a STRING variable gets no
- * shared-memory slot and is NOT visible in the live table, over REST or in the
- * HMI. Convert it to a number, or compare it to a BOOL, for anything you need
- * to watch while the program runs.
+ * A STRING is a READ-ONLY live value: its 64-byte shared-memory slot carries
+ * the text (truncated to 63 bytes + NUL), visible in the live table, over REST
+ * and in the HMI, but it cannot be written or forced.
  *
  * POLL_MS = 0 selects the shared default (KRON_SYS_POLL_US). There is no lower
  * clamp: a tachometer may genuinely need a 100 ms read, so the cost of one
@@ -1223,40 +1226,52 @@ static inline void Read_Hwmon_Call(Read_Hwmon *inst)
  * archive, and TIME has no entry there. These blocks fill the gap instead, so
  * their names deliberately avoid the _TO_ spelling.
  *
- * IEC TIME is an UNSIGNED 32-bit count of MICROseconds end to end, which
- * bounds a duration to about 71.6 minutes. Every block below saturates rather
- * than wrapping: a negative result clamps to 0, an overflow to the maximum.
+ * IEC TIME (and LTIME, the same type) is a SIGNED 64-bit count of
+ * MICROseconds end to end (kronstandard.h), so a duration may be negative
+ * (T#-5s) and spans about +/- 292 000 years. Every block below SATURATES at
+ * the int64 limits rather than wrapping (signed overflow is undefined
+ * behaviour in C). T_To_Ms additionally saturates to its DINT output.
+ *
+ * The fields are declared int64_t, not TIME: this header must not depend on
+ * kronstandard.h being included first, and the two are the same type.
  *===========================================================================*/
 
-#define KRON_T_MAX 0xFFFFFFFFu
+#define KRON_T_MAX INT64_MAX
+#define KRON_T_MIN INT64_MIN
 
-/* Clamp a double to the TIME range. */
-static inline uint32_t __kron_t_sat(double v)
+/* Clamp a double to the TIME range. NaN yields 0. (double)INT64_MAX rounds
+ * up to 2^63, so `>=` catches every value that does not fit. */
+static inline int64_t __kron_t_sat(double v)
 {
-    if (v <= 0.0)                     return 0u;
-    if (v >= (double)KRON_T_MAX)      return KRON_T_MAX;
-    return (uint32_t)v;
+    if (v != v)                       return 0;
+    if (v >= 9223372036854775808.0)   return KRON_T_MAX;
+    if (v < -9223372036854775808.0)   return KRON_T_MIN;
+    return (int64_t)v;
 }
 
 /* ── T_To_Ms — TIME to whole milliseconds ─────────────────────────────── */
 typedef struct {
-    uint32_t IN;    /* duration, microseconds                  (input)  */
-    int32_t  OUT;   /* whole milliseconds, truncated           (output) */
+    int64_t  IN;    /* duration, microseconds                  (input)  */
+    int32_t  OUT;   /* whole ms, truncated toward 0, saturated (output) */
     bool     EN;    /* enable — power flow                     (input)  */
     bool     ENO;   /* echoes EN                               (output) */
 } T_To_Ms;
 
 static inline void T_To_Ms_Call(T_To_Ms *inst)
 {
+    int64_t ms;
     inst->ENO = inst->EN;
     if (!inst->EN) return;
-    inst->OUT = (int32_t)(inst->IN / 1000u);
+    ms = inst->IN / 1000;                       /* C division truncates toward 0 */
+    if (ms > INT32_MAX)      inst->OUT = INT32_MAX;   /* > ~24.8 days */
+    else if (ms < INT32_MIN) inst->OUT = INT32_MIN;
+    else                     inst->OUT = (int32_t)ms;
 }
 
 /* ── Ms_To_T — whole milliseconds to TIME ─────────────────────────────── */
 typedef struct {
-    int32_t  IN;    /* milliseconds; negative clamps to 0      (input)  */
-    uint32_t OUT;   /* duration, microseconds                  (output) */
+    int32_t  IN;    /* milliseconds, may be negative           (input)  */
+    int64_t  OUT;   /* duration, microseconds (exact)          (output) */
     bool     EN;    /* enable — power flow                     (input)  */
     bool     ENO;   /* echoes EN                               (output) */
 } Ms_To_T;
@@ -1265,12 +1280,12 @@ static inline void Ms_To_T_Call(Ms_To_T *inst)
 {
     inst->ENO = inst->EN;
     if (!inst->EN) return;
-    inst->OUT = __kron_t_sat((double)inst->IN * 1000.0);
+    inst->OUT = (int64_t)inst->IN * 1000;       /* |IN| < 2^31: cannot overflow */
 }
 
 /* ── T_To_Sec — TIME to fractional seconds ────────────────────────────── */
 typedef struct {
-    uint32_t IN;    /* duration, microseconds                  (input)  */
+    int64_t  IN;    /* duration, microseconds                  (input)  */
     float    OUT;   /* seconds, fractional                     (output) */
     bool     EN;    /* enable — power flow                     (input)  */
     bool     ENO;   /* echoes EN                               (output) */
@@ -1285,8 +1300,8 @@ static inline void T_To_Sec_Call(T_To_Sec *inst)
 
 /* ── Sec_To_T — fractional seconds to TIME ────────────────────────────── */
 typedef struct {
-    float    IN;    /* seconds; negative clamps to 0           (input)  */
-    uint32_t OUT;   /* duration, microseconds                  (output) */
+    float    IN;    /* seconds, may be negative                (input)  */
+    int64_t  OUT;   /* duration, microseconds, saturating      (output) */
     bool     EN;    /* enable — power flow                     (input)  */
     bool     ENO;   /* echoes EN                               (output) */
 } Sec_To_T;
@@ -1300,41 +1315,47 @@ static inline void Sec_To_T_Call(Sec_To_T *inst)
 
 /* ── Add_T — sum of two durations ─────────────────────────────────────── */
 typedef struct {
-    uint32_t IN1;   /*                                         (input)  */
-    uint32_t IN2;   /*                                         (input)  */
-    uint32_t OUT;   /* IN1 + IN2, saturating                   (output) */
+    int64_t  IN1;   /*                                         (input)  */
+    int64_t  IN2;   /*                                         (input)  */
+    int64_t  OUT;   /* IN1 + IN2, saturating                   (output) */
     bool     EN;    /* enable — power flow                     (input)  */
     bool     ENO;   /* echoes EN                               (output) */
 } Add_T;
 
 static inline void Add_T_Call(Add_T *inst)
 {
+    int64_t r;
     inst->ENO = inst->EN;
     if (!inst->EN) return;
-    inst->OUT = __kron_t_sat((double)inst->IN1 + (double)inst->IN2);
+    if (__builtin_add_overflow(inst->IN1, inst->IN2, &r))
+        r = (inst->IN2 > 0) ? KRON_T_MAX : KRON_T_MIN;
+    inst->OUT = r;
 }
 
 /* ── Sub_T — difference of two durations ──────────────────────────────── */
 typedef struct {
-    uint32_t IN1;   /*                                         (input)  */
-    uint32_t IN2;   /*                                         (input)  */
-    uint32_t OUT;   /* IN1 - IN2, clamped at 0                 (output) */
+    int64_t  IN1;   /*                                         (input)  */
+    int64_t  IN2;   /*                                         (input)  */
+    int64_t  OUT;   /* IN1 - IN2, may be negative, saturating  (output) */
     bool     EN;    /* enable — power flow                     (input)  */
     bool     ENO;   /* echoes EN                               (output) */
 } Sub_T;
 
 static inline void Sub_T_Call(Sub_T *inst)
 {
+    int64_t r;
     inst->ENO = inst->EN;
     if (!inst->EN) return;
-    inst->OUT = (inst->IN1 > inst->IN2) ? (inst->IN1 - inst->IN2) : 0u;
+    if (__builtin_sub_overflow(inst->IN1, inst->IN2, &r))
+        r = (inst->IN2 < 0) ? KRON_T_MAX : KRON_T_MIN;
+    inst->OUT = r;
 }
 
 /* ── Mul_T — scale a duration ─────────────────────────────────────────── */
 typedef struct {
-    uint32_t IN;    /*                                         (input)  */
+    int64_t  IN;    /*                                         (input)  */
     float    N;     /* scale factor                            (input)  */
-    uint32_t OUT;   /* IN * N, saturating                      (output) */
+    int64_t  OUT;   /* IN * N, saturating                      (output) */
     bool     EN;    /* enable — power flow                     (input)  */
     bool     ENO;   /* echoes EN                               (output) */
 } Mul_T;
@@ -1348,9 +1369,9 @@ static inline void Mul_T_Call(Mul_T *inst)
 
 /* ── Div_T — divide a duration ────────────────────────────────────────── */
 typedef struct {
-    uint32_t IN;    /*                                         (input)  */
+    int64_t  IN;    /*                                         (input)  */
     float    N;     /* divisor; 0 yields OUT = 0               (input)  */
-    uint32_t OUT;   /* IN / N, saturating                      (output) */
+    int64_t  OUT;   /* IN / N, saturating                      (output) */
     bool     EN;    /* enable — power flow                     (input)  */
     bool     ENO;   /* echoes EN                               (output) */
 } Div_T;
@@ -1359,7 +1380,7 @@ static inline void Div_T_Call(Div_T *inst)
 {
     inst->ENO = inst->EN;
     if (!inst->EN) return;
-    if (inst->N == 0.0f) { inst->OUT = 0u; return; }
+    if (inst->N == 0.0f) { inst->OUT = 0; return; }
     inst->OUT = __kron_t_sat((double)inst->IN / (double)inst->N);
 }
 
@@ -1375,15 +1396,15 @@ static inline void Div_T_Call(Div_T *inst)
  * OUT starts true. Dropping ENABLE forces OUT false and restarts the phase, so
  * the first high period after re-enabling is always a full one.
  * A dwell of 0 toggles on every scan — that is the literal reading of the
- * request, not a disabled blinker.
+ * request, not a disabled blinker. A negative dwell behaves as 0.
  *
  * ⚠️ Resolution is bounded by the task interval, like every timer here: the
  * observed half-period is the dwell rounded up to a multiple of the scan.
  */
 typedef struct {
     bool     ENABLE;       /* run — power flow                       (input)  */
-    uint32_t T_LOW;        /* low dwell, microseconds (IEC TIME)     (input)  */
-    uint32_t T_HIGH;       /* high dwell, microseconds (IEC TIME)    (input)  */
+    int64_t  T_LOW;        /* low dwell, microseconds (IEC TIME)     (input)  */
+    int64_t  T_HIGH;       /* high dwell, microseconds (IEC TIME)    (input)  */
     bool     OUT;          /*                                        (output) */
     uint64_t __change_us;  /* monotonic reading of the last edge               */
     bool     __primed;     /* false while disabled                             */
@@ -1392,7 +1413,7 @@ typedef struct {
 static inline void Blink_Call(Blink *inst)
 {
     uint64_t now;
-    uint32_t dwell;
+    int64_t  dwell;
 
     if (!inst->ENABLE) {
         inst->OUT     = false;
@@ -1410,6 +1431,7 @@ static inline void Blink_Call(Blink *inst)
     if (now < inst->__change_us) inst->__change_us = now;   /* clock stepped back */
 
     dwell = inst->OUT ? inst->T_HIGH : inst->T_LOW;
+    if (dwell < 0) dwell = 0;
     if ((now - inst->__change_us) >= (uint64_t)dwell) {
         inst->OUT         = !inst->OUT;
         inst->__change_us = now;
@@ -1424,11 +1446,11 @@ static inline void Blink_Call(Blink *inst)
  *
  * OUT adopts IN on the first scan rather than defaulting to false, so a switch
  * already closed at start-up is not reported as open for PT.
- * A PT of 0 makes OUT track IN directly.
+ * A PT of 0 or below makes OUT track IN directly.
  */
 typedef struct {
     bool     IN;           /* raw signal — power flow                (input)  */
-    uint32_t PT;           /* settle time, microseconds (IEC TIME)   (input)  */
+    int64_t  PT;           /* settle time, microseconds (IEC TIME)   (input)  */
     bool     OUT;          /* debounced signal                       (output) */
     uint64_t __since_us;   /* when the candidate value first appeared          */
     bool     __candidate;  /* the value IN currently holds                     */
@@ -1455,7 +1477,7 @@ static inline void Debounce_Call(Debounce *inst)
     }
 
     if (inst->__candidate != inst->OUT
-        && (now - inst->__since_us) >= (uint64_t)inst->PT) {
+        && (inst->PT <= 0 || (now - inst->__since_us) >= (uint64_t)inst->PT)) {
         inst->OUT = inst->__candidate;
     }
 }
@@ -1469,11 +1491,11 @@ static inline void Debounce_Call(Debounce *inst)
  *         An unknown mode falls back to sine.
  *
  * The phase origin is captured when EN goes true, so the waveform always
- * starts at phase 0. A PERIOD of 0 holds OUT at OFFSET.
+ * starts at phase 0. A PERIOD of 0 or below holds OUT at OFFSET.
  */
 typedef struct {
     uint8_t  MODE;         /* 0 sine, 1 square, 2 triangle, 3 saw    (input)  */
-    uint32_t PERIOD;       /* microseconds (IEC TIME)                (input)  */
+    int64_t  PERIOD;       /* microseconds (IEC TIME)                (input)  */
     float    AMPLITUDE;    /* peak deviation from OFFSET             (input)  */
     float    OFFSET;       /* centre value                           (input)  */
     float    OUT;          /*                                        (output) */
@@ -1496,7 +1518,7 @@ static inline void Gen_Signal_Call(Gen_Signal *inst)
     if (!inst->__primed) { inst->__primed = true; inst->__origin_us = now; }
     if (now < inst->__origin_us) inst->__origin_us = now;   /* clock stepped back */
 
-    if (inst->PERIOD == 0u) { inst->OUT = inst->OFFSET; return; }
+    if (inst->PERIOD <= 0) { inst->OUT = inst->OFFSET; return; }
 
     phase = (double)((now - inst->__origin_us) % (uint64_t)inst->PERIOD)
           / (double)inst->PERIOD;                            /* 0.0 .. 1.0 */

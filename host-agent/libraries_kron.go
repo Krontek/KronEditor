@@ -192,7 +192,7 @@ func (s *Server) runUpdateLibraries(repos []string) error {
 		// layout resources/krontek-include/ already has and what the generated
 		// kron_hal.h / host_glue.c include by bare name. Until then, the HAL
 		// headers are edited directly in resources/krontek-include/HAL/ (and
-		// mirrored from KrontekLibraries if present — CLAUDE.md §1).
+		// mirrored from KrontekLibraries if present — CLAUDE.md).
 		isHAL := strings.EqualFold(repo, "KronHAL")
 		dst := stageInclude
 		if isHAL {
@@ -253,7 +253,7 @@ func (s *Server) runUpdateLibraries(repos []string) error {
 	}
 
 	// ⚠️ The GitHub clone is NOT written back over a local KrontekLibraries/.
-	// The Tauri version did that, but CLAUDE.md §1 makes KrontekLibraries the
+	// The Tauri version did that, but CLAUDE.md makes KrontekLibraries the
 	// SOURCE OF TRUTH that is edited first — so copying GitHub state onto it
 	// would silently overwrite exactly the local work it is meant to hold.
 	if local := localKrontekLibrariesDir(); local != "" {
@@ -434,7 +434,7 @@ func soemBuildInputs(libName, platform, soemRoot string) (flags []string, includ
 // build actions and must survive — the Tauri version wiped the whole include
 // dir and got away with it only because it rebuilt SOEM in the same pass.
 //
-// ⚠️ Headers live in ONE place now (CLAUDE.md §1/§3). The original copied them
+// ⚠️ Headers live in ONE place now (CLAUDE.md). The original copied them
 // into every resources/<triple>/include/; those copies were consolidated
 // precisely because drift between them was a recurring bug, so this must not
 // grow back into a per-target loop.
@@ -459,13 +459,13 @@ func (s *Server) installKrontekHeaders(stageInclude string) error {
 	// followed by a fresh copy). The moment KronHAL stopped being a repo,
 	// nothing staged HAL/ any more — so a successful "Build Libraries" run
 	// silently deleted all five committed kronhal_*.h files, the very headers
-	// CLAUDE.md §1 names the source of truth. They only survived because they
+	// CLAUDE.md names the source of truth. They only survived because they
 	// are tracked in git.
 	//
 	// Within a scope the replacement is still complete, so a header deleted
 	// upstream stops shadowing the new tree.
 	// ⚠️ ...and the same trap exists one scope over, for a single file rather
-	// than a directory: kronsystem.h is authored in-repo (CLAUDE.md §14), not
+	// than a directory: kronsystem.h is authored in-repo (src/services/CLAUDE.md), not
 	// cloned from any Krontek repo, so nothing ever stages it and the
 	// top-level wipe deleted it on every successful run — taking all 25
 	// SYSTEM/TIMERS blocks with it. Like the HAL headers, it only survived

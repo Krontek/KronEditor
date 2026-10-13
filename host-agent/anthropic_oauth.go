@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"html"
 	"io"
 	"net/http"
 	"net/url"
@@ -173,11 +174,22 @@ func (s *Server) handleAnthropicOAuthExchange(w http.ResponseWriter, r *http.Req
 func (s *Server) handleAnthropicOAuthCallback(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	code, state := q.Get("code"), q.Get("state")
+	// ⚠️ Every interpolated string is HTML-escaped and the page carries a
+	// no-script CSP: this handler is reachable by any link a user clicks, and
+	// it used to reflect the `error` query parameter verbatim (reflected XSS on
+	// the agent's own origin, which can drive file I/O and compile/exec).
 	page := func(title, msg string) {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		fmt.Fprintf(w, `<!doctype html><meta charset=utf-8><title>%s</title><body style="font-family:system-ui;background:#1e1e1e;color:#ddd;display:flex;align-items:center;justify-content:center;height:100vh;margin:0"><div style="text-align:center"><h2 style="color:#4ec9b0">%s</h2><p>%s</p></div>`, title, title, msg)
+		w.Header().Set("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'")
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		t, m := html.EscapeString(title), html.EscapeString(msg)
+		fmt.Fprintf(w, `<!doctype html><meta charset=utf-8><title>%s</title><body style="font-family:system-ui;background:#1e1e1e;color:#ddd;display:flex;align-items:center;justify-content:center;height:100vh;margin:0"><div style="text-align:center"><h2 style="color:#4ec9b0">%s</h2><p>%s</p></div>`, t, t, m)
 	}
 	if errMsg := q.Get("error"); errMsg != "" {
+		// The provider's error code is shown escaped and truncated, never raw.
+		if len(errMsg) > 64 {
+			errMsg = errMsg[:64] + "..."
+		}
 		page("Authorization failed", "Claude returned: "+errMsg+". You can close this tab.")
 		return
 	}

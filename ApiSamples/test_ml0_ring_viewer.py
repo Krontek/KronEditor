@@ -12,11 +12,11 @@ sys.path.insert(0, os.path.dirname(__file__))
 from ml0_ring_viewer import RingReader
 
 
-def build_frame(records, stride_n=1, dropped=0):
-    """records = [(seq, task_id, payload_bytes), ...] -> full frame incl. length prefix."""
-    body = struct.pack("<IIQ", len(records), stride_n, dropped)
+def build_frame(records, stride_n=1, dropped=0, epoch=1):
+    """records = [(seq, task_id, payload_bytes), ...] -> full v2 frame incl. length prefix."""
+    body = struct.pack("<HHIIQQ", 2, 28, len(records), stride_n, dropped, epoch)
     for seq, tid, payload in records:
-        body += struct.pack("<QHH", seq, tid, len(payload)) + payload
+        body += struct.pack("<QHHI", seq, tid, len(payload), seq) + payload
     return struct.pack("<I", len(body)) + body
 
 
@@ -77,7 +77,18 @@ def test_stride_and_dropped_surface():
     print("ok stride/dropped: stride_N=5 dropped=42 surfaced")
 
 
+def test_epoch_change_requests_relayout():
+    r = make_reader([{"ml": 0, "name": "v", "fmt": "q", "size": 8,
+                      "task_id": 0, "poff": 0, "count": 0, "value": None}])
+    r._apply_frame(build_frame([(0, 0, struct.pack("<q", 7))], epoch=1)[4:])
+    n = r._apply_frame(build_frame([(9, 0, struct.pack("<q", 1))], epoch=2)[4:])
+    assert n == 0 and r.relayout and r.restarts == 1, (n, r.relayout)
+    assert r.vars[0]["value"] == 7   # nothing decoded with the stale layout
+    print("ok epoch: change flagged, stale layout not used")
+
+
 if __name__ == "__main__":
+    test_epoch_change_requests_relayout()
     test_single_lint_counts_and_current_value()
     test_cumulative_across_frames()
     test_two_vars_same_task_payload_offsets()

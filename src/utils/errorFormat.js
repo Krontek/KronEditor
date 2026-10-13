@@ -13,7 +13,7 @@
  * chains. The previous behavior split that raw text on '\n' and logged EVERY
  * line as its own error row — so a single real error produced 4-6 unreadable
  * rows and the one line that actually said what broke had no visual priority
- * over the noise around it. See CLAUDE.md §5 compile-gate notes and the
+ * over the noise around it. See src/services/CLAUDE.md compile-gate notes and the
  * host-agent compile.go / hotswap.go comments this mirrors.
  */
 

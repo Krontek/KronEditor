@@ -479,5 +479,23 @@
         "LT": "Q = TRUE while IN1 < IN2.",
         "Read_System_Time": "Real-time-clock read. While EN is TRUE, TIME is refreshed every scan with the milliseconds since LOCAL MIDNIGHT (0…86 399 999 — the IEC time-of-day reading), taken from the OS wall clock. While EN is FALSE the last value is held and ENO is FALSE. It is a clock, not a stopwatch: the value jumps backwards at midnight and on any NTP or DST correction, so use a TON/TONR timer to measure elapsed time. On a target board the reading is only as good as the board's RTC/NTP setup.",
         "enNote": "Execution Control is ON: the block body runs only while EN is TRUE; ENO mirrors EN so following blocks can chain on it."
+    },
+    "forces": {
+        "markerTitle": "Forced: the value is held by a force. Click to change or release it.",
+        "tab": "Force list",
+        "colVariable": "Variable",
+        "colValue": "Current value",
+        "unforce": "Unforce",
+        "unforceTitle": "Release this force: the program controls the variable again",
+        "unforceAll": "Unforce all",
+        "unforceAllTitle": "Release every force on the running PLC / simulation",
+        "empty": "No variables are forced.",
+        "emptyHint": "Force a value from the variable table, a ladder element, the ST editor or the watch table. It is listed here with an Unforce button.",
+        "notRunning": "Nothing is running. Forces are listed here while a PLC or simulation runs.",
+        "indicator": "FORCED ({{count}})",
+        "indicatorTitle": "{{count}} variable(s) are forced: their values are held, not computed by the program. Click to open the Force list.",
+        "unforceAllDone": "All forces released.",
+        "unforceAllFailed": "Unforce all failed: {{error}}",
+        "notStreamed": "not on screen"
     }
 }

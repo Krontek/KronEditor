@@ -6,25 +6,41 @@ const TASK_COLORS = [
     '#f44336', '#2196f3', '#e91e63', '#009688',
 ];
 
+// Parses any IEC duration (compound `T#1s500ms`, `T#1m`, `_` separators) to
+// µs and picks the largest of s/ms/us that represents it EXACTLY. The old
+// suffix test read `T#1s500ms` as 1 ms and fell back to a silent 10 ms for
+// `T#1m` — the card showed (and the next edit wrote back) a different interval
+// from the one the transpiler compiles.
+const TIME_UNIT_US = { D: 86400e6, H: 3600e6, M: 60e6, S: 1e6, MS: 1e3, US: 1, NS: 1e-3 };
 const parseInterval = (str) => {
-    const s = (str || 'T#10ms').toUpperCase().replace(/^T#|^TIME#/, '');
-    if (s.endsWith('MS')) return { value: parseFloat(s), unit: 'ms' };
-    if (s.endsWith('US')) return { value: parseFloat(s), unit: 'us' };
-    if (s.endsWith('S')) return { value: parseFloat(s), unit: 's' };
-    return { value: 10, unit: 'ms' };
+    const s = String(str || 'T#10ms').trim().toUpperCase().replace(/^(?:TIME|T)#/, '').replace(/_/g, '');
+    const re = /(\d+(?:\.\d+)?)(MS|US|NS|D|H|M|S)/y;
+    let us = 0, idx = 0;
+    while (idx < s.length) {
+        re.lastIndex = idx;
+        const m = re.exec(s);
+        if (!m) return { value: 10, unit: 'ms' };
+        us += parseFloat(m[1]) * TIME_UNIT_US[m[2]];
+        idx = re.lastIndex;
+    }
+    us = Math.round(us);
+    if (!(us > 0)) return { value: 10, unit: 'ms' };
+    if (us % 1e6 === 0) return { value: us / 1e6, unit: 's' };
+    if (us % 1e3 === 0) return { value: us / 1e3, unit: 'ms' };
+    return { value: us, unit: 'us' };
 };
 
 const fmtInterval = (value, unit) => `T#${value}${unit}`;
 
-// ⚠️ Values here are MICROseconds. Both inputs this formats — the runtime's
 // SCHED_FIFO priority bounds (Linux). A task with no stored value predates the
 // field and gets the maximum, matching what the runtime hardcoded before.
 export const RT_PRIORITY_MIN = 1;
 export const RT_PRIORITY_MAX = 99;
 export const DEFAULT_RT_PRIORITY = 99;
 
+// ⚠️ Values here are MICROseconds. Both inputs this formats — the
 // `__exec_us_<prog>` field and the task interval parsed into `ivUs` — are µs
-// (CLAUDE.md §5 "exec-time is MICROseconds"). It used to be `fmtExecNs` and
+// (src/services/CLAUDE.md "exec-time is MICROseconds"). It used to be `fmtExecNs` and
 // treated its argument as NANOseconds, so every number on the running task card
 // was displayed 1000x too small: a T#1s task interval rendered as "1.00ms" and
 // a T#1ms one as "1.0µs". Overrun detection was never affected — that compares
@@ -56,7 +72,7 @@ export default function TaskManager({
     const update = (newTasks) => onTaskConfigChange({ ...(taskConfig || {}), tasks: newTasks });
 
     const assignedSet = new Map();
-    tasks.forEach(t => t.programs.forEach(p => assignedSet.set(p.program, t.id)));
+    tasks.forEach(t => (t.programs || []).forEach(p => assignedSet.set(p.program, t.id)));
     const unassigned = programs.filter(p => !assignedSet.has(p.name));
 
     // SCHED_FIFO priority for this task's scan thread. 99 (the maximum) is the
@@ -92,7 +108,7 @@ export default function TaskManager({
         setOpenDropdown(null);
         update(tasks.map(t => {
             if (t.id !== taskId) return t;
-            return { ...t, programs: [...t.programs, { program: progName, priority: t.programs.length }] };
+            return { ...t, programs: [...(t.programs || []), { program: progName, priority: (t.programs || []).length }] };
         }));
     };
 
@@ -100,7 +116,7 @@ export default function TaskManager({
         update(tasks.map(t => {
             if (t.id !== taskId) return t;
             return {
-                ...t, programs: t.programs
+                ...t, programs: (t.programs || [])
                     .filter(p => p.program !== progName)
                     .sort((a, b) => a.priority - b.priority)
                     .map((p, i) => ({ ...p, priority: i })),
@@ -111,7 +127,7 @@ export default function TaskManager({
     const moveProgram = (taskId, progName, dir) => {
         update(tasks.map(t => {
             if (t.id !== taskId) return t;
-            const sorted = [...t.programs].sort((a, b) => a.priority - b.priority);
+            const sorted = [...(t.programs || [])].sort((a, b) => a.priority - b.priority);
             const idx = sorted.findIndex(p => p.program === progName);
             const to = idx + dir;
             if (to < 0 || to >= sorted.length) return t;
@@ -160,8 +176,8 @@ export default function TaskManager({
                 {tasks.map((task, ti) => {
                     const color = TASK_COLORS[ti % TASK_COLORS.length];
                     const iv = parseInterval(task.interval);
-                    const sorted = [...task.programs].sort((a, b) => a.priority - b.priority);
-                    const available = programs.filter(p => !task.programs.some(tp => tp.program === p.name));
+                    const sorted = [...(task.programs || [])].sort((a, b) => a.priority - b.priority);
+                    const available = programs.filter(p => !(task.programs || []).some(tp => tp.program === p.name));
                     const ivUs = iv.unit === 'us' ? iv.value : iv.unit === 'ms' ? iv.value * 1000 : iv.value * 1_000_000;
                     const totalExecUs = sorted.reduce((sum, p) => {
                         const us = liveVariables?.[`prog____exec_us_${p.program.replace(/\s+/g, '_')}`];

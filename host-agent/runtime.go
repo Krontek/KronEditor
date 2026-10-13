@@ -102,7 +102,7 @@ func (s *Server) handleRunSimulation(w http.ResponseWriter, r *http.Request) {
 			"the plain simulation runtime is Linux-only; this platform uses the hot-swap runtime (POST /api/host/hotswap/run)")
 		return
 	}
-	buildDir := s.paths.BuildDir()
+	buildDir := s.paths.SimBuildDir()
 	binPath := filepath.Join(buildDir, simBin)
 	varTablePath := filepath.Join(buildDir, "variables.json")
 
@@ -141,6 +141,9 @@ func (s *Server) handleRunSimulation(w http.ResponseWriter, r *http.Request) {
 	// hotswaphost/host.c), so a privileged plain sim can only be stopped
 	// through privilegedKill — see handleStopSimulation.
 	cmd, launchNote := runtimeLaunchCmd(binPath, nil)
+	// retain.dat is written to the runtime's cwd; without this it landed in
+	// whatever directory the agent happened to be started from.
+	cmd.Dir = buildDir
 	cmd.Stdout = nil
 	cmd.Stderr = nil
 	if launchNote != "" {
@@ -234,9 +237,9 @@ func (s *Server) handleStopSimulation(w http.ResponseWriter, r *http.Request) {
 type writeVariableReq struct {
 	Name  string `json:"name"`
 	Value string `json:"value"`
-	// Mode selects the force-flag semantics in the hot-swap sim: "force" (default)
-	// holds the value every scan; "pulse" injects it for a single scan then the
-	// logic resumes (the generated plc_shm_pull auto-clears a pulse flag).
+	// Mode (hot-swap sim): "force" (default) writes once and holds the value
+	// every scan; "pulse" writes it once and the logic owns it from the same
+	// scan; "unforce" releases the hold (a non-empty Value is written once).
 	Mode string `json:"mode"`
 }
 
@@ -667,18 +670,26 @@ type pollSpec struct {
 // variables are dropped from the plan instead of being re-tested every tick.
 func newPollSpec(key, vtype string, offset uint64) (pollSpec, bool) {
 	size := typeSize(vtype)
+	if size == 0 && isTextType(vtype) {
+		// A STRING field in PlcState IS its text (kron_string_t, a fixed
+		// char[plcStringBytes] — value semantics), so the legacy /proc/mem
+		// poller reads it in place at its DWARF/byte_offset address, exactly
+		// like the mirror slot. decodeValue stops at the first NUL.
+		size = plcStringBytes
+	}
 	if size == 0 {
 		return pollSpec{}, false
 	}
 	return pollSpec{key: key, vtype: strings.ToUpper(vtype), offset: int64(offset), size: size}, true
 }
 
+// plcStringBytes is the size of a STRING field in PlcState (kron_string_t):
+// STRING_SHM_BYTES in CTranspilerService.js, KRON_STRING_LEN in plc.h.
+const plcStringBytes = 64
+
 // newMirrorPollSpec is newPollSpec for the SHM MIRROR, where a slot's width
-// comes from the deployed variable table instead of the C type. ⚠️ The two
-// cannot be merged: the legacy /proc/mem poller reads PlcState directly, where
-// a STRING field is an 8-byte `char *` and not the text, so typeSize keeps
-// returning 0 for it and that poller keeps skipping it. Reading the table
-// width there would hand back whatever bytes follow the pointer.
+// comes from the deployed variable table instead of the C type (an untrusted
+// on-disk value, hence the maxMirrorSlotBytes bound).
 func newMirrorPollSpec(key, vtype string, offset uint64, tableSize int) (pollSpec, bool) {
 	size := typeSize(vtype)
 	if size == 0 && isTextType(vtype) {
@@ -704,12 +715,14 @@ func typeSize(t string) int {
 		return 1
 	case "INT", "UINT", "WORD":
 		return 2
-	case "DINT", "UDINT", "TIME", "REAL", "DWORD":
+	case "DINT", "UDINT", "REAL", "DWORD":
 		return 4
-	case "LINT", "ULINT", "LREAL", "LWORD":
+	// TIME/LTIME: a signed 64-bit count of microseconds (kronstandard.h).
+	case "LINT", "ULINT", "LREAL", "LWORD", "TIME", "LTIME":
 		return 8
 	case "TON", "TOF":
-		return 16
+		// PT, ET, StartTime (int64 each) + IN, Q, M, padded to 8.
+		return 32
 	case "CTU":
 		return 8
 	default:
@@ -731,12 +744,12 @@ func decodeValue(buf []byte, t string) interface{} {
 		return binary.LittleEndian.Uint16(buf[:2])
 	case "DINT":
 		return int32(binary.LittleEndian.Uint32(buf[:4]))
-	case "UDINT", "TIME", "DWORD":
+	case "UDINT", "DWORD":
 		return binary.LittleEndian.Uint32(buf[:4])
-	case "LINT":
-		return int64(binary.LittleEndian.Uint64(buf[:8]))
+	case "LINT", "TIME", "LTIME":
+		return jsonSafe64(int64(binary.LittleEndian.Uint64(buf[:8])))
 	case "ULINT", "LWORD":
-		return binary.LittleEndian.Uint64(buf[:8])
+		return jsonSafe64(binary.LittleEndian.Uint64(buf[:8]))
 	case "REAL":
 		return sanitizeFloat(float64(math.Float32frombits(binary.LittleEndian.Uint32(buf[:4]))), true)
 	case "LREAL":
@@ -752,14 +765,14 @@ func decodeValue(buf []byte, t string) interface{} {
 		}
 		return strings.ToValidUTF8(string(b), "")
 	case "TON", "TOF":
-		if len(buf) >= 15 {
+		if len(buf) >= 27 {
 			return map[string]interface{}{
-				"PT":        binary.LittleEndian.Uint32(buf[0:4]),
-				"ET":        binary.LittleEndian.Uint32(buf[4:8]),
-				"StartTime": binary.LittleEndian.Uint32(buf[8:12]),
-				"IN":        buf[12] != 0,
-				"Q":         buf[13] != 0,
-				"M":         buf[14] != 0,
+				"PT":        jsonSafe64(int64(binary.LittleEndian.Uint64(buf[0:8]))),
+				"ET":        jsonSafe64(int64(binary.LittleEndian.Uint64(buf[8:16]))),
+				"StartTime": jsonSafe64(int64(binary.LittleEndian.Uint64(buf[16:24]))),
+				"IN":        buf[24] != 0,
+				"Q":         buf[25] != 0,
+				"M":         buf[26] != 0,
 			}
 		}
 	case "CTU":
@@ -836,7 +849,7 @@ func encodeValue(t, value string) ([]byte, bool) {
 		out := make([]byte, 4)
 		binary.LittleEndian.PutUint32(out, uint32(int32(v)))
 		return out, true
-	case "UDINT", "TIME", "DWORD":
+	case "UDINT", "DWORD":
 		v, err := strconv.ParseUint(s, 10, 32)
 		if err != nil {
 			return nil, false
@@ -844,7 +857,9 @@ func encodeValue(t, value string) ([]byte, bool) {
 		out := make([]byte, 4)
 		binary.LittleEndian.PutUint32(out, uint32(v))
 		return out, true
-	case "LINT":
+	case "LINT", "TIME", "LTIME":
+		// TIME/LTIME are int64 microseconds; the editor sends the decimal µs
+		// count (a string, so a value beyond 2^53 survives JSON exactly).
 		v, err := strconv.ParseInt(s, 10, 64)
 		if err != nil {
 			return nil, false
@@ -893,4 +908,24 @@ func writeProcMem(pid int, address uint64, data []byte) error {
 		return fmt.Errorf("write at 0x%x: %w", address, err)
 	}
 	return nil
+}
+
+// jsonSafe64 keeps a 64-bit integer a number while a double (the editor's
+// JSON.parse) holds it exactly, and turns it into a DECIMAL STRING beyond
+// ±2^53 — same rule as KronServer's /stream/vars, and the write path parses
+// the string form back exactly (strconv), so a value can be written back
+// verbatim.
+func jsonSafe64(v any) any {
+	const maxExact = 1 << 53
+	switch n := v.(type) {
+	case int64:
+		if n > maxExact || n < -maxExact {
+			return strconv.FormatInt(n, 10)
+		}
+	case uint64:
+		if n > maxExact {
+			return strconv.FormatUint(n, 10)
+		}
+	}
+	return v
 }

@@ -20,10 +20,9 @@ import (
 //
 // Output is the name of the binary to produce. Defaults to "runtime.bin".
 //
-// CompilerArgs are passed verbatim to gcc, appended after the source files.
-// Frontend controls -I, -l, -O, etc. — this keeps the agent generic during
-// PoC. The cross-compile + sysroot logic will move server-side in a later
-// stage.
+// CompilerArgs must be empty: a non-empty list is refused with 400 (see
+// handleBuild). The field stays in the schema so an old client gets a clear
+// error instead of having its flags silently ignored.
 type buildRequest struct {
 	Sources      map[string]string `json:"sources"`
 	Output       string            `json:"output"`
@@ -52,6 +51,15 @@ func handleBuild(w http.ResponseWriter, r *http.Request) {
 	}
 	if len(req.Sources) == 0 {
 		writeError(w, http.StatusBadRequest, "sources is empty")
+		return
+	}
+	// ⚠️ compilerArgs are REFUSED outright. The only caller (Settings' PoC
+	// "test host build" button) never sends any, and a denylist over a
+	// compiler's flag surface (rejectedCompilerArg, kept below as a second
+	// line) is never complete — any page that reaches this endpoint could
+	// otherwise steer what the compiler reads, loads or writes.
+	if len(req.CompilerArgs) > 0 {
+		writeError(w, http.StatusBadRequest, "compilerArgs are not accepted by this endpoint")
 		return
 	}
 	if req.Output == "" {

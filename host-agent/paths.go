@@ -47,14 +47,97 @@ func NewPaths(resourcesRoot, toolchainsRoot, appDataDir string) (*Paths, error) 
 	if p.AppDataDir == "" {
 		p.AppDataDir = defaultAppDataDir()
 	}
-	if err := os.MkdirAll(p.BuildDir(), 0o755); err != nil {
+	if err := os.MkdirAll(p.SimBuildDir(), 0o755); err != nil {
 		return nil, fmt.Errorf("create build dir: %w", err)
+	}
+	// One-time move of the local sim's retained values from the pre-split
+	// location (the sim ran in BuildDir() itself), so an upgrade does not
+	// silently reset every RETAIN variable.
+	oldRetain := filepath.Join(p.BuildDir(), "retain.dat")
+	newRetain := filepath.Join(p.SimBuildDir(), "retain.dat")
+	if _, err := os.Stat(newRetain); os.IsNotExist(err) {
+		if _, err := os.Stat(oldRetain); err == nil {
+			_ = os.Rename(oldRetain, newRetain)
+		}
 	}
 	return p, nil
 }
 
+// BuildDir is the BASE build directory (<AppDataDir>/build). Nothing is built
+// in it directly any more — see SimBuildDir / TargetBuildDir. It is still what
+// /api/host/build-dir and /health report, because the editor derives the
+// app-data dir (ESI library) from it.
 func (p *Paths) BuildDir() string {
 	return filepath.Join(p.AppDataDir, "build")
+}
+
+// SimBuildDir holds everything the LOCAL simulation builds and runs from
+// (plc.c, sim_runtime.bin, plc_host, logic_<n>.so, swap_request/result,
+// retain.dat, runtime.log, the macOS mirror).
+//
+// ⚠️ The local sim and the target builds used to share BuildDir(): a cold
+// hot-swap build's CleanupExcept(-1) deleted the target's staged logic_*.so, a
+// target build wiped the running sim's swap_result, and Build & Send rewrote
+// the plc.c a live sim's next swap compiled. Each side now cleans only its own
+// directory.
+func (p *Paths) SimBuildDir() string {
+	return filepath.Join(p.BuildDir(), "sim")
+}
+
+// TargetBuildDir is the cross-build directory for one board (Build & Send's
+// runtime.bin + variables.json, and the field hot-swap loader-host + logic).
+func (p *Paths) TargetBuildDir(boardID string) string {
+	return filepath.Join(p.BuildDir(), "target", sanitizeBoardID(boardID))
+}
+
+// sanitizeBoardID turns a board id into ONE safe path segment: anything but
+// [A-Za-z0-9_-] becomes '_' (so "..", separators and drive letters cannot
+// escape <build>/target), and an empty id gets a fixed name.
+func sanitizeBoardID(id string) string {
+	b := []byte(id)
+	for i, c := range b {
+		ok := c == '_' || c == '-' || (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+		if !ok {
+			b[i] = '_'
+		}
+	}
+	if len(b) == 0 {
+		return "default"
+	}
+	return string(b)
+}
+
+// lastTargetFile records which board the most recent target build was for.
+// The deploy endpoints (deploy-to-server, hotswap target-deploy/deploy-swap)
+// carry only the server address, so without an explicit boardId they deploy
+// the most recently built target — exactly what the single shared build dir
+// used to give them.
+func (p *Paths) lastTargetFile() string {
+	return filepath.Join(p.BuildDir(), "target", "last_board")
+}
+
+// PrepareTargetBuildDir creates the board's target dir and records it as the
+// most recent target build.
+func (p *Paths) PrepareTargetBuildDir(boardID string) (string, error) {
+	dir := p.TargetBuildDir(boardID)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return "", err
+	}
+	_ = os.WriteFile(p.lastTargetFile(), []byte(sanitizeBoardID(boardID)+"\n"), 0o644)
+	return dir, nil
+}
+
+// ResolveTargetBuildDir picks the target dir a deploy reads from: the given
+// board's when boardID is set, else the most recent target build's.
+func (p *Paths) ResolveTargetBuildDir(boardID string) (string, error) {
+	if boardID != "" {
+		return p.TargetBuildDir(boardID), nil
+	}
+	b, err := os.ReadFile(p.lastTargetFile())
+	if err != nil {
+		return "", fmt.Errorf("no target build yet — build for the target first")
+	}
+	return p.TargetBuildDir(strings.TrimSpace(string(b))), nil
 }
 
 func (p *Paths) HmiStateDir() string {

@@ -20,7 +20,13 @@ export const exportProjectToXml = (projectStructure, boardId, connectionSettings
     if (connectionSettings.sshPort) {
         root.setAttribute("sshPort", connectionSettings.sshPort);
     }
-    if (connectionSettings.apiPassword) {
+    // An EMPTY password is written too: it means "REST API disabled", and
+    // omitting it made a reopened project fall back to the default password.
+    if (connectionSettings.apiPasswordRedacted) {
+        // Copy sent to the target: KronServer serves it unauthenticated
+        // (GET /deploy/project-file), so the plaintext password never goes there.
+        root.setAttribute("apiPasswordRedacted", "true");
+    } else if (connectionSettings.apiPassword !== undefined && connectionSettings.apiPassword !== null) {
         root.setAttribute("apiPassword", connectionSettings.apiPassword);
     }
     if (connectionSettings.autoRun) {
@@ -110,7 +116,8 @@ export const importProjectFromXml = (xmlString) => {
         const plcAddress = doc.documentElement.getAttribute("plcAddress") || null;
         const sshUser = doc.documentElement.getAttribute("sshUser") || null;
         const sshPort = doc.documentElement.getAttribute("sshPort") || null;
-        const apiPassword = doc.documentElement.getAttribute("apiPassword") || null;
+        const apiPassword = doc.documentElement.hasAttribute("apiPassword") ? doc.documentElement.getAttribute("apiPassword") : null;
+        const apiPasswordRedacted = doc.documentElement.getAttribute("apiPasswordRedacted") === "true";
         const autoRun = doc.documentElement.getAttribute("autoRun") === "true";
 
         const parseSection = (sectionName, key) => {
@@ -192,7 +199,7 @@ export const importProjectFromXml = (xmlString) => {
             try { hmiLayout = JSON.parse(hmiSection.textContent); } catch (e) { /* ignore */ }
         }
 
-        return { projectStructure, boardId, plcAddress, sshUser, sshPort, apiPassword, autoRun, buses, busConfigs, watchTable, hmiLayout };
+        return { projectStructure, boardId, plcAddress, sshUser, sshPort, apiPassword, apiPasswordRedacted, autoRun, buses, busConfigs, watchTable, hmiLayout };
     } catch (e) {
         console.error("Critical Import Error:", e);
         return null;

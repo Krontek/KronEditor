@@ -1022,7 +1022,7 @@ export const BOARD_FAMILIES = [
   // For the same reason `interfaces` carries only the DEVICE-NODE peripherals
   // (I2C/SPI/UART/CAN/USB, all overridable per port in Board Config); GPIO,
   // PWM and ADC are omitted because their numbering is SoC-specific and the
-  // shared RPi HAL would silently drive a different pad (CLAUDE.md §10).
+  // shared RPi HAL would silently drive a different pad (resources/krontek-include/CLAUDE.md).
   //
   // ⚠️ The arch is in the ID, not a config field: compile.go and
   // deploy_ssh.go both switch on the board id, so one "generic_linux" entry

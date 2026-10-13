@@ -30,7 +30,7 @@ export function registerIECSTLanguage(monaco) {
       'SINT', 'INT', 'DINT', 'LINT',
       'USINT', 'UINT', 'UDINT', 'ULINT',
       'REAL', 'LREAL',
-      'TIME', 'DATE', 'TIME_OF_DAY', 'TOD', 'DATE_AND_TIME', 'DT',
+      'TIME', 'LTIME', 'DATE', 'TIME_OF_DAY', 'TOD', 'DATE_AND_TIME', 'DT',
       'STRING', 'WSTRING',
     ],
     builtinFBs: [
@@ -57,7 +57,7 @@ export function registerIECSTLanguage(monaco) {
         [/\/\/.*$/, 'comment'],
         [/\(\*/, 'comment', '@blockComment'],
         [/\/\*/, 'comment', '@blockComment2'],
-        [/\b(T|TIME)#[0-9a-z_dhmsu]+\b/i, 'number.time'],
+        [/\b(LTIME|TIME|LT|T)#[-+]?[0-9a-z_.dhmsun]+\b/i, 'number.time'],
         [/\b16#[0-9A-Fa-f_]+\b/, 'number.hex'],
         [/\b8#[0-7_]+\b/, 'number.octal'],
         [/\b2#[01_]+\b/, 'number.binary'],

@@ -50,6 +50,10 @@ func (s *Server) handleCheckServerStatus(w http.ResponseWriter, r *http.Request)
 
 type deployToServerReq struct {
 	ServerAddr string `json:"serverAddr"`
+	// Optional: which board's target build to deploy. Empty = the most recent
+	// target build (Paths.ResolveTargetBuildDir), which is what every current
+	// caller means.
+	BoardID string `json:"boardId"`
 }
 
 func (s *Server) handleDeployToServer(w http.ResponseWriter, r *http.Request) {
@@ -62,7 +66,11 @@ func (s *Server) handleDeployToServer(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	buildDir := s.paths.BuildDir()
+	buildDir, err := s.paths.ResolveTargetBuildDir(req.BoardID)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
 	runtimeBytes, err := os.ReadFile(filepath.Join(buildDir, "runtime.bin"))
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "read runtime.bin: "+err.Error())
@@ -125,7 +133,11 @@ func (s *Server) handleHotSwapTargetDeploy(w http.ResponseWriter, r *http.Reques
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	buildDir := s.paths.BuildDir()
+	buildDir, err := s.paths.ResolveTargetBuildDir(req.BoardID)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
 
 	// Refuse to upload if the build dir's runtime.bin isn't actually the
 	// hot-swap loader-host (e.g. a plain Build & Send ran afterward and

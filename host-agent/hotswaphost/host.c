@@ -42,18 +42,20 @@
  *   dynamic load      dlopen/dlsym/dlclose     | LoadLibrary/GetProcAddress/…    | dlopen/dlsym/dlclose
  *   swap signal       SIGUSR1                  | named auto-reset Event          | SIGUSR1
  *   sleep to deadline clock_nanosleep ABSTIME  | waitable timer                  | mach_wait_until
- *   barrier           pthread_barrier_*        | pthread_barrier_* (winpthreads) | shim (mutex + condvar)
+ *   barrier           hs_barrier (mutex + condvar, stop-aware) — one implementation everywhere
  *
  * Everything else — the scan structure, the swap protocol, the ping-pong slot
  * rules — has exactly ONE implementation. Keep it that way; the barrier/scan
- * logic is the part that must not diverge, which is why macOS gets a barrier
- * SHIM under the standard names rather than a second copy of the scan loop.
+ * logic is the part that must not diverge, which is why the barrier is ONE
+ * portable mutex+condvar implementation (hs_barrier_t) rather than a
+ * per-platform choice or a second copy of the scan loop.
  *
  * ⚠️ Two "POSIX" primitives are missing on macOS and both fail at COMPILE
  * time, so neither can be discovered late:
  *   - clock_nanosleep() does not exist (no TIMER_ABSTIME sleep at all).
  *   - pthread_barrier_* was never implemented — Apple skipped the optional
- *     POSIX barriers entirely, so _POSIX_BARRIERS is undefined.
+ *     POSIX barriers entirely, so _POSIX_BARRIERS is undefined. (The scan
+ *     loop no longer uses them anywhere: see hs_barrier_t.)
  * A third difference is silent and therefore worse: macOS has no /dev/shm, and
  * a shm_open'd object is invisible to the filesystem, so the Go agent could
  * never read it back. See mirror_path() below.
@@ -71,6 +73,9 @@
 #define PLC_SWAP_EVENT_NAME "Local\\kron_plc_swap"
 typedef HMODULE plc_module_t;
 static plc_module_t plc_dlopen(const char *p)              { return LoadLibraryA(p); }
+/* See the POSIX twin below. LoadLibrary of an already-loaded path likewise just
+ * bumps the refcount of the old module. */
+static int          plc_is_loaded(const char *p)           { return GetModuleHandleA(p) != NULL; }
 static void        *plc_dlsym(plc_module_t h, const char *n) { return (void *)(uintptr_t)GetProcAddress(h, n); }
 static void         plc_dlclose(plc_module_t h)            { if (h) FreeLibrary(h); }
 static const char  *plc_dlerror(void) {
@@ -117,8 +122,32 @@ static void plc_sleep_until(const struct timespec *deadline) {
 #include <sys/mman.h>
 #include <sys/stat.h>   /* watch_files_thread (file swap/stop triggers) */
 #include <sched.h>      /* per-task SCHED_FIFO priority */
+/* ⚠️ struct stat's nanosecond mtime is st_mtim on Linux but st_mtimespec on
+ * macOS (which has no st_mtim at all — a compile error on the Mac build). */
+#if defined(__APPLE__)
+#define HS_MTIME_NSEC(st) ((long long)(st).st_mtimespec.tv_nsec)
+#else
+#define HS_MTIME_NSEC(st) ((long long)(st).st_mtim.tv_nsec)
+#endif
 typedef void *plc_module_t;
-static plc_module_t plc_dlopen(const char *p)              { return dlopen(p, RTLD_NOW | RTLD_GLOBAL); }
+/* ⚠️ RTLD_LOCAL, never RTLD_GLOBAL. A GLOBAL module's definitions (TON_Call and
+ * every other archive function linked into it) join the process-wide lookup
+ * scope, so the NEXT generation's calls bound to them — which pinned the old
+ * module in memory through its dlclose. The dlopen of that same slot path two
+ * swaps later then returned the stale, still-mapped handle: every second swap
+ * ran the OLD code and still reported OK. The host is -rdynamic, so us_tick,
+ * plc_stop, __plc_shm and the __hs_* trampolines resolve without it. */
+static plc_module_t plc_dlopen(const char *p)              { return dlopen(p, RTLD_NOW | RTLD_LOCAL); }
+/* Is a module with this path still mapped? dlopen would hand back THAT one. */
+static int          plc_is_loaded(const char *p) {
+#if defined(RTLD_NOLOAD)
+    void *h = dlopen(p, RTLD_NOW | RTLD_NOLOAD);
+    if (h) { dlclose(h); return 1; }
+#else
+    (void)p;
+#endif
+    return 0;
+}
 static void        *plc_dlsym(plc_module_t h, const char *n) { return dlsym(h, n); }
 static void         plc_dlclose(plc_module_t h)            { if (h) dlclose(h); }
 static const char  *plc_dlerror(void)                      { return dlerror(); }
@@ -147,50 +176,6 @@ static void plc_sleep_until(const struct timespec *deadline) {
     if (tb.denom == 0) mach_timebase_info(&tb);
     uint64_t ticks = (uint64_t)delta_ns * (uint64_t)tb.denom / (uint64_t)tb.numer;
     mach_wait_until(mach_absolute_time() + ticks);
-}
-
-/* ⚠️ macOS ships no pthread_barrier_* at all (the optional POSIX barriers were
- * never implemented). The scan-boundary barrier is the core of the swap
- * mechanism, so rather than fork the scan loop we provide the three functions
- * it uses under their standard names — the loop below stays byte-identical
- * across platforms.
- *
- * Phase-counted so the barrier is safely REUSABLE: a thread records the phase
- * it entered on and sleeps until the phase advances, which is what makes a
- * fast thread unable to race ahead into the next barrier round and steal a
- * slot from a straggler still waiting in the previous one. */
-typedef struct {
-    pthread_mutex_t m;
-    pthread_cond_t  c;
-    unsigned        count;    /* threads required to trip the barrier */
-    unsigned        waiting;
-    unsigned        phase;
-} pthread_barrier_t;
-typedef int pthread_barrierattr_t;
-#define PTHREAD_BARRIER_SERIAL_THREAD 1
-
-static int pthread_barrier_init(pthread_barrier_t *b, const pthread_barrierattr_t *a, unsigned n) {
-    (void)a;
-    if (n == 0) return EINVAL;
-    pthread_mutex_init(&b->m, NULL);
-    pthread_cond_init(&b->c, NULL);
-    b->count = n; b->waiting = 0; b->phase = 0;
-    return 0;
-}
-
-static int pthread_barrier_wait(pthread_barrier_t *b) {
-    pthread_mutex_lock(&b->m);
-    unsigned phase = b->phase;
-    if (++b->waiting == b->count) {
-        b->phase++;
-        b->waiting = 0;
-        pthread_cond_broadcast(&b->c);
-        pthread_mutex_unlock(&b->m);
-        return PTHREAD_BARRIER_SERIAL_THREAD;
-    }
-    while (phase == b->phase) pthread_cond_wait(&b->c, &b->m);
-    pthread_mutex_unlock(&b->m);
-    return 0;
 }
 
 /* mirror_path maps the POSIX shm name the generated plc.c exports
@@ -241,9 +226,14 @@ __attribute__((weak)) void __hs_axis_bind(void *(*getptr)(int));
 
 volatile uint64_t us_tick = 0;   /* owned + exported for the logic.so */
 volatile int plc_stop = 0;
-/* The /dev/shm mirror (force flags + monitored values). Host-owned so it
- * survives a logic swap → the editor keeps reading live variables. The logic
- * .so references this (extern) in its plc_shm_pull/sync. */
+/* The /dev/shm mirror (monitored values + runtime-owned force flags + the
+ * force-write command mailbox, SHM layout v2). Host-owned so it survives a
+ * logic swap → the editor keeps reading live variables, and a command posted
+ * around a swap is neither lost nor applied twice: the mailbox cursors live
+ * HERE, not in the module, and no task thread is inside plc_shm_pull while
+ * the barrier holds. The logic .so references this (extern) in its
+ * plc_shm_pull/sync, and initialises the mailbox once from plc_init_hs —
+ * which is why the mirror must be mapped BEFORE pinit() below. */
 unsigned char *__plc_shm = NULL;
 
 #define MAXT 16
@@ -267,7 +257,61 @@ static unsigned long long g_layout_hash = 0;
 static int                g_layout_hash_set = 0;
 
 static volatile int      g_swap_req = 0;
-static pthread_barrier_t g_barrier;
+
+/* ── Scan-boundary barrier ────────────────────────────────────────────────
+ * Phase-counted mutex+condvar barrier, used on EVERY platform (macOS has no
+ * pthread_barrier_* at all, and the standard one cannot be interrupted).
+ * Phase counting makes it reusable: a thread sleeps until the phase it entered
+ * on advances, so a fast thread cannot lap into the next round and steal a
+ * slot from a straggler.
+ *
+ * ⚠️ STOP-AWARE: a task thread that sees plc_stop leaves its loop without
+ * coming to the barrier, so a sibling already parked there for a swap would
+ * wait for it forever and the host would never exit (the agent then had to
+ * SIGKILL it, losing the final retain flush). Every exiting task thread calls
+ * hs_barrier_abort(), which releases all waiters with -1 and makes every later
+ * wait return -1 at once. */
+typedef struct {
+    pthread_mutex_t m;
+    pthread_cond_t  c;
+    unsigned        count;    /* threads required to trip the barrier */
+    unsigned        waiting;
+    unsigned        phase;
+    int             aborted;
+} hs_barrier_t;
+
+static void hs_barrier_init(hs_barrier_t *b, unsigned n) {
+    pthread_mutex_init(&b->m, NULL);
+    pthread_cond_init(&b->c, NULL);
+    b->count = n ? n : 1; b->waiting = 0; b->phase = 0; b->aborted = 0;
+}
+
+/* 0 = tripped normally, -1 = aborted (the caller must leave its scan loop). */
+static int hs_barrier_wait(hs_barrier_t *b) {
+    pthread_mutex_lock(&b->m);
+    if (b->aborted) { pthread_mutex_unlock(&b->m); return -1; }
+    unsigned phase = b->phase;
+    if (++b->waiting == b->count) {
+        b->phase++;
+        b->waiting = 0;
+        pthread_cond_broadcast(&b->c);
+        pthread_mutex_unlock(&b->m);
+        return 0;
+    }
+    while (phase == b->phase && !b->aborted) pthread_cond_wait(&b->c, &b->m);
+    int rc = (phase == b->phase) ? -1 : 0;   /* phase moved = tripped before the abort */
+    pthread_mutex_unlock(&b->m);
+    return rc;
+}
+
+static void hs_barrier_abort(hs_barrier_t *b) {
+    pthread_mutex_lock(&b->m);
+    b->aborted = 1;
+    pthread_cond_broadcast(&b->c);
+    pthread_mutex_unlock(&b->m);
+}
+
+static hs_barrier_t g_barrier;
 
 /* ── Retentive variables ──────────────────────────────────────────────────
  * The logic module owns the retain file format and the packing (it is the side
@@ -283,6 +327,8 @@ static pthread_barrier_t g_barrier;
 #define RETAIN_INTERVAL_MS 1000
 static int             (*g_retain_save)(void) = NULL;
 static pthread_mutex_t   g_retain_mu = PTHREAD_MUTEX_INITIALIZER;
+
+static int parse_gen_from_path(const char *path);
 
 #if defined(_WIN32)
 /* Windows has no SIGUSR1. The agent signals a named auto-reset Event; this
@@ -314,22 +360,58 @@ static void on_usr1(int s) { (void)s; g_swap_req = 1; }
  *
  * The signals stay installed: a runtime started by KronServer (already root)
  * still gets them, and they are the faster path when they work. */
+/* Identity of the LAST swap_request that was acted on (or the startup one).
+ * Shared between the watcher and do_swap_locked: a swap triggered by SIGUSR1
+ * reads the same file the watcher would see changed 10 ms later, and without
+ * the hand-over that one request would be swapped TWICE. */
+typedef struct { long long ino, sec, nsec, size; } req_id_t;
+static req_id_t        g_req_seen = { -1, -1, -1, -1 };
+static pthread_mutex_t g_req_mu   = PTHREAD_MUTEX_INITIALIZER;
+
+static req_id_t req_id_of(const struct stat *st) {
+    req_id_t r = { (long long)st->st_ino, (long long)st->st_mtime, HS_MTIME_NSEC(*st), (long long)st->st_size };
+    return r;
+}
+static int req_id_eq(req_id_t a, req_id_t b) {
+    return a.ino == b.ino && a.sec == b.sec && a.nsec == b.nsec && a.size == b.size;
+}
+
+/* A request is COMPLETE when it is one non-empty line ending in '\n' — every
+ * writer appends one. ⚠️ A writer that is not atomic (plain write(2) rather
+ * than tmp + rename) can be observed mid-write; such a file must neither
+ * trigger nor become the baseline, so the watcher fires once the finished file
+ * lands instead of swapping a truncated path. */
+static int request_complete(void) {
+    char buf[512];
+    FILE *f = fopen("./swap_request", "rb");
+    if (!f) return 0;
+    size_t n = fread(buf, 1, sizeof buf - 1, f);
+    fclose(f);
+    if (n < 2 || buf[n - 1] != '\n') return 0;
+    buf[n - 1] = 0;
+    return parse_gen_from_path(buf) >= 0;
+}
+
 static void *watch_files_thread(void *arg) {
     (void)arg;
     struct stat st;
-    long long seen_sec = -1, seen_nsec = -1, seen_size = -1;
     if (stat("./swap_request", &st) == 0) {
-        seen_sec = (long long)st.st_mtime; seen_nsec = (long long)st.st_mtim.tv_nsec; seen_size = (long long)st.st_size;
+        pthread_mutex_lock(&g_req_mu);
+        g_req_seen = req_id_of(&st);
+        pthread_mutex_unlock(&g_req_mu);
     }
     while (!plc_stop) {
         struct timespec ts = { 0, 10 * 1000 * 1000 };   /* 10 ms */
         nanosleep(&ts, NULL);
         if (stat("./swap_request", &st) == 0) {
-            long long sec = (long long)st.st_mtime, nsec = (long long)st.st_mtim.tv_nsec, size = (long long)st.st_size;
-            if (sec != seen_sec || nsec != seen_nsec || size != seen_size) {
-                seen_sec = sec; seen_nsec = nsec; seen_size = size;
-                g_swap_req = 1;
-            }
+            req_id_t cur = req_id_of(&st);
+            pthread_mutex_lock(&g_req_mu);
+            int changed = !req_id_eq(cur, g_req_seen);
+            pthread_mutex_unlock(&g_req_mu);
+            /* Baseline is NOT advanced here: do_swap_locked records the
+             * identity of the file it actually read. An incomplete file is
+             * simply looked at again on the next poll. */
+            if (changed && request_complete()) g_swap_req = 1;
         }
         if (stat("./stop_request", &st) == 0) {
             remove("./stop_request");
@@ -347,6 +429,32 @@ static void on_term(int s) { (void)s; plc_stop = 1; }
 static uint64_t mono_us(void) {
     struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
     return (uint64_t)t.tv_sec * 1000000ULL + (uint64_t)t.tv_nsec / 1000ULL;
+}
+
+/* Sleeps toward the SAME absolute deadline in slices of at most 50 ms,
+ * re-checking plc_stop between slices.
+ * ⚠️ A single sleep to the deadline made a stop wait out the whole task
+ * interval (a T#10s task took up to 10 s to notice stop_request, far past the
+ * agent's grace, so it was SIGKILLed and skipped the final retain flush). The
+ * deadline itself is unchanged and each slice goes through plc_sleep_until, so
+ * the zero-drift property and the per-platform timing fixes above (64-bit
+ * delta, Windows waitable timer, mach timebase) all still apply. */
+#define HS_SLEEP_SLICE_NS 50000000LL
+static void scan_sleep_until(const struct timespec *deadline) {
+    for (;;) {
+        if (plc_stop) return;
+        struct timespec now;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        long long delta_ns = ((long long)deadline->tv_sec - (long long)now.tv_sec) * 1000000000LL
+                           + ((long long)deadline->tv_nsec - (long long)now.tv_nsec);
+        if (delta_ns <= 0) return;
+        if (delta_ns <= HS_SLEEP_SLICE_NS) { plc_sleep_until(deadline); return; }
+        long long t = (long long)now.tv_nsec + HS_SLEEP_SLICE_NS;
+        struct timespec slice;
+        slice.tv_sec  = now.tv_sec + (time_t)(t / 1000000000LL);
+        slice.tv_nsec = (long)(t % 1000000000LL);
+        plc_sleep_until(&slice);
+    }
 }
 
 /* Parses the generation number out of a "<dir>/logic_<N>.so" path. Returns -1
@@ -519,6 +627,16 @@ static void do_swap_locked(void) {
         size_t n = fread(path, 1, sizeof path - 1, rf);
         path[n] = 0;
         while (n && (path[n-1] == '\n' || path[n-1] == '\r' || path[n-1] == ' ' || path[n-1] == '\t')) path[--n] = 0;
+#if !defined(_WIN32)
+        /* This request is now consumed, whichever trigger fired — the watcher
+         * must not fire again for the same file (see g_req_seen). */
+        struct stat rst;
+        if (path[0] && fstat(fileno(rf), &rst) == 0) {
+            pthread_mutex_lock(&g_req_mu);
+            g_req_seen = req_id_of(&rst);
+            pthread_mutex_unlock(&g_req_mu);
+        }
+#endif
         fclose(rf);
     }
     if (!path[0]) {
@@ -536,6 +654,18 @@ static void do_swap_locked(void) {
         return;
     }
     int gen = parse_gen_from_path(path);
+
+    /* ⚠️ A module with this path still mapped means dlopen would return THAT
+     * handle — the old code — and the swap would "succeed" without changing
+     * anything. RTLD_LOCAL removes the known cause; this turns any other one
+     * (a module pinned by something we did not foresee) into a visible
+     * failure instead of a silent no-op. Nothing has been touched yet, so
+     * there is nothing to roll back. */
+    if (plc_is_loaded(path)) {
+        fprintf(stderr, "[host] swap refused: %s is still loaded (stale module) — keeping current\n", path);
+        write_swap_result("FAIL", gen, "STALE");
+        return;
+    }
 
     plc_module_t nh = plc_dlopen(path);
     if (!nh) {
@@ -656,16 +786,20 @@ static void *task_thread(void *arg) {
         /* Scan-boundary swap: every thread gathers, thread 0 swaps + clears the
          * request, then all resume against the new (or rolled-back) logic. */
         if (g_swap_req) {
-            pthread_barrier_wait(&g_barrier);
+            /* -1 = a sibling is stopping (see hs_barrier_t): leave, never swap. */
+            if (hs_barrier_wait(&g_barrier) != 0) break;
             if (idx == 0) { do_swap(); g_swap_req = 0; }
-            pthread_barrier_wait(&g_barrier);
+            if (hs_barrier_wait(&g_barrier) != 0) break;
         }
 
         us_tick = mono_us();
         if (g_body[idx]) g_body[idx]();
 
-        plc_sleep_until(&next);
+        scan_sleep_until(&next);
     }
+    /* Whatever made us leave, nobody may wait for this thread at a barrier. */
+    plc_stop = 1;
+    hs_barrier_abort(&g_barrier);
     return NULL;
 }
 
@@ -754,6 +888,20 @@ int main(int argc, char **argv) {
         write_swap_result("FAIL", cold_gen, rb_reason(rc0));
         return 1;
     }
+#if !defined(_WIN32)
+    /* ⚠️ Our OWN pid, for the agent's last-resort kill. Under `sudo` the agent's
+     * cmd.Process is sudo, not us: SIGKILLing that pid (privilegedKill) left
+     * this root host running as an orphan, still holding the bus and the shm
+     * mirror. Chowned like the other files we create; removed on a clean exit. */
+    {
+        FILE *pf = fopen("./plc_host.pid", "w");
+        if (pf) {
+            fprintf(pf, "%ld\n", (long)getpid());
+            fclose(pf);
+            hs_give_to_owner("./plc_host.pid");
+        }
+    }
+#endif
     /* Confirms to the Go supervisor that the FIRST logic module is loaded and
      * bound — handleHotSwapRun polls for this before declaring "started", so
      * a fresh run that can't even bind its initial .so is caught immediately
@@ -822,7 +970,7 @@ int main(int argc, char **argv) {
     printf("[host] started: %s  tasks=%d  state=%lu bytes\n", argv[1], g_ntask, ssize());
     fflush(stdout);
 
-    pthread_barrier_init(&g_barrier, NULL, g_ntask > 0 ? g_ntask : 1);
+    hs_barrier_init(&g_barrier, g_ntask > 0 ? (unsigned)g_ntask : 1);
     pthread_t mon;
     if (getenv("HS_MONITOR")) pthread_create(&mon, NULL, monitor_thread, NULL);
     pthread_t th[MAXT];
@@ -845,5 +993,8 @@ int main(int argc, char **argv) {
     pthread_mutex_lock(&g_retain_mu);
     if (g_retain_save) g_retain_save();
     pthread_mutex_unlock(&g_retain_mu);
+#if !defined(_WIN32)
+    remove("./plc_host.pid");
+#endif
     return 0;
 }

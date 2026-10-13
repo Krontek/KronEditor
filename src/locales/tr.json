@@ -479,5 +479,23 @@
         "LT": "IN1 < IN2 olduğu sürece Q = TRUE.",
         "Read_System_Time": "Gerçek zaman saati (RTC) okuma. EN TRUE iken TIME her tarama döngüsünde YEREL GECE YARISINDAN itibaren geçen milisaniye ile güncellenir (0…86 399 999 — IEC günün saati değeri); değer işletim sisteminin sistem saatinden alınır. EN FALSE iken son değer korunur ve ENO FALSE olur. Bu bir saattir, kronometre değil: gece yarısında ve her NTP veya yaz saati düzeltmesinde değer geriye atlar; geçen süreyi ölçmek için TON/TONR kullanın. Hedef kartta okunan değer, kartın RTC/NTP ayarı kadar doğrudur.",
         "enNote": "Yürütme Kontrolü AÇIK: blok gövdesi yalnız EN TRUE iken çalışır; ENO EN'i aynalar, sonraki bloklar ona zincirlenebilir."
+    },
+    "forces": {
+        "markerTitle": "Zorlanmış: değer bir zorlama ile sabit tutuluyor. Değiştirmek veya bırakmak için tıklayın.",
+        "tab": "Zorlama listesi",
+        "colVariable": "Değişken",
+        "colValue": "Güncel değer",
+        "unforce": "Zorlamayı kaldır",
+        "unforceTitle": "Bu zorlamayı kaldır: değişkeni yeniden program kontrol eder",
+        "unforceAll": "Tümünü kaldır",
+        "unforceAllTitle": "Çalışan PLC / simülasyondaki tüm zorlamaları kaldır",
+        "empty": "Zorlanmış değişken yok.",
+        "emptyHint": "Değişken tablosundan, bir ladder elemanından, ST editöründen veya izleme tablosundan bir değer zorlayın. Burada bir Zorlamayı kaldır düğmesiyle listelenir.",
+        "notRunning": "Çalışan bir şey yok. Zorlamalar, bir PLC veya simülasyon çalışırken burada listelenir.",
+        "indicator": "ZORLANMIŞ ({{count}})",
+        "indicatorTitle": "{{count}} değişken zorlanmış: değerleri program tarafından hesaplanmıyor, sabit tutuluyor. Zorlama listesini açmak için tıklayın.",
+        "unforceAllDone": "Tüm zorlamalar kaldırıldı.",
+        "unforceAllFailed": "Tüm zorlamaları kaldırma başarısız: {{error}}",
+        "notStreamed": "ekranda değil"
     }
 }

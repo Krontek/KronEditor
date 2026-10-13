@@ -10,7 +10,7 @@ package main
 // reached anyone, because os/exec sends a nil Stdout to /dev/null.
 //
 // ⚠️ This is a DIAGNOSTIC channel, not a logging API for PLC programs — see
-// CLAUDE.md §14: a program still publishes values through SHM, never printf.
+// src/services/CLAUDE.md: a program still publishes values through SHM, never printf.
 
 import (
 	"fmt"

@@ -10,7 +10,7 @@ import { APP_VERSION } from '../version';
 
 // ⚠️ KronHAL is NOT a separate repo any more — the HAL headers (kronhal_rpi.h
 // etc.) live only in resources/krontek-include/HAL/ and are edited there /
-// mirrored from KrontekLibraries (CLAUDE.md §1), never fetched by this build.
+// mirrored from KrontekLibraries (CLAUDE.md), never fetched by this build.
 const KRON_REPOS = [
     'KronStandard', 'KronControl', 'KronCompare', 'KronConverter',
     'KronMathematic', 'KronCommunication', 'KronLogic', 'KronMotion',

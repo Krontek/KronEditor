@@ -267,22 +267,47 @@ const ButtonComp = ({ w, h, p, value, onWrite, liveKey, isPreview }) => {
     const bg = active ? (p.onColor || '#007acc') : (p.offColor || '#252525');
     const border = p.borderColor || '#3a3a3a';
 
-    const handleDown = useCallback(() => {
+    // Momentary: press = FORCE TRUE (held while pressed), release = UNFORCE
+    // writing FALSE once, so the logic owns the bit again afterwards.
+    // ⚠️ Pointer capture keeps the release on this element when the cursor or
+    // finger slides off, and pointercancel / lostpointercapture count as a
+    // release — a missed release would leave the bit forced TRUE. downRef makes
+    // the release fire exactly once (pointerup is followed by
+    // lostpointercapture). Ordering of press vs release is guaranteed by the
+    // per-key chain in App.jsx handleForceWrite.
+    const downRef = useRef(false);
+    const handleDown = useCallback((e) => {
         if (!isPreview || !onWrite) return;
-        if (p.mode === 'momentary') { setPressed(true); onWrite(liveKey, true); }
-        else { onWrite(liveKey, !on); }
+        if (e.button > 0) return; // primary button / touch / pen only
+        if (p.mode === 'momentary') {
+            if (downRef.current) return;
+            downRef.current = true;
+            try { e.currentTarget.setPointerCapture(e.pointerId); } catch { /* element gone */ }
+            setPressed(true);
+            onWrite(liveKey, true, 'force');
+        } else {
+            onWrite(liveKey, !on);
+        }
     }, [isPreview, onWrite, liveKey, p.mode, on]);
 
     const handleUp = useCallback(() => {
-        if (!isPreview || !onWrite) return;
-        if (p.mode === 'momentary') { setPressed(false); onWrite(liveKey, false); }
-    }, [isPreview, onWrite, liveKey, p.mode]);
+        if (!downRef.current) return;
+        downRef.current = false;
+        setPressed(false);
+        if (isPreview && onWrite) onWrite(liveKey, false, 'unforce');
+    }, [isPreview, onWrite, liveKey]);
+
+    // Unmounted mid-press (page switch, leaving preview): release too.
+    const releaseRef = useRef(null);
+    releaseRef.current = handleUp;
+    useEffect(() => () => releaseRef.current && releaseRef.current(), []);
 
     return (
         <div
-            onMouseDown={handleDown}
-            onMouseUp={handleUp}
-            onMouseLeave={handleUp}
+            onPointerDown={handleDown}
+            onPointerUp={handleUp}
+            onPointerCancel={handleUp}
+            onLostPointerCapture={handleUp}
             style={{
                 width: '100%', height: '100%',
                 background: bg,
@@ -291,6 +316,7 @@ const ButtonComp = ({ w, h, p, value, onWrite, liveKey, isPreview }) => {
                 display: 'flex', alignItems: 'center', justifyContent: 'center',
                 cursor: isPreview ? 'pointer' : 'default',
                 userSelect: 'none',
+                touchAction: 'none',
                 transition: 'background 0.08s',
                 boxShadow: active ? `inset 0 2px 6px rgba(0,0,0,0.4)` : `0 2px 4px rgba(0,0,0,0.3)`,
             }}

@@ -1,24 +1,84 @@
 // src/utils/plcStandards.js
 
+// Coerce a live TIME value to a BigInt. TIME/LTIME are signed 64-bit
+// MICROseconds; a value beyond ±2^53 arrives as a decimal STRING (jsonSafe64
+// on both agents), which Number() would round. Returns null when the value
+// is not an integer count.
+const toBigIntUs = (us) => {
+    if (typeof us === 'bigint') return us;
+    if (typeof us === 'string') {
+        const t = us.trim();
+        return /^[-+]?\d+$/.test(t) ? BigInt(t) : null;
+    }
+    const n = Number(us);
+    return Number.isFinite(n) ? BigInt(Math.round(n)) : null;
+};
+
 /**
- * Format a TIME value (stored as microseconds u32) into IEC T# notation.
- * e.g. 1100000 → "T#1s100ms", 1020100 → "T#1s20ms100us"
+ * Format a TIME/LTIME value (signed 64-bit microseconds) into IEC T# notation.
+ * e.g. 1100000 → "T#1s100ms", 7200000000 → "T#2h", -5000000 → "T#-5s",
+ * 90061000001 → "T#1d1h1m1s1us". A non-numeric value is returned as text.
  */
 export const formatTimeUs = (us) => {
-    const v = Math.round(Number(us));
-    if (isNaN(v) || v < 0) return String(us);
-    if (v === 0) return 'T#0s';
-    let rem = v;
-    const m  = Math.floor(rem / 60_000_000); rem %= 60_000_000;
-    const s  = Math.floor(rem /  1_000_000); rem %=  1_000_000;
-    const ms = Math.floor(rem /      1_000); rem %=      1_000;
-    const uv = rem;
-    let result = 'T#';
-    if (m)  result += `${m}m`;
-    if (s)  result += `${s}s`;
-    if (ms) result += `${ms}ms`;
-    if (uv) result += `${uv}us`;
+    const big = toBigIntUs(us);
+    if (big === null) return String(us);
+    if (big === 0n) return 'T#0s';
+    const neg = big < 0n;
+    let rem = neg ? -big : big;
+    const parts = [[86_400_000_000n, 'd'], [3_600_000_000n, 'h'], [60_000_000n, 'm'],
+        [1_000_000n, 's'], [1_000n, 'ms'], [1n, 'us']];
+    let result = neg ? 'T#-' : 'T#';
+    for (const [unit, suffix] of parts) {
+        const q = rem / unit;
+        rem %= unit;
+        if (q) result += `${q}${suffix}`;
+    }
     return result;
+};
+
+/**
+ * Parse a user-typed TIME value into microseconds, as a BigInt (exact over
+ * the whole int64 range). Accepts an IEC literal with or without its prefix
+ * (`T#2h`, `LTIME#-5s`, `1m30s`, `-500ms`) or a bare integer, which is taken
+ * as MICROseconds (the raw value the runtime holds). Returns null when the
+ * text is not a duration or does not fit a signed 64-bit integer.
+ */
+const TIME_UNIT_US_BIG = { D: 86_400_000_000n, H: 3_600_000_000n, M: 60_000_000n, S: 1_000_000n, MS: 1_000n, US: 1n };
+const INT64_MIN = -(2n ** 63n);
+const INT64_MAX = 2n ** 63n - 1n;
+export const parseTimeUs = (raw) => {
+    let s = String(raw ?? '').trim().toUpperCase().replace(/^(?:LTIME|TIME|LT|T)#/, '').replace(/_/g, '');
+    if (!s) return null;
+    let neg = false;
+    if (s[0] === '-' || s[0] === '+') { neg = s[0] === '-'; s = s.slice(1); }
+    if (!s) return null;
+    let total;
+    if (/^\d+$/.test(s)) {
+        total = BigInt(s);
+    } else {
+        // Fractions are allowed (T#1.5s); NS is accepted and rounded to µs.
+        const re = /(\d+)(?:\.(\d+))?(MS|US|NS|D|H|M|S)/y;
+        total = 0n;
+        let idx = 0;
+        let nsRem = 0n;
+        while (idx < s.length) {
+            re.lastIndex = idx;
+            const m = re.exec(s);
+            if (!m) return null;
+            const [, whole, frac = '', unit] = m;
+            if (unit === 'NS') {
+                nsRem += BigInt(whole);
+            } else {
+                const u = TIME_UNIT_US_BIG[unit];
+                total += BigInt(whole) * u;
+                if (frac) total += (BigInt(frac) * u) / (10n ** BigInt(frac.length));
+            }
+            idx = re.lastIndex;
+        }
+        total += (nsRem + 500n) / 1000n;
+    }
+    if (neg) total = -total;
+    return (total < INT64_MIN || total > INT64_MAX) ? null : total;
 };
 
 // True for the IEC duration types the T#-prefix normalisation applies to.
@@ -31,6 +91,7 @@ export const isTimeType = (type) => {
  * Normalise a user-typed TIME value into an IEC literal so the user need not
  * type the `T#` prefix. Rules (for a TIME-typed field):
  *   "500ms"   → "T#500ms"        (prefix added)
+ *   "-5s"     → "T#-5s"          (TIME is signed)
  *   "1m30s"   → "T#1m30s"
  *   "500"     → "T#500ms"        (NO unit ⇒ milliseconds, not µs)
  *   "T#5s"    → "T#5s"           (already prefixed → left untouched, prefix
@@ -46,10 +107,11 @@ export const normalizeTimeLiteral = (raw) => {
     // normalising the prefix case so `t#5s` stays valid.
     const pfx = s.match(/^(LTIME|TIME|LT|T)#/i);
     if (pfx) return s.replace(/^(LTIME|TIME|LT|T)#/i, (m) => m.toUpperCase());
-    // Bare number, no unit → milliseconds.
-    if (/^\d+(?:\.\d+)?$/.test(s)) return `T#${s}ms`;
-    // Number(s) followed by d/h/m/s/ms/us/ns units (compound allowed) → add T#.
-    if (/^(?:\d+(?:\.\d+)?(?:d|h|m|s|ms|us|ns))+$/i.test(s.replace(/_/g, ''))) {
+    // Bare number, no unit → milliseconds (a leading sign is kept: T#-5ms).
+    if (/^[-+]?\d+(?:\.\d+)?$/.test(s)) return `T#${s}ms`;
+    // Number(s) followed by d/h/m/s/ms/us/ns units (compound allowed, one
+    // optional leading sign) → add T#.
+    if (/^[-+]?(?:\d+(?:\.\d+)?(?:d|h|m|s|ms|us|ns))+$/i.test(s.replace(/_/g, ''))) {
         return `T#${s}`;
     }
     return s; // unrecognised — leave it for the transpiler to flag

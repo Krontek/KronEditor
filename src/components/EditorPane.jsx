@@ -7,7 +7,9 @@ import RungEditorNew from './RungEditorNew';
 import ResourceEditor from './ResourceEditor';
 import DragDropManager from '../utils/DragDropManager';
 import ForceWriteModal from './common/ForceWriteModal';
-import { liveGet, memberGet, liveEntriesWithPrefix, findVarByName, hasVarNamed } from '../utils/iecNames';
+import { liveGet, liveResolveKey, memberGet, liveEntriesWithPrefix, findVarByName, hasVarNamed } from '../utils/iecNames';
+import { useForcedSet } from './common/ForcedMarker';
+import { isKeyForced, stLiveKeyAt, ensureForcedDecorationStyle } from '../utils/forcedVars';
 
 // IEC scalar (elementary) types — anything else (FB instances like TON/CTU,
 // UDTs, ARRAY[...]) is a COMPOSITE whose live value is a struct/array, shown in
@@ -115,6 +117,7 @@ const EditorPane = ({
 
   // ST Editor Force Write Modal state
   const [stForceWriteData, setStForceWriteData] = useState(null);
+  const forcedSet = useForcedSet();
 
   // Refs for checking current state in callbacks/providers without dependencies
   const variablesRef = useRef(variables);
@@ -190,15 +193,19 @@ const EditorPane = ({
     setVariables(newVariables);
 
     if (fileType === 'LD' || fileType === 'SCL') {
-      setRungs(prevRungs => prevRungs.map(rung => ({
-        ...rung,
-        blocks: (rung.blocks || []).filter(b => b.data.instanceName !== variableToDelete.name),
-        connections: (rung.connections || []).filter(c => {
-          const sourceExists = (rung.blocks || []).some(b => b.id === c.source);
-          const targetExists = (rung.blocks || []).some(b => b.id === c.target);
-          return sourceExists && targetExists;
-        })
-      })));
+      // Connections are filtered against the SURVIVING blocks — testing the
+      // original list kept every wire of a deleted block as a dangling edge.
+      // Names compare case-insensitively (IEC identifiers, CLAUDE.md).
+      const deadName = (variableToDelete.name || '').toLowerCase();
+      setRungs(prevRungs => prevRungs.map(rung => {
+        const blocks = (rung.blocks || []).filter(b => (b.data?.instanceName || '').toLowerCase() !== deadName);
+        const kept = new Set(blocks.map(b => b.id));
+        return {
+          ...rung,
+          blocks,
+          connections: (rung.connections || []).filter(c => kept.has(c.source) && kept.has(c.target)),
+        };
+      }));
     }
   };
 
@@ -398,10 +405,11 @@ const EditorPane = ({
           };
         };
         // Push an inline badge after the [startCol, endCol) range on a 1-based line.
-        const pushDec = (lineNo, startCol, endCol, style) => {
+        // A FORCED value's badge gets `live-var-forced` (red frame + "F").
+        const pushDec = (lineNo, startCol, endCol, style, forced = false) => {
           decs.push({
             range: new monacoInstance.Range(lineNo, startCol, lineNo, endCol),
-            options: { className: style.hl, after: { content: ` ${style.text}`, inlineClassName: style.txt } },
+            options: { className: style.hl, after: { content: ` ${style.text}`, inlineClassName: forced ? `${style.txt} live-var-forced` : style.txt } },
           });
         };
 
@@ -437,6 +445,7 @@ const EditorPane = ({
               const mm = line.slice(j + 1).match(/^[a-zA-Z_][a-zA-Z0-9_]*/);
               const member = mm && mm[0];
               let mv;
+              let memberKey;
               if (valM && typeof valM === 'object') {
                 // Local sim: FB decoded to an object {Q, ET, …}.
                 mv = member ? memberGet(valM, member) : undefined;
@@ -446,10 +455,11 @@ const EditorPane = ({
                 const fk = `prog_${safeProgName}_${word}.${member}`;
                 const fkVal = liveGet(liveVariables, fk);
                 mv = fkVal !== undefined ? fkVal : liveGet(liveVariables, `prog__${word}.${member}`);
+                memberKey = liveResolveKey(liveVariables, fk) || liveResolveKey(liveVariables, `prog__${word}.${member}`);
               }
               if (member && mv !== undefined && typeof mv !== 'object') {
                 const memStartCol = j + 2;                // 1-based col of member's first char
-                pushDec(i + 1, memStartCol, memStartCol + member.length, primStyle(mv));
+                pushDec(i + 1, memStartCol, memStartCol + member.length, primStyle(mv), isKeyForced(forcedSet, memberKey));
               }
               continue;
             }
@@ -470,7 +480,8 @@ const EditorPane = ({
             }
 
             // Primitive scalar — badge right after the identifier.
-            pushDec(i + 1, match.index + 1, afterIdx + 1, primStyle(val));
+            const scalarKey = liveResolveKey(liveVariables, progKey) || liveResolveKey(liveVariables, globalKey);
+            pushDec(i + 1, match.index + 1, afterIdx + 1, primStyle(val), isKeyForced(forcedSet, scalarKey));
           }
         });
 
@@ -485,7 +496,7 @@ const EditorPane = ({
     validate();
     const disposable = model.onDidChangeContent(validate);
     return () => disposable.dispose();
-  }, [variables, globalVars, code, fileType, monacoInstance, liveVariables, parentName]);
+  }, [variables, globalVars, code, fileType, monacoInstance, liveVariables, parentName, forcedSet]);
 
   // --- AUTOCOMPLETE PROVIDER ---
   useEffect(() => {
@@ -687,6 +698,7 @@ const EditorPane = ({
     // ── Register IEC 61131-3 Structured Text language & plc-dark theme ──
     registerIECSTLanguage(monaco);
 
+    ensureForcedDecorationStyle();
     // Inject CSS for live variable inline decorations (only once)
     if (!document.getElementById('inline-live-var-style')) {
       const style = document.createElement('style');
@@ -744,6 +756,27 @@ const EditorPane = ({
       if (!window.liveVariablesRef || !window.onForceWriteRef) return;
 
       const liveVars = window.liveVariablesRef;
+
+      // A single click on a FORCED value's badge (its red "F") opens the force
+      // dialog — Release is there. The badge is Monaco injected text, so the
+      // clicked identifier is the one ending at the click position.
+      const el = e.target.element;
+      if (el && el.classList && el.classList.contains('live-var-forced') && e.target.position) {
+        const pos = e.target.position;
+        const line = editor.getModel()?.getLineContent(pos.lineNumber) || '';
+        const safeProg = (window.parentNameRef || '').trim().replace(/\s+/g, '_');
+        const hit = stLiveKeyAt(line, pos.column, liveVars, safeProg);
+        if (hit && hit.key) {
+          const v = findVarByName([...(window.variablesRef || []), ...(window.globalVarsRef || [])], hit.name);
+          window.setStForceWriteDataFn({
+            varName: hit.name,
+            varType: v ? v.type : (typeof liveVars[hit.key] === 'boolean' ? 'BOOL' : 'INT'),
+            currentValue: liveVars[hit.key],
+            liveKey: hit.key,
+          });
+          return;
+        }
+      }
 
       // Ensure click target is text
       if (e.target.type !== monaco.editor.MouseTargetType.CONTENT_TEXT) return;
@@ -1080,7 +1113,7 @@ const EditorPane = ({
           varType={stForceWriteData.varType}
           currentValue={stForceWriteData.currentValue}
           liveKey={stForceWriteData.liveKey}
-          allowPulse={isSimulationMode}
+          allowPulse
           onConfirm={(key, val, mode) => {
             if (onForceWrite) onForceWrite(key, val, mode);
           }}

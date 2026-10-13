@@ -17,6 +17,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -79,8 +80,24 @@ type ProcessManager struct {
 	// each online change into the OTHER ping-pong slot, so we always know
 	// exactly which numbered logic is live and which one is being sent — never
 	// inferred from an ambiguous directory listing. Guarded by mu; -1 = the
-	// runtime is not running in hot-swap mode.
+	// runtime is not running in hot-swap mode. Reset to -1 whenever the
+	// process stops or exits: nothing is running, so nothing is "confirmed".
 	curGen int
+
+	// lastGoodGen survives the process exiting (curGen does not): the
+	// generation last launched or last CONFIRMED by a swap. A cold start
+	// (crash-restart, AutoRun, Run button) prefers it over "highest logic_<n>
+	// on disk" — after a swap whose outcome timed out BOTH slots exist, and the
+	// highest number is just the newer upload, not the code known to run.
+	// -1 = unknown (fresh agent, or a deploy wiped the slots).
+	lastGoodGen int
+
+	// restartEpoch is bumped by every user intent that supersedes a pending
+	// crash-restart: Stop, a manual Start, cancelling AutoRun. The restart timer
+	// captures it when armed and re-checks it under mu right before spawning —
+	// checking AutoRun alone left a window where a Stop landing between the
+	// timer firing and its Start() was silently undone.
+	restartEpoch uint64
 
 	// preStartHook runs inside Start() AFTER any previous process has been
 	// fully stopped and BEFORE the new one is spawned. Wired to
@@ -95,6 +112,10 @@ type ProcessManager struct {
 	lastStartedAt      time.Time   // for backoff reset logic
 	consecutiveCrashes int         // current index into restartBackoffDelays
 }
+
+// logicSlotNameRe is the only logic file name /hotswap/swap accepts: one of the
+// two ping-pong slots (hotswaplib.PingPongGeneration), nothing path-like.
+var logicSlotNameRe = regexp.MustCompile(`^logic_[01]\.so$`)
 
 // swapResultTimeout bounds how long SwapLogic/Start wait for the loader-host
 // to report a swap/cold-start outcome. Mirrors host-agent/hotswap.go's
@@ -116,7 +137,7 @@ func (pm *ProcessManager) recordEvent(kind, status, detail string) {
 }
 
 func NewProcessManager(deployDir string) *ProcessManager {
-	return &ProcessManager{deployDir: deployDir, curGen: -1}
+	return &ProcessManager{deployDir: deployDir, curGen: -1, lastGoodGen: -1}
 }
 
 // ConfirmedGen returns the logic generation currently running in hot-swap mode
@@ -127,6 +148,15 @@ func (pm *ProcessManager) ConfirmedGen() int {
 	pm.mu.Lock()
 	defer pm.mu.Unlock()
 	return pm.curGen
+}
+
+// ForgetLogicGenerations drops the remembered good generation. Called when a
+// deploy removes or replaces the logic slots, so a later cold start goes back
+// to discovering what is actually on disk.
+func (pm *ProcessManager) ForgetLogicGenerations() {
+	pm.mu.Lock()
+	pm.lastGoodGen = -1
+	pm.mu.Unlock()
 }
 
 // SetAutoRunGetter wires up the callback used by the crash-restart watchdog
@@ -157,6 +187,7 @@ func (pm *ProcessManager) CancelPendingRestart() {
 	pm.mu.Lock()
 	defer pm.mu.Unlock()
 	pm.cancelRestartLocked()
+	pm.restartEpoch++
 }
 
 // pidFilePath returns the location of the runtime PID file.
@@ -279,10 +310,21 @@ func (pm *ProcessManager) terminateOrphan(pid int) {
 // informational cold-start poll below runs WITHOUT mu so Stop()/Status()
 // are never stalled behind the up-to-5s wait.
 func (pm *ProcessManager) Start() error {
+	return pm.start(-1)
+}
+
+// errRestartSuperseded aborts a crash-restart whose epoch was overtaken by a
+// Stop / manual Start / AutoRun-off while it was waiting.
+var errRestartSuperseded = errors.New("auto-restart superseded")
+
+// start is Start with an optional epoch guard: expectEpoch >= 0 (the restart
+// timer) spawns only if restartEpoch still equals it, checked under mu inside
+// spawnRuntime so no Stop can slip in between the check and the spawn.
+func (pm *ProcessManager) start(expectEpoch int64) error {
 	pm.swapMu.Lock()
 	defer pm.swapMu.Unlock()
 
-	hotSwapGen, hotSwap, err := pm.spawnRuntime()
+	hotSwapGen, hotSwap, err := pm.spawnRuntime(expectEpoch)
 	if err != nil {
 		return err
 	}
@@ -315,10 +357,19 @@ func (pm *ProcessManager) Start() error {
 // run the pre-start hook (initial values), spawn the new runtime. Returns the
 // discovered hot-swap generation so Start() can poll the cold-start outcome
 // after releasing mu. Caller must hold swapMu.
-func (pm *ProcessManager) spawnRuntime() (hotSwapGen int, hotSwap bool, err error) {
+func (pm *ProcessManager) spawnRuntime(expectEpoch int64) (hotSwapGen int, hotSwap bool, err error) {
 	pm.mu.Lock()
 	defer pm.mu.Unlock()
 
+	if expectEpoch >= 0 {
+		if uint64(expectEpoch) != pm.restartEpoch {
+			return 0, false, errRestartSuperseded
+		}
+	} else {
+		// A manual start supersedes any restart timer, including one that has
+		// already fired and is waiting on swapMu behind us.
+		pm.restartEpoch++
+	}
 	// A manual start always supersedes a pending auto-restart.
 	pm.cancelRestartLocked()
 	// Clear the intentional-stop latch from a previous Stop(). Without this,
@@ -373,15 +424,17 @@ func (pm *ProcessManager) spawnRuntime() (hotSwapGen int, hotSwap bool, err erro
 	// in-memory counter) — this is what makes the switch correct after an
 	// agent restart or when generation 0 has since been cleaned up.
 	var logicPath string
-	hotSwapGen, logicPath, hotSwap = hotswaplib.DiscoverGeneration(pm.deployDir)
+	hotSwapGen, logicPath, hotSwap = pm.coldStartGenerationLocked()
 	// Record the generation we are about to launch as the CONFIRMED-running one
 	// (or -1 for a plain self-contained binary). A cold hot-swap deploy wipes
 	// stale logic_*.so and ships exactly logic_0, so on a freshly deployed
 	// device this is deterministically 0 — no ambiguity about what is running.
 	if hotSwap {
 		pm.curGen = hotSwapGen
+		pm.lastGoodGen = hotSwapGen
 	} else {
 		pm.curGen = -1
+		pm.lastGoodGen = -1
 	}
 
 	// SOEM requires CAP_NET_RAW (raw socket access for EtherCAT).
@@ -435,6 +488,23 @@ func (pm *ProcessManager) spawnRuntime() (hotSwapGen int, hotSwap bool, err erro
 	return hotSwapGen, hotSwap, nil
 }
 
+// coldStartGenerationLocked picks the logic module a cold start launches: the
+// last known-good generation when its slot still exists, else the highest
+// logic_<n>.so on disk. After a swap whose outcome timed out BOTH slots are
+// present, and "highest" is merely the newer upload, not the code known to
+// run. Caller holds mu.
+func (pm *ProcessManager) coldStartGenerationLocked() (gen int, path string, ok bool) {
+	gen, path, ok = hotswaplib.DiscoverGeneration(pm.deployDir)
+	if ok && pm.lastGoodGen >= 0 && pm.lastGoodGen != gen {
+		if p := hotswaplib.GenerationPath(pm.deployDir, pm.lastGoodGen); fileExists(p) {
+			slog.Info("Cold start uses the last confirmed logic generation",
+				"generation", pm.lastGoodGen, "highest_on_disk", gen)
+			return pm.lastGoodGen, p, true
+		}
+	}
+	return gen, path, ok
+}
+
 // SwapLogic pushes an ONLINE CHANGE to the running loader-host: it writes the
 // new logic .so path to deploy-dir/swap_request and sends SIGUSR1 so the host
 // swaps it at the next scan boundary, preserving PlcState (it rolls back a bad
@@ -458,6 +528,13 @@ func (pm *ProcessManager) spawnRuntime() (hotSwapGen int, hotSwap bool, err erro
 // run as root (or be granted the runtime via setcap), so the signal reaches the
 // loader-host directly.
 func (pm *ProcessManager) SwapLogic(logicFile string) (status, detail string, err error) {
+	// ⚠️ The name comes from an unauthenticated request body and is joined onto
+	// deployDir: "../../tmp/logic_0.so" parsed fine (ParseGenFromName takes the
+	// Base) and pointed the root loader-host at an arbitrary .so. Only a bare
+	// ping-pong slot name is accepted.
+	if logicFile != filepath.Base(logicFile) || !logicSlotNameRe.MatchString(logicFile) {
+		return "", "", fmt.Errorf("invalid logic name %q (expected logic_0.so or logic_1.so)", logicFile)
+	}
 	pm.swapMu.Lock()
 	defer pm.swapMu.Unlock()
 
@@ -504,6 +581,7 @@ func (pm *ProcessManager) SwapLogic(logicFile string) (status, detail string, er
 		// and delete the OTHER ping-pong slot. Never inferred from disk.
 		pm.mu.Lock()
 		pm.curGen = gen
+		pm.lastGoodGen = gen
 		pm.mu.Unlock()
 		_ = hotswaplib.CleanupExcept(pm.deployDir, gen)
 		slog.Info("Hot-swap confirmed", "generation", gen)
@@ -523,6 +601,7 @@ func (pm *ProcessManager) Stop() error {
 	// User intent: keep it down. Affects both the in-flight watchProcess
 	// decision and any timer that hasn't fired yet.
 	pm.cancelRestartLocked()
+	pm.restartEpoch++ // a restart timer already in flight must not undo this
 	pm.consecutiveCrashes = 0
 	if !pm.isRunning() {
 		// Nothing running: do NOT latch intentionalStop — a stale latch would
@@ -592,6 +671,7 @@ func (pm *ProcessManager) stopLocked() error {
 	pm.closeLogFiles()
 	pm.cmd = nil
 	pm.done = nil
+	pm.curGen = -1 // nothing is running, so no generation is confirmed running
 	pm.removePIDFile()
 	return nil
 }
@@ -644,6 +724,7 @@ func (pm *ProcessManager) watchProcess(cmd *exec.Cmd, done chan struct{}) {
 	pm.closeLogFiles()
 	pm.cmd = nil
 	pm.done = nil
+	pm.curGen = -1 // exited: an online change now has nothing to swap into
 	pm.removePIDFile()
 
 	// Auto-restart decision.
@@ -680,28 +761,44 @@ func (pm *ProcessManager) scheduleRestartLocked() {
 		"consecutive_crashes", pm.consecutiveCrashes,
 	)
 
-	pm.restartTimer = time.AfterFunc(delay, func() {
+	epoch := pm.restartEpoch
+	var timer *time.Timer
+	timer = time.AfterFunc(delay, func() {
 		pm.mu.Lock()
-		pm.restartTimer = nil
+		if pm.restartTimer == timer {
+			pm.restartTimer = nil
+		}
+		superseded := pm.restartEpoch != epoch
 		autoRun := pm.autoRunGetter != nil && pm.autoRunGetter()
 		pm.mu.Unlock()
 
+		if superseded {
+			slog.Info("AutoRun: restart canceled (stopped or restarted meanwhile)")
+			return
+		}
 		if !autoRun {
 			slog.Info("AutoRun: restart canceled (AutoRun is now off)")
 			return
 		}
-		if err := pm.Start(); err != nil {
+		// The epoch is re-checked under mu inside spawnRuntime: a Stop between
+		// the check above and the spawn must still win.
+		if err := pm.start(int64(epoch)); err != nil {
+			if errors.Is(err, errRestartSuperseded) {
+				slog.Info("AutoRun: restart canceled (stopped or restarted meanwhile)")
+				return
+			}
 			slog.Error("AutoRun: restart attempt failed", "err", err)
 			// Schedule another retry — the cycle continues until AutoRun
 			// is toggled off, the user calls Stop, or Start finally succeeds.
 			pm.mu.Lock()
-			retry := pm.autoRunGetter != nil && pm.autoRunGetter()
+			retry := pm.restartEpoch == epoch && pm.autoRunGetter != nil && pm.autoRunGetter()
 			if retry {
 				pm.scheduleRestartLocked()
 			}
 			pm.mu.Unlock()
 		}
 	})
+	pm.restartTimer = timer
 }
 
 // cancelRestartLocked stops a pending restart timer if one is armed.
@@ -711,6 +808,11 @@ func (pm *ProcessManager) cancelRestartLocked() {
 		pm.restartTimer.Stop()
 		pm.restartTimer = nil
 	}
+}
+
+func fileExists(p string) bool {
+	st, err := os.Stat(p)
+	return err == nil && !st.IsDir()
 }
 
 func (pm *ProcessManager) closeLogFiles() {

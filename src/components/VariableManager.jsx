@@ -1,6 +1,8 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { DataTypeSelector, ModernSelect } from './common/Selectors';
 import ForceWriteModal from './common/ForceWriteModal';
+import ForcedMarker, { useForcedSet } from './common/ForcedMarker';
+import { isAnyMemberForced } from '../utils/forcedVars';
 import { useTranslation } from 'react-i18next';
 import { formatTimeUs, isTimeType, normalizeTimeLiteral } from '../utils/plcStandards';
 import { blockConfig } from './RungContainer';
@@ -199,6 +201,7 @@ const VariableManager = ({
   projectStructure = null
 }) => {
   const { t } = useTranslation();
+  const forcedSet = useForcedSet();
   // Multi-select: set of selected variable ids. anchorId is the last clicked
   // row used as the pivot for Shift-range selection.
   const [selectedIds, setSelectedIds] = useState(() => new Set());
@@ -467,7 +470,7 @@ const VariableManager = ({
       let display;
       if (typeof v === 'boolean') display = v ? 'T' : 'F';
       else if (e.type === 'BOOL' && (v === 0 || v === 1)) display = v ? 'T' : 'F';
-      else if (e.type === 'TIME') display = formatTimeUs(v);
+      else if (isTimeType(e.type)) display = formatTimeUs(v);
       else display = String(v ?? '---');
       return `${e.pin}=${display}`;
     }).join(' ');
@@ -481,7 +484,7 @@ const VariableManager = ({
       if ('Q' in val && 'CV' in val) return `Q=${val.Q ? 'T' : 'F'} CV=${val.CV}`;
       return JSON.stringify(val);
     }
-    if (type === 'TIME') return formatTimeUs(val);
+    if (isTimeType(type)) return formatTimeUs(val);
     return String(val);
   };
 
@@ -589,6 +592,9 @@ const VariableManager = ({
               const hasValue = liveVal !== null && liveVal !== undefined;
               const canForce = !!onForceWrite && liveVariables;
               const isComplex = isComplexType(v.type);
+              // A composite (FB instance / struct / array) is forced when any
+              // of its flat member keys is.
+              const isForced = !!liveVariables && isAnyMemberForced(forcedSet, liveKey);
 
               return (
                 <React.Fragment key={v.id}>
@@ -642,8 +648,10 @@ const VariableManager = ({
                         // independently scoped and MAY share a name+type — do not
                         // check across programs (that wrongly rejected e.g. a
                         // second program declaring its own `var1 : INT`).
-                        const isDuplicate = variables.some(other => other.id !== v.id && other.name === v.name && other.type === newType) ||
-                          globalVars.some(other => other.name === v.name && other.type === newType);
+                        // Names compare case-insensitively, like the rename check.
+                        const lname = (v.name || '').toLowerCase();
+                        const isDuplicate = variables.some(other => other.id !== v.id && (other.name || '').toLowerCase() === lname && other.type === newType) ||
+                          globalVars.some(other => (other.name || '').toLowerCase() === lname && other.type === newType);
                         if (isDuplicate) {
                           alert(t('errors.varExistsWithType', { name: v.name, type: newType }));
                           return;
@@ -716,6 +724,14 @@ const VariableManager = ({
                           return formatLiveDisplay(liveVal, v.type);
                         })()}
                       </span>
+                      {isForced && (
+                        <ForcedMarker
+                          onClick={(!isComplex && canForce && !getFBOutputValues(v.name, v.type))
+                            ? () => setForceModal({ varName: v.name, varType: v.type, liveKey, liveVal })
+                            : undefined}
+                          style={{ cursor: 'inherit' }}
+                        />
+                      )}
                     </td>
                   )}
                   <td style={bCell}>
@@ -787,7 +803,7 @@ const VariableManager = ({
           varType={forceModal.varType}
           currentValue={forceModal.liveVal}
           liveKey={forceModal.liveKey}
-          allowPulse={isSimulationMode}
+          allowPulse
           onConfirm={(key, val, mode) => { onForceWrite && onForceWrite(key, val, mode); }}
         />
       )}

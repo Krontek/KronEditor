@@ -5,12 +5,38 @@ import RungContainer, { blockConfig } from './RungContainer';
 import ErrorBoundary from './ErrorBoundary';
 import BlockSettingsModal from './BlockSettingsModal';
 import ForceWriteModal from './common/ForceWriteModal';
+import { useForcedSet } from './common/ForcedMarker';
+import { isKeyForced, stLiveKeyAt, ensureForcedDecorationStyle } from '../utils/forcedVars';
 import DragDropManager from '../utils/DragDropManager';
 import { registerIECSTLanguage } from '../utils/iecSTLanguage';
 import { findStMarkers } from '../utils/stValidation';
 import { writeClipboard, readClipboard, useKronClipboard, CLIP_KIND } from '../utils/kronClipboard';
 import { setEditorScope, getEditorScope, EDITOR_SCOPE, hasTextSelection } from '../utils/editorScope';
 import { liveGet, liveResolveKey, hasVarNamed, findVarByName } from '../utils/iecNames';
+
+// True when `name` is referenced anywhere in `rungs`: a block's instance, a pin
+// operand (`name` or `name.member`), or an identifier in ST rung code (comments
+// and string literals ignored). Case-insensitive, like every IEC name.
+function isNameUsedInRungs(rungs, name) {
+  const lower = String(name || '').toLowerCase();
+  if (!lower) return false;
+  const esc = lower.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const ident = new RegExp(`(^|[^A-Za-z0-9_.])${esc}(?![A-Za-z0-9_])`, 'i');
+  return (rungs || []).some(r => {
+    if ((r.blocks || []).some(b => {
+      if ((b.data?.instanceName || '').toLowerCase() === lower) return true;
+      return Object.values(b.data?.values || {}).some(v => typeof v === 'string' && ident.test(v.trim()));
+    })) return true;
+    if (r.code) {
+      const code = String(r.code)
+        .replace(/\(\*[\s\S]*?\*\)/g, ' ')
+        .replace(/\/\/[^\n]*/g, ' ')
+        .replace(/'(?:\$.|[^'$])*'|"(?:\$.|[^"$])*"/g, ' ');
+      if (ident.test(code)) return true;
+    }
+    return false;
+  });
+}
 
 // IEC ST identifier validation for SCL inline editors.
 // Returns Monaco markers for undeclared identifiers.
@@ -94,8 +120,12 @@ function validateSCLCode(code, variables, globalVars, monaco, model, hwPortVars 
 // Auto-sizing Monaco editor for SCL ST rungs.
 // IMPORTANT: must stop mouse event propagation to prevent the outer
 // draggable rung div from intercepting clicks and blocking Monaco input.
-const SCLInlineEditor = ({ code, readOnly, onCodeChange, onBlur, variables = [], globalVars = [], liveVariables = null, parentName = '', hwPortVars = [] }) => {
+const SCLInlineEditor = ({ code, readOnly, onCodeChange, onBlur, variables = [], globalVars = [], liveVariables = null, parentName = '', hwPortVars = [], onForceRequest = null }) => {
   const [height, setHeight] = useState(60);
+  const forcedSet = useForcedSet();
+  // Read by the mount-registered mouse handler (outlives mount-time props).
+  const forceCtxRef = useRef(null);
+  forceCtxRef.current = { onForceRequest, liveVariables, parentName, variables, globalVars };
   const editorRef = useRef(null);
   const monacoRef = useRef(null);
   const liveDecsRef = useRef([]);
@@ -174,11 +204,14 @@ const SCLInlineEditor = ({ code, readOnly, onCodeChange, onBlur, variables = [],
         let val = liveGet(liveVariables, progKey);
         if (val === undefined) val = liveGet(liveVariables, globalKey);
         if (val === undefined) continue;
+        const liveKey = liveResolveKey(liveVariables, progKey) || liveResolveKey(liveVariables, globalKey);
 
         const isBool = typeof val === 'boolean';
         const displayStr = isBool ? (val ? 'TRUE' : 'FALSE') : String(val);
         const hlClass = isBool ? (val ? 'live-var-hl-true' : 'live-var-hl-false') : 'live-var-hl-num';
-        const textClass = isBool ? (val ? 'live-var-text-true' : 'live-var-text-false') : 'live-var-text-num';
+        // A FORCED value's badge gets `live-var-forced` (red frame + "F").
+        const textClass = (isBool ? (val ? 'live-var-text-true' : 'live-var-text-false') : 'live-var-text-num')
+          + (isKeyForced(forcedSet, liveKey) ? ' live-var-forced' : '');
         decs.push({
           range: new mc.Range(lineIdx + 1, match.index + 1, lineIdx + 1, match.index + 1 + word.length),
           options: { className: hlClass, after: { content: ` ${displayStr}`, inlineClassName: textClass } },
@@ -187,7 +220,7 @@ const SCLInlineEditor = ({ code, readOnly, onCodeChange, onBlur, variables = [],
     }
 
     liveDecsRef.current = ed.deltaDecorations(liveDecsRef.current, decs);
-  }, [liveVariables, variables, globalVars, parentName]);
+  }, [liveVariables, variables, globalVars, parentName, forcedSet]);
 
   return (
     <div
@@ -217,6 +250,7 @@ const SCLInlineEditor = ({ code, readOnly, onCodeChange, onBlur, variables = [],
         beforeMount={monaco => {
           registerIECSTLanguage(monaco);
           monacoRef.current = monaco;
+          ensureForcedDecorationStyle();
           if (!document.getElementById('inline-live-var-style')) {
             const style = document.createElement('style');
             style.id = 'inline-live-var-style';
@@ -265,6 +299,25 @@ const SCLInlineEditor = ({ code, readOnly, onCodeChange, onBlur, variables = [],
           updateHeight();
           // Read through refs — these listeners outlive the mount-time props.
           editor.onDidBlurEditorText(() => { onBlurRef.current && onBlurRef.current(); });
+          // Click on a forced value's red "F" badge → the force dialog.
+          editor.onMouseDown((e) => {
+            const ctx = forceCtxRef.current;
+            const el = e.target.element;
+            if (!ctx?.onForceRequest || !ctx.liveVariables || !e.target.position) return;
+            if (!(el && el.classList && el.classList.contains('live-var-forced'))) return;
+            const pos = e.target.position;
+            const line = editor.getModel()?.getLineContent(pos.lineNumber) || '';
+            const safeProg = (ctx.parentName || '').trim().replace(/\s+/g, '_');
+            const hit = stLiveKeyAt(line, pos.column, ctx.liveVariables, safeProg);
+            if (!hit || !hit.key) return;
+            const v = findVarByName([...(ctx.variables || []), ...(ctx.globalVars || [])], hit.name);
+            ctx.onForceRequest({
+              varName: hit.name,
+              varType: v?.type || (typeof ctx.liveVariables[hit.key] === 'boolean' ? 'BOOL' : 'INT'),
+              liveKey: hit.key,
+              currentValue: ctx.liveVariables[hit.key],
+            });
+          });
           // Initial validation
           const model = editor.getModel();
           if (model && mc) {
@@ -1190,11 +1243,16 @@ const RungEditorNew = ({ variables, setVariables, rungs, setRungs, availableBloc
       let newVariables = variables;
       if (blockToDelete?.data?.instanceName) {
         const instanceName = blockToDelete.data.instanceName;
-        const isUsedElsewhere = newRungs.some(r =>
-          r.blocks.some(b => b.data?.instanceName === instanceName)
-        );
-        if (!isUsedElsewhere) {
-          newVariables = variables.filter(v => v.name !== instanceName);
+        const declared = findVarByName(variables, instanceName);
+        // ⚠️ Only an auto-declared LOCAL may go with its block (inline
+        // declaration, src/CLAUDE.md) — never an FB/function interface pin
+        // (Input/Output/InOut) or a Retain/Temp the user declared on purpose —
+        // and only when NOTHING else names it: another block's instance or pin
+        // operand, or any ST rung of this POU. Matching is case-insensitive
+        // (IEC); the old exact instanceName-only check deleted variables still
+        // used by ST code or pin operands.
+        if (declared && (declared.class || 'Local') === 'Local' && !isNameUsedInRungs(newRungs, instanceName)) {
+          newVariables = variables.filter(v => v !== declared);
           setVariables(newVariables);
         }
       }
@@ -1497,6 +1555,7 @@ const RungEditorNew = ({ variables, setVariables, rungs, setRungs, availableBloc
                               liveVariables={liveVariables}
                               parentName={parentName}
                               hwPortVars={hwPortVars}
+                              onForceRequest={onForceWrite ? setSimForceModal : null}
                             />
                           </div>
                         </div>

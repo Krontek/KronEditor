@@ -26,6 +26,8 @@ from tkinter import ttk
 import urllib.request
 import urllib.error
 
+from kron_client import ring_frame_header, iter_ring_records
+
 TYPE_FMT = {
     "bool": ("?", 1), "int8": ("b", 1), "uint8": ("B", 1),
     "int16": ("h", 2), "uint16": ("H", 2), "int32": ("i", 4), "uint32": ("I", 4),
@@ -64,8 +66,10 @@ class RingReader(threading.Thread):
         self.connected = False
         self.vars = []          # [{ml, name, fmt, size, task_id, poff, count, value}]
         self.total_records = 0
-        self.dropped = 0
-        self.attach_backlog = None  # ring history lapped before we connected (not a stream loss)
+        self.dropped = 0            # records the server lost on THIS connection (all real loss)
+        self.epoch = None           # runtime generation of the frames being decoded
+        self.relayout = False       # set on an epoch change: re-fetch /ring/info
+        self.restarts = 0
         self.stride_n = 1
         self.started_at = None
 
@@ -83,6 +87,32 @@ class RingReader(threading.Thread):
         with urllib.request.urlopen(req, timeout=5) as r:
             return json.load(r)
 
+    def _layout_display(self, info):
+        """Flatten the ring's addressed vars in %ML (payload/offset) order and
+        take the first N. Each display var carries its within-task payload
+        offset so it can be decoded from a record of its task. None = failed."""
+        layout = info.get("layout")
+        display = []
+        ml = 0
+        if layout:
+            for task in layout.get("tasks", []):
+                tid = task["task_id"]
+                poff = 0
+                for v in task.get("vars", []):
+                    fmt, sz = TYPE_FMT.get(v["type"], ("%ds" % v["size"], v["size"]))
+                    display.append({
+                        "ml": ml, "name": v["name"], "fmt": fmt, "size": sz,
+                        "task_id": tid, "poff": poff, "count": 0, "value": None,
+                    })
+                    poff += sz
+                    ml += 1
+        if not display:
+            self._fail("The device reports no addressed variables in the ring.")
+            return None
+        if self.want_n > 0:
+            display = display[: self.want_n]
+        return display
+
     # ---- thread body --------------------------------------------------------
     def run(self):
         try:
@@ -94,30 +124,9 @@ class RingReader(threading.Thread):
                            + "\n(Build & Send a runtime that has addressed variables.)")
                 return
 
-            layout = info.get("layout")
-            # Flatten the ring's addressed vars in %ML (payload/offset) order and
-            # take the first N. Each display var carries its within-task payload
-            # offset so we can decode it from a record of its task.
-            display = []
-            ml = 0
-            if layout:
-                for task in layout.get("tasks", []):
-                    tid = task["task_id"]
-                    poff = 0
-                    for v in task.get("vars", []):
-                        fmt, sz = TYPE_FMT.get(v["type"], ("%ds" % v["size"], v["size"]))
-                        display.append({
-                            "ml": ml, "name": v["name"], "fmt": fmt, "size": sz,
-                            "task_id": tid, "poff": poff, "count": 0, "value": None,
-                        })
-                        poff += sz
-                        ml += 1
-            if not display:
-                self._fail("The device reports no addressed variables in the ring.")
+            display = self._layout_display(info)
+            if display is None:
                 return
-            if self.want_n > 0:
-                display = display[: self.want_n]
-
             with self.lock:
                 self.vars = display
                 self.connected = True
@@ -126,7 +135,8 @@ class RingReader(threading.Thread):
             self._wanted_tasks = {d["task_id"] for d in display}
 
             # stream
-            req = urllib.request.Request(self.base + "/api/v1/stream/ring",
+            # ?v=2: frame format v2 (version, epoch, per-record scan counter).
+            req = urllib.request.Request(self.base + "/api/v1/stream/ring?v=2",
                                          headers={"Authorization": "Bearer " + token})
             self._resp = urllib.request.urlopen(req, timeout=10)
             resp = self._resp
@@ -139,6 +149,15 @@ class RingReader(threading.Thread):
                 if not body:
                     break
                 self._apply_frame(body)
+                if self.relayout:
+                    # Build & Send / restart: the payload layout may differ.
+                    display = self._layout_display(self._ring_info(token))
+                    if display is None:
+                        return
+                    with self.lock:
+                        self.vars = display
+                        self.relayout = False
+                    self._wanted_tasks = {d["task_id"] for d in display}
             with self.lock:
                 self.connected = False
         except urllib.error.HTTPError as e:
@@ -162,14 +181,22 @@ class RingReader(threading.Thread):
         """Decode one /stream/ring frame body (post length prefix) and fold it
         into the shared state: per-variable value + running count, plus totals.
         Returns the number of records that belonged to our tracked tasks."""
-        count, stride_n, dropped = struct.unpack_from("<IIQ", body, 0)
-        off = 16
+        hdr = ring_frame_header(body)
+        stride_n, dropped = hdr["stride_n"], hdr["dropped_total"]
+        if self.epoch is not None and hdr["epoch"] != self.epoch:
+            # New runtime generation: its records may use a different layout,
+            # so decode nothing more until /ring/info has been re-fetched.
+            self.epoch = hdr["epoch"]
+            with self.lock:
+                self.relayout = True
+                self.restarts += 1
+                self.stride_n, self.dropped = stride_n, dropped
+            return 0
+        self.epoch = hdr["epoch"]
         updates = {}  # ml -> (value, hits)
         recs_for_us = 0
-        for _ in range(count):
-            seq, task_id, plen = struct.unpack_from("<QHH", body, off)
-            payload = body[off + 12: off + 12 + plen]
-            off += 12 + plen
+        for seq, task_id, scan, start, plen in iter_ring_records(body, hdr):
+            payload = body[start:start + plen]
             if task_id not in self._wanted_tasks:
                 continue
             recs_for_us += 1
@@ -185,8 +212,6 @@ class RingReader(threading.Thread):
         with self.lock:
             self.stride_n = stride_n
             self.dropped = dropped
-            if self.attach_backlog is None:
-                self.attach_backlog = dropped  # first frame = pre-connect history
             self.total_records += recs_for_us
             for d in self.vars:
                 u = updates.get(d["ml"])
@@ -291,7 +316,6 @@ class App:
                 connected = r.connected
                 total = r.total_records
                 dropped = r.dropped
-                backlog = r.attach_backlog or 0
                 stride = r.stride_n
                 started = r.started_at
                 snapshot = [(d["ml"], d["name"], d["count"], d["value"]) for d in r.vars]
@@ -313,9 +337,9 @@ class App:
                     dt = time.time() - started
                     rate = total / dt if dt > 0 else 0
                 state = "● Connected" if connected else "○ Idle"
-                # only drops AFTER attach are a real streaming loss; the first
-                # frame's dropped is ring history from before we connected.
-                stream_drops = max(0, dropped - backlog)
+                # dropped_total counts from 0 for this connection (the server
+                # starts at the producer's current position): all of it is loss.
+                stream_drops = dropped
                 loss = "" if stream_drops == 0 else f"  ⚠ streaming drops={stream_drops:,}"
                 self.status.config(
                     text=f"{state}   total read: {total:,}   rate: {rate:,.0f}/s   "

@@ -6,6 +6,7 @@ import (
 	"sync/atomic"
 	"syscall"
 	"testing"
+	"time"
 	"unsafe"
 )
 
@@ -68,6 +69,7 @@ func (p *ringProducer) append(taskID uint16, payload []byte) uint64 {
 	base := ringHeaderBytes + int(s%uint64(p.nslots))*p.recordStride
 	binary.LittleEndian.PutUint16(p.mem[base+recOffTaskID:], taskID)
 	binary.LittleEndian.PutUint16(p.mem[base+recOffPayloadLen:], uint16(len(payload)))
+	binary.LittleEndian.PutUint32(p.mem[base+recOffScan:], uint32(s*3)) // v2 scan counter (stride 3)
 	copy(p.mem[base+recOffPayload:base+p.recordStride], payload)
 	atomic.StoreUint64((*uint64)(unsafe.Pointer(&p.mem[base+recOffSeq])), s) // publish
 	return s
@@ -361,4 +363,87 @@ func TestRingSetStrideRoundTrips(t *testing.T) {
 	if rc.StrideN() != 7 {
 		t.Fatalf("consumer StrideN=%d, want 7", rc.StrideN())
 	}
+}
+
+// A slot already overwritten by a later lap (slot.seq > s) is a lost record and
+// must be counted, not silently skipped.
+func TestRingDrainCountsOverwrittenSlot(t *testing.T) {
+	name := "kron_test_overwritten"
+	p := newRingProducer(t, name, 24, 64, []ringTask{{PeriodUs: 100, PayloadLen: 8, TaskID: 0}})
+	defer p.close()
+	rc, err := OpenRing(name)
+	if err != nil {
+		t.Fatalf("OpenRing: %v", err)
+	}
+	defer rc.Close()
+	for i := 0; i < 10; i++ {
+		p.append(0, make([]byte, 8))
+	}
+	// Pretend slot 3 was already rewritten by the next lap.
+	base := ringHeaderBytes + 3*24
+	atomic.StoreUint64((*uint64)(unsafe.Pointer(&p.mem[base+recOffSeq])), 3+64)
+	readSeq, dropped, recs := rc.Drain(0, nil, 0)
+	if dropped != 1 || len(recs) != 9 || readSeq != 10 {
+		t.Fatalf("dropped=%d recs=%d readSeq=%d, want 1/9/10", dropped, len(recs), readSeq)
+	}
+}
+
+// A slot that never publishes while later records exist must not stall the
+// stream for ever: after ringStuckTimeout it is skipped and counted.
+func TestRingDrainSkipsStuckSlot(t *testing.T) {
+	name := "kron_test_stuck"
+	p := newRingProducer(t, name, 24, 64, []ringTask{{PeriodUs: 100, PayloadLen: 8, TaskID: 0}})
+	defer p.close()
+	rc, err := OpenRing(name)
+	if err != nil {
+		t.Fatalf("OpenRing: %v", err)
+	}
+	defer rc.Close()
+	for i := 0; i < 5; i++ {
+		p.append(0, make([]byte, 8))
+	}
+	// Slot 2 "crashed mid-write": claimed, never published (reads as a hole).
+	atomic.StoreUint64((*uint64)(unsafe.Pointer(&p.mem[ringHeaderBytes+2*24+recOffSeq])), 0)
+
+	var cur RingCursor
+	now := time.Now()
+	dropped, recs := rc.DrainCursor(&cur, nil, 0, now)
+	if dropped != 0 || len(recs) != 2 || cur.ReadSeq != 2 {
+		t.Fatalf("first pass: dropped=%d recs=%d readSeq=%d, want 0/2/2 (wait on slot 2)", dropped, len(recs), cur.ReadSeq)
+	}
+	dropped, recs = rc.DrainCursor(&cur, nil, 0, now.Add(ringStuckTimeout/2))
+	if dropped != 0 || len(recs) != 0 {
+		t.Fatalf("before the timeout: dropped=%d recs=%d, want still waiting", dropped, len(recs))
+	}
+	dropped, recs = rc.DrainCursor(&cur, nil, 0, now.Add(ringStuckTimeout+time.Millisecond))
+	if dropped != 1 || len(recs) != 2 || cur.ReadSeq != 5 {
+		t.Fatalf("after the timeout: dropped=%d recs=%d readSeq=%d, want 1/2/5", dropped, len(recs), cur.ReadSeq)
+	}
+}
+
+// Shrinking the segment under the shared consumer must not SIGBUS: the layout
+// is invalidated until the next epoch and nothing past the new EOF is touched.
+func TestRingResizeShrinkInvalidatesUntilNextEpoch(t *testing.T) {
+	name := "kron_test_shrink"
+	p := newRingProducer(t, name, 24, 8192, []ringTask{{PeriodUs: 100, PayloadLen: 8, TaskID: 0}})
+	defer p.close()
+	rc, err := OpenRing(name)
+	if err != nil {
+		t.Fatalf("OpenRing: %v", err)
+	}
+	defer rc.Close()
+	for i := 0; i < 8000; i++ {
+		p.append(0, make([]byte, 8))
+	}
+	if err := rc.Resize(64 << 10); err != nil {
+		t.Fatalf("Resize: %v", err)
+	}
+	// Every accessor must survive; the drain reads nothing until re-parsed.
+	readSeq, _, recs := rc.Drain(0, nil, 0)
+	if len(recs) != 0 || readSeq != 0 || rc.Nslots() != 0 {
+		t.Fatalf("after shrink: recs=%d readSeq=%d nslots=%d, want nothing read", len(recs), readSeq, rc.Nslots())
+	}
+	rc.Reclaim(8000)
+	rc.ReclaimAll()
+	_ = rc.WriteSeq()
 }

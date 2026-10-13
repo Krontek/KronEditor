@@ -21,7 +21,8 @@ import { getStandardFBPins } from '../services/CTranspilerService';
 
 // Time/duration literals (T#500ms, TIME#1s) — replaced with same-length spaces
 // so they don't read as identifiers and marker columns stay accurate.
-const TIME_LITERAL = /\b(?:T|TIME|LT|LTIME)#[0-9smhd._]+/gi;
+// TIME is signed (T#-5s), and us/ns are units too.
+const TIME_LITERAL = /\b(?:LTIME|TIME|LT|T)#[-+]?[0-9smhdun._]+/gi;
 // IEC typed-radix integer literals (16#FE, 2#1010, 8#777).
 const RADIX_LITERAL = /\b\d+#[0-9A-Fa-f_]+\b/g;
 

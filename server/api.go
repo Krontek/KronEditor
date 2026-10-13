@@ -11,7 +11,7 @@
 //   GET  /api/v1/variables/{name}  → read a single addressed variable
 //   POST /api/v1/variables/{name}  → write a single addressed variable
 //   GET  /api/v1/stream            → SSE stream of addressed variables (cadence configurable)
-//   POST /api/v1/forces/clear      → clear force flags on addressed variables
+//   POST /api/v1/forces/clear      → clear ALL force flags (every variable, not only addressed)
 //   GET  /api/v1/runtime           → runtime status (running, pid, auto_run, stream_interval_ms)
 //   POST /api/v1/runtime/start     → start PLC runtime
 //   POST /api/v1/runtime/stop      → stop PLC runtime
@@ -20,6 +20,7 @@
 package main
 
 import (
+	"context"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
@@ -29,6 +30,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/krontek/hotswaplib/shmcmd"
 )
 
 // RuntimeController is the surface the API needs to start/stop the PLC and
@@ -55,12 +58,17 @@ type APIManager struct {
 
 // NewAPIManager creates a new API manager with its own session store.
 func NewAPIManager(ipc *IPCManager, rt RuntimeController, shmName string) *APIManager {
-	return &APIManager{
+	am := &APIManager{
 		ipc:      ipc,
 		rt:       rt,
 		sessions: NewSessionStore(),
 		shmName:  shmName,
 	}
+	// A deploy that changes (or removes) the API password revokes every bearer
+	// token issued under the old one — otherwise a leaked token kept working
+	// for its full 8 h TTL after the password was rotated.
+	ipc.SetAPIPasswordChangeHook(am.sessions.Clear)
+	return am
 }
 
 // RegisterAPIRoutes registers all /api/v1/ routes on the given mux.
@@ -73,6 +81,7 @@ func RegisterAPIRoutes(mux *http.ServeMux, am *APIManager) {
 	mux.HandleFunc("GET /api/v1/stream/buffered", am.requireToken(am.handleBufferedStream))
 	mux.HandleFunc("GET /api/v1/stream/ring", am.requireToken(am.handleRingStream))
 	mux.HandleFunc("GET /api/v1/ring/info", am.requireToken(am.handleRingInfo))
+	mux.HandleFunc("GET /api/v1/forces", am.requireToken(am.handleListForces))
 	mux.HandleFunc("POST /api/v1/forces/clear", am.requireToken(am.handleClearForces))
 
 	mux.HandleFunc("GET /api/v1/runtime", am.requireToken(am.handleRuntimeStatus))
@@ -100,12 +109,20 @@ func (am *APIManager) handleAuth(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	gen := am.ipc.APIPasswordGen()
 	if !am.ipc.CheckAPIPassword(body.Password) {
 		jsonError(w, http.StatusUnauthorized, "invalid password")
 		return
 	}
 
 	sess := am.sessions.Create("api_client", RoleOperator)
+	if am.ipc.APIPasswordGen() != gen {
+		// The password changed between the check and the Create, so the hook's
+		// Clear may have run BEFORE this token existed. Do not hand it out.
+		am.sessions.Delete(sess.Token)
+		jsonError(w, http.StatusUnauthorized, "API password changed, retry")
+		return
+	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{"token": sess.Token})
 }
@@ -173,14 +190,24 @@ func (am *APIManager) handleWriteOne(w http.ResponseWriter, r *http.Request) {
 
 	var body struct {
 		Value json.RawMessage `json:"value"`
+		// mode: "force" (default), "pulse" or "unforce" — see API.md.
+		Mode string `json:"mode"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		jsonError(w, http.StatusBadRequest, "invalid JSON")
 		return
 	}
+	op, err := shmcmd.ParseOp(body.Mode)
+	if err != nil {
+		jsonError(w, http.StatusBadRequest, err.Error())
+		return
+	}
 
-	if err := am.ipc.WriteVariable(name, body.Value); err != nil {
-		jsonError(w, http.StatusInternalServerError, err.Error())
+	// Returns only after the runtime APPLIED the command (force-write
+	// mailbox); 409 not running / version mismatch, 503 mailbox full, 504 the
+	// runtime did not acknowledge in time — see shmcmd.HTTPStatus.
+	if err := am.ipc.WriteVariableMode(name, body.Value, op); err != nil {
+		jsonError(w, shmcmd.HTTPStatus(err), err.Error())
 		return
 	}
 
@@ -206,6 +233,15 @@ func (am *APIManager) handleStream(w http.ResponseWriter, r *http.Request) {
 	slog.Info("API SSE stream started", "remote", r.RemoteAddr)
 	heartbeat := time.NewTicker(25 * time.Second)
 	defer heartbeat.Stop()
+	// ⚠️ A Ticker, never `case <-time.After(interval)` inside the select: that
+	// re-arms a fresh timer on EVERY loop pass, so whichever other case fires
+	// first restarts the wait — with an interval >= the 25 s heartbeat the
+	// heartbeat always won and no data frame was ever sent. The interval is
+	// re-read after each data tick, so /api/v1/runtime/config still applies
+	// without a reconnect.
+	interval := GetAPIStreamInterval()
+	tick := time.NewTicker(interval)
+	defer tick.Stop()
 
 	for {
 		select {
@@ -217,7 +253,11 @@ func (am *APIManager) handleStream(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			flusher.Flush()
-		case <-time.After(GetAPIStreamInterval()):
+		case <-tick.C:
+			if cur := GetAPIStreamInterval(); cur != interval {
+				interval = cur
+				tick.Reset(interval)
+			}
 			vars, err := am.ipc.ReadAddressedVariables()
 			if err != nil {
 				continue
@@ -293,32 +333,60 @@ var typeCode = map[VarType]byte{
 	VarFloat32: 9, VarFloat64: 10,
 }
 
+// bufferedFrameVersion is the /api/v1/stream/buffered frame format. v1 had no
+// version field, no timestamps and a u8 variable count; see API.md.
+const bufferedFrameVersion = 2
+
+// monoEpoch anchors the monotonic microsecond clock the buffered stream
+// reports (time.Since uses the monotonic reading; wall-clock steps never move it).
+var monoEpoch = time.Now()
+
+func monoMicros(t time.Time) uint64 { return uint64(t.Sub(monoEpoch) / time.Microsecond) }
+
 // handleBufferedStream streams a high-rate, server-buffered BINARY feed of
 // addressed variables. Delivery cadence is fixed at 5 ms; the client picks a
 // sample interval (interval_us) which may be shorter, in which case the server
 // samples that fast and packs every sample accumulated per 5 ms into one frame.
-// This decouples a fast sample rate from an HTTP-friendly 5 ms push rate.
 //
-//	GET /api/v1/stream/buffered?vars=a,b,c&interval_us=1000
+//	GET /api/v1/stream/buffered?v=2&vars=a,b,c&interval_us=1000
 //
-// Frame (little-endian, one per 5 ms that has >=1 sample):
+// Frame v2 (little-endian, one per 5 ms that has >=1 sample or a loss to report):
+//
 //	u32 frame_len       bytes after this field
-//	u16 sample_count    number of samples in this frame (~ 5000/interval_us)
-//	u8  var_count
+//	u16 version         2
+//	u16 var_count       (v1: u8 — wrapped above 255)
+//	u32 sample_count
+//	u32 interval_us     the effective sample interval
+//	u32 missed          ticks that produced NO sample since the previous frame:
+//	                    scheduler stalls (the ticker drops ticks) + buffer overflow
+//	u64 t_first_us      monotonic µs (server process clock) of the first sample
 //	u8  types[var_count]
 //	sample_count × ( each var's native value, in request order )
 //
-// Loss policy: if the PLC writes faster than interval_us the intermediate
-// values are aliased away (accepted); samples are assumed evenly spaced by
-// interval_us (no per-sample timestamp). Delivery of what WAS sampled is
-// lossless. Addressed variables only; max ~5 concurrent clients expected.
+// ⚠️ Samples are on a NOMINAL grid: sample i was taken at about
+// t_first_us + i·interval_us, and `missed` says how many grid points went
+// unsampled (where is unknown — a client that needs exact spacing should treat
+// a frame with missed > 0 as containing a gap).
+//
+// ⚠️ The stream ENDS when the variable table changes (a Build & Send): the
+// offsets it resolved at connect would otherwise keep decoding whatever now
+// lives there under the old names. Reconnect to resolve again.
+//
+// ⚠️ ?v=2 is REQUIRED. A v1 client (no version field, u8 count) would misparse
+// every v2 frame into plausible garbage, so a request without it gets a 400
+// naming the change instead of a stream it cannot read.
 func (am *APIManager) handleBufferedStream(w http.ResponseWriter, r *http.Request) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		http.Error(w, "streaming not supported", http.StatusInternalServerError)
 		return
 	}
+	if r.URL.Query().Get("v") != strconv.Itoa(bufferedFrameVersion) {
+		jsonError(w, http.StatusBadRequest, "buffered stream frame format v2 required: add ?v=2 (frames now carry a version, u16 var_count, timestamps and a missed-sample counter — see API.md)")
+		return
+	}
 
+	gen := am.ipc.TableGen()
 	var vars []Variable
 	var types []byte
 	bytesPerSample := 0
@@ -345,6 +413,10 @@ func (am *APIManager) handleBufferedStream(w http.ResponseWriter, r *http.Reques
 		jsonError(w, http.StatusBadRequest, "no valid addressed variables in 'vars'")
 		return
 	}
+	if len(vars) > 0xFFFF {
+		jsonError(w, http.StatusBadRequest, "too many variables (max 65535)")
+		return
+	}
 
 	intervalUs := 1000
 	if n, err := strconv.Atoi(r.URL.Query().Get("interval_us")); err == nil && n > 0 {
@@ -355,8 +427,8 @@ func (am *APIManager) handleBufferedStream(w http.ResponseWriter, r *http.Reques
 		intervalUs = minSampleUs
 	}
 	const deliverUs = 5000
-	// Cap buffered samples so a stalled/slow client can't grow the frame without
-	// bound (drops newest while full — accepted loss).
+	// Cap buffered samples so a stalled/slow client can't grow the frame
+	// without bound. Overflow is no longer silent: it is counted in `missed`.
 	maxSamples := (deliverUs/intervalUs)*4 + 4
 
 	w.Header().Set("Content-Type", "application/octet-stream")
@@ -365,53 +437,114 @@ func (am *APIManager) handleBufferedStream(w http.ResponseWriter, r *http.Reques
 	w.WriteHeader(http.StatusOK)
 	flusher.Flush()
 
-	sampleTick := time.NewTicker(time.Duration(intervalUs) * time.Microsecond)
-	defer sampleTick.Stop()
+	// Own cancel: the handler also returns on a table change or a write error,
+	// and the sampler must stop then too (the deferred wait below would block).
+	ctx, cancel := context.WithCancel(r.Context())
+	interval := time.Duration(intervalUs) * time.Microsecond
+
+	// The SAMPLER runs in its own goroutine so a slow socket write (TCP
+	// backpressure) cannot stall sampling: it only ever blocks on the mutex
+	// for the few µs a frame swap takes.
+	var (
+		mu      sync.Mutex
+		buf     = make([]byte, 0, maxSamples*bytesPerSample)
+		count   int
+		missed  uint32
+		tFirst  uint64
+		stopped = make(chan struct{})
+	)
+	go func() {
+		defer close(stopped)
+		tk := time.NewTicker(interval)
+		defer tk.Stop()
+		start := time.Now()
+		var lastIdx int64 = -1
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case now := <-tk.C:
+				// Grid index of this tick; a jump of k > 1 means the ticker
+				// dropped k-1 ticks (Go tickers drop, never queue).
+				idx := int64(now.Sub(start) / interval)
+				mu.Lock()
+				if lastIdx >= 0 && idx > lastIdx+1 {
+					missed += uint32(idx - lastIdx - 1)
+				}
+				lastIdx = idx
+				if count < maxSamples {
+					if count == 0 {
+						tFirst = monoMicros(now)
+					}
+					buf = am.ipc.AppendRawSample(vars, buf)
+					count++
+				} else {
+					missed++
+				}
+				mu.Unlock()
+			}
+		}
+	}()
+	defer func() { cancel(); <-stopped }()
+
 	deliverTick := time.NewTicker(deliverUs * time.Microsecond)
 	defer deliverTick.Stop()
-
-	buf := make([]byte, 0, maxSamples*bytesPerSample)
-	count := 0
-	ctx := r.Context()
-
+	out := make([]byte, 0, 24+len(types)+maxSamples*bytesPerSample)
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-sampleTick.C:
-			if count < maxSamples {
-				buf = am.ipc.AppendRawSample(vars, buf)
-				count++
-			}
 		case <-deliverTick.C:
-			if count == 0 {
-				continue
-			}
-			var hdr [7]byte
-			binary.LittleEndian.PutUint32(hdr[0:4], uint32(2+1+len(types)+len(buf)))
-			binary.LittleEndian.PutUint16(hdr[4:6], uint16(count))
-			hdr[6] = byte(len(vars))
-			if _, err := w.Write(hdr[:]); err != nil {
-				return
-			}
-			if _, err := w.Write(types); err != nil {
-				return
-			}
-			if _, err := w.Write(buf); err != nil {
-				return
-			}
-			flusher.Flush()
-			buf = buf[:0]
-			count = 0
 		}
+		if am.ipc.TableGen() != gen {
+			slog.Info("Buffered stream ended: variable table changed", "remote", r.RemoteAddr)
+			return
+		}
+		mu.Lock()
+		if count == 0 && missed == 0 {
+			mu.Unlock()
+			continue
+		}
+		out = out[:0]
+		out = appendU32(out, 0) // frame_len placeholder
+		out = appendU16(out, bufferedFrameVersion)
+		out = appendU16(out, uint16(len(vars)))
+		out = appendU32(out, uint32(count))
+		out = appendU32(out, uint32(intervalUs))
+		out = appendU32(out, missed)
+		out = appendU64(out, tFirst)
+		out = append(out, types...)
+		out = append(out, buf...)
+		buf, count, missed = buf[:0], 0, 0
+		mu.Unlock()
+		binary.LittleEndian.PutUint32(out[0:4], uint32(len(out)-4))
+		if _, err := w.Write(out); err != nil {
+			return
+		}
+		flusher.Flush()
 	}
 }
 
-// handleClearForces clears force flags on all addressed variables.
+// handleListForces lists the FORCED addressed variables (REST scope: an
+// unaddressed variable is invisible here even when forced — the editor's
+// /stream/vars "__forced" key carries the full set).
+//
+//	GET /api/v1/forces
+//	Response: {"forced": ["prog__pump_on"], "count": 1}
+func (am *APIManager) handleListForces(w http.ResponseWriter, r *http.Request) {
+	forced := am.ipc.ForcedVariables(true)
+	jsonOK(w, map[string]any{"forced": forced, "count": len(forced)})
+}
+
+// handleClearForces clears ALL force flags — every variable in the table, not
+// just the addressed ones (same operation as the editor's ClearAllForces).
 //
 //	POST /api/v1/forces/clear
 func (am *APIManager) handleClearForces(w http.ResponseWriter, r *http.Request) {
-	am.ipc.ClearAllForces()
+	if err := am.ipc.ClearAllForces(); err != nil {
+		jsonError(w, shmcmd.HTTPStatus(err), err.Error())
+		return
+	}
 	jsonOK(w, map[string]string{"status": "ok"})
 }
 

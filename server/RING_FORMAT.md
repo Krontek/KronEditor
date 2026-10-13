@@ -27,7 +27,7 @@ exactly — change all three together (same rule as the `/dev/shm` mirror paths)
 | off | type | name | written by | meaning |
 |----|------|------|-----------|---------|
 | 0  | u32 | magic         | producer | `0x4B524E47` ("KRNG") |
-| 4  | u32 | version       | producer | `1` |
+| 4  | u32 | version       | producer | `2` (v2: scan counter in record +12, release fence after the claim). A v1 producer leaves +12 zero; the consumer accepts both |
 | 8  | u32 | header_bytes  | producer | `256` |
 | 12 | u32 | record_stride | producer | bytes per slot, `align8(16 + max_task_payload)` |
 | 16 | u32 | nslots        | producer | `(total_bytes - 256) / record_stride` |
@@ -58,7 +58,7 @@ Records begin at offset `256`.
 | 0  | u64 | seq         | the `write_seq` value under which this slot was written (always `≥ 1`); a slot that reads back `0` is empty/punched (a tmpfs hole), never a real record |
 | 8  | u16 | task_id     | which task wrote it |
 | 10 | u16 | payload_len | valid bytes in payload |
-| 12 | u32 | reserved    | 0 |
+| 12 | u32 | scan        | v2: the producer's per-task scan counter (low 32 bits) of the scan this record captured; consecutive records of one task differ by `stride_N`. v1: 0 |
 | 16 | u8[record_stride-16] | payload | addressed vars of `task_id`, in variable-table order (client decodes) |
 
 ## Producer algorithm (per task thread, C)
@@ -90,19 +90,22 @@ Per scan of task `g` (after `plc_shm_sync`, so values are final):
 ```c
 uint32_t N = atomic_load(&hdr->stride_N, relaxed);
 if (N == 0) return;                 /* PAUSED — no consumer connected */
-if ((scan_g++ % N) != 0) { /* skip */ }
+uint64_t sc = scan_g++;
+if ((sc % N) != 0) { /* skip */ }
 else {
     uint64_t s   = atomic_fetch_add(&hdr->write_seq, 1, relaxed);
+    atomic_thread_fence(release);   // seqlock writer: payload stores stay AFTER the claim
     Record *slot = base + 256 + (s % nslots) * record_stride;
     slot->task_id     = g;
     slot->payload_len = payload_len_g;
+    slot->scan        = (uint32_t)sc;
     memcpy(slot->payload, <task g addressed vars>, payload_len_g);
     atomic_store(&slot->seq, s, release);   // publish LAST
 }
 ```
 Multiple task threads are independent producers; `fetch_add` gives each a unique
 `s`, so two writers never target the same slot unless a full lap (`nslots`) apart.
-Wait-free: one relaxed add + one release store, never blocks on the consumer.
+Wait-free: one relaxed add, one release fence, one release store; never blocks on the consumer.
 
 ## Consumer algorithm (KronServer, Go)
 
@@ -118,11 +121,68 @@ if w - readSeq > nslots:            // lapped: oldest records overwritten
 for s := readSeq; s < w; s++ {
     slot = base + 256 + (s % nslots)*record_stride
     ss = atomic_load(slot.seq, acquire)
-    if ss != s { break }            // producer mid-write (ss<s) → stop, retry next tick
-    emit(slot.task_id, slot.payload[:payload_len])
+    if ss > s:                      // overwritten by a later lap
+        dropped += 1; readSeq = s + 1; continue
+    if ss < s:                      // unpublished (mid-write, crashed, or a punched hole = 0)
+        if w > s + 1 and s has been unpublished for > 100 ms:
+            dropped += 1; readSeq = s + 1; continue     // stuck slot: skip it
+        break                       // producer mid-write → stop, retry next tick
+    copy payload (8-byte atomic loads; payload is 8-aligned by layout)
+    if atomic_load(write_seq) > s + nslots:              // next occupant claimed
+        dropped += 1; readSeq = s + 1; continue          // copy may be torn: discard
+    emit(slot.task_id, payload[:payload_len])
     readSeq = s + 1
 }
 ```
+
+**Every lost record is counted in `dropped`** — lapped, overwritten, torn or
+stuck. A client that sees `dropped` unchanged between frames received every
+record in its seq range; any hole in the seq numbers is accounted for there.
+
+- ⚠️ **Torn-read check.** A slot is reused by seq `s + nslots`. Once that seq is
+  claimed (`write_seq > s + nslots`) the producer may be rewriting the slot while
+  the consumer copies it, so the copy is re-validated AFTER it is taken and
+  discarded if the next occupant was claimed meanwhile. This relies on the
+  producer's payload stores not becoming visible before its `fetch_add` — the
+  producer emits `__atomic_thread_fence(__ATOMIC_RELEASE)` right after the
+  `fetch_add` (a relaxed `fetch_add` gives no such ordering on ARM). `task_id`,
+  `payload_len` and `scan` are read BEFORE the copy and are covered by the same
+  re-check.
+- ⚠️ **Stuck-slot guard.** A producer killed between its `fetch_add` and its
+  `seq` store, or a slot punched by Reclaim, never publishes. Waiting only while
+  the slot is the NEWEST claimed one (`w == s + 1`) is a real mid-write; once
+  later seqs exist and the slot stays unpublished for ~100 ms it is skipped and
+  counted, so one dead slot cannot stall the stream for ever.
+
+## Wire frame (`GET /api/v1/stream/ring?v=2`)
+
+The stream is a sequence of length-prefixed frames, one per 5 ms tick that has
+≥ 1 record, plus one (possibly empty) frame whenever the epoch changes.
+
+```
+u32  frame_len        bytes after this field
+u16  version          2
+u16  header_len       bytes from `version` to the first record (28 in v2)
+u32  record_count
+u32  stride_N         current decimation
+u64  dropped_total    records lost on THIS connection (starts at 0)
+u64  epoch            the header's epoch the records were drained under
+record × record_count:
+    u64 seq, u16 task_id, u16 payload_len, u32 scan, u8 payload[payload_len]
+```
+
+- ⚠️ **`?v=2` is required**; without it the server answers 400. The v1 frame
+  had no version field (its first word was `record_count`), so a v1 client fed
+  v2 frames — or the reverse — decodes plausible garbage instead of failing.
+  Requiring the parameter makes the mismatch an explicit error. A future
+  version may append header fields: clients skip to `header_len`.
+- **Epoch.** On a change the server resets its cursor to the new run's
+  `write_seq` and emits a frame at once; the client must re-fetch
+  `/api/v1/ring/info` (the layout may differ) and must not count the `seq`
+  jump as loss.
+- `dropped_total` starts at 0 per connection — there is no attach backlog.
+- Per-record wire header is 16 bytes (`wireRecordHeaderBytes`); the
+  controller's `P` (`WireBytesPerSec`) includes it.
 
 ## Decimation control (KronServer, off the real-time path, ~100 ms tick)
 
@@ -131,12 +191,15 @@ for s := readSeq; s < w; s++ {
 - Backlog `fill = (write_seq - readSeq) / nslots`.
 - Emergency: `fill > 0.5` → `N = min(2N, Nmax)` immediately (grow-fast; no swell).
 - Analytic floor: `N ≥ ceil(P / (α·D))`, `α = 0.9` (stay strictly under the link).
-- Relax: `fill < 0.1` sustained AND above floor → `N = max(1, N-1)` (shrink-slow).
+- Relax: `fill < 0.1` → `N = max(1, N - max(1, N/10))` (multiplicative, but
+  slower than the doubling). The floor applies ONLY while `fill > 0.1`: with no
+  backlog `D` measures utilisation (what was chosen to send), not capacity, and
+  a floor derived from it would hold a high stride up by itself.
 - Store `N` into `stride_N` atomically. Single global N = proportional ("same
   ratio") decimation: every task keeps exactly `1/N` of its samples, uniformly
   strided on its own scan counter.
-- **Pause/resume:** the FIRST client to register writes the last-good `N` (≥ 1)
-  immediately, without waiting for a control tick; the LAST one to disconnect
+- **Pause/resume:** the FIRST client to register after an idle period resets
+  `N = 1` and writes it immediately, without waiting for a control tick; the LAST one to disconnect
   writes `0`. So the producer only ever runs while somebody is reading. The
   trade-off is deliberate: there is no pre-connect history, and a client sees
   data building from the moment it attaches.
@@ -156,14 +219,124 @@ the ring's resident memory tracks the *live backlog*:
 - Each stream connection reports its `readSeq` to the controller; the controller
   computes `minReadSeq` across all clients and, each ~100 ms tick, frees the
   consumed pages via `fallocate(FALLOC_FL_PUNCH_HOLE)` on `<shm>_ring`.
-- ⚠️ **Only slots that are BOTH already-read (`seq < minReadSeq`) AND not yet
-  overwritten (`seq > write_seq - nslots`) are punched**, so the wait-free
-  producer is never raced: it re-faults a punched page (RSS 0 → allocated) only
-  when it laps back to write there. Punch ranges are rounded INWARD to page
+- ⚠️ **Only slots that are BOTH already-read (`seq < minReadSeq`) AND safely
+  behind the write cursor (`seq ≥ write_seq - nslots + 1 + nslots/4`) are
+  punched.** `write_seq` is a snapshot taken before a punch that can take a
+  while, so a quarter of the ring is kept as margin: the producer would have to
+  advance `nslots/4` records during the punch to reach a slot being freed. It
+  re-faults a punched page (RSS 0 → allocated) when it laps back to write there. Punch ranges are rounded INWARD to page
   boundaries so a page shared with a still-live slot is left intact.
 - On PAUSE (last client disconnects) the whole records area is punched → **idle
-  RSS ~0**.
+  RSS ~0**. This happens under the controller lock together with the "no
+  clients" check, so a client connecting at that moment cannot have its first
+  records punched.
+- ⚠️ **Resizing a mapped segment.** KronServer pre-sizes the segment before every
+  runtime start while its consumer may still have it mapped. A SHRINK under a
+  live mapping is a SIGBUS (fatal to the agent), so the resize runs under the
+  consumer's lock, the mapping is cut to the new size and the parsed layout is
+  invalidated (`nslots = 0`, nothing is read) until the new runtime's epoch bump
+  re-parses a header that fits.
 - Net: consumer keeps up → RSS ≈ 0; consumer falls behind → RSS grows toward the
   cap; sustained overrate → decimation holds it there; idle → RSS 0. tmpfs frees
   the pages immediately (`madvise(DONTNEED)` does NOT free a shared tmpfs page —
   `fallocate` punch-hole is the correct tool).
+
+
+---
+
+# Variable segment (`/dev/shm/<shm-name>`, SHM layout v2)
+
+The 64 KiB segment the runtime mirrors its variables into (`PLC_SHM_SIZE`,
+KronServer `-shm-size`). Writers: KronServer on target, the host agent for the
+local hot-swap simulation (loader-host-owned mirror; on macOS a plain file
+`<buildDir>/plc_runtime.mirror`, on Windows the section `Local\plc_runtime`).
+Generated by `CTranspilerService.js` (`tryAssignShm`, `generateShmMailbox`);
+the Go writer is `hotswaplib/shmcmd`, shared by both agents.
+
+| range | content | owner |
+|---|---|---|
+| `[0, 32768)` | data slots, offsets from `variable_table.json` | runtime writes (`plc_shm_sync`); readers read |
+| `[32768, 61440)` | one flag byte per variable, `force_flag_offset = 32768 + index` | **runtime only** |
+| `[61440, 65536)` | force-write mailbox | header fields per table below |
+
+- ⚠️ **Natural alignment.** An `n`-byte scalar sits at a multiple of
+  `min(n, 8)`. The runtime copies every scalar slot with ONE
+  `__atomic_load_n`/`__atomic_store_n` of its width and the Go readers use
+  `sync/atomic` for 4/8 bytes — so no reader ever sees half of an old LREAL and
+  half of a new one (and armv7 can do a 64-bit atomic only at an 8-aligned
+  address; mmap bases are page-aligned, so the offset alignment suffices).
+  STRING (64-byte, read-only) stays a `memcpy`: a torn display line is possible
+  and tolerated.
+- **Flag byte**: `0` = the logic owns the value; `0x81` = FORCED (re-injected
+  every scan from `PlcState.__plc_fv`, the forced-value shadow at the slot's
+  offset — NOT from the slot, which another task's sync may have overwritten
+  with a stale value). Any other non-zero value was written by an outdated
+  (v1) writer: the runtime clears it, counts it in the mailbox header (+44) and
+  prints one warning. PULSE is no longer a stored flag value.
+
+## Force-write mailbox (at 61440)
+
+Header (64 bytes):
+
+| off | type | name | written by |
+|---|---|---|---|
+| 0 | u32 | magic `0x424D524B` ("KRMB") | runtime, LAST at init (release); 0 = not ready |
+| 4 | u16 | layout version (2) | runtime |
+| 6 | u16 | header bytes (64) | runtime |
+| 8 | u32 | capacity (64) | runtime |
+| 12 | u32 | entry bytes (32) | runtime |
+| 16 | u32 | nvars (valid indices `[0, nvars)`) | runtime |
+| 20 | u32 | consumer try-lock | runtime task threads |
+| 24 | u64 | head — last posted seq | **writer** |
+| 32 | u64 | ack — last consumed seq (release) | runtime |
+| 40 | u32 | reserved | — |
+| 44 | u32 | foreign flag writes seen | runtime |
+
+Entry `seq % capacity` at `61440 + 64 + slot × 32`:
+
+| off | type | name |
+|---|---|---|
+| 0 | u64 | seq — published LAST by the writer (release); valid ⇔ `== seq` |
+| 8 | u32 | variable index (`force_flag_offset - 32768`) |
+| 12 | u32 | status: 0 pending → runtime CASes 1 (claimed) → 2 applied / 3 bad index / 4 bad size / 5 read-only / 6 bad op; a timed-out writer CASes 0 → `0xFFFFFFFF` (cancelled) |
+| 16 | u8 | op: 1 FORCE, 2 PULSE, 3 UNFORCE, 4 CLEAR_ALL |
+| 17 | u8 | value size (must equal the variable's size) |
+| 18 | u8 | has-value (UNFORCE only: also write the value once) |
+| 24 | u8[8] | value, little-endian |
+
+**Writer** (one process per segment; its threads serialised by a mutex):
+check magic/version/capacity/entry size (mismatch ⇒ refuse: "runtime/server
+protocol mismatch — redeploy KronServer (server/build.sh + Deploy Server) and
+Build & Send"); `head - ack ≥ capacity` ⇒ 503 full; write the entry fields,
+then `seq` (release), then `head`. Wait until `ack ≥ seq` (bounded: 2 × the
+slowest task interval + 100 ms, clamped to 250 ms–2 s), polling the process's
+liveness so a stop fails fast. On timeout CAS status 0 → cancelled: if that
+wins the command is withdrawn and **never applied late** (504); if the
+runtime already claimed it, wait briefly for its ack. Success only after
+`status == applied`.
+
+**Consumer** (generated C, start of every `plc_shm_pull`, every task thread):
+acquire-load magic; try-lock (+20) — a thread that finds it taken skips, never
+blocks (RT priority inversion); for `s = ack+1 …` (at most one lap per scan):
+acquire-load `entry.seq`, stop unless `== s`; CAS status 0 → claimed; apply
+(FORCE: forced value into `PlcState.__plc_fv`, then flag `0x81` with release;
+PULSE/UNFORCE: flag 0; then — if a value is carried — PlcState and the slot);
+store the final status (release); store `ack = s` (release). Unlock.
+
+**Init** (`plc_mb_init`, once per runtime start before any task thread: in
+`plc_shm_init` for the single binary, in `plc_init_hs` on a hot-swap cold
+start — never on a swap): unpublish magic; reload every flag-`0x81` variable's
+forced value from its slot (a crash-restart with the same table keeps its
+forces — `plc_shm_sync` wrote the forced value there); `ack = head` (drop
+anything posted while nothing consumed); write header fields; publish magic.
+
+- ⚠️ **Hot-swap.** The mailbox lives in the HOST-owned mirror and the forced
+  values in host-owned PlcState, and no task thread is inside `plc_shm_pull`
+  while the swap barrier holds — so a command is neither lost nor applied twice
+  across a swap.
+- ⚠️ **KronServer's pre-start hook** (old runtime gone, new one not spawned)
+  resets the mailbox (magic 0, `ack = head`) and, when the variable table
+  changed, zeroes the flag region directly. That direct write is legal ONLY
+  there: there is no consumer to race. `ClearAllForces` with the runtime
+  stopped clears the flags directly for the same reason; with it running it
+  is one CLEAR_ALL command.

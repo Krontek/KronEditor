@@ -9,12 +9,14 @@ import (
 	"context"
 	"encoding/json"
 	"log/slog"
+	"strconv"
 	"sync/atomic"
 	"time"
 
 	connect "connectrpc.com/connect"
-	plcv1 "plc-agent/gen/plc/v1"
+	"github.com/krontek/hotswaplib/shmcmd"
 	"google.golang.org/protobuf/types/known/structpb"
+	plcv1 "plc-agent/gen/plc/v1"
 )
 
 // streamInterval is the fixed cadence of editor-facing streams: the
@@ -96,33 +98,59 @@ func (s *PLCService) Stop(_ context.Context, _ *connect.Request[plcv1.StopReques
 	return connect.NewResponse(&plcv1.StopResponse{}), nil
 }
 
-// WriteVar force-writes a variable value into shared memory.
+// WriteVar posts a force-write command and returns once the runtime applied it.
+// req.mode selects force (default) / pulse / unforce.
 func (s *PLCService) WriteVar(_ context.Context, req *connect.Request[plcv1.WriteVarRequest]) (*connect.Response[plcv1.WriteVarResponse], error) {
 	name := req.Msg.GetName()
 	if name == "" {
 		return nil, connect.NewError(connect.CodeInvalidArgument, nil)
 	}
-	v := req.Msg.GetValue()
-	if v == nil {
-		return nil, connect.NewError(connect.CodeInvalidArgument, nil)
-	}
-	// Re-marshal the protobuf Value to JSON for ipc.WriteVariable.
-	raw, err := json.Marshal(v.AsInterface())
+	op, err := shmcmd.ParseOp(req.Msg.GetMode())
 	if err != nil {
 		return nil, connect.NewError(connect.CodeInvalidArgument, err)
 	}
-	if err := s.ipc.WriteVariable(name, json.RawMessage(raw)); err != nil {
-		slog.Warn("Failed to write variable", "name", name, "err", err)
-		return nil, connect.NewError(connect.CodeInternal, err)
+	v := req.Msg.GetValue()
+	if v == nil && op != shmcmd.OpUnforce {
+		return nil, connect.NewError(connect.CodeInvalidArgument, nil)
 	}
-	slog.Info("Variable force-written", "name", name)
+	// Re-marshal the protobuf Value to JSON for ipc.WriteVariableMode. A
+	// 64-bit integer arrives as a decimal STRING (a Value number is a double)
+	// and normalizeRawValue parses it exactly.
+	var raw []byte
+	if v != nil {
+		if raw, err = json.Marshal(v.AsInterface()); err != nil {
+			return nil, connect.NewError(connect.CodeInvalidArgument, err)
+		}
+	}
+	if err := s.ipc.WriteVariableMode(name, json.RawMessage(raw), op); err != nil {
+		slog.Warn("Failed to write variable", "name", name, "err", err)
+		return nil, connect.NewError(connectCodeFor(err), err)
+	}
+	slog.Info("Variable written", "name", name, "mode", req.Msg.GetMode())
 	return connect.NewResponse(&plcv1.WriteVarResponse{}), nil
 }
 
 // ClearAllForces removes all force flags.
 func (s *PLCService) ClearAllForces(_ context.Context, _ *connect.Request[plcv1.ClearAllForcesRequest]) (*connect.Response[plcv1.ClearAllForcesResponse], error) {
-	s.ipc.ClearAllForces()
+	if err := s.ipc.ClearAllForces(); err != nil {
+		return nil, connect.NewError(connectCodeFor(err), err)
+	}
 	return connect.NewResponse(&plcv1.ClearAllForcesResponse{}), nil
+}
+
+// connectCodeFor maps a force-write failure to a ConnectRPC code.
+func connectCodeFor(err error) connect.Code {
+	switch shmcmd.KindOf(err) {
+	case shmcmd.KindNotRunning, shmcmd.KindNotReady, shmcmd.KindMismatch:
+		return connect.CodeFailedPrecondition
+	case shmcmd.KindFull:
+		return connect.CodeResourceExhausted
+	case shmcmd.KindTimeout:
+		return connect.CodeDeadlineExceeded
+	case shmcmd.KindRejected, shmcmd.KindInvalid:
+		return connect.CodeInvalidArgument
+	}
+	return connect.CodeInternal
 }
 
 // StreamVars pushes a full variable snapshot every streamInterval (50 ms)
@@ -170,6 +198,10 @@ func toProtoStruct(m map[string]any) (*structpb.Struct, error) {
 	norm := make(map[string]any, len(m))
 	for k, v := range m {
 		switch val := v.(type) {
+		case int64, uint64:
+			// ⚠️ A protobuf Value number is a double: every LINT/ULINT/LWORD
+			// above 2^53 used to arrive rounded. See jsonSafe64.
+			norm[k] = jsonSafe64(val)
 		case int8:
 			norm[k] = float64(val)
 		case uint8:
@@ -187,3 +219,28 @@ func toProtoStruct(m map[string]any) (*structpb.Struct, error) {
 
 // remoteAddrKey is used to store the remote address in context.
 type remoteAddrKey struct{}
+
+// maxExactDouble is 2^53: every integer of magnitude <= this is exact in a
+// float64 (and in a JavaScript number).
+const maxExactDouble = 1 << 53
+
+// jsonSafe64 returns a 64-bit integer unchanged while a double holds it
+// exactly, and as a DECIMAL STRING beyond that. Clients that decode numbers as
+// doubles (protobuf Value, JavaScript) would otherwise silently round it; the
+// editor and normalizeRawValue both accept the string form, so a value read
+// this way can be written back verbatim. Other values pass through.
+func jsonSafe64(v any) any {
+	switch n := v.(type) {
+	case int64:
+		if n > maxExactDouble || n < -maxExactDouble {
+			return strconv.FormatInt(n, 10)
+		}
+		return n
+	case uint64:
+		if n > maxExactDouble {
+			return strconv.FormatUint(n, 10)
+		}
+		return n
+	}
+	return v
+}

@@ -114,7 +114,7 @@ func TestRunBuildSoemEndToEnd(t *testing.T) {
 		"x86_64-linux-gnu", "x86_64-w64-mingw32", "aarch64-linux-gnu", "arm-linux-gnueabihf",
 	}
 	// Plus the host's own darwin triple when this test runs ON a Mac — macOS
-	// is HOST-ONLY (§15/CLAUDE.md, same rule as every other library target)
+	// is HOST-ONLY (host-agent/CLAUDE.md, same rule as every other library target)
 	// because its unofficial contrib/ port still needs the real SOEM headers
 	// staged from a real clone, and archiving needs the bundled toolchain's
 	// -isysroot resolved via a real `xcrun`. It is not "deliberately absent"

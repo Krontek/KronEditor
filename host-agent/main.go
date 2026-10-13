@@ -36,6 +36,7 @@ type Server struct {
 	hmi            *HmiState
 	ollama         *OllamaState
 	hotswap        *HotSwapState
+	mbWriter       mailboxWriter // force-write mailbox of the running hot-swap sim (hotswap.go)
 	anthropicOAuth *AnthropicOAuthState
 	live           *LiveFilter
 }
@@ -120,6 +121,7 @@ func main() {
 	mux.HandleFunc("/api/host/hotswap/run", srvState.handleHotSwapRun)
 	mux.HandleFunc("/api/host/hotswap/swap", srvState.handleHotSwapSwap)
 	mux.HandleFunc("/api/host/hotswap/stop", srvState.handleHotSwapStop)
+	mux.HandleFunc("/api/host/hotswap/clear-forces", srvState.handleHotSwapClearForces) // release every force (CLEAR_ALL)
 	mux.HandleFunc("/api/host/hotswap/target-build", srvState.handleHotSwapTargetBuild)   // cross-compile host+logic.so for the field
 	mux.HandleFunc("/api/host/hotswap/target-logic", srvState.handleHotSwapTargetLogic)   // recompile logic.so for an online change
 	mux.HandleFunc("/api/host/hotswap/target-deploy", srvState.handleHotSwapTargetDeploy) // upload runtime.bin(host)+variables+logic.so to KronServer

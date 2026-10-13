@@ -3,6 +3,7 @@ import { buildGeneratedDeviceArtifacts } from '../utils/deviceCodegen';
 import { getPortOptions } from '../utils/devicePortMapping';
 import { validateIECAddress } from '../utils/iecAddress';
 import { buildEcVarNames, findEcIssues } from '../utils/ecNaming';
+import { createSTExprCompiler, STExprError } from './stExpr';
 
 const getBoardFamilyDefine = (boardId) => {
     if (!boardId) return null;
@@ -90,9 +91,30 @@ const IDENTIFIER_REF_REGEX = /^[A-Za-z_][A-Za-z0-9_]*(\[[^\]]*\]|\.[A-Za-z_][A-Z
 
 const isPointerInputType = (iecType) => POINTER_INPUT_TYPES.has(String(iecType || '').toUpperCase());
 const isStringInputType = (iecType) => /^W?STRING$/i.test(String(iecType || '').trim());
-// Bytes a STRING occupies in the shared-memory mirror, NUL-padded. Matches
-// KRON_SYS_TEXT_LEN in kronsystem.h so a reader block's whole line fits.
+// Bytes a STRING occupies — in PlcState AND in the shared-memory mirror,
+// including the NUL. Matches KRON_SYS_TEXT_LEN in kronsystem.h (a static
+// assert in plc.h holds the two together) so a reader block's whole line fits.
+// IEC `STRING[n]` is not supported: every STRING is this one fixed size.
 const STRING_SHM_BYTES = 64;
+
+// ── IEC STRING has VALUE semantics ──────────────────────────────────────────
+// A STRING variable (global, program local, FB/UDT member, array element,
+// FUNCTION local/input) is a fixed `kron_string_t` = `char[STRING_SHM_BYTES]`
+// holding the TEXT, never a `char *`. A pointer field was wrong three ways: a
+// retained one persisted an address from the previous process, under hot-swap
+// a literal assigned once pointed into the .rodata of a dlclose'd logic_N.so,
+// and `a := b` aliased instead of copying.
+// ⚠️ An array cannot be the target of C `=`, so EVERY assignment to STRING
+// storage is lowered to KRON_STRSET (bounded, NUL-terminating, NUL-padding;
+// see the plc.h preamble). The macro refuses a target that is not a
+// kron_string_t at COMPILE time, so a mis-detected `const char *` pin (the
+// standard blocks' PATH/NAME inputs, which are pointers re-assigned every
+// scan) fails loudly instead of being written through.
+const STRING_C_TYPE = 'kron_string_t';
+const kronStrset = (dst, src) => `KRON_STRSET(${dst}, ${src})`;
+// C return type of a FUNCTION: a STRING result is handed back as a pointer to
+// a per-thread buffer (an array cannot be returned) — see transpilePOUSource.
+const fnReturnCType = (iecType) => (isStringInputType(iecType) ? 'const char *' : mapType(iecType || 'VOID'));
 
 // IEC type name → the KRON_ library's spelling, e.g. INT→INT16. Module level
 // because the ST rewrite and the ladder conversion branch must agree; they had
@@ -112,34 +134,211 @@ const strConvSymbol = (progName, tag) => `prog_${progName}_sconv_${tag}`;
 // Upper bound on ST call sites. Comments and string literals are stripped
 // before the rewrite runs, so the rewrite can only consume FEWER than this —
 // never more, which would reference a field that was never declared.
-const countStringConvCalls = (code) => ((String(code || '')
-    .replace(/\(\*[\s\S]*?\*\)/g, '')
-    .replace(/\/\/[^\n]*/g, '')
+const countStringConvCalls = (code) => ((stripIecComments(code, { blankStrings: true })
     .match(/\b[A-Za-z]+_TO_STRING\s*\(/g)) || []).length;
 
 // ── Shared-memory mirror: one emitter per direction ─────────────────────────
 // ⚠️ Both plc_shm_sync/pull and their per-task twins in generateMainLoop are
 // generated from these, so the two copies cannot drift apart.
 //
-// A STRING variable is a `char *` into the runtime's own memory, so the slot
-// carries the TEXT: copy the characters, NUL-pad the rest, truncate past the
-// slot. Two consequences, both deliberate:
+// SHM layout v2 (the byte contract is server/RING_FORMAT.md § "Variable
+// segment"): data slots from 0 at NATURAL alignment, one runtime-owned flag
+// byte per variable from SHM_FORCE_FLAGS_BASE, and the force-write command
+// mailbox at SHM_MAILBOX_BASE. Writers (KronServer, the host agent) never touch
+// a slot or a flag any more — they post a command and wait for its ack.
+//
+// A STRING variable is a `kron_string_t` (char[64]) holding the text, and the
+// slot carries the same TEXT: copy the characters, NUL-pad the rest. The scan
+// is bounded by the slot, so a buffer something filled without a terminator
+// (a block's own VALUE) can never be over-read. Two consequences, both
+// deliberate:
 //   - the mirror is written UNCONDITIONALLY for text, ignoring the force flag,
 //     because a string cannot be forced (see below) and honouring a stray flag
 //     would freeze the display;
-//   - text is NEVER pulled back. Writing into `char *` would have to own a
-//     buffer, and the pointer usually addresses a literal or a block's own
-//     field. STRING is a read-only live value.
+//   - text is NEVER pulled back: a 64-byte copy cannot be applied atomically
+//     between scans the way a scalar is, and a STRING pin of a standard block
+//     is a `const char *` the runtime does not own. STRING is a read-only
+//     live value (KronServer encodeValue, writeHotSwapVariable, the UI and the
+//     mailbox's PLC_MB_ST_READ_ONLY all refuse a write).
+// ⚠️ Text is the one slot NOT copied atomically (64 bytes cannot be): a reader
+// racing this memcpy can see half of the old line and half of the new one. A
+// torn display line is tolerable for a read-only diagnostic; anything that
+// needs a consistent value must not be a STRING.
+const SHM_LAYOUT_VERSION = 2;
+const SHM_TOTAL_SIZE = 65536;      // must match PLC_SHM_SIZE and KronServer's -shm-size
+const SHM_FORCE_FLAGS_BASE = 32768;
+const SHM_MAILBOX_BASE = 61440;    // 0xF000: the top 4 KiB of the segment
+const SHM_MAILBOX_CAP = 64;
+// Natural-width carrier for a scalar slot. Every slot is aligned to its own
+// width (max 8), so these loads/stores are single-copy atomic on every target —
+// including 64-bit values on armv7 (ldrexd/strexd need 8-byte alignment).
+const SHM_SCALAR_C = { 1: 'uint8_t', 2: 'uint16_t', 4: 'uint32_t', 8: 'uint64_t' };
+const shmScalarC = (size) => SHM_SCALAR_C[size] || null;
+
 const shmSyncLine = ({ c_symbol, offset, size, flagOffset, isString }) => isString
-    ? `    { const char *__s = (const char *)(S->${c_symbol}); size_t __n = __s ? strlen(__s) : 0u;` +
-      ` if (__n > ${size - 1}u) __n = ${size - 1}u;` +
+    ? `    { const char *__s = (const char *)(S->${c_symbol}); size_t __n = 0u;` +
+      ` while (__n < ${size - 1}u && __s[__n]) __n++;` +
       ` if (__n) memcpy(__plc_shm + ${offset}, __s, __n);` +
       ` memset(__plc_shm + ${offset} + __n, 0, ${size}u - __n); }\n`
-    : `    if (__plc_shm[${flagOffset}] == 0) { memcpy(__plc_shm + ${offset}, (const void*)&(S->${c_symbol}), ${size}); }\n`;
+    // A FORCED slot shows the forced value (kept in S->__plc_fv, which only the
+    // mailbox consumer writes), never whatever the logic computed this scan.
+    : `    PLC_SLOT_ST(${offset}, (PLC_FLAG_LD(${flagOffset}) == PLC_FLAG_FORCED) ? (const void*)(S->__plc_fv + ${offset}) : (const void*)&(S->${c_symbol}), ${shmScalarC(size)});\n`;
 
+// ⚠️ The forced value is re-injected from S->__plc_fv, NOT from the data slot.
+// The slot is a display: plc_shm_sync on ANOTHER task thread may have read the
+// flag as 0 just before the consumer forced it and store the stale computed
+// value afterwards — re-reading the slot would then pin that stale value, the
+// exact race the mailbox exists to remove. Any flag value other than 0 /
+// PLC_FLAG_FORCED was written by an outdated writer (v1 KronServer/agent).
 const shmPullLine = ({ c_symbol, offset, size, flagOffset, isString }) => isString
     ? ''
-    : `    if (__plc_shm[${flagOffset}]) { memcpy((void*)&(S->${c_symbol}), __plc_shm + ${offset}, ${size}); if (__plc_shm[${flagOffset}] == 2) __plc_shm[${flagOffset}] = 0; }\n`;
+    : `    { uint8_t __f = PLC_FLAG_LD(${flagOffset}); if (__f) { if (__f == PLC_FLAG_FORCED) PLC_COPY_IN(&(S->${c_symbol}), S->__plc_fv + ${offset}, ${shmScalarC(size)}); else plc_mb_foreign(${flagOffset}u, __f); } }\n`;
+
+// ── Force-write command mailbox (runtime = the ONLY consumer) ──────────────
+// Writers used to store the value into the data slot and then set the flag
+// byte. A plc_shm_sync between those two stores overwrote the new value, the
+// flag then pinned the OLD one, and the request still returned 200. Now a
+// writer posts {seq, index, op, size, value} into this mailbox, publishing seq
+// LAST (release); the runtime drains it at the start of every plc_shm_pull,
+// applies each command (PlcState + forced value + slot + flag — the runtime
+// OWNS the flag bytes now) and publishes `ack`. The writer returns success only
+// after the ack. Byte layout: server/RING_FORMAT.md § "Force-write mailbox";
+// the Go writer is hotswaplib/shmcmd, shared by KronServer and the host agent.
+//
+// ⚠️ Every task thread runs plc_shm_pull, so consumption is a TRY-lock in the
+// segment itself: a thread that finds it taken simply skips (the holder
+// applies everything pending). Never a blocking mutex — RT tasks of different
+// priority would invert on it. The lock and the cursors live in the MIRROR,
+// which the loader-host owns, so under hot-swap nothing is lost or applied
+// twice across a swap (no thread is ever inside pull while the barrier holds).
+const generateShmMailbox = (shmEntries) => {
+    let c = '';
+    c += `#include <stdio.h>\n`;
+    c += `#define PLC_SHM_LAYOUT_VERSION ${SHM_LAYOUT_VERSION}u\n`;
+    c += `#define PLC_FORCE_FLAGS_BASE ${SHM_FORCE_FLAGS_BASE}u\n`;
+    // Flag byte values (runtime-written): 0 = the logic owns the value,
+    // PLC_FLAG_FORCED = re-injected from S->__plc_fv every scan. PULSE is no
+    // longer a stored state — it is applied once when its command is consumed.
+    // Anything else came from an outdated writer and is cleared + counted.
+    c += `#define PLC_FLAG_FORCED 0x81u\n`;
+    c += `#define PLC_MB_BASE ${SHM_MAILBOX_BASE}u\n`;
+    c += `#define PLC_MB_MAGIC 0x424D524Bu /* "KRMB" */\n`;
+    c += `#define PLC_MB_HDR 64u\n`;
+    c += `#define PLC_MB_CAP ${SHM_MAILBOX_CAP}u\n`;
+    c += `#define PLC_MB_ENTRY 32u\n`;
+    c += `#define PLC_MB_NVARS ${shmEntries.length}u\n`;
+    c += `#define PLC_MB_OP_FORCE 1u\n#define PLC_MB_OP_PULSE 2u\n#define PLC_MB_OP_UNFORCE 3u\n#define PLC_MB_OP_CLEAR_ALL 4u\n`;
+    c += `#define PLC_MB_ST_CLAIMED 1u\n#define PLC_MB_ST_APPLIED 2u\n#define PLC_MB_ST_BAD_INDEX 3u\n#define PLC_MB_ST_BAD_SIZE 4u\n#define PLC_MB_ST_READ_ONLY 5u\n#define PLC_MB_ST_BAD_OP 6u\n`;
+    c += `#define PLC_FLAG_LD(f) __atomic_load_n(__plc_shm + (f), __ATOMIC_ACQUIRE)\n`;
+    c += `#define PLC_SLOT_ST(off, src, T) do { T __v; memcpy(&__v, (src), sizeof(T)); __atomic_store_n((T *)(__plc_shm + (off)), __v, __ATOMIC_RELAXED); } while (0)\n`;
+    c += `#define PLC_COPY_IN(dst, src, T) do { T __v = __atomic_load_n((const T *)(src), __ATOMIC_RELAXED); memcpy((dst), &__v, sizeof(T)); } while (0)\n`;
+    // Atomic store of an n-byte scalar to an n-aligned address.
+    c += `static void plc_mb_put(uint8_t *d, const uint8_t *s, int n) {\n`;
+    c += `    switch (n) {\n`;
+    c += `    case 1: __atomic_store_n(d, s[0], __ATOMIC_RELAXED); break;\n`;
+    c += `    case 2: { uint16_t v; memcpy(&v, s, 2); __atomic_store_n((uint16_t *)d, v, __ATOMIC_RELAXED); } break;\n`;
+    c += `    case 4: { uint32_t v; memcpy(&v, s, 4); __atomic_store_n((uint32_t *)d, v, __ATOMIC_RELAXED); } break;\n`;
+    c += `    case 8: { uint64_t v; memcpy(&v, s, 8); __atomic_store_n((uint64_t *)d, v, __ATOMIC_RELAXED); } break;\n`;
+    c += `    default: break;\n    }\n}\n`;
+    // index → (slot offset, PlcState address, size); -1 = read-only (STRING).
+    c += `static int plc_mb_target(uint32_t i, uint32_t *off, void **st) {\n`;
+    c += `    switch (i) {\n`;
+    shmEntries.forEach((e, i) => {
+        c += e.isString
+            ? `    case ${i}u: return -1;\n`
+            : `    case ${i}u: *off = ${e.offset}u; *st = (void *)&(S->${e.c_symbol}); return ${e.size};\n`;
+    });
+    c += `    default: (void)off; (void)st; return 0;\n    }\n}\n`;
+    // A flag byte this runtime never writes: an outdated writer (a v1
+    // KronServer or host agent) stored value + flag directly. Its write is
+    // dropped — honouring it would bring back the race — and said out loud.
+    c += `static void plc_mb_foreign(uint32_t flag, uint8_t v) {\n`;
+    c += `    static int warned = 0;\n`;
+    c += `    if (!__atomic_compare_exchange_n(__plc_shm + flag, &v, (uint8_t)0, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) return;\n`;
+    c += `    __atomic_fetch_add((uint32_t *)(__plc_shm + PLC_MB_BASE + 44u), 1u, __ATOMIC_RELAXED);\n`;
+    c += `    if (!__atomic_exchange_n(&warned, 1, __ATOMIC_RELAXED))\n`;
+    c += `        fprintf(stderr, "[plc] ignored a force flag written directly into shared memory: the writer predates the force-write mailbox (SHM layout v%u) - redeploy KronServer (server/build.sh + Deploy Server to Target)\\n", PLC_SHM_LAYOUT_VERSION);\n`;
+    c += `}\n`;
+    c += `static uint32_t plc_mb_apply(const uint8_t *e) {\n`;
+    c += `    uint32_t idx; memcpy(&idx, e + 8, 4);\n`;
+    c += `    uint8_t op = e[16], sz = e[17], has = e[18];\n`;
+    c += `    const uint8_t *val = e + 24;\n`;
+    c += `    if (op == PLC_MB_OP_CLEAR_ALL) {\n`;
+    c += `        for (uint32_t i = 0; i < PLC_MB_NVARS; i++) __atomic_store_n(__plc_shm + PLC_FORCE_FLAGS_BASE + i, (uint8_t)0, __ATOMIC_RELEASE);\n`;
+    c += `        return PLC_MB_ST_APPLIED;\n    }\n`;
+    c += `    if (op < PLC_MB_OP_FORCE || op > PLC_MB_OP_UNFORCE) return PLC_MB_ST_BAD_OP;\n`;
+    c += `    uint32_t off = 0; void *st = 0;\n`;
+    c += `    int n = plc_mb_target(idx, &off, &st);\n`;
+    c += `    if (n == 0) return PLC_MB_ST_BAD_INDEX;\n`;
+    c += `    if (n < 0) return PLC_MB_ST_READ_ONLY;\n`;
+    c += `    int writes = (op != PLC_MB_OP_UNFORCE) || has;\n`;
+    c += `    if (writes && sz != (uint8_t)n) return PLC_MB_ST_BAD_SIZE;\n`;
+    c += `    uint8_t *flag = __plc_shm + PLC_FORCE_FLAGS_BASE + idx;\n`;
+    c += `    if (op == PLC_MB_OP_FORCE) {\n`;
+    // forced value FIRST, then the flag with release: a pull on another task
+    // that acquire-loads FORCED is guaranteed to read the new forced value.
+    c += `        plc_mb_put(S->__plc_fv + off, val, n);\n`;
+    c += `        __atomic_store_n(flag, (uint8_t)PLC_FLAG_FORCED, __ATOMIC_RELEASE);\n`;
+    c += `    } else {\n`;
+    c += `        __atomic_store_n(flag, (uint8_t)0, __ATOMIC_RELEASE);\n`;
+    c += `    }\n`;
+    c += `    if (writes) { memcpy(st, val, (size_t)n); plc_mb_put(__plc_shm + off, val, n); }\n`;
+    c += `    return PLC_MB_ST_APPLIED;\n`;
+    c += `}\n`;
+    c += `static void plc_mb_consume(void) {\n`;
+    c += `    uint8_t *mb = __plc_shm + PLC_MB_BASE;\n`;
+    c += `    if (__atomic_load_n((uint32_t *)(mb + 0), __ATOMIC_ACQUIRE) != PLC_MB_MAGIC) return;\n`;
+    c += `    if (__atomic_exchange_n((uint32_t *)(mb + 20), 1u, __ATOMIC_ACQUIRE) != 0u) return; /* another task is draining */\n`;
+    c += `    uint64_t ack = __atomic_load_n((uint64_t *)(mb + 32), __ATOMIC_RELAXED);\n`;
+    // Bounded to one lap per scan, so a flood can never stretch a scan.
+    c += `    for (uint32_t k = 0; k < PLC_MB_CAP; k++) {\n`;
+    c += `        uint64_t s = ack + 1u;\n`;
+    c += `        uint8_t *e = mb + PLC_MB_HDR + (uint32_t)(s % PLC_MB_CAP) * PLC_MB_ENTRY;\n`;
+    c += `        if (__atomic_load_n((uint64_t *)e, __ATOMIC_ACQUIRE) != s) break;\n`;
+    // CLAIM before applying: a writer that timed out CASes the same word to
+    // "cancelled", so a late runtime can never apply a write its client was
+    // already told had failed.
+    c += `        uint32_t expect = 0u;\n`;
+    c += `        if (__atomic_compare_exchange_n((uint32_t *)(e + 12), &expect, PLC_MB_ST_CLAIMED, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))\n`;
+    c += `            __atomic_store_n((uint32_t *)(e + 12), plc_mb_apply(e), __ATOMIC_RELEASE);\n`;
+    c += `        ack = s;\n`;
+    c += `        __atomic_store_n((uint64_t *)(mb + 32), ack, __ATOMIC_RELEASE);\n`;
+    c += `    }\n`;
+    c += `    __atomic_store_n((uint32_t *)(mb + 20), 0u, __ATOMIC_RELEASE);\n`;
+    c += `}\n`;
+    // Runs once per runtime start, BEFORE any task thread exists (plc_shm_init
+    // in the single binary, plc_init_hs on a hot-swap cold start — never on a
+    // swap, whose mailbox state must carry over untouched).
+    c += `static void plc_mb_init(void) {\n`;
+    c += `    if (!__plc_shm) return;\n`;
+    c += `    uint8_t *mb = __plc_shm + PLC_MB_BASE;\n`;
+    c += `    __atomic_store_n((uint32_t *)(mb + 0), 0u, __ATOMIC_RELEASE); /* unpublished while re-initialising */\n`;
+    // A force that survived a crash-restart with the SAME table (KronServer
+    // clears the flags when the table changed): its slot still shows the forced
+    // value, because plc_shm_sync wrote S->__plc_fv there — reload it.
+    c += `    for (uint32_t i = 0; i < PLC_MB_NVARS; i++) {\n`;
+    c += `        uint8_t f = __atomic_load_n(__plc_shm + PLC_FORCE_FLAGS_BASE + i, __ATOMIC_RELAXED);\n`;
+    c += `        if (!f) continue;\n`;
+    c += `        uint32_t off = 0; void *st = 0;\n`;
+    c += `        int n = plc_mb_target(i, &off, &st);\n`;
+    c += `        if (f != PLC_FLAG_FORCED || n <= 0) { __atomic_store_n(__plc_shm + PLC_FORCE_FLAGS_BASE + i, (uint8_t)0, __ATOMIC_RELAXED); continue; }\n`;
+    c += `        memcpy(S->__plc_fv + off, __plc_shm + off, (size_t)n);\n`;
+    c += `        memcpy(st, __plc_shm + off, (size_t)n);\n`;
+    c += `    }\n`;
+    // Anything posted while no runtime was consuming belongs to nobody: its
+    // writer has timed out (and been told so) — drop it, never apply it late.
+    c += `    __atomic_store_n((uint64_t *)(mb + 32), __atomic_load_n((uint64_t *)(mb + 24), __ATOMIC_ACQUIRE), __ATOMIC_RELAXED);\n`;
+    c += `    __atomic_store_n((uint32_t *)(mb + 20), 0u, __ATOMIC_RELAXED);\n`;
+    c += `    __atomic_store_n((uint16_t *)(mb + 4), (uint16_t)PLC_SHM_LAYOUT_VERSION, __ATOMIC_RELAXED);\n`;
+    c += `    __atomic_store_n((uint16_t *)(mb + 6), (uint16_t)PLC_MB_HDR, __ATOMIC_RELAXED);\n`;
+    c += `    __atomic_store_n((uint32_t *)(mb + 8), PLC_MB_CAP, __ATOMIC_RELAXED);\n`;
+    c += `    __atomic_store_n((uint32_t *)(mb + 12), PLC_MB_ENTRY, __ATOMIC_RELAXED);\n`;
+    c += `    __atomic_store_n((uint32_t *)(mb + 16), PLC_MB_NVARS, __ATOMIC_RELAXED);\n`;
+    c += `    __atomic_store_n((uint32_t *)(mb + 0), PLC_MB_MAGIC, __ATOMIC_RELEASE); /* publish LAST */\n`;
+    c += `}\n`;
+    return c;
+};
+
 // ── IEC STRING literals ───────────────────────────────────────────────────
 // IEC escapes the `$` character ($$ $' $" $L $N $P $R $T and $xx hex); C
 // escapes the backslash. Decoding to plain text FIRST and re-escaping for C
@@ -191,6 +390,144 @@ const normalizeBooleanLiteral = (value) => {
     if (normalized === 'TRUE') return 'true';
     if (normalized === 'FALSE') return 'false';
     return null;
+};
+
+// ── ST source scanning ──────────────────────────────────────────────────────
+// ⚠️ ONE scanner removes comments, and it skips string literals while doing
+// it. The regex pair it replaces (`\(\*[\s\S]*?\*\)` then `\/\/.*`) knew
+// nothing about quotes, so `s := '(* x *)'` became `s := ''` and
+// `u := 'http://a'` lost the rest of its line. Strings honour IEC `$'` / `$"`
+// escapes and never span a line (an unterminated quote must not swallow the
+// rest of the POU). `(* … *)` NESTS — `(* a (* b *) c *)` is one comment; the
+// lazy regex ended it at the first `*)` and leaked ` c *)` into C. `/* … */`
+// (IEC 3rd edition) and `// …` are handled too.
+//   keepLayout   — a comment becomes spaces (newlines kept), so line/column
+//                  numbers stay valid (the validator reports positions);
+//                  otherwise a comment becomes one space, or its newlines.
+//   blankStrings — string literals become spaces (validator: never flag an
+//                  identifier inside text).
+//   strTable     — string literals become `\x0e<idx>\x0f` placeholders with the
+//                  original text pushed here, so the keyword-normalisation
+//                  regexes that run next cannot split `'go THEN stop'`.
+const stripIecComments = (code, { keepLayout = false, blankStrings = false, strTable = null } = {}) => {
+    const s = String(code || '');
+    const n = s.length;
+    let out = '';
+    let i = 0;
+    const dropComment = (text) => {
+        if (keepLayout) return text.replace(/[^\n]/g, ' ');
+        const nl = (text.match(/\n/g) || []).length;
+        return nl ? '\n'.repeat(nl) : ' ';
+    };
+    while (i < n) {
+        const c = s[i];
+        const c2 = s[i + 1];
+        if (c === "'" || c === '"') {
+            let j = i + 1;
+            while (j < n && s[j] !== c && s[j] !== '\n') j += (s[j] === '$' && j + 1 < n && s[j + 1] !== '\n') ? 2 : 1;
+            const end = (j < n && s[j] === c) ? j + 1 : j;
+            const lit = s.slice(i, end);
+            if (blankStrings) out += lit.replace(/[^\n]/g, ' ');
+            else if (strTable) { strTable.push(lit); out += `\x0e${strTable.length - 1}\x0f`; }
+            else out += lit;
+            i = end;
+            continue;
+        }
+        if (c === '(' && c2 === '*') {
+            let j = i + 2, depth = 1;
+            while (j < n && depth > 0) {
+                if (s[j] === '(' && s[j + 1] === '*') { depth++; j += 2; }
+                else if (s[j] === '*' && s[j + 1] === ')') { depth--; j += 2; }
+                else j++;
+            }
+            out += dropComment(s.slice(i, j));
+            i = j;
+            continue;
+        }
+        if (c === '/' && c2 === '*') {
+            const close = s.indexOf('*/', i + 2);
+            const j = close < 0 ? n : close + 2;
+            out += dropComment(s.slice(i, j));
+            i = j;
+            continue;
+        }
+        if (c === '/' && c2 === '/') {
+            let j = i;
+            while (j < n && s[j] !== '\n') j++;
+            out += keepLayout ? ' '.repeat(j - i) : '';
+            i = j;
+            continue;
+        }
+        out += c;
+        i++;
+    }
+    return out;
+};
+
+// ── IEC numeric literals → C ────────────────────────────────────────────────
+// `_` is a digit separator everywhere in IEC (`1_000`, `16#FF_FF`), `2#`/`8#`
+// are real radixes, and a leading zero is DECIMAL (`010` = ten) while C reads
+// it as octal. Returns null for anything that is not a plain numeric literal.
+const iecNumberToC = (tok) => {
+    const t = String(tok).replace(/_/g, '');
+    const r = /^(2|8|10|16)#([0-9A-Fa-f]+)$/.exec(t);
+    if (r) {
+        const prefix = { 2: '0b', 8: '0o', 10: '', 16: '0x' }[r[1]];
+        if (r[1] === '16' && /^[0-9A-Fa-f]+$/.test(r[2])) return '0x' + r[2].toUpperCase();
+        try { const v = BigInt(prefix + r[2]); return r[1] === '10' ? v.toString() : '0x' + v.toString(16).toUpperCase(); }
+        catch { return null; }
+    }
+    if (/^\d+$/.test(t)) return t.replace(/^0+(?=\d)/, '');
+    if (/^\d+\.\d+(?:[eE][+-]?\d+)?$/.test(t) || /^\d+[eE][+-]?\d+$/.test(t)) return t.replace(/^0+(?=\d)/, '');
+    return null;
+};
+
+// IEC elementary type → C type, for `TYPE#literal` and conversion casts.
+const IEC_SCALAR_C = {
+    BOOL: 'bool', BYTE: 'uint8_t', WORD: 'uint16_t', DWORD: 'uint32_t', LWORD: 'uint64_t',
+    SINT: 'int8_t', INT: 'int16_t', DINT: 'int32_t', LINT: 'int64_t',
+    USINT: 'uint8_t', UINT: 'uint16_t', UDINT: 'uint32_t', ULINT: 'uint64_t',
+    REAL: 'float', LREAL: 'double',
+};
+const IEC_INT_TYPES = new Set(['SINT', 'INT', 'DINT', 'LINT', 'USINT', 'UINT', 'UDINT', 'ULINT',
+    'BYTE', 'WORD', 'DWORD', 'LWORD']);
+const IEC_BIT_WIDTH = {
+    BOOL: 1, SINT: 8, USINT: 8, BYTE: 8, INT: 16, UINT: 16, WORD: 16,
+    DINT: 32, UDINT: 32, DWORD: 32, LINT: 64, ULINT: 64, LWORD: 64,
+};
+// Width-aware rotate. ROL/ROR are NOT shifts: the bits pushed out re-enter on
+// the other side, so the operand's own width (BYTE 8 … LWORD 64) is part of
+// the operation. `(W - n%W) % W` keeps every shift count in [0, W-1] (a shift
+// by W is undefined behaviour in C).
+const rotateExpr = (dir, x, n, width) => {
+    const w = [8, 16, 32, 64].includes(width) ? width : 32;
+    const T = `uint${w}_t`;
+    const k = `((unsigned)(${n}) % ${w}u)`;
+    const back = `((${w}u - ${k}) % ${w}u)`;
+    const [a, b] = dir === 'ROL' ? ['<<', '>>'] : ['>>', '<<'];
+    return `((${T})(((${T})(${x}) ${a} ${k}) | ((${T})(${x}) ${b} ${back})))`;
+};
+
+// ⚠️ A name that is a C keyword (or an object-like macro the generated code
+// can see) cannot be a C identifier. Program locals are safe — they are always
+// emitted as `prog_<P>_<name>` — but globals, FB locals and FUNCTION
+// params/locals are emitted under their own name. The IEC name stays the
+// identity everywhere the editor looks (live keys, variables.json, retain
+// keys); only the C identifier changes. `S` is here because it is the
+// generated code's own PlcState pointer: a FUNCTION parameter named `S`
+// shadowed it and broke every `S->` in that body.
+const C_RESERVED_NAMES = new Set([
+    'auto', 'break', 'case', 'char', 'const', 'continue', 'default', 'do', 'double',
+    'else', 'enum', 'extern', 'float', 'for', 'goto', 'if', 'inline', 'int', 'long',
+    'register', 'restrict', 'return', 'short', 'signed', 'sizeof', 'static', 'struct',
+    'switch', 'typedef', 'union', 'unsigned', 'void', 'volatile', 'while',
+    '_Bool', '_Complex', '_Imaginary', '_Alignas', '_Alignof', '_Atomic', '_Generic',
+    '_Noreturn', '_Static_assert', '_Thread_local', 'asm', 'typeof',
+    'bool', 'true', 'false', 'NULL', 'errno', 'stdin', 'stdout', 'stderr', 'EOF', 'S',
+]);
+const cIdent = (name) => {
+    const s = String(name ?? '');
+    return C_RESERVED_NAMES.has(s) ? `iec_${s}` : s;
 };
 
 const resolveHardwarePortSymbol = (value) => {
@@ -450,7 +787,7 @@ const buildRuntimePortHelpers = (boardId, interfaceConfig = {}) => {
 const ST_KEYWORDS_LOWER = new Set([
     'if','then','elsif','else','end_if','case','of','end_case',
     'for','to','by','do','end_for','while','end_while',
-    'repeat','until','end_repeat','return','exit',
+    'repeat','until','end_repeat','return','exit','continue',
     'true','false','and','or','not','xor','mod',
     'bool','int','uint','dint','udint','lint','ulint',
     'real','lreal','time','string','byte','word','dword','lword',
@@ -458,6 +795,7 @@ const ST_KEYWORDS_LOWER = new Set([
     'ton','tof','tp','tonr','ctu','ctd','ctud','sr','rs','r_trig','f_trig',
     'shl','shr','rol','ror','band','bor','bxor','bnot',
     'add','sub','mul','div','abs','sqrt','expt','sin','cos','tan','asin','acos','atan',
+    'ln','log','exp','trunc',
     'max','min','limit','sel','mux','move',
     'gt','ge','eq','ne','le','lt',
     'norm_x','scale_x',
@@ -490,31 +828,35 @@ export const validateProjectST = (projectStructure, stdFunctionNames = [], hwPor
     const hwPortNames = new Set(
         (hwPortVars || []).map(v => (v.name || '').toLowerCase())
     );
+    // ⚠️ Must accept every name the ST expression compiler (stExpr.js)
+    // accepts, or this pre-build check aborts a build the transpiler would
+    // have compiled: user FUNCTION / FB names (`Add2(a, b)`, `F := …` inside
+    // F) and enumerated values (`Red`, `Color#Red`) were all "undefined".
+    const pouNames = new Set([...(projectStructure?.functions || []), ...(projectStructure?.functionBlocks || [])]
+        .map(f => (f.name || '').trim().replace(/\s+/g, '_').toLowerCase()).filter(Boolean));
+    const enumValueNames = new Set((projectStructure?.dataTypes || [])
+        .filter(dt => dt?.type === 'Enumerated')
+        .flatMap(dt => (dt.content?.values || []).map(v => String(v?.name || '').trim().toLowerCase()))
+        .filter(Boolean));
 
     const validateCode = (code, varNames, contextLabel) => {
-        // Strip multi-line (* block comments *) preserving line count, then split
-        const stripped = (code || '').replace(/\(\*[\s\S]*?\*\)/g, match => '\n'.repeat((match.match(/\n/g) || []).length));
+        // Comments AND string literals become spaces (stripIecComments keeps the
+        // layout), so line/column numbers stay valid, a `//` inside a string no
+        // longer truncates the line and `(* … *)` inside a string is not a comment.
+        const stripped = stripIecComments(code, { keepLayout: true, blankStrings: true });
         const lines = stripped.split('\n');
         // Parenthesis nesting tracked across the whole POU — multi-line FB calls
         // span newlines, so we cannot reset depth per line.
         let depth = 0;
         lines.forEach((rawLine, i) => {
-            // Strip:
-            //   - single-line comments
-            //   - in-line (* ... *) block comments
+            // Strip (comments and strings are already blanked above):
             //   - typed-radix integer literals (16#FE, 2#1010, 8#777)
             //   - IEC time/date/datetime literals (T#5ms, TIME#1h30m, D#2026-01-01,
             //     DT#2026-01-01-12:00:00, TOD#13:45:00.123)
             // Replace with same-length spaces so column numbers in errors stay accurate.
             const line = rawLine
-                // Blank single-quoted string literals FIRST (length-preserving) so
-                // identifiers inside 'strings' are never flagged and a // inside a
-                // string doesn't truncate the line.
-                .replace(/'(?:[^'\\\r\n]|\\.)*'/g, m => ' '.repeat(m.length))
-                .replace(/\/\/.*$/, '')
-                .replace(/\(\*.*?\*\)/g, '')
                 .replace(/\b\d+#[0-9A-Fa-f_]+\b/g, m => ' '.repeat(m.length))
-                .replace(/\b(?:T|TIME|LTIME|D|DATE|LDATE|DT|LDT|TOD|LTOD)#[A-Za-z0-9_.:\-]+/gi,
+                .replace(/\b(?:T|LT|TIME|LTIME|D|DATE|LDATE|DT|LDT|TOD|LTOD)#[A-Za-z0-9_.:\-+]+/gi,
                          m => ' '.repeat(m.length));
             const regex = /\b[a-zA-Z_][a-zA-Z0-9_]*\b/g;
             let scanIdx = 0;
@@ -531,13 +873,14 @@ export const validateProjectST = (projectStructure, stdFunctionNames = [], hwPor
                 const word = match[0];
                 const lower = word.toLowerCase();
                 // Inside an FB-call argument list, an identifier directly followed by
-                // ':=' is a parameter NAME (Execute, Port_ID, IN, PT, …), not a var.
-                if (depth > 0 && /^\s*:=/.test(line.slice(regex.lastIndex))) continue;
+                // ':=' (input) or '=>' (output) is a parameter NAME, not a var.
+                if (depth > 0 && /^\s*(?::=|=>)/.test(line.slice(regex.lastIndex))) continue;
                 if (ST_KEYWORDS_LOWER.has(lower)) continue;
                 if (stdLower.has(lower)) continue;
                 if (globalVarNames.has(lower)) continue;
                 if (dataTypeNames.has(lower)) continue;
                 if (hwPortNames.has(lower)) continue;
+                if (pouNames.has(lower) || enumValueNames.has(lower)) continue;
                 if (varNames.has(lower)) continue;
                 if (ST_CONVERSION_REGEX.test(word)) continue;
                 if (!isNaN(word)) continue;
@@ -623,43 +966,67 @@ export const transpileToC = (projectStructure, standardHeaders = [], boardId = n
         }
     });
 
+    // ⚠️ IEC identifiers — type names included — are CASE-INSENSITIVE, C is
+    // not: a variable declared `int` became the C keyword `int` (wrong width,
+    // no SHM slot) and one declared `ton` named a C type that does not exist.
+    // Every declared type is canonicalised ONCE here, on a copy, so the dozens
+    // of exact type comparisons below (FB tables, isFBType, mapType, the SHM
+    // size table) all see the spelling the tables use. User FB / data-type
+    // names win over a standard block of the same name, as they do elsewhere.
+    projectStructure = canonicalizeProjectTypes(projectStructure, [
+        ...Object.keys(FB_TRIGGER_PIN), ...Object.keys(FB_OUTPUTS), ...Object.keys(FB_INPUTS),
+        ...Object.keys(stdFunctions).filter(k => stdFunctions[k].isFB),
+        ...(boardId ? Object.keys(getBoardBlockMeta(boardId).triggerPin || {}) : []),
+        'AXIS_REF',
+    ]);
+
     const IEC_TYPE_SIZES = {
         'BOOL': 1, 'SINT': 1, 'USINT': 1, 'BYTE': 1,
         'INT': 2, 'UINT': 2, 'WORD': 2,
-        'DINT': 4, 'UDINT': 4, 'TIME': 4, 'REAL': 4, 'DWORD': 4,
+        'DINT': 4, 'UDINT': 4, 'REAL': 4, 'DWORD': 4,
         'LINT': 8, 'ULINT': 8, 'LREAL': 8, 'LWORD': 8,
-        // ⚠️ STRING is a `char *` in the generated C, so its slot holds the
-        // TEXT, not the pointer — an address from the runtime's own memory
-        // would mean nothing to KronServer. Fixed width, NUL-padded, and
-        // TRUNCATED past it; see the string branch of plc_shm_sync. It stays
+        // TIME/LTIME: signed 64-bit MICROseconds (kronstandard.h), so the
+        // slot is 8 bytes, naturally aligned like LINT.
+        'TIME': 8, 'LTIME': 8,
+        // STRING is a `kron_string_t` (char[64]) in PlcState and its slot
+        // holds the same TEXT. Fixed width, NUL-padded; see the string branch
+        // of plc_shm_sync. ⚠️ Its C ALIGNMENT is 1, not min(size, 8) — the
+        // struct/array offset walks below use cAlignOf for that. It stays
         // out of IEC_TYPE_PREFIX (not addressable, so never in the capture
         // ring) and out of IEC_CAST_C / IEC_TO_KRON_TYPE (no X_TO_Y
         // conversion is a C cast, which is meaningless for text).
         'STRING': STRING_SHM_BYTES
     };
 
-    // Shared memory offset tracker — each scalar PLC variable gets a consecutive slot
-    // Force flags region starts at FORCE_FLAGS_BASE: one byte per variable, set by KronServer
-    // to prevent plc_shm_sync from overwriting a forced value with the PLC-computed value.
-    const FORCE_FLAGS_BASE = 32768;
-    const PLC_SHM_TOTAL_SIZE = 65536; // must match PLC_SHM_SIZE emitted into plc.c
+    // Shared memory offset tracker — each scalar PLC variable gets its own slot.
+    // Data grows from 0, one runtime-owned flag byte per variable from
+    // SHM_FORCE_FLAGS_BASE, and the command mailbox owns the top of the segment
+    // (SHM layout v2 — server/RING_FORMAT.md § "Variable segment").
+    const FORCE_FLAGS_BASE = SHM_FORCE_FLAGS_BASE;
     let shmOffset = 0;
     const shmEntries = []; // {c_symbol, offset, size, flagOffset, isString} → plc_shm_sync()
     const tryAssignShm = (type, c_symbol) => {
         const size = IEC_TYPE_SIZES[type?.toUpperCase()];
         if (!size) return {}; // FB, user-defined type or unknown — no SHM slot
-        const offset = shmOffset;
+        // ⚠️ NATURAL alignment (a = min(size, 8)). Packed slots put an LREAL at
+        // an odd offset, where neither the runtime nor KronServer can copy it
+        // in one atomic access — a reader could see half of the old double and
+        // half of the new one (and armv7 cannot even do a 64-bit atomic at an
+        // unaligned address). Offsets travel in the variable table, so every
+        // consumer follows automatically.
+        const align = Math.min(size, 8);
+        const offset = (shmOffset + align - 1) & ~(align - 1);
         const flagOffset = FORCE_FLAGS_BASE + shmEntries.length;
         // Data region must stay below the force-flag region, and the flag region
-        // must stay inside the shared-memory segment — otherwise the generated
-        // memcpy offsets silently corrupt neighbouring variables / overflow SHM.
+        // below the mailbox — otherwise the generated copies silently corrupt
+        // neighbouring variables / the command mailbox.
         if (offset + size > FORCE_FLAGS_BASE) {
             throw new Error(`Too many/too large variables for shared memory: data region exceeds ${FORCE_FLAGS_BASE} bytes at variable "${c_symbol}". Reduce the number/size of monitored variables (e.g. large arrays).`);
         }
-        if (flagOffset >= PLC_SHM_TOTAL_SIZE) {
-            throw new Error(`Too many variables for shared memory: force-flag region exceeds the ${PLC_SHM_TOTAL_SIZE}-byte segment at variable "${c_symbol}". Reduce the number of monitored variables.`);
+        if (flagOffset >= SHM_MAILBOX_BASE) {
+            throw new Error(`Too many variables for shared memory: force-flag region reaches the command mailbox at ${SHM_MAILBOX_BASE} at variable "${c_symbol}". Reduce the number of monitored variables.`);
         }
-        shmOffset += size;
+        shmOffset = offset + size;
         // The flag rides on the ENTRY, not a closure: generateMainLoop emits a
         // second copy of these functions from the same array and would
         // otherwise have no way to tell text from a number.
@@ -675,20 +1042,22 @@ export const transpileToC = (projectStructure, standardHeaders = [], boardId = n
     const resolveInitialValue = (val, type) => {
         const T = String(type || '').toUpperCase();
         if (val !== undefined && val !== null && val !== '') {
-            const s = String(val).trim();
+            // A typed literal (`INT#5`) and `_` digit separators (`1_000`) must
+            // seed the same number the C initialiser (formatVarInitial) does.
+            const s = String(val).trim().replace(/^(?!L?T#|L?TIME#)[A-Za-z]+#(?=[-+]?\d)/i, '');
             if (T === 'BOOL') {
                 const b = s.toLowerCase();
                 return b === 'true' || b === '1';
             }
             if (T === 'STRING' || T === 'WSTRING') return unquoteIecString(s) ?? iecStringDecode(s);
-            if (T === 'TIME' && /^(?:T|TIME)#/i.test(s)) return mapIECtoTimeUs(s);
+            if (isTimeTypeName(T) && isTimeLiteral(s)) return mapIECtoTimeUs(s);
             const radix = s.match(/^(\d+)#([0-9A-Fa-f_]+)$/);
             if (radix) {
                 const n = parseInt(radix[2].replace(/_/g, ''), parseInt(radix[1], 10));
                 return Number.isFinite(n) ? n : 0;
             }
             if (/^-?0x[0-9A-Fa-f]+$/i.test(s)) return parseInt(s, 16);
-            const num = Number(s);
+            const num = Number(/^[-+]?\d[\d_]*(?:\.[\d_]+)?(?:[eE][+-]?\d+)?$/.test(s) ? s.replace(/_/g, '') : s);
             return Number.isFinite(num) ? num : 0;
         }
         if (T === 'BOOL') return false;
@@ -753,7 +1122,7 @@ export const transpileToC = (projectStructure, standardHeaders = [], boardId = n
     // --- AXIS_REF GATE ---
     // ⚠️ Enabling "Axis" on a slave makes the transpiler emit
     // `AXIS_REF_Init(&S->Axis1, …)`, but the AXIS_REF itself is a USER global
-    // (§13: the declaration comes from the variable table so programs can write
+    // (src/services/CLAUDE.md: the declaration comes from the variable table so programs can write
     // Axis1.Set.Position). Forget the global and clang reports
     // `no member named 'Axis1' in 'struct PlcState'` against generated code —
     // a message that says nothing about the actual mistake.
@@ -791,7 +1160,7 @@ export const transpileToC = (projectStructure, standardHeaders = [], boardId = n
     const addressProblems = [];
     const checkAddress = (v, scope) => {
         if (!v || !v.address) return;
-        if (EC_PDO_VAR_NAMES.has((v.name || '').trim())) return; // EtherCAT-owned, no SHM slot
+        if (ecPdoCanon((v.name || '').trim())) return; // EtherCAT-owned, no SHM slot
         const res = validateIECAddress(v.address, v.type);
         if (!res.ok) addressProblems.push(`  • ${scope}.${v.name || '(unnamed)'} : ${v.type || '?'} — ${res.message}`);
     };
@@ -819,8 +1188,62 @@ export const transpileToC = (projectStructure, standardHeaders = [], boardId = n
 #ifndef ABS
 #define ABS(x) ((x) < 0 ? -(x) : (x))
 #endif
+/* IEC '/' and MOD. An INTEGER divide by zero (and INT_MIN / -1) raises SIGFPE
+ * on x86_64 and kills the runtime, so the integer form yields 0 instead; the
+ * divisor is evaluated once. A floating divide keeps IEEE semantics (inf/nan).
+ * _Generic picks the branch from the type of the result, so this is right
+ * whatever the operand types turn out to be. */
+#ifndef KRON_IDIV
+#define __KRON_DIV_BAD(d) ((d) == 0 || (((__typeof__(d))-1 < 0) && (d) == (__typeof__(d))-1))
+#define KRON_IDIV(a, b) ({ __typeof__(b) __kd = (b); _Generic((a) / __kd, \\
+    float: (a) / __kd, double: (a) / __kd, long double: (a) / __kd, \\
+    default: (__KRON_DIV_BAD(__kd) ? (__kd == 0 ? 0 : -(a)) : (a) / __kd)); })
+#define KRON_IMOD(a, b) ({ __typeof__(b) __kd = (b); __KRON_DIV_BAD(__kd) ? 0 : (a) % __kd; })
+#endif
+/* REAL -> integer conversion ROUNDS (IEC 61131-3), it does not truncate as a C
+ * cast does; an integer argument passes through unchanged. */
+#ifndef KRON_RND
+#define KRON_RND(x) _Generic((x), float: (int64_t)llrintf((float)(x)), \\
+    double: (int64_t)llrint((double)(x)), long double: (int64_t)llrintl((long double)(x)), \\
+    default: (int64_t)(x))
+#endif
+/* IEC NOT/AND/OR/XOR on operands whose IEC type the transpiler could not see
+ * (an AXIS_REF member, a pin no table describes): logical on a C bool,
+ * bitwise on anything else — decided by the C type at compile time. */
+#ifndef KRON_NOT_U
+#define KRON_NOT_U(x)    _Generic((x), bool: !(x), default: ~(x))
+#define KRON_AND_U(a, b) _Generic((a), bool: (a) && (b), default: (a) & (b))
+#define KRON_OR_U(a, b)  _Generic((a), bool: (a) || (b), default: (a) | (b))
+#define KRON_XOR_U(a, b) _Generic((a), bool: (bool)(a) != (bool)(b), default: (a) ^ (b))
+#endif
+/* IEC STRING: a fixed array holding the TEXT (value semantics), never a
+ * pointer — so it can be retained, survives a hot-swap and \`a := b\` copies.
+ * Every assignment to STRING storage goes through KRON_STRSET: a bounded copy
+ * that always NUL-terminates, zero-fills the rest (the retain image and the
+ * shared-memory slot stay deterministic) and, when it truncates, never splits
+ * a UTF-8 sequence. memmove, so \`s := s\` is harmless. The _Generic refuses
+ * at COMPILE time any target that is not a kron_string_t (e.g. a standard
+ * block's \`const char *\` pin) instead of writing through it. */
+#ifndef KRON_STRING_LEN
+#define KRON_STRING_LEN ${STRING_SHM_BYTES}
+typedef char kron_string_t[KRON_STRING_LEN];
+static inline void __kron_strset(char *dst, size_t cap, const char *src)
+{
+    size_t n = 0;
+    if (!src) src = "";
+    while (n + 1 < cap && src[n]) n++;
+    if (n + 1 == cap && src[n])
+        while (n > 0 && ((unsigned char)src[n] & 0xC0u) == 0x80u) n--;
+    memmove(dst, src, n);
+    memset(dst + n, 0, cap - n);
+}
+#define KRON_STRSET(d, s) __kron_strset(_Generic(&(d), kron_string_t *: (d)), KRON_STRING_LEN, (s))
+#endif
 
-${boardDefines}${runtimePortHelpers}${customIncludes}${ecCfgEarly.motionIncludes ? ecCfgEarly.motionIncludes + '\n' : ''}${ecCfgEarly.axisLockMacros || '#define KRON_AXIS_LOCK()   ((void)0)\n#define KRON_AXIS_UNLOCK() ((void)0)\n'}extern volatile uint64_t us_tick;
+${boardDefines}${runtimePortHelpers}${customIncludes}#if defined(KRON_SYS_TEXT_LEN)
+_Static_assert(KRON_SYS_TEXT_LEN == KRON_STRING_LEN, "kronsystem.h KRON_SYS_TEXT_LEN must equal the transpiler's STRING size");
+#endif
+${ecCfgEarly.motionIncludes ? ecCfgEarly.motionIncludes + '\n' : ''}${ecCfgEarly.axisLockMacros || '#define KRON_AXIS_LOCK()   ((void)0)\n#define KRON_AXIS_UNLOCK() ((void)0)\n'}extern volatile uint64_t us_tick;
 
 `;
 
@@ -872,6 +1295,30 @@ ${boardDefines}${runtimePortHelpers}${customIncludes}${ecCfgEarly.motionIncludes
         Object.keys(halMeta.inputTypes).forEach(k => {
             if (!(k in FB_INPUT_TYPES)) { FB_INPUT_TYPES[k] = halMeta.inputTypes[k]; _halSavedKeys.inputTypes.push(k); }
         });
+    }
+    // ⚠️ LEGACY per-channel HAL blocks (`I2C0_Read`, `SPI1_Transfer`, …): the
+    // Toolbox replaced them with the generic COMM_PROTO_BLOCKS, so the board
+    // meta above no longer lists them, yet kronhal.h still typedefs them and
+    // saved projects still carry them. Unregistered, the LD emitter never set
+    // EN (the _Call silently did nothing) and read power flow from a `.Q` the
+    // HAL struct does not have — a compile error. Register them as the EN/ENO
+    // blocks they are, from the pin list each saved block carries.
+    for (const cat of ['programs', 'functionBlocks', 'functions']) {
+        for (const pou of projectStructure[cat] || []) {
+            for (const rung of pou.content?.rungs || []) {
+                for (const b of rung.blocks || []) {
+                    const t = b.type;
+                    if (!t || t in FB_TRIGGER_PIN || !/^(?:I2C|SPI|UART|USB|CAN|ADC|PWM)\d+_[A-Za-z]+$/.test(t)) continue;
+                    const cd = b.data?.customData;
+                    if (!cd || !Array.isArray(cd.inputs) || !Array.isArray(cd.outputs)) continue;
+                    FB_TRIGGER_PIN[t] = 'EN'; _halSavedKeys.triggerPin.push(t); HAL_BLOCK_TYPES.add(t);
+                    FB_Q_OUTPUT[t] = 'ENO'; _halSavedKeys.qOutput.push(t);
+                    FB_INPUTS[t] = cd.inputs.map(p => p.name).filter(n => n !== 'EN'); _halSavedKeys.inputs.push(t);
+                    FB_OUTPUTS[t] = ['ENO', ...cd.outputs.map(p => p.name).filter(n => n !== 'ENO')]; _halSavedKeys.outputs.push(t);
+                    FB_INPUT_TYPES[t] = Object.fromEntries(cd.inputs.map(p => [p.name, p.type])); _halSavedKeys.inputTypes.push(t);
+                }
+            }
+        }
     }
 
     const deviceArtifacts = buildGeneratedDeviceArtifacts(projectStructure, config, boardId);
@@ -995,11 +1442,15 @@ ${boardDefines}${runtimePortHelpers}${customIncludes}${ecCfgEarly.motionIncludes
     // (alignment = scalar size, up to 8) — matches the C compiler's struct
     // layout. A packed walk (just summing sizes) disagreed with real padding,
     // so the local sim read garbage for padded UDTs.
+    // C alignment of a scalar IEC type: its width up to 8, except a STRING,
+    // which is a char array (alignment 1) — treating it as 8-aligned shifted
+    // every member after a STRING in a UDT by up to 7 bytes.
+    const cAlignOf = (type, size) => (isStringInputType(type) ? 1 : Math.min(Math.max(size, 1), 8));
     const structMemberOffsets = (members) => {
         let off = 0;
         return (members || []).map(member => {
             const size = IEC_TYPE_SIZES[member.type?.toUpperCase()] || 0;
-            const align = Math.min(Math.max(size, 1), 8);
+            const align = cAlignOf(member.type, size);
             off = Math.ceil(off / align) * align;
             const entry = { member, offset: off };
             off += size;
@@ -1018,23 +1469,28 @@ ${boardDefines}${runtimePortHelpers}${customIncludes}${ecCfgEarly.motionIncludes
             const gInitVal = resolveInitialValue(v.initialValue, v.type);
             // EC-owned PDO variable: lives in the GPI struct behind an access
             // macro — no PlcState field, no SHM slot, no S-> mapping.
-            if (EC_PDO_VAR_NAMES.has((v.name || '').trim())) {
+            if (ecPdoCanon((v.name || '').trim())) {
                 variableTable.globalVars[v.name] = { type: v.type, initialValue: gInitVal };
                 return;
             }
             const isUserType = !!dataTypeDefs[v.type];
-            const initVal = isUserType ? '' : formatVarInitial(v.initialValue, v.type);
-            stateFields.push(`${mapType(v.type)} ${v.name};`);
-            if (initVal) stateInits.push(`S->${v.name}${initVal};`);
+            // C identifier of the field; the IEC name stays the live key.
+            const gC = cIdent(v.name);
+            const gIsFB = isFBType(v.type, projectStructure) || !!stdFunctions[v.type]?.isFB
+                || HAL_BLOCK_TYPES.has(v.type) || (v.type in FB_TRIGGER_PIN && !isInlineMathType(v.type));
+            const initLine = (isUserType || gIsFB) ? '' : initAssignStmt(`S->${gC}`, v.initialValue, v.type);
+            stateFields.push(`${mapType(v.type)} ${gC};`);
+            if (initLine) stateInits.push(initLine);
+            if (gIsFB) stateInits.push(...fbInstanceInitLines(v.type, `S->${gC}`, v.initialValue, projectStructure));
             const gRetain = isRetainVar(v);
             // Globals are keyed by bare name — the same identity the ST/LD code
             // uses, so renaming a PROGRAM never orphans a retained global.
-            if (gRetain) retainEntries.push({ key: v.name, field: v.name });
+            if (gRetain) retainEntries.push({ key: v.name, field: gC });
             variableTable.globalVars[v.name] = { type: v.type, initialValue: gInitVal, ...(gRetain ? { retain: true } : {}) };
             // Debug: top-level entry (scalar types get a SHM slot)
-            const gShmSlot = !isUserType ? tryAssignShm(v.type, v.name) : {};
+            const gShmSlot = !isUserType ? tryAssignShm(v.type, gC) : {};
             variableTable.debugDefaults[`prog__${v.name}`] = {
-                type: v.type, c_symbol: v.name, defaultValue: gInitVal, address: v.address || '', ...gShmSlot,
+                type: v.type, c_symbol: gC, defaultValue: gInitVal, address: v.address || '', ...gShmSlot,
                 ...(gRetain ? { retain: true } : {})
             };
             // Debug: expand array elements and struct members for monitoring
@@ -1042,31 +1498,31 @@ ${boardDefines}${runtimePortHelpers}${customIncludes}${ecCfgEarly.motionIncludes
             if (dtDef?.type === 'Array') {
                 const { baseType, elements } = expandArrayElements(dtDef);
                 elements.forEach(({ suffix, offset }) => {
-                    const elemCSym = `${v.name}${suffix}`;
+                    const elemCSym = `${gC}${suffix}`;
                     const elemShmSlot = tryAssignShm(baseType, elemCSym);
                     variableTable.debugDefaults[`prog__${v.name}${suffix}`] = {
                         type: baseType, c_symbol: elemCSym,
-                        base_symbol: v.name, byte_offset: offset,
-                        defaultValue: 0, address: v.address || '', ...elemShmSlot
+                        base_symbol: gC, byte_offset: offset,
+                        defaultValue: isStringInputType(baseType) ? '' : 0, address: v.address || '', ...elemShmSlot
                     };
                 });
             } else if (dtDef?.type === 'Structure') {
                 structMemberOffsets(dtDef.content.members).forEach(({ member, offset }) => {
-                    const memCSym = `${v.name}.${member.name}`;
+                    const memCSym = `${gC}.${cIdent(member.name)}`;
                     const memShmSlot = tryAssignShm(member.type, memCSym);
                     variableTable.debugDefaults[`prog__${v.name}.${member.name}`] = {
                         type: member.type, c_symbol: memCSym,
-                        base_symbol: v.name, byte_offset: offset,
-                        defaultValue: 0, address: v.address || '', ...memShmSlot
+                        base_symbol: gC, byte_offset: offset,
+                        defaultValue: isStringInputType(member.type) ? '' : 0, address: v.address || '', ...memShmSlot
                     };
                 });
             } else if (v.type === 'AXIS_REF') {
                 AXIS_REF_DEBUG_FIELDS.forEach(field => {
-                    const memCSym = `${v.name}.${field.name}`;
+                    const memCSym = `${gC}.${field.name}`;
                     const memShmSlot = tryAssignShm(field.type, memCSym);
                     variableTable.debugDefaults[`prog__${v.name}.${field.name}`] = {
                         type: field.type, c_symbol: memCSym,
-                        base_symbol: v.name, byte_offset: field.offset,
+                        base_symbol: gC, byte_offset: field.offset,
                         defaultValue: 0, address: v.address || '', ...memShmSlot
                     };
                 });
@@ -1083,7 +1539,7 @@ ${boardDefines}${runtimePortHelpers}${customIncludes}${ecCfgEarly.motionIncludes
             header += `typedef struct {\n`;
             fb.content.variables.forEach(v => {
                 if (isInlineMathType(v.type)) return; // Inline math — no struct member needed
-                header += `    ${mapType(v.type)} ${v.name};\n`;
+                header += `    ${mapType(v.type)} ${cIdent((v.name || '').trim().replace(/\s+/g, '_'))};\n`;
             });
             // Edge-memory members for Rising/Falling LD contacts/coils inside
             // this FB's ladder (per-instance previous-scan state).
@@ -1108,7 +1564,7 @@ ${boardDefines}${runtimePortHelpers}${customIncludes}${ecCfgEarly.motionIncludes
 
     if (projectStructure.functions) {
         projectStructure.functions.forEach(fn => {
-            const retType = mapType(fn.returnType || 'VOID');
+            const retType = fnReturnCType(fn.returnType || 'VOID');
             let fnName = (fn.name || '').trim().replace(/\s+/g, '_');
             header += `static inline ${retType} ${fnName}(${buildFunctionParams(fn)});\n`;
         });
@@ -1193,6 +1649,10 @@ ${boardDefines}${runtimePortHelpers}${customIncludes}${ecCfgEarly.motionIncludes
                     // ("My FB" → typedef My_FB), or the field declaration
                     // references a nonexistent type name.
                     stateFields.push(`${vType.replace(/\s+/g, '_')} prog_${progName}_inst_${vName};`);
+                    // FB-local initial values (recursively, FB-in-FB) plus the
+                    // instance's own `(PT := T#1s)` initialiser. Without this a
+                    // user FB declaring `cnt : INT := 100` started at 0.
+                    stateInits.push(...fbInstanceInitLines(vType, `S->prog_${progName}_inst_${vName}`, v.initialValue, projectStructure));
                 } else {
                     // Program-local variables — emit initial value when the user
                     // provided one in the Variable Manager. Without this, scalar
@@ -1200,9 +1660,9 @@ ${boardDefines}${runtimePortHelpers}${customIncludes}${ecCfgEarly.motionIncludes
                     // `state := 90` or `pca_dev_addr := 16#40`, which silently
                     // breaks state machines that rely on a non-zero start state.
                     const isUserType = !!dataTypeDefs[vType];
-                    const initStr = isUserType ? '' : formatVarInitial(v.initialValue, vType);
+                    const initLine = isUserType ? '' : initAssignStmt(`S->prog_${progName}_${vName}`, v.initialValue, vType);
                     stateFields.push(`${mapType(vType)} prog_${progName}_${vName};`);
-                    if (initStr) stateInits.push(`S->prog_${progName}_${vName}${initStr};`);
+                    if (initLine) stateInits.push(initLine);
                 }
 
                 const cSym = isFB ? `prog_${progName}_inst_${vName}` : `prog_${progName}_${vName}`;
@@ -1249,17 +1709,17 @@ ${boardDefines}${runtimePortHelpers}${customIncludes}${ecCfgEarly.motionIncludes
                             variableTable.debugDefaults[`prog_${progName}_${vName}${suffix}`] = {
                                 type: baseType, c_symbol: elemCSym,
                                 base_symbol: cSym, byte_offset: offset,
-                                defaultValue: 0, address: v.address || '', ...elemShmSlot
+                                defaultValue: isStringInputType(baseType) ? '' : 0, address: v.address || '', ...elemShmSlot
                             };
                         });
                     } else if (dtDef?.type === 'Structure') {
                         structMemberOffsets(dtDef.content.members).forEach(({ member, offset }) => {
-                            const memCSym = `${cSym}.${member.name}`;
+                            const memCSym = `${cSym}.${cIdent(member.name)}`;
                             const memShmSlot = tryAssignShm(member.type, memCSym);
                             variableTable.debugDefaults[`prog_${progName}_${vName}.${member.name}`] = {
                                 type: member.type, c_symbol: memCSym,
                                 base_symbol: cSym, byte_offset: offset,
-                                defaultValue: 0, address: v.address || '', ...memShmSlot
+                                defaultValue: isStringInputType(member.type) ? '' : 0, address: v.address || '', ...memShmSlot
                             };
                         });
                     }
@@ -1293,17 +1753,22 @@ ${boardDefines}${runtimePortHelpers}${customIncludes}${ecCfgEarly.motionIncludes
                     initialValue: svDefault
                 };
                 const svShmSlot = tryAssignShm(sv.type, cSym);
+                // ⚠️ Flagged so the editor can tell a pin shadow (pure debug
+                // mirror of an FB/block pin, NOT program state) from a real
+                // variable without guessing from the `in_`/`out_` name shape.
                 variableTable.debugDefaults[`prog_${progName}_${shortKey}`] = {
                     type: sv.type,
                     c_symbol: cSym,
                     defaultValue: svDefault,
+                    isPinShadow: true,
+                    pinDir: 'out',
                     ...svShmSlot
                 };
             });
 
             // Text buffers for x_TO_STRING call sites in this program.
             collectStringConvBuffers(prog, progName).forEach(sym => {
-                stateFields.push(`char ${sym}[${STRING_SHM_BYTES}];`);
+                stateFields.push(`${STRING_C_TYPE} ${sym};`);
             });
 
             // Collect input shadow vars — writable placeholders for unassigned/literal FB input pins
@@ -1325,6 +1790,8 @@ ${boardDefines}${runtimePortHelpers}${customIncludes}${ecCfgEarly.motionIncludes
                     type: sv.type,
                     c_symbol: sv.symbol,
                     defaultValue: sv.initVal,
+                    isPinShadow: true,
+                    pinDir: 'in',
                     ...isvShmSlot
                 };
             });
@@ -1372,6 +1839,13 @@ ${boardDefines}${runtimePortHelpers}${customIncludes}${ecCfgEarly.motionIncludes
     // instances/UDTs without anyone updating the hot-swap layout guard".
     // stateFields is fully finalized by this point — every push site runs
     // earlier than this in transpilePOUSource/this function.
+    // Forced values live HERE, in PlcState, at the same offset as the
+    // variable's data slot — not in the slot itself (see shmPullLine for the
+    // race that rules the slot out). PlcState is host-owned under hot-swap, so
+    // a force survives a logic swap; only the mailbox consumer writes it.
+    if (shmEntries.length > 0) {
+        stateFields.push(`_Alignas(8) uint8_t __plc_fv[${Math.max(8, Math.ceil(shmOffset / 8) * 8)}];`);
+    }
     const plcStateLayoutHash = fnv1a64Hex(stateFields.join('\n'));
 
     // --- 6. BUILD SERVER VARIABLES ARRAY ---
@@ -1388,7 +1862,9 @@ ${boardDefines}${runtimePortHelpers}${customIncludes}${ecCfgEarly.motionIncludes
         'REAL': 'float32',
         'LREAL': 'float64',
         'STRING': 'string',
-        'TIME': 'uint32',
+        // KronServer has no duration type: TIME/LTIME travel as the signed
+        // 64-bit count of microseconds they are.
+        'TIME': 'int64', 'LTIME': 'int64',
     };
     variableTable.variables = Object.entries(variableTable.debugDefaults)
         .filter(([, info]) => info.offset !== undefined)
@@ -1420,7 +1896,8 @@ ${boardDefines}${runtimePortHelpers}${customIncludes}${ecCfgEarly.motionIncludes
         // returns NULL, and the sim runs perfectly while the editor shows no
         // live values and every force-write silently does nothing.
         source += `\n#if defined(__linux__) || defined(_WIN32) || defined(__APPLE__)\n`;
-        source += `#define PLC_SHM_SIZE 65536\n`;
+        source += `#define PLC_SHM_SIZE ${SHM_TOTAL_SIZE}\n`;
+        source += `static void plc_mb_init(void);\n`;
         source += `#if defined(_WIN32)\n`;
         // Win32 kernel object name — NOT the POSIX "/plc_runtime": a Windows
         // named section lives in the object namespace ("Local\\..." = per
@@ -1449,6 +1926,7 @@ ${boardDefines}${runtimePortHelpers}${customIncludes}${ecCfgEarly.motionIncludes
         source += `                                 0, PLC_SHM_SIZE, PLC_SHM_NAME);\n`;
         source += `    if (!h) return;\n`;
         source += `    __plc_shm = (uint8_t *)MapViewOfFile(h, 0x000F001F /*FILE_MAP_ALL_ACCESS*/, 0, 0, PLC_SHM_SIZE);\n`;
+        source += `    plc_mb_init();\n`;
         source += `}\n`;
         source += `#else\n`;
         // NOTE (macOS): this non-hot-swap branch is dead code there — the plain
@@ -1467,19 +1945,14 @@ ${boardDefines}${runtimePortHelpers}${customIncludes}${ecCfgEarly.motionIncludes
         source += `    __plc_shm = (uint8_t *)mmap(NULL, PLC_SHM_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);\n`;
         source += `    if (__plc_shm == MAP_FAILED) __plc_shm = NULL;\n`;
         source += `    close(fd);\n`;
+        source += `    plc_mb_init();\n`;
         source += `}\n`;
         source += `#endif\n`;
         source += `#endif\n`;
-        source += `#define PLC_FORCE_FLAGS_BASE ${FORCE_FLAGS_BASE}\n`;
-        // Force-flag byte values: 0 = normal (logic owns the value), 1 = FORCE
-        // (value is re-injected every scan → held constant), 2 = PULSE (inject
-        // once then auto-release: pull applies it and immediately clears the flag
-        // to 0, so the logic resumes from the injected value on the SAME scan —
-        // e.g. seeding a counter to 0 which then counts up again). sync writes
-        // PlcState→shm only for flag==0, so a released pulse is written back the
-        // same scan.
+        source += generateShmMailbox(shmEntries);
         source += `static void plc_shm_pull(void) {\n`;
         source += `    if (!__plc_shm) return;\n`;
+        source += `    plc_mb_consume();\n`;
         shmEntries.forEach(e => { source += shmPullLine(e); });
         source += `}\n`;
         source += `static void plc_shm_sync(void) {\n`;
@@ -1548,6 +2021,22 @@ ${boardDefines}${runtimePortHelpers}${customIncludes}${ecCfgEarly.motionIncludes
         exec_time_key: `prog____exec_us_${pt.name}`,
     }));
     variableTable.base_tick_us = mainLoop.baseTickUs;
+    // SHM layout v2 descriptor for the force-write writers (KronServer and the
+    // host agent). A table WITHOUT it was built for the v1 runtime; the writers
+    // also verify the mailbox magic/version in the segment itself, so a table
+    // and a runtime from different builds cannot silently disagree.
+    // max_task_interval_us sizes the writer's ack timeout.
+    if (shmEntries.length > 0) {
+        variableTable.shm_layout = {
+            version: SHM_LAYOUT_VERSION,
+            size: SHM_TOTAL_SIZE,
+            force_flags_base: SHM_FORCE_FLAGS_BASE,
+            mailbox_offset: SHM_MAILBOX_BASE,
+            mailbox_capacity: SHM_MAILBOX_CAP,
+            nvars: shmEntries.length,
+            max_task_interval_us: mainLoop.programTasks.reduce((m, pt) => Math.max(m, pt.intervalUs || 0), 0),
+        };
+    }
     variableTable.base_tick = formatUsDisplay(mainLoop.baseTickUs);
 
     // Cleanup: remove board-specific entries from module-level lookup tables
@@ -1638,6 +2127,140 @@ ${boardDefines}${runtimePortHelpers}${customIncludes}${ecCfgEarly.motionIncludes
     return { header, source, variableTable, hal: ecCfg.halContent || '', hostGlue, plcStateLayoutHash };
 };
 
+const IEC_ELEMENTARY_TYPES = new Set([
+    ...Object.keys(IEC_SCALAR_C), 'TIME', 'LTIME', 'STRING', 'WSTRING', 'POINTER', 'VOID',
+    'DATE', 'TOD', 'DT', 'TIME_OF_DAY', 'DATE_AND_TIME',
+]);
+// See the call site in transpileToC. Returns a shallow copy with every
+// declared type (variables, FUNCTION return types, UDT members / base types)
+// spelled the way the transpiler's tables spell it. Unknown names are kept.
+const canonicalizeProjectTypes = (ps, standardTypeNames = []) => {
+    if (!ps) return ps;
+    const canon = new Map();
+    standardTypeNames.forEach(n => { if (n) canon.set(String(n).toLowerCase(), String(n)); });
+    [...(ps.functionBlocks || []), ...(ps.functions || []), ...(ps.dataTypes || [])].forEach(d => {
+        const n = (d?.name || '').trim();
+        if (n) canon.set(n.toLowerCase(), n);
+    });
+    const canonType = (t) => {
+        if (typeof t !== 'string') return t;
+        const raw = t.trim();
+        if (!raw) return t;
+        const up = raw.toUpperCase();
+        if (IEC_ELEMENTARY_TYPES.has(up)) return up;
+        return canon.get(raw.toLowerCase()) || t;
+    };
+    const canonVars = (vars) => Array.isArray(vars)
+        ? vars.map(v => (v && typeof v.type === 'string') ? { ...v, type: canonType(v.type) } : v)
+        : vars;
+    const canonPou = (p) => {
+        if (!p) return p;
+        const out = { ...p };
+        if (p.returnType) out.returnType = canonType(p.returnType);
+        if (p.content?.variables) out.content = { ...p.content, variables: canonVars(p.content.variables) };
+        return out;
+    };
+    const canonDt = (dt) => {
+        if (!dt?.content) return dt;
+        const c = { ...dt.content };
+        if (Array.isArray(c.members)) c.members = canonVars(c.members);
+        if (c.baseType) c.baseType = canonType(c.baseType);
+        return { ...dt, content: c };
+    };
+    return {
+        ...ps,
+        programs: (ps.programs || []).map(canonPou),
+        functionBlocks: (ps.functionBlocks || []).map(canonPou),
+        functions: (ps.functions || []).map(canonPou),
+        dataTypes: (ps.dataTypes || []).map(canonDt),
+        resources: (ps.resources || []).map(r => (r?.content?.globalVars
+            ? { ...r, content: { ...r.content, globalVars: canonVars(r.content.globalVars) } }
+            : r)),
+    };
+};
+
+// One cold-init statement for the field at C path `cPath`, or '' when the
+// variable has no initial value. A STRING is COPIED into its own array
+// (KRON_STRSET) — never pointed at the literal, which under hot-swap lives in
+// the .rodata of a module that a later swap dlclose()s.
+const initAssignStmt = (cPath, raw, type) => {
+    const init = formatVarInitial(raw, type);
+    if (!init) return '';
+    return isStringInputType(type)
+        ? `${kronStrset(cPath, init.replace(/^ = /, ''))};`
+        : `${cPath}${init};`;
+};
+
+// Cold-init lines for one FB instance at C path `cPath` (`S->prog_P_inst_t1`,
+// `S->g`, or a nested member). A user FB contributes its locals' declared
+// initial values — recursively, so an FB inside an FB is initialised too — and
+// the instance's own IEC initialiser `(PT := T#1s, …)` is applied last, as an
+// override. Both used to be dropped: plc_state_init only knew scalars, so
+// `cnt : INT := 100` inside an FB started at 0.
+const fbInstanceInitLines = (type, cPath, instInit, ps, depth = 0) => {
+    if (depth > 16) throw new Error(`FB instance nesting too deep at "${cPath}" (recursive FB type "${type}"?).`);
+    const t = String(type || '').trim();
+    const fb = (ps?.functionBlocks || []).find(f => (f.name || '').trim().replace(/\s+/g, '_') === t.replace(/\s+/g, '_'));
+    const isFbTypeName = (tn) => {
+        const x = String(tn || '').trim();
+        return (ps?.functionBlocks || []).some(f => (f.name || '').trim() === x)
+            || (x in FB_TRIGGER_PIN && !isInlineMathType(x));
+    };
+    const lines = [];
+    const members = {};
+    if (fb) {
+        (fb.content?.variables || []).forEach(v => {
+            const vn = (v.name || '').trim().replace(/\s+/g, '_');
+            if (!vn || isInlineMathType(v.type)) return;
+            members[vn.toLowerCase()] = { name: vn, type: v.type };
+            const member = `${cPath}.${cIdent(vn)}`;
+            if (isFbTypeName(v.type)) {
+                lines.push(...fbInstanceInitLines(v.type, member, v.initialValue, ps, depth + 1));
+            } else if (!(ps?.dataTypes || []).some(dt => dt.name === v.type)) {
+                const line = initAssignStmt(member, v.initialValue, v.type);
+                if (line) lines.push(line);
+            }
+        });
+    }
+    const raw = String(instInit ?? '').trim();
+    if (!raw) return lines;
+    const m = /^\(([\s\S]*)\)$/.exec(raw);
+    if (!m) {
+        throw new Error(`Initial value "${raw}" of "${cPath.replace(/^S->(?:prog_.*?_inst_)?/, '')}" (${t}) must be a ` +
+            `parenthesised list of pin assignments, e.g. (PT := T#1s).`);
+    }
+    splitTopLevelArgs(m[1]).forEach(a => {
+        const mm = /^([A-Za-z_][A-Za-z0-9_]*)\s*:=\s*([\s\S]+)$/.exec(a);
+        if (!mm) throw new Error(`Instance initialiser "${raw}" (${t}): "${a}" is not a "Name := value" pair.`);
+        let field, fieldType;
+        if (fb) {
+            const mem = members[mm[1].toLowerCase()];
+            if (!mem) throw new Error(`Instance initialiser "${raw}": ${t} has no variable "${mm[1]}".`);
+            field = cIdent(mem.name);
+            fieldType = mem.type;
+        } else {
+            const pin = canonicalPinName(t, mm[1]);
+            const known = (FB_INPUTS[t] || []).includes(pin) || (FB_OUTPUTS[t] || []).includes(pin)
+                || FB_INPUT_TYPES[t]?.[pin] !== undefined || FB_TRIGGER_PIN[t] === pin;
+            if (!known) throw new Error(`Instance initialiser "${raw}": ${t} has no pin "${mm[1]}".`);
+            field = cStructPin(t, pin);
+            fieldType = FB_INPUT_TYPES[t]?.[pin] || (pin === FB_TRIGGER_PIN[t] ? 'BOOL' : getOutputPinType(t, pin, null));
+        }
+        // ⚠️ A standard block's STRING pin (Read_Sys_File.PATH, …) is a
+        // `const char *`, not storage. Set once here it would point into the
+        // .rodata of the module that ran plc_state_init — dangling after the
+        // first hot-swap — so it must be given on the CALL, where it is
+        // re-assigned every scan.
+        if (!fb && isStringInputType(fieldType)) {
+            throw new Error(`Instance initialiser "${raw}" (${t}): STRING pin ${mm[1]} cannot be set here — ` +
+                `give it on the block/call instead (it is re-assigned every scan there).`);
+        }
+        const line = initAssignStmt(`${cPath}.${field}`, mm[2].trim(), fieldType);
+        if (line) lines.push(line);
+    });
+    return lines;
+};
+
 const isFBType = (type, structure) => {
     const t = (type || '').trim();
     return structure.functionBlocks?.some(fb => (fb.name || '').trim() === t);
@@ -1654,13 +2277,53 @@ const TIME_UNIT_US = {
     'D': 86400000000, 'H': 3600000000, 'M': 60000000,
     'S': 1000000, 'MS': 1000, 'US': 1, 'NS': 0.001,
 };
+// ⚠️ TIME (and LTIME, the same type) is a SIGNED 64-bit count of
+// MICROseconds end to end (kronstandard.h), so negative durations (T#-5s) are
+// legal. The bound enforced here is the tighter of the int64 range and JS's
+// exact-integer range: a literal is summed as a JS number, and beyond 2^53 µs
+// (~285 years) the sum would silently round, so the emitted C would not be
+// the value written. Refused instead, naming the literal.
+const TIME_US_LIMIT = Number.MAX_SAFE_INTEGER; // 2^53 - 1 µs, well inside int64
+const checkTimeRange = (us, raw) => {
+    if (!Number.isFinite(us) || Math.abs(us) > TIME_US_LIMIT) {
+        throw new Error(
+            `TIME value "${raw}" is out of range: TIME is a signed 64-bit count of microseconds, ` +
+            `and a literal must stay within +/- ${TIME_US_LIMIT} µs (about 285 years) to be exact.`);
+    }
+    // -0 → 0, so the emitted C never reads "-0".
+    return us === 0 ? 0 : us;
+};
+const TIME_PREFIX_RE = /^(?:LTIME|TIME|LT|T)#/i;
+const isTimeLiteral = (s) => TIME_PREFIX_RE.test(String(s ?? '').trim());
+const isTimeTypeName = (t) => /^L?TIME$/i.test(String(t ?? '').trim());
+// A TASK interval is not a TIME value: it reaches the runtime through the
+// `unsigned long plc_task_interval_us()` ABI (32-bit on armv7) and must be
+// positive, so it keeps the old 1 µs .. 0xFFFFFFFF µs (~71.6 min) window even
+// though TIME itself is now 64-bit and signed.
+const TASK_INTERVAL_US_MAX = 0xFFFFFFFF;
+const mapTaskIntervalUs = (iecTimeStr) => {
+    const us = mapIECtoTimeUs(iecTimeStr);
+    if (!(us >= 1) || us > TASK_INTERVAL_US_MAX) {
+        throw new Error(
+            `Task interval "${iecTimeStr}" = ${us} µs is out of range: a task interval must be ` +
+            `between 1 µs and T#71m34s967ms295us.`);
+    }
+    return us;
+};
 const mapIECtoTimeUs = (iecTimeStr) => {
     if (iecTimeStr === undefined || iecTimeStr === null || String(iecTimeStr).trim() === '') return 10000;
     const raw = String(iecTimeStr).trim();
-    const str = raw.toUpperCase().replace(/^(?:LTIME|TIME|LT|T)#/, '').replace(/_/g, '');
+    let str = raw.toUpperCase().replace(TIME_PREFIX_RE, '').replace(/_/g, '');
     if (!str) return 10000;
+    // IEC allows a sign on the whole duration: T#-5s, T#-1m30s.
+    let sign = 1;
+    if (str[0] === '-' || str[0] === '+') {
+        if (str[0] === '-') sign = -1;
+        str = str.slice(1);
+        if (!str) throw new Error(`Invalid TIME literal "${raw}" — expected forms like T#500ms, T#-5s, T#1h2m3s500ms.`);
+    }
     // Bare number (no unit) — historically accepted in pin fields as µs.
-    if (/^\d+(?:\.\d+)?$/.test(str)) return Math.round(parseFloat(str));
+    if (/^\d+(?:\.\d+)?$/.test(str)) return checkTimeRange(sign * Math.round(parseFloat(str)), raw);
     // Unit order matters: MS before M, US/NS before S.
     const re = /(\d+(?:\.\d+)?)(MS|US|NS|D|H|M|S)/y;
     let total = 0;
@@ -1669,19 +2332,19 @@ const mapIECtoTimeUs = (iecTimeStr) => {
         re.lastIndex = idx;
         const m = re.exec(str);
         if (!m) {
-            throw new Error(`Invalid TIME literal "${raw}" — expected forms like T#500ms, T#1.5s, T#1h2m3s500ms.`);
+            throw new Error(`Invalid TIME literal "${raw}" — expected forms like T#500ms, T#-5s, T#1h2m3s500ms.`);
         }
         total += parseFloat(m[1]) * TIME_UNIT_US[m[2]];
         idx = re.lastIndex;
     }
-    return Math.round(total);
+    return checkTimeRange(sign * Math.round(total), raw);
 };
 
 // formatVarInitial — turn a Variable Manager `initialValue` field into a C
 // initialiser fragment (`= ...`). Without this normalisation the raw IEC
 // text would land in plc.h verbatim and break the build:
 //   BOOL  : `True` / `TRUE` / `1`     →  ` = true`        (C `bool`)
-//   TIME  : `T#300ms` / `TIME#1s`     →  ` = 300000`      (uint32 µs, matches transformExpr)
+//   TIME  : `T#300ms` / `LTIME#-1s`   →  ` = 300000` / ` = -1000000` (int64 µs, matches the ST expression compiler)
 //   INT…  : `16#40` / `2#1010`        →  ` = 0x40` / ` = 0b1010`
 //   STRING: `hello`                    →  ` = "hello"`
 // Empty/undefined returns '' so the caller can append nothing.
@@ -1693,14 +2356,20 @@ const formatVarInitial = (raw, type) => {
         const b = String(raw).trim().toLowerCase();
         return ` = ${(b === 'true' || b === '1') ? 'true' : 'false'}`;
     }
-    if (T === 'TIME') {
+    if (isTimeTypeName(T)) {
         const s = String(raw).trim();
-        if (/^(?:T|TIME)#/i.test(s)) return ` = ${mapIECtoTimeUs(s)}`;
+        if (isTimeLiteral(s)) return ` = ${mapIECtoTimeUs(s)}`;
+        const neg = /^-/.test(s);
+        const n = iecNumberToC(s.replace(/^[-+]/, ''));
+        if (n !== null && /^\d+$/.test(n)) return ` = ${checkTimeRange((neg ? -1 : 1) * Number(n), s)}`;
         return ` = ${s}`;
     }
     // Numeric — accept C decimal/hex (`64`, `0x40`) or IEC typed-radix
-    // (`16#40`, `2#1010`) and translate the latter to C syntax.
-    const rawStr = String(raw).trim();
+    // (`16#40`, `2#1010`) and translate the latter to C syntax. A typed
+    // literal (`INT#5`) drops its prefix, and `_` separators (`1_000`) go.
+    const rawStr = String(raw).trim().replace(/^[A-Za-z]+#(?=[-+]?\d)/, '');
+    const asNum = /^[-+]/.test(rawStr) ? iecNumberToC(rawStr.slice(1)) : iecNumberToC(rawStr);
+    if (asNum !== null) return ` = ${rawStr[0] === '-' ? '-' : ''}${asNum}`;
     const cVal = rawStr.replace(/\b(\d+)#([0-9A-Fa-f_]+)\b/g, (_, base, digits) => {
         const cleaned = digits.replace(/_/g, '');
         if (base === '16') return `0x${cleaned}`;
@@ -2177,7 +2846,7 @@ extern KRON_Process_Image __gpi;
         axisInitCode += `\n    /* ── Motion Axes ── */\n    KRON_AXIS_LOCK();\n    memset(&Kron_PI, 0, sizeof(Kron_PI));\n`;
         // ⚠️ An axis is simulated when the ETHERCAT MASTER is stubbed, never
         // because this is "a simulation build". The local sim drives a real bus
-        // on Linux (KRON_EC_SIM was dropped from the hot-swap build, §13), so
+        // on Linux (KRON_EC_SIM was dropped from the hot-swap build, host-agent/CLAUDE.md), so
         // tying AXIS_REF.Simulation to the transpiler's simMode left the bus
         // real and every axis fake: KronAxis_WriteOutput takes its
         // `slot == NULL || Simulation || !present` branch, which mirrors
@@ -2628,7 +3297,7 @@ cleanupCode +
 // ⚠️ The snapshot is taken ASYNCHRONOUSLY (a flusher thread, not the scan), so a
 // >word-sized value (LINT/LREAL on a 32-bit board) can in principle be sampled
 // mid-update. Scan-synchronised capture would need per-task partitioning like
-// the capture ring's producer (§16) — a known v1 gap, not an oversight.
+// the capture ring's producer (server/CLAUDE.md) — a known v1 gap, not an oversight.
 //
 // Layout: "KRTN" u16 version u16 count, then count × { u16 nameLen, name,
 // u16 size, value bytes }. Scalars are explicit little-endian; the payload is
@@ -2640,7 +3309,7 @@ export const isRetainVar = (v) => String(v?.class || '').toLowerCase() === 'reta
 const generateRetainSupport = (retainEntries) => {
     if (!retainEntries.length) return '';
     let s = `\n// --- RETENTIVE (RETAIN) VARIABLES ---\n`;
-    s += `// Values persisted to ./${'retain.dat'} and restored at PLC_Init. See CLAUDE.md §17.\n`;
+    s += `// Values persisted to ./${'retain.dat'} and restored at PLC_Init. See src/services/CLAUDE.md.\n`;
     s += `#include <stdio.h>\n#include <stddef.h>\n`;
     s += `#if defined(_WIN32)\n`;
     // ⚠️ ISO rename() fails on Windows when the destination exists (same trap as
@@ -2799,7 +3468,7 @@ const generateMainLoop = (projectStructure, config, boardId = null, shmEnabled =
     if (projectStructure.taskConfig?.tasks?.length > 0) {
         const usedTaskNames = new Set();
         projectStructure.taskConfig.tasks.forEach(task => {
-            const intervalUs = mapIECtoTimeUs(task.interval);
+            const intervalUs = mapTaskIntervalUs(task.interval);
             const progs = [...(task.programs || [])]
                 .sort((a, b) => a.priority - b.priority)
                 .map(p => (p.program || '').trim().replace(/\s+/g, '_'))
@@ -2843,7 +3512,7 @@ const generateMainLoop = (projectStructure, config, boardId = null, shmEnabled =
         config.content.instances.forEach(inst => {
             const task = config.content.tasks?.find(t => t.name === inst.task);
             const pName = (inst.program || '').trim().replace(/\s+/g, '_');
-            const intervalUs = task ? mapIECtoTimeUs(task.interval) : 10000;
+            const intervalUs = task ? mapTaskIntervalUs(task.interval) : 10000;
             const tKey = inst.task || '__default';
             if (!legacyTaskMap[tKey]) legacyTaskMap[tKey] = { taskName: tKey.replace(/\s+/g, '_'), intervalUs, rtPriority: 99, programs: [] };
             legacyTaskMap[tKey].programs.push(pName);
@@ -3031,10 +3700,11 @@ const generateMainLoop = (projectStructure, config, boardId = null, shmEnabled =
     // All currently include the full variable set; partition per-task in future if needed.
     if (shmEnabled && shmEntries.length > 0) {
         taskGroups.forEach(tg => {
-            // See plc_shm_pull above for the flag semantics: 1 = FORCE (hold),
-            // 2 = PULSE (apply once, auto-clear, logic resumes same scan).
+            // See generateShmMailbox for the command protocol: the mailbox is
+            // drained FIRST, so a command takes effect on this very scan.
             mainSrc += `static void plc_shm_pull_${tg.taskName}(void) {\n`;
             mainSrc += `    if (!__plc_shm) return;\n`;
+            mainSrc += `    plc_mb_consume();\n`;
             shmEntries.forEach(e => { mainSrc += shmPullLine(e); });
             mainSrc += `}\n`;
             mainSrc += `static void plc_shm_sync_${tg.taskName}(void) {\n`;
@@ -3087,7 +3757,7 @@ const generateMainLoop = (projectStructure, config, boardId = null, shmEnabled =
         mainSrc += `    uint64_t oldEpoch; memcpy(&oldEpoch, r + 48, 8);\n`;
         mainSrc += `    uint32_t u32; uint16_t u16; uint64_t u64;\n`;
         mainSrc += `    u32 = 0x4B524E47u; memcpy(r+0,&u32,4);\n`;   // magic
-        mainSrc += `    u32 = 1u;          memcpy(r+4,&u32,4);\n`;   // version
+        mainSrc += `    u32 = 2u;          memcpy(r+4,&u32,4);\n`;   // version (2: scan counter in record +12, fence after fetch_add)
         mainSrc += `    u32 = 256u;        memcpy(r+8,&u32,4);\n`;   // header_bytes
         mainSrc += `    u32 = (uint32_t)PLC_RING_STRIDE; memcpy(r+12,&u32,4);\n`;
         mainSrc += `    u32 = (uint32_t)nslots; memcpy(r+16,&u32,4);\n`;
@@ -3128,11 +3798,20 @@ const generateMainLoop = (projectStructure, config, boardId = null, shmEnabled =
             mainSrc += `    if (!__plc_ring) return;\n`;
             mainSrc += `    uint32_t N = __atomic_load_n((uint32_t*)(__plc_ring + 40), __ATOMIC_RELAXED);\n`;
             mainSrc += `    if (N == 0) return; /* paused: no consumer connected → don't burn scan cycles / RAM */\n`;
-            mainSrc += `    if ((__ring_scan_${t.taskName}++ % N) != 0) return;\n`;
+            mainSrc += `    uint64_t sc = __ring_scan_${t.taskName}++;\n`;
+            mainSrc += `    if ((sc % N) != 0) return;\n`;
             mainSrc += `    uint64_t s = __atomic_fetch_add((uint64_t*)(__plc_ring + 32), 1ull, __ATOMIC_RELAXED);\n`;
+            // ⚠️ Seqlock writer fence: the payload stores below must not become
+            // visible before the claim above. KronServer's torn-read check
+            // (copy, then re-read write_seq) is only sound with it — a relaxed
+            // fetch_add orders nothing on ARM.
+            mainSrc += `    __atomic_thread_fence(__ATOMIC_RELEASE);\n`;
             mainSrc += `    uint8_t *slot = __plc_ring + 256 + (uint64_t)(s % __plc_ring_nslots) * PLC_RING_STRIDE;\n`;
             mainSrc += `    uint16_t tid = ${t.taskId}u; memcpy(slot + 8, &tid, 2);\n`;
             mainSrc += `    uint16_t pl = ${t.payloadLen}u; memcpy(slot + 10, &pl, 2);\n`;
+            // v2: this task's scan counter (low 32 bits) — consecutive kept
+            // records differ by stride_N, so a client SEES thinning.
+            mainSrc += `    uint32_t scl = (uint32_t)sc; memcpy(slot + 12, &scl, 4);\n`;
             mainSrc += `    uint8_t *p = slot + 16;\n`;
             let po = 0;
             t.vars.forEach((v) => {
@@ -3202,7 +3881,10 @@ const generateMainLoop = (projectStructure, config, boardId = null, shmEnabled =
         mainSrc += `    struct timespec __next;\n`;
         mainSrc += `    clock_gettime(CLOCK_MONOTONIC, &__next);\n`;
         mainSrc += `    while (!plc_stop) {\n`;
-        mainSrc += `        __next.tv_nsec += ${tg.intervalUs * 1000}UL;\n`;
+        // ⚠️ Whole seconds go to tv_sec: tv_nsec is a 32-bit long on armv7, so
+        // adding interval*1000 ns for an interval >= ~2.1 s overflowed it.
+        if (tg.intervalUs >= 1000000) mainSrc += `        __next.tv_sec += ${Math.floor(tg.intervalUs / 1000000)};\n`;
+        mainSrc += `        __next.tv_nsec += ${(tg.intervalUs % 1000000) * 1000}L;\n`;
         mainSrc += `        while (__next.tv_nsec >= 1000000000L) { __next.tv_sec++; __next.tv_nsec -= 1000000000L; }\n`;
         if (!gpiMutexEnabled && isIoTask && ecPdoReadCode) mainSrc += ecPdoReadCode;
         // us_tick → wall-clock so IEC timers stay accurate even if a scan overruns.
@@ -3361,7 +4043,11 @@ const generateMainLoop = (projectStructure, config, boardId = null, shmEnabled =
         axisNames.forEach((a, i) => { mainSrc += `        case ${i}: return (void*)&S->${a};\n`; });
         mainSrc += `        default: return 0;\n    }\n}\n`;
     }
-    mainSrc += `void plc_init_hs(void) { PLC_Init(); }\n`;
+    // The host maps the mirror BEFORE calling this, so the mailbox is
+    // initialised exactly once per cold start — never on a swap.
+    mainSrc += shmEnabled
+        ? `void plc_init_hs(void) { PLC_Init(); plc_mb_init(); }\n`
+        : `void plc_init_hs(void) { PLC_Init(); }\n`;
     mainSrc += `void plc_cleanup_hs(void) { PLC_Cleanup(); }\n`;
     if (shmEnabled) {
         // Host opens this /dev/shm mirror and assigns __plc_shm before the scan.
@@ -3376,14 +4062,39 @@ const generateMainLoop = (projectStructure, config, boardId = null, shmEnabled =
 
 // FUNCTION POU helpers — Input-class variables become C parameters in
 // declaration order; everything else is a body-local.
+// ⚠️ VAR_IN_OUT is a PARAMETER too, passed BY POINTER: it used to be left
+// out of the parameter list and declared as a body local, so the caller's
+// argument count no longer matched the prototype and nothing was written back.
+// Inside the body the name resolves to `(*name)` (see buildStMaps / the LD
+// resolver); at a call site the argument becomes `&(arg)` and must be a
+// variable.
+const isInOutClass = (v) => String(v?.class || '').toLowerCase() === 'inout';
 const functionInputVars = (pou) =>
-    (pou?.content?.variables || []).filter(v => String(v.class || '').toLowerCase() === 'input');
+    (pou?.content?.variables || []).filter(v => ['input', 'inout'].includes(String(v.class || '').toLowerCase()));
 
+// ⚠️ A STRING VAR_INPUT arrives as `const char *__in_<name>` and the body
+// copies it into a local kron_string_t of the declared name (IEC passes inputs
+// BY VALUE): an array parameter would decay to a pointer into the CALLER's
+// storage, so assigning to the input inside the function wrote the caller's
+// variable, and KRON_STRSET could not tell it from a pointer. A STRING
+// VAR_IN_OUT is `kron_string_t *` and works on the caller's array as intended.
+const stringInputParamName = (vName) => `__in_${vName}`;
+const isStringByValueInput = (v) => !isInOutClass(v) && isStringInputType(v?.type);
+// ⚠️ A STRING-returning FUNCTION takes its result buffer from the CALLER
+// (`kron_string_t *__res`, first parameter): every ST call site owns one
+// (stExpr.js userCall). One per-function static buffer made `F(a) = F(b)`
+// compare F(b) with itself, whatever order C evaluated the calls in.
+const STRING_RESULT_PARAM = '__res';
 const buildFunctionParams = (pou) => {
     const ins = functionInputVars(pou);
-    if (ins.length === 0) return 'void';
-    return ins
-        .map(v => `${mapType((v.type || '').trim())} ${(v.name || '').trim().replace(/\s+/g, '_')}`)
+    const res = isStringInputType(pou?.returnType) ? [`${STRING_C_TYPE} *${STRING_RESULT_PARAM}`] : [];
+    if (ins.length === 0 && res.length === 0) return 'void';
+    return [...res, ...ins
+        .map(v => {
+            const n = cIdent((v.name || '').trim().replace(/\s+/g, '_'));
+            if (isStringByValueInput(v)) return `const char *${stringInputParamName(n)}`;
+            return `${mapType((v.type || '').trim())} ${isInOutClass(v) ? '*' : ''}${n}`;
+        })]
         .join(', ');
 };
 
@@ -3395,7 +4106,8 @@ const transpilePOUSource = (pou, category, stdFunctions = {}, parentName = '', g
     let src = ``;
     let safeName = (pou.name || '').trim().replace(/\s+/g, '_');
     let sig = `static inline void ${safeName}()`;
-    const fnRetType = category === 'function' ? mapType(pou.returnType || 'VOID') : 'void';
+    const fnRetType = category === 'function' ? fnReturnCType(pou.returnType || 'VOID') : 'void';
+    const fnReturnsString = category === 'function' && isStringInputType(pou.returnType);
 
     if (category === 'function') {
         sig = `static inline ${fnRetType} ${safeName}(${buildFunctionParams(pou)})`;
@@ -3411,35 +4123,45 @@ const transpilePOUSource = (pou, category, stdFunctions = {}, parentName = '', g
     // mid-body result assignments keep executing the rest of the body (IEC
     // semantics) and the single `return __ret;` epilogue returns the final value.
     let fnEpilogue = '';
+    const stringFnReturn = `{ ${kronStrset(`*${STRING_RESULT_PARAM}`, '__ret')}; return *${STRING_RESULT_PARAM}; }`;
     const fnInputNames = new Set();
     if (category === 'function') {
         functionInputVars(pou).forEach(v => {
             const vName = (v.name || '').trim().replace(/\s+/g, '_');
             if (vName) fnInputNames.add(vName);
         });
+        // STRING inputs: the by-value copy (see buildFunctionParams).
+        functionInputVars(pou).filter(isStringByValueInput).forEach(v => {
+            const n = cIdent((v.name || '').trim().replace(/\s+/g, '_'));
+            src += `    ${STRING_C_TYPE} ${n}; ${kronStrset(n, stringInputParamName(n))};\n`;
+        });
         (pou.content?.variables || []).forEach(v => {
             const vName = (v.name || '').trim().replace(/\s+/g, '_');
             if (!vName || fnInputNames.has(vName)) return;
             if (isInlineMathType(v.type)) return;
+            if (isStringInputType(v.type)) {
+                // Copied, so an over-long initial is truncated like any other
+                // assignment instead of being a C initializer error.
+                src += `    ${STRING_C_TYPE} ${cIdent(vName)} = {0};\n`;
+                const line = initAssignStmt(cIdent(vName), v.initialValue, v.type);
+                if (line) src += `    ${line}\n`;
+                return;
+            }
             const init = formatVarInitial(v.initialValue, v.type) || ' = {0}';
-            src += `    ${mapType((v.type || '').trim())} ${vName}${init};\n`;
+            src += `    ${mapType((v.type || '').trim())} ${cIdent(vName)}${init};\n`;
         });
-        if (fnRetType !== 'void') {
+        if (fnReturnsString) {
+            // ⚠️ An array cannot be returned: the result is built in a local
+            // and copied into the CALLER's buffer (see buildFunctionParams),
+            // whose address is returned — valid for as long as the caller's
+            // scope, and distinct per call site.
+            src += `    ${STRING_C_TYPE} __ret = {0};\n`;
+            fnEpilogue = `    ${stringFnReturn}\n`;
+        } else if (fnRetType !== 'void') {
             src += `    ${fnRetType} __ret = {0};\n`;
             fnEpilogue = `    return __ret;\n`;
         }
     }
-
-    // User-defined FUNCTION input order — lets ST rewrite named-argument calls
-    // (`MyFunc(A := x)`) into positional C calls.
-    const userFunctionInputs = {};
-    (projectStructure?.functions || []).forEach(fn => {
-        const n = (fn.name || '').trim().replace(/\s+/g, '_');
-        if (!n) return;
-        userFunctionInputs[n] = functionInputVars(fn)
-            .map(v => (v.name || '').trim().replace(/\s+/g, '_'))
-            .filter(Boolean);
-    });
 
     // User-defined FB input pin order — lets ST map POSITIONAL FB instance
     // calls (`inst(a, b)`) onto the FB's declared input pins.
@@ -3452,6 +4174,10 @@ const transpilePOUSource = (pou, category, stdFunctions = {}, parentName = '', g
             .map(v => (v.name || '').trim().replace(/\s+/g, '_'))
             .filter(Boolean);
     });
+    // Member names + types of user FBs and structure UDTs — lets `t2.q`,
+    // `myFb.count` and `pt.x` be spelled in any case (IEC) and still name the
+    // real C member, and lets an InOut pin get its copy-back.
+    const memberCtx = buildMemberCtx(projectStructure);
 
     // Local variable names + which of them are FB instances (for LD member
     // access like `blink.Q` → inst_ field, and local-vs-global precedence).
@@ -3465,29 +4191,52 @@ const transpilePOUSource = (pou, category, stdFunctions = {}, parentName = '', g
         if (isFB) fbInstanceNames.add(vName);
     });
 
-    // Build C-symbol → IEC-type map for LD type inference (REAL detection)
+    // Case-insensitive views of the declared names (IEC identifiers are
+    // case-insensitive): lower → declared spelling, and lower → IEC type with
+    // locals shadowing globals.
+    const globalLower = new Map(globalVarNames.map(g => [String(g).toLowerCase(), g]));
+    const nameTypes = new Map();
+    (globalVarsList || []).forEach(gv => {
+        const gName = (gv.name || '').trim().replace(/\s+/g, '_');
+        if (gName) nameTypes.set(gName.toLowerCase(), gv.type);
+    });
+    (pou.content?.variables || []).forEach(v => {
+        const vName = (v.name || '').trim().replace(/\s+/g, '_');
+        if (vName) nameTypes.set(vName.toLowerCase(), v.type);
+    });
+    // FUNCTION VAR_IN_OUT parameters are pointers: every use is `(*name)`.
+    const fnPtrParams = new Set(category === 'function'
+        ? (pou.content?.variables || []).filter(isInOutClass).map(v => (v.name || '').trim().replace(/\s+/g, '_'))
+        : []);
+
+    // Build C-symbol → IEC-type map for LD type inference (REAL detection).
+    // ⚠️ Keyed by the EXACT text resolveVal returns (`S->prog_Main_x`,
+    // `S->g`, `instance->x`, `(*p)`): it used to be keyed `prog_Main_x` / `g`,
+    // so no lookup ever hit and every LD math block on REAL variables ran the
+    // int32 struct path, truncating the result. Bare forms stay as aliases.
     const buildCSymTypeMap = () => {
         const map = {};
-        // Global vars: C symbol = variable name unchanged
         globalVarsList.forEach(v => {
             const vName = (v.name || '').trim().replace(/\s+/g, '_');
-            if (vName) map[vName] = v.type;
+            if (!vName) return;
+            map[vName] = v.type;
+            map[`S->${cIdent(vName)}`] = v.type;
         });
-        // Local POU variables
         (pou.content.variables || []).forEach(v => {
             const vName = (v.name || '').trim().replace(/\s+/g, '_');
             if (!vName) return;
-            let cSym;
-            if (globalVarNames.includes(vName)) {
-                cSym = vName;
+            const keys = [];
+            if (globalLower.has(vName.toLowerCase())) {
+                const g = globalLower.get(vName.toLowerCase());
+                keys.push(g, `S->${cIdent(g)}`);
             } else if (category === 'program') {
-                cSym = `prog_${safeName}_${vName}`;
+                keys.push(`prog_${safeName}_${vName}`, `S->prog_${safeName}_${vName}`);
             } else if (category === 'function_block') {
-                cSym = `instance->${vName}`;
+                keys.push(`instance->${cIdent(vName)}`);
             } else {
-                cSym = vName;
+                keys.push(cIdent(vName), `(*${cIdent(vName)})`);
             }
-            map[cSym] = v.type;
+            keys.forEach(k => { map[k] = v.type; });
         });
         return map;
     };
@@ -3507,23 +4256,34 @@ const transpilePOUSource = (pou, category, stdFunctions = {}, parentName = '', g
             const vName = (v.name || '').trim().replace(/\s+/g, '_');
             if (!vName) return;
             varTypeMap[vName] = v.type;
-            if (globalVarNames.includes(vName)) {
-                varMap[vName] = `S->${vName}`; // global: PlcState field (hot-swap)
+            const g = globalLower.get(vName.toLowerCase());
+            if (g) {
+                varMap[vName] = `S->${cIdent(g)}`; // global: PlcState field (hot-swap)
             } else if (category === 'program') {
                 varMap[vName] = fbInstanceNames.has(vName)
                     ? `S->prog_${parentName}_inst_${vName}`
                     : `S->prog_${parentName}_${vName}`;
             } else if (category === 'function_block') {
-                varMap[vName] = `instance->${vName}`;
+                varMap[vName] = `instance->${cIdent(vName)}`;
             } else {
-                varMap[vName] = vName;
+                varMap[vName] = fnPtrParams.has(vName) ? `(*${cIdent(vName)})` : cIdent(vName);
             }
         });
         // Globals referenced but not declared locally are PlcState fields too.
-        globalVarNames.forEach(g => { const gn = (g || '').trim().replace(/\s+/g, '_'); if (gn && !(gn in varMap)) varMap[gn] = `S->${gn}`; });
+        const mappedLower = new Set(Object.keys(varMap).map(k => k.toLowerCase()));
+        globalVarNames.forEach(g => {
+            const gn = (g || '').trim().replace(/\s+/g, '_');
+            if (gn && !mappedLower.has(gn.toLowerCase())) { varMap[gn] = `S->${cIdent(gn)}`; mappedLower.add(gn.toLowerCase()); }
+        });
         // EtherCAT PDO variables must stay BARE so the GPI access macro applies
         // (they have no PlcState field — mapping them to S->name breaks compile).
-        EC_PDO_VAR_NAMES.forEach(n => { if (varMap[n] === `S->${n}`) delete varMap[n]; });
+        // Mapped to the macro's own spelling, so `EC_x` written in any case
+        // still names `ec_X`.
+        Object.keys(varMap).forEach(k => {
+            const c = ecPdoCanon(k);
+            if (c && varMap[k] === `S->${cIdent(k)}`) varMap[k] = c;
+        });
+        EC_PDO_VAR_NAMES.forEach(n => { if (!mappedLower.has(n.toLowerCase())) varMap[n] = n; });
         // Function result variable: FuncName := expr → __ret = expr.
         if (category === 'function' && fnRetType !== 'void') {
             varMap[safeName] = '__ret';
@@ -3533,19 +4293,45 @@ const transpilePOUSource = (pou, category, stdFunctions = {}, parentName = '', g
 
     const stOpts = {
         fnReturnVar: (category === 'function' && fnRetType !== 'void') ? '__ret' : null,
-        userFunctionInputs,
+        // `FuncName := …` / RETURN in a STRING function are copies into __ret.
+        fnResult: (category === 'function' && fnRetType !== 'void')
+            ? { name: safeName, type: pou.returnType, isString: fnReturnsString } : null,
         userFBInputs,
+        memberCtx,
+        // Full signatures for the expression compiler (stExpr.js).
+        userFunctionDefs: new Map((projectStructure?.functions || [])
+            .map(fn => {
+                const n = (fn.name || '').trim().replace(/\s+/g, '_');
+                return [n.toLowerCase(), {
+                    name: n,
+                    ret: fn.returnType || 'VOID',
+                    params: functionInputVars(fn).filter(v => (v.name || '').trim()).map(v => ({
+                        name: (v.name || '').trim().replace(/\s+/g, '_'), type: v.type, inout: isInOutClass(v),
+                    })),
+                }];
+            })
+            .filter(([n]) => n)),
+        // Expression temps / per-call STRING result buffers, unique per POU.
+        exprSeq: { next: 0 },
+        stringFnReturn: fnReturnsString ? stringFnReturn : null,
         // ONE counter for the whole POU: an SCL program calls transpileSTLogics
         // once per ST rung, and a per-call counter would hand the same buffer
         // to two different conversions.
         strConv: category === 'program' ? { progName: safeName, next: 0 } : null,
+        // Same reason: EXIT labels and hidden FOR counters must be unique
+        // across every ST rung of one C function.
+        labelSeq: { next: 0 },
     };
+    const declaredCanon = new Map();
+    globalVarNames.forEach(g => declaredCanon.set(String(g).toLowerCase(), g));
+    localVarNames.forEach(n => declaredCanon.set(n.toLowerCase(), n));
+    const ldCtx = { memberCtx, nameTypes, fnPtrParams, declaredCanon };
 
     if (pou.type === 'ST') {
         const { varMap, varTypeMap } = buildStMaps();
         src += transpileSTLogics(pou.content.code, stdFunctions, parentName, category, varMap, varTypeMap, userFBTypes, stOpts);
     } else if (pou.type === 'LD') {
-        src += transpileLDLogics(pou.content.rungs, stdFunctions, safeName, category, globalVarNames, inputShadowMap, 0, buildCSymTypeMap(), localVarNames, fbInstanceNames);
+        src += transpileLDLogics(pou.content.rungs, stdFunctions, safeName, category, globalVarNames, inputShadowMap, 0, buildCSymTypeMap(), localVarNames, fbInstanceNames, ldCtx);
     } else if (pou.type === 'SCL') {
         // SCL: mixed LD/ST per rung. Each rung carries a `lang` field ('LD' or 'ST').
         let sclLdRungIdx = 0;
@@ -3557,7 +4343,7 @@ const transpilePOUSource = (pou, category, stdFunctions = {}, parentName = '', g
             } else {
                 // Default: treat as LD rung
                 src += `    // SCL rung [LD]\n`;
-                src += transpileLDLogics([rung], stdFunctions, safeName, category, globalVarNames, inputShadowMap, sclLdRungIdx, buildCSymTypeMap(), localVarNames, fbInstanceNames);
+                src += transpileLDLogics([rung], stdFunctions, safeName, category, globalVarNames, inputShadowMap, sclLdRungIdx, buildCSymTypeMap(), localVarNames, fbInstanceNames, ldCtx);
                 sclLdRungIdx++;
             }
         });
@@ -3587,6 +4373,7 @@ const FB_TRIGGER_PIN = {
     'BAND': 'EN', 'BOR': 'EN', 'BXOR': 'EN', 'BNOT': 'EN',
     'SHL': 'EN', 'SHR': 'EN', 'ROL': 'EN', 'ROR': 'EN',
     'SIN': 'EN', 'COS': 'EN', 'TAN': 'EN', 'ASIN': 'EN', 'ACOS': 'EN', 'ATAN': 'EN',
+    'LN': 'EN', 'LOG': 'EN', 'EXP': 'EN',
     'SEL': 'EN', 'MUX': 'EN',
     // Conversion (72 entries generated below), Scaling
     'NORM_X': 'EN', 'SCALE_X': 'EN',
@@ -3647,6 +4434,7 @@ const FB_Q_OUTPUT = {
     'BAND': 'ENO', 'BOR': 'ENO', 'BXOR': 'ENO', 'BNOT': 'ENO',
     'SHL': 'ENO', 'SHR': 'ENO', 'ROL': 'ENO', 'ROR': 'ENO',
     'SIN': 'ENO', 'COS': 'ENO', 'TAN': 'ENO', 'ASIN': 'ENO', 'ACOS': 'ENO', 'ATAN': 'ENO',
+    'LN': 'ENO', 'LOG': 'ENO', 'EXP': 'ENO',
     'SEL': 'ENO', 'MUX': 'ENO',
     // Conversion (72 entries generated below), Scaling
     'NORM_X': 'ENO', 'SCALE_X': 'ENO',
@@ -3757,7 +4545,7 @@ const getOutputPinType = (blockType, pinName, customData) => {
         const m = blockType.match(/_TO_([A-Z]+)$/);
         if (m) return m[1];
         if (['ADD', 'SUB', 'MUL', 'DIV', 'MOD', 'MOVE', 'SEL', 'MUX'].includes(blockType)) return 'DINT';
-        if (['ABS', 'SQRT', 'EXPT', 'MAX', 'MIN', 'LIMIT', 'SIN', 'COS', 'TAN', 'ASIN', 'ACOS', 'ATAN', 'NORM_X', 'SCALE_X'].includes(blockType)) return 'REAL';
+        if (['ABS', 'SQRT', 'EXPT', 'MAX', 'MIN', 'LIMIT', 'SIN', 'COS', 'TAN', 'ASIN', 'ACOS', 'ATAN', 'LN', 'LOG', 'EXP', 'NORM_X', 'SCALE_X'].includes(blockType)) return 'REAL';
         if (['BAND', 'BOR', 'BXOR', 'BNOT', 'SHL', 'SHR', 'ROL', 'ROR'].includes(blockType)) return 'DWORD';
     }
     // User-defined FB: look up actual type from customData variables
@@ -3771,6 +4559,23 @@ const getOutputPinType = (blockType, pinName, customData) => {
         if (outDef) return outDef.type || 'BOOL';
     }
     return 'BOOL';
+};
+
+// IEC type of a standard block's pin for the ST expression typer, or null
+// when no table states it. ⚠️ Deliberately NOT getOutputPinType: that falls
+// through to BOOL for any pin it does not know, and a guessed BOOL would make
+// the typer refuse `inst.ErrorID = 5` (or pick logical AND on a WORD).
+const stdPinTypeForExpr = (blockType, pin) => {
+    if (FB_TRIGGER_PIN[blockType] === pin) return 'BOOL';
+    const it = FB_INPUT_TYPES[blockType]?.[pin];
+    if (it) return it;
+    if (['Q', 'Q1', 'QU', 'QD', 'ENO', 'EN'].includes(pin)) return 'BOOL';
+    if ((blockType === 'UART_Receive' || blockType === 'USB_Receive') && pin === 'ReceivedLength') return 'UINT';
+    const tables = [EC_FB_OUTPUT_TYPES, SYSTEM_FB_OUTPUT_TYPES, MOTION_FB_OUTPUT_TYPES, GENERATED_FB_OUTPUT_TYPES];
+    for (const t of tables) if (t[blockType]?.[pin]) return t[blockType][pin];
+    if (pin === 'ET' && (FB_OUTPUTS[blockType] || []).includes('ET')) return 'TIME';
+    if (pin === 'CV' && (FB_OUTPUTS[blockType] || []).includes('CV')) return 'INT';
+    return null;
 };
 
 // IEC type of the debug shadow field behind an INLINE (EN/ENO, stateless)
@@ -3915,9 +4720,10 @@ const collectInputShadowVars = (rungs, progName) => {
             const pinTypes = FB_INPUT_TYPES[type];
             Object.entries(pinTypes).forEach(([editorPin, iecType]) => {
                 if (isPointerInputType(iecType)) return;
-                // A STRING pin is a char* into the module's rodata: no SHM slot
-                // type exists for it and a shadow field would be NULL, so the
-                // literal is assigned directly every scan instead.
+                // A standard block's STRING pin is a `const char *`, re-pointed
+                // at its literal/variable every scan (which keeps it valid across
+                // a hot-swap). A writable shadow would be pointless — text is a
+                // read-only live value — so there is none.
                 if (isStringInputType(iecType)) return;
                 // The Axis pin is passed as the _Call's 2nd parameter, not a
                 // struct field — a shadow var would declare a stray AXIS_REF
@@ -3932,7 +4738,7 @@ const collectInputShadowVars = (rungs, progName) => {
                 let initStr = '0';
                 let initVal = 0;
                 if (cleanVal) {
-                    if (iecType === 'TIME') {
+                    if (isTimeTypeName(iecType)) {
                         const us = mapIECtoTimeUs(cleanVal);
                         initStr = String(us);
                         initVal = us;
@@ -3965,8 +4771,7 @@ const collectUndeclaredPinVars = (rungs, progName, declaredVarNames, globalVarNa
     const seen = new Set();
     const vars = [];
     const isLiteral = (s) =>
-        /^-?[0-9]/.test(s) || /^(true|false)$/i.test(s) ||
-        s.toUpperCase().startsWith('T#') || s.toUpperCase().startsWith('TIME#');
+        /^-?[0-9]/.test(s) || /^(true|false)$/i.test(s) || isTimeLiteral(s);
 
     (rungs || []).forEach(rung => {
         (rung.blocks || []).forEach(b => {
@@ -4030,6 +4835,7 @@ const FB_OUTPUTS = {
     'SHL': ['ENO', 'OUT'], 'SHR': ['ENO', 'OUT'], 'ROL': ['ENO', 'OUT'], 'ROR': ['ENO', 'OUT'],
     'SIN': ['ENO', 'OUT'], 'COS': ['ENO', 'OUT'], 'TAN': ['ENO', 'OUT'],
     'ASIN': ['ENO', 'OUT'], 'ACOS': ['ENO', 'OUT'], 'ATAN': ['ENO', 'OUT'],
+    'LN': ['ENO', 'OUT'], 'LOG': ['ENO', 'OUT'], 'EXP': ['ENO', 'OUT'],
     'SEL': ['ENO', 'OUT'], 'MUX': ['ENO', 'OUT'],
     'NORM_X': ['ENO', 'OUT'], 'SCALE_X': ['ENO', 'OUT'],
     // EtherCAT diagnostics
@@ -4117,8 +4923,15 @@ export { FB_OUTPUTS };
 const MATH_FB_BLOCKS = new Set([
     'ADD', 'SUB', 'MUL', 'DIV', 'MOD', 'MOVE', 'ABS',
     'SQRT', 'EXPT', 'NEG', 'AVG',
-    'SIN', 'COS', 'TAN', 'ASIN', 'ACOS', 'ATAN'
+    'SIN', 'COS', 'TAN', 'ASIN', 'ACOS', 'ATAN', 'LN', 'LOG', 'EXP',
 ]);
+// Unary <math.h> functions: no kronmath.h struct exists for any of them (a
+// `SIN` struct was referenced and never compiled), so they are ALWAYS emitted
+// inline in floating point, whatever the operand type. block → C function.
+const MATH_UNARY_C = {
+    SQRT: 'sqrt', SIN: 'sin', COS: 'cos', TAN: 'tan', ASIN: 'asin', ACOS: 'acos', ATAN: 'atan',
+    LN: 'log', LOG: 'log10', EXP: 'exp',
+};
 // Map block type → C struct type name (only where they differ)
 const MATH_FB_STRUCT = {
     'ABS': 'ABS_FB', 'SQRT': 'SQRT_FB', 'MIN': 'MIN_FB', 'MAX': 'MAX_FB',
@@ -4130,40 +4943,12 @@ const MATH_FB_PIN_MAP = {
     'EXPT': { 'IN': 'IN1', 'EXP': 'IN2' },
 };
 
-// ── Inline KRON_ functions (kroncompare.h) — still use direct function calls ──
-const KRON_FN = {
-    // Comparison (kroncompare.h)
-    'GT': 'KRON_GT', 'GE': 'KRON_GE', 'EQ': 'KRON_EQ',
-    'NE': 'KRON_NE', 'LE': 'KRON_LE', 'LT': 'KRON_LT',
-    // Selection (kroncompare.h)
-    'SEL': 'KRON_SEL', 'MUX': 'KRON_MUX',
-    // Range (kroncompare.h)
-    'MAX': 'KRON_MAX', 'MIN': 'KRON_MIN', 'LIMIT': 'KRON_LIMIT',
-};
-// ── IEC selection / range functions in ST TEXT ──────────────────────────────
-// ⚠️ `KRON_FN` is consulted by the LD path ONLY. In ST these names used to
-// reach C verbatim, so `LIMIT(0, x, 100)` compiled as a call to an undeclared
-// `LIMIT` — reported by clang as `unknown type name` / implicit declaration,
-// i.e. exactly the phantom-block symptom, on code that is perfectly valid IEC.
-//
-// They expand to plain C conditional expressions rather than the archive's
-// `KRON_LIMIT`/`KRON_MIN`/… macros, for two reasons:
-//   • those dispatch with `_Generic` on ONE argument (`mn` for LIMIT, `in0` for
-//     SEL), so a literal bound picks the int32 overload and silently truncates
-//     a REAL: `LIMIT(0, x_real, 100)` → `KRON_LIMIT_I`. C's usual arithmetic
-//     conversions get the mixed int/real case right by construction;
-//   • no dependency on the per-triple `.a`, so an ST-only project still builds.
-// ⚠️ Like the `ABS` macro, the expansion evaluates its arguments more than
-// once — fine for ST expressions, which are side-effect-free apart from a user
-// FUNCTION call. A variadic MIN/MAX folds pairwise, so each extra argument
-// past the second duplicates the accumulated text (3 args → 3 copies of the
-// first): normal use is fine, a 6-input MIN would bloat the C.
-const ST_SELECTION_FN_ARGS = {
-    MIN: null, MAX: null, MUX: null,          // variadic
-    LIMIT: ['MN', 'IN', 'MX'],
-    SEL: ['G', 'IN0', 'IN1'],
-};
-
+// ── Comparison / selection / range ──────────────────────────────────────────
+// ⚠️ Neither path uses kroncompare.h's KRON_GT/KRON_LIMIT/KRON_SEL… any more:
+// they dispatch with `_Generic` on ONE argument, so `GT(5, r_real)` compared
+// as int32 and `LIMIT(0, x_real, 100)` truncated. The ladder emits plain C
+// operators / conditionals (transpileLDLogics); ST emits typed conditionals
+// with single-evaluation temps (stExpr.js).
 // splitTopLevelArgs splits an argument list on commas that are NOT inside
 // nested parentheses or brackets. String literals are already placeholder
 // tokens by the time this runs, so no quote handling is needed.
@@ -4180,84 +4965,6 @@ const splitTopLevelArgs = (inner) => {
     return args.map(a => a.trim()).filter(a => a !== '');
 };
 
-// expandSTSelectionCalls rewrites MIN/MAX/LIMIT/SEL/MUX calls in an ST
-// expression. Recurses through arguments so nested calls expand too, and
-// leaves a name alone when the project declares its own function/FB of that
-// name. Accepts positional and named (`LIMIT(MN := 0, …)`, already normalised
-// to `MN = 0` by the assignment pass) argument forms — the same "by NAME, not
-// position" rule the LD path follows.
-const expandSTSelectionCalls = (expr, isUserDefinedName = () => false) => {
-    const re = /\b(MIN|MAX|LIMIT|SEL|MUX)\s*\(/i;
-    const m = re.exec(expr);
-    if (!m) return expr;
-    const name = m[1].toUpperCase();
-    if (isUserDefinedName(m[1])) {
-        // Not ours: skip past this call head and keep scanning.
-        const head = expr.slice(0, m.index + m[0].length);
-        return head + expandSTSelectionCalls(expr.slice(m.index + m[0].length), isUserDefinedName);
-    }
-    const open = m.index + m[0].length - 1;
-    let depth = 0, close = -1;
-    for (let i = open; i < expr.length; i++) {
-        if (expr[i] === '(') depth++;
-        else if (expr[i] === ')' && --depth === 0) { close = i; break; }
-    }
-    if (close < 0) throw new Error(`ST: unbalanced parentheses in ${name}(...)`);
-
-    let args = splitTopLevelArgs(expr.slice(open + 1, close))
-        .map(a => expandSTSelectionCalls(a, isUserDefinedName));
-
-    // Named arguments → positional, by the pin names the LD side uses.
-    const named = {};
-    const allNamed = args.length > 0 && args.every(a => {
-        const mm = a.match(/^([A-Za-z_][A-Za-z0-9_]*)\s*=(?!=)\s*([\s\S]+)$/);
-        if (!mm) return false;
-        named[mm[1].toUpperCase()] = mm[2].trim();
-        return true;
-    });
-    if (allNamed) {
-        const order = ST_SELECTION_FN_ARGS[name] ||
-            (name === 'MUX' ? ['K', ...Object.keys(named).filter(k => k !== 'K').sort()]
-                : Object.keys(named).sort());
-        const missing = order.filter(k => named[k] === undefined);
-        if (missing.length) throw new Error(`ST: ${name}(...) is missing argument(s) ${missing.join(', ')}`);
-        args = order.map(k => named[k]);
-    }
-
-    const p = args.map(a => `(${a})`);
-    let out;
-    switch (name) {
-        case 'MIN':
-        case 'MAX': {
-            if (p.length < 2) throw new Error(`ST: ${name}(...) needs at least 2 arguments, got ${p.length}`);
-            const op = name === 'MIN' ? '<' : '>';
-            out = p.reduce((acc, cur) => `(${acc} ${op} ${cur} ? ${acc} : ${cur})`);
-            break;
-        }
-        case 'LIMIT':
-            if (p.length !== 3) throw new Error(`ST: LIMIT(MN, IN, MX) needs 3 arguments, got ${p.length}`);
-            out = `(${p[1]} < ${p[0]} ? ${p[0]} : (${p[1]} > ${p[2]} ? ${p[2]} : ${p[1]}))`;
-            break;
-        case 'SEL':
-            if (p.length !== 3) throw new Error(`ST: SEL(G, IN0, IN1) needs 3 arguments, got ${p.length}`);
-            out = `(${p[0]} ? ${p[2]} : ${p[1]})`;
-            break;
-        case 'MUX': {
-            if (p.length < 2) throw new Error(`ST: MUX(K, IN0, ...) needs at least 2 arguments, got ${p.length}`);
-            const k = p[0], ins = p.slice(1);
-            // Out-of-range K clamps to the last input (IEC leaves it undefined).
-            out = ins.slice(0, -1).reduceRight(
-                (acc, cur, i) => `(${k} == ${i} ? ${cur} : ${acc})`,
-                ins[ins.length - 1]);
-            out = `(${out})`;
-            break;
-        }
-        default:
-            return expr;
-    }
-    return expr.slice(0, m.index) + out +
-        expandSTSelectionCalls(expr.slice(close + 1), isUserDefinedName);
-};
 
 // Bitwise — use C operators directly
 const BITWISE_OP = {
@@ -4274,6 +4981,77 @@ const HAL_BLOCK_TYPES = new Set();
 // they must stay BARE names in generated code (no S-> prefix, no PlcState field,
 // no SHM slot) or the macro expansion produces invalid C.
 const EC_PDO_VAR_NAMES = new Set();
+// The PDO macro's own spelling for a name written in any case, else null.
+const ecPdoCanon = (name) => {
+    const l = String(name || '').toLowerCase();
+    for (const n of EC_PDO_VAR_NAMES) if (n.toLowerCase() === l) return n;
+    return null;
+};
+
+// Member tables of user FB types and structure UDTs (lowercased lookups) —
+// see canonMemberPath.
+const buildMemberCtx = (ps) => {
+    const types = new Map();
+    const add = (typeName, vars) => {
+        const n = String(typeName || '').trim().replace(/\s+/g, '_');
+        if (!n) return;
+        const members = new Map();
+        (vars || []).forEach(v => {
+            const vn = String(v?.name || '').trim().replace(/\s+/g, '_');
+            if (vn) members.set(vn.toLowerCase(), { name: vn, type: v.type, inout: isInOutClass(v) });
+        });
+        types.set(n.toLowerCase(), { name: n, members });
+    };
+    (ps?.functionBlocks || []).forEach(fb => add(fb.name, fb.content?.variables));
+    (ps?.dataTypes || []).forEach(dt => { if (dt?.type === 'Structure') add(dt.name, dt.content?.members); });
+    // ARRAY data types: element type + dimension count, so an assignment to
+    // `arr[i]` / `arr[i].member` can tell whether its target is STRING storage.
+    const arrays = new Map();
+    (ps?.dataTypes || []).forEach(dt => {
+        if (dt?.type !== 'Array') return;
+        const n = String(dt.name || '').trim().replace(/\s+/g, '_');
+        if (n) arrays.set(n.toLowerCase(), { baseType: dt.content?.baseType, dims: (dt.content?.dimensions || []).length || 1 });
+    });
+    // ENUMERATED data types: type lower → declared name, value lower →
+    // { name, type } (C enum constants are bare, file-scope identifiers).
+    const enumTypes = new Map();
+    const enumValues = new Map();
+    (ps?.dataTypes || []).forEach(dt => {
+        if (dt?.type !== 'Enumerated') return;
+        const n = String(dt.name || '').trim();
+        if (!n) return;
+        enumTypes.set(n.toLowerCase(), n);
+        (dt.content?.values || []).forEach(v => {
+            const vn = String(v?.name || '').trim();
+            if (vn) enumValues.set(vn.toLowerCase(), { name: vn, type: n });
+        });
+    });
+    return { types, arrays, enumTypes, enumValues };
+};
+
+
+// `inst.member.member…` written in any case → the C member names. IEC is
+// case-insensitive, C is not: `t2.q` on a TON is the field `Q`, and a member
+// whose name is a C keyword is emitted under its mangled name (cIdent).
+// Unknown types / members are left as written (clang then names them).
+const canonMemberPath = (baseType, members, ctx) => {
+    let t = String(baseType || '').trim();
+    return members.map(m => {
+        const info = t ? ctx?.types?.get(t.toLowerCase()) : null;
+        if (info) {
+            const mem = info.members.get(String(m).toLowerCase());
+            t = mem ? String(mem.type || '').trim() : '';
+            return mem ? cIdent(mem.name) : m;
+        }
+        if (t && (FB_OUTPUTS[t] || FB_INPUTS[t] || FB_TRIGGER_PIN[t])) {
+            const fbt = t;
+            t = '';
+            return cStructPin(fbt, canonicalPinName(fbt, m));
+        }
+        t = '';
+        return m;
+    });
+};
 
 // Statically-known blocks that use EN as their power-flow pin but are REAL
 // instance FBs backed by a struct + _Call (kronsystem.h) — the same exemption
@@ -4281,7 +5059,7 @@ const EC_PDO_VAR_NAMES = new Set();
 // always present so they live in a permanent set. Without the exemption they
 // would be treated as stateless inline math: no PlcState field, no instance, no
 // shadow vars, and the LD path would fall into the inline branch that has no
-// KRON_FN/BITWISE/MATH_FB entry for them.
+// code generator for them.
 // ⚠️ Every member needs a struct + `<Type>_Call(<Type>*)` reachable from a
 // kron*.h in resources/krontek-include/ — otherwise the generated C references
 // a type and a function that do not exist and the build fails at compile time.
@@ -4296,10 +5074,10 @@ const SYSTEM_FB_TYPES = new Set([
     'Read_CPU_Temperature', 'Read_System_Load', 'Read_Disk_Free',
     'Read_Sys_File', 'Read_Hwmon',
     // TIME arithmetic. These are stateless, but they cannot take the inline
-    // path: that branch dispatches through KRON_FN / BITWISE_OP / MATH_FB_BLOCKS
+    // path: that branch dispatches by block name (comparisons, BITWISE_OP, MATH_FB_BLOCKS…)
     // and a name in none of those tables has nowhere to be emitted. They are
-    // also why the block names avoid the X_TO_Y spelling — transformExpr
-    // rewrites that to KRON_<src>_TO_<dst>, which only resolves in the archive.
+    // also why the block names avoid the X_TO_Y spelling — the ST expression
+    // compiler maps that to KRON_<src>_TO_<dst>, which only resolves in the archive.
     'T_To_Ms', 'Ms_To_T', 'T_To_Sec', 'Sec_To_T',
     'Add_T', 'Sub_T', 'Mul_T', 'Div_T',
     // Signal generation (Blink/Debounce need no entry — their trigger is not EN)
@@ -4351,6 +5129,7 @@ const FB_INPUTS = {
     // Trig
     'SIN': ['EN', 'IN'], 'COS': ['EN', 'IN'], 'TAN': ['EN', 'IN'],
     'ASIN': ['EN', 'IN'], 'ACOS': ['EN', 'IN'], 'ATAN': ['EN', 'IN'],
+    'LN': ['EN', 'IN'], 'LOG': ['EN', 'IN'], 'EXP': ['EN', 'IN'],
     // Selection
     'SEL': ['EN', 'G', 'IN0', 'IN1'],
     'MUX': ['EN', 'K', 'IN0', 'IN1'],
@@ -4510,6 +5289,9 @@ const canonicalPinName = (fbType, userPin) => {
             if (k.toLowerCase() === lower) return k;
         }
     }
+    for (const k of (FB_INPUTS[fbType] || [])) {
+        if (k.toLowerCase() === lower) return k;
+    }
     const outputs = FB_OUTPUTS[fbType];
     if (outputs) {
         for (const k of outputs) {
@@ -4584,37 +5366,32 @@ _CONV_TYPES.forEach(src => _CONV_TYPES.forEach(dst => {
     if (src !== dst) FB_INPUTS[`${src}_TO_${dst}`] = ['EN', 'IN'];
 }));
 
+
 const transpileSTLogics = (code, stdFunctions = {}, parentName = '', category = 'program', varMap = {}, varTypeMap = {}, userFBTypes = new Set(), opts = {}) => {
     if (!code) return `    // ST Implementation Empty\n`;
-    const { fnReturnVar = null, userFunctionInputs = {}, userFBInputs = {}, strConv = null } = opts;
+    const {
+        fnReturnVar = null, userFBInputs = {},
+        strConv = null, memberCtx = null, labelSeq = { next: 0 }, fnResult = null,
+        userFunctionDefs = new Map(), exprSeq = { next: 0 },
+        stringFnReturn = null,
+    } = opts;
+    // Case-insensitive type lookup (IEC identifiers are case-insensitive).
+    const varTypeLower = new Map(Object.entries(varTypeMap).map(([k, v]) => [k.toLowerCase(), v]));
+    const typeOfName = (n) => varTypeLower.get(String(n || '').toLowerCase());
 
-    // ⚠️ A project may declare its own MIN/MAX/… FUNCTION or FB type; that name
-    // must keep its own meaning instead of expanding to the IEC selection form.
-    // Declared VARIABLES are deliberately NOT in this set: the expander only
-    // matches a call form (`MIN(`), which a variable can never be, and
-    // including them turned `MIN(a, b)` in a POU that also declares `Min` into
-    // `S->prog_X_Min(a, b)` — invalid C from valid IEC. A bare `Min + 1` is
-    // untouched either way. Compared case-INSENSITIVELY per the IEC identifier
-    // rule (these keys keep their declared case, so a direct lookup misses
-    // `Min`), and precomputed once rather than per line.
-    const shadowedStdNames = new Set([
-        ...Object.keys(userFunctionInputs),
-        ...userFBTypes,
-    ].map(n => String(n).toLowerCase()));
-    const isShadowedStdName = (n) => shadowedStdNames.has(String(n).toLowerCase());
 
     // Strip IEC 61131-3 comments and VAR…END_VAR blocks before splitting:
     //   (* block comments — single or multi-line *)
     //   // line comments
     //   VAR … END_VAR (inline variable declarations — already declared in variable table)
-    const stripped = code
-        .replace(/\(\*[\s\S]*?\*\)/g, '')
-        // Strip // line comments HERE, before the keyword-normalization below.
-        // Otherwise an ST keyword that happens to appear inside a comment (e.g.
-        // the word "of" in "period of 1 second") matches \bOF\b and gets a
-        // newline injected, splitting the comment so its tail ("1 second")
-        // survives the later per-line // strip and leaks into the C output.
-        .replace(/\/\/[^\n]*/g, '')
+    // ⚠️ Comments go BEFORE the keyword normalization below — otherwise an ST
+    // keyword inside a comment (the word "of" in "period of 1 second") matches
+    // \bOF\b, gets a newline injected, and the comment's tail leaks into C.
+    // String literals become `\x0e<n>\x0f` placeholders for the same reason
+    // (`'go THEN stop'` must not be split); the expression tokenizer reads them.
+    const strTable = [];
+    const restoreStr = (t) => String(t).replace(/\x0e(\d+)\x0f/g, (_, i) => strTable[+i]);
+    const stripped = stripIecComments(code, { strTable })
         // Drop a leading `global.` / `GVL.` namespace prefix that some models
         // (CODESYS habit) put on variable refs — `global.blink(IN := …)` →
         // `blink(IN := …)`. Without this the FB-call detector misses the call
@@ -4640,6 +5417,7 @@ const transpileSTLogics = (code, stdFunctions = {}, parentName = '', category = 
         .replace(/\bTHEN\b[ \t]*(?=[^\r\n])/gi, 'THEN\n')
         .replace(/\bDO\b[ \t]*(?=[^\r\n])/gi, 'DO\n')
         .replace(/\bOF\b[ \t]*(?=[^\r\n])/gi, 'OF\n')
+        .replace(/\bREPEAT\b[ \t]*(?=[^\r\n;])/gi, 'REPEAT\n')
         // Before ELSIF / ELSE / END_xxx / UNTIL / END_CASE — ensure they start on own line
         .replace(/[ \t]*\bELSIF\b/gi, '\nELSIF')
         .replace(/[ \t]*\bELSE\b(?!\s*IF\b)[ \t]*/gi, '\nELSE\n')
@@ -4651,14 +5429,14 @@ const transpileSTLogics = (code, stdFunctions = {}, parentName = '', category = 
         .replace(/[ \t]*\bUNTIL\b/gi, '\nUNTIL')
         // Split `; <control keyword>` so a control keyword always starts on its own line
         // (handles cases like `x := 1; IF cond THEN` left over after block-comment removal).
-        .replace(/;[ \t]*(?=(?:IF|CASE|FOR|WHILE|REPEAT|RETURN|EXIT)\b)/gi, ';\n');
+        .replace(/;[ \t]*(?=(?:IF|CASE|FOR|WHILE|REPEAT|RETURN|EXIT|CONTINUE)\b)/gi, ';\n');
 
     // Join continuation lines: a line ending with AND/OR/NOT/XOR, an arithmetic
     // operator (+ - * /), a comparison operator (< > <= >= <>), comma, or
     // open-paren (after stripping comment) means the expression continues on
     // the next line.  Merge them so the keyword matchers (IF…THEN, ELSIF…THEN,
     // WHILE…DO, FOR…DO) see a single line.
-    const rawLines = normalized.split(/\r?\n|\\n/).map(l => l.replace(/\/\/.*$/, ''));
+    const rawLines = normalized.split(/\r?\n|\\n/);
     const lines = [];
     let pending = '';
     // A physical line that STARTS with a binary operator also continues the
@@ -4712,8 +5490,8 @@ const transpileSTLogics = (code, stdFunctions = {}, parentName = '', category = 
     //   `1: init_wait(IN := TRUE, PT := T#30ms);`
     // becomes two separate lines so the body goes through the full statement
     // pipeline (FB-call detection, etc.) instead of being dumped raw into
-    // transformExpr (which would mangle `:=` into `=` inside named args).
-    {
+    // the expression compiler (which refuses `:=` inside an expression).
+    const splitCaseLabels = () => {
         const expanded = [];
         // Label atoms: numbers (incl. negative), identifiers (enum members),
         // TypeName#EnumValue — same shapes the case-label handler accepts.
@@ -4733,14 +5511,15 @@ const transpileSTLogics = (code, stdFunctions = {}, parentName = '', category = 
         }
         lines.length = 0;
         for (const ln of expanded) lines.push(ln);
-    }
+    };
+    splitCaseLabels();
 
     // Split lines that pack multiple `;`-separated statements onto one physical
     // line, e.g. the body of a single-line `IF … THEN fb(); x := 1; END_IF`
     // (after control-keyword normalization the body survives as
     // `fb(); x := 1;`). The FB-call detector (regex anchored with `$`) matches
     // a WHOLE line as exactly one `inst(args);` call, so a trailing second
-    // statement made it fall through to transformExpr — which mangles a named
+    // statement made it fall through to the expression path — which mangled a named
     // FB call `init_wait(IN := FALSE)` into `init_wait(IN = false)` (undeclared
     // `IN`). Splitting on TOP-LEVEL `;` (paren depth 0, outside '…' strings)
     // gives each statement its own line; control-flow headers (IF/FOR/END_*)
@@ -4769,6 +5548,10 @@ const transpileSTLogics = (code, stdFunctions = {}, parentName = '', category = 
         lines.length = 0;
         for (const ln of expanded) lines.push(ln);
     }
+    // Again: the `;` split can expose a new `label: body` line
+    // (`1: EXIT; 2: CONTINUE;` → `2: CONTINUE;`), whose body must reach the
+    // statement handlers rather than be emitted as an expression.
+    splitCaseLabels();
 
     let out = '';
     let indentLevel = 1; // 1 = inside function body (4 spaces)
@@ -4787,169 +5570,136 @@ const transpileSTLogics = (code, stdFunctions = {}, parentName = '', category = 
 
     const indent = () => '    '.repeat(indentLevel);
 
-    // Substitute known variable names with their C equivalents.
-    // SINGLE-PASS: one alternation regex (longest name first) with a callback —
-    // never rescans already-substituted output, so a variable named `s`, `q`
-    // or `instance` can no longer corrupt an earlier `S->…` / `instance->…`
-    // substitution. Matches preceded by `.` or `->` (member access) are skipped.
-    const escapeRegExp = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    // IEC name (any case) → C symbol.
     const varMapLower = {};
     Object.keys(varMap).forEach(name => { varMapLower[name.toLowerCase()] = varMap[name]; });
-    const varNamesSorted = Object.keys(varMap).sort((a, b) => b.length - a.length);
-    const varNameRegex = varNamesSorted.length > 0
-        ? new RegExp(`\\b(?:${varNamesSorted.map(escapeRegExp).join('|')})\\b`, 'gi')
-        : null;
-    const resolveVarsInExpr = (expr) => {
-        if (!varNameRegex) return expr;
-        return String(expr).replace(varNameRegex, (m, offset, whole) => {
-            const prev = offset > 0 ? whole[offset - 1] : '';
-            if (prev === '.') return m; // member access (x.Q) — leave member name alone
-            if (prev === '>' && offset > 1 && whole[offset - 2] === '-') return m; // already C `->`
-            const mapped = varMapLower[m.toLowerCase()];
-            return mapped !== undefined ? mapped : m;
-        });
+
+    // ── Expression compiler (stExpr.js) ────────────────────────────────────
+    // Every expression below — conditions, right-hand sides, call arguments,
+    // CASE selectors, FOR bounds, indexes, assignment targets — is parsed and
+    // typed there; this function only keeps the statement structure.
+    const fbTypeOf = (t) => {
+        const ty = String(t || '').trim();
+        return !!ty && (stdFunctions[ty]?.isFB === true || HAL_BLOCK_TYPES.has(ty) || userFBTypes.has(ty)
+            || (ty in FB_TRIGGER_PIN && !isInlineMathType(ty)));
     };
-
-    const transformExpr = (expr) => {
-        // Protect string and wstring literals from substitution. IEC uses single
-        // quotes for STRING and double quotes for WSTRING. We escape them out,
-        // perform all transformations, and splice back at the end so AND/OR/MOD
-        // keywords or commas inside string content stay intact.
-        const stringTokens = [];
-        let work = String(expr).replace(/'(?:[^'\\]|\\.)*'|"(?:[^"\\]|\\.)*"/g, m => {
-            stringTokens.push(m);
-            return `${stringTokens.length - 1}`;
-        });
-
-        // Named-argument USER FUNCTION calls (`MyFunc(A := x, B := y)`) → map the
-        // args positionally by the function's Input declaration order, BEFORE the
-        // `:=` protection below would mangle them into `A = x`. Only non-nested
-        // argument lists are handled (regex limit) — the common form.
-        Object.entries(userFunctionInputs).forEach(([fnName, inputs]) => {
-            if (!inputs || inputs.length === 0) return;
-            const re = new RegExp(`\\b${fnName}\\s*\\(([^()]*)\\)`, 'gi');
-            work = work.replace(re, (m, argStr) => {
-                if (!/:=/.test(argStr)) return m;
-                const byName = {};
-                argStr.split(',').forEach(a => {
-                    const mm = a.match(/^\s*([A-Za-z_][A-Za-z0-9_]*)\s*:=\s*([\s\S]+?)\s*$/);
-                    if (mm) byName[mm[1].toLowerCase()] = mm[2];
-                });
-                const positional = inputs.map(p => byName[p.toLowerCase()] !== undefined ? byName[p.toLowerCase()] : '0');
-                return `${fnName}(${positional.join(', ')})`;
-            });
-        });
-
-        // ⚠️ A STRING comparison must become strcmp, not `==`: comparing two
-        // `char *` in C tests ADDRESSES, so equal text in different buffers is
-        // "not equal" and the program silently never matches. Lowered here,
-        // BEFORE the `=` → `==` pass, while the operands are still IEC text and
-        // string literals are still protected tokens.
-        {
-            const isStrOperand = (o) => {
-                if (/^\x01\d+\x02$/.test(o)) return true;             // string literal
-                const t = varTypeMap[o] ?? varTypeMap[Object.keys(varTypeMap)
-                    .find(k => k.toLowerCase() === o.toLowerCase()) ?? ''];
-                return /^W?STRING$/i.test(String(t || ''));
-            };
-            const OPERAND = `(?:\\x01\\d+\\x02|[A-Za-z_][A-Za-z0-9_.]*)`;
-            const cmpRe = new RegExp(`(${OPERAND})\\s*(<>|<=|>=|<|>|(?<![:=<>!])=(?!=))\\s*(${OPERAND})`, 'g');
-            work = work.replace(cmpRe, (m, lhs, op, rhs) => {
-                if (!isStrOperand(lhs) && !isStrOperand(rhs)) return m;
-                if (op === '=')  return `__kron_streq(${lhs}, ${rhs})`;
-                if (op === '<>') return `(!__kron_streq(${lhs}, ${rhs}))`;
-                // Ordering two strings has no defined meaning here and would
-                // compare pointers; say so rather than emit it.
-                const shown = m.replace(/\x01(\d+)\x02/g, (_, i) => stringTokens[+i]);
-                throw new Error(
-                    `STRING comparison "${shown.trim()}" is not supported: only = and <> ` +
-                    `work on text. Convert with STRING_TO_DINT / STRING_TO_REAL to order values.`);
-            });
+    const userFbLower = new Set([...userFBTypes].map(n => String(n).toLowerCase()));
+    const stdFbLower = new Map(Object.keys(FB_TRIGGER_PIN).concat(Object.keys(FB_OUTPUTS), Object.keys(stdFunctions).filter(k => stdFunctions[k]?.isFB))
+        .filter(k => !isInlineMathType(k)).map(k => [k.toLowerCase(), k]));
+    const exprEnv = {
+        H: {
+            iecNumberToC, mapIECtoTimeUs, iecStringDecode, cEscapeString, cIdent, mapType, rotateExpr,
+            IEC_KRON_NAME, strConvSymbol, STRING_SHM_BYTES,
+        },
+        strTable,
+        lookupVar: (name) => {
+            const l = String(name).toLowerCase();
+            if (fnResult && l === String(fnResult.name).toLowerCase() && varMapLower[l] !== undefined) {
+                return { c: varMapLower[l], t: fnResult.type || null };
+            }
+            const c = varMapLower[l];
+            if (c === undefined) return null;
+            return { c, t: typeOfName(name) ?? null };
+        },
+        enumMember: (name) => memberCtx?.enumValues?.get(String(name).toLowerCase()) || null,
+        enumTypes: memberCtx?.enumTypes || new Map(),
+        memberCtx,
+        stdMember: (t, m) => {
+            if (!(FB_OUTPUTS[t] || FB_INPUTS[t] || FB_TRIGGER_PIN[t] || FB_INPUT_TYPES[t] || stdFunctions[t]?.isFB)) return null;
+            const pin = canonicalPinName(t, m);
+            const pt = stdPinTypeForExpr(t, pin);
+            // A standard block's STRING INPUT is a `const char *` re-pointed
+            // every scan — assigned with `=`, never copied into.
+            return { c: cStructPin(t, pin), t: pt, ptrStr: isStringInputType(pt) && FB_INPUT_TYPES[t]?.[pin] !== undefined };
+        },
+        isFbTypeName: (n) => userFbLower.has(String(n).toLowerCase()) || stdFbLower.has(String(n).toLowerCase()),
+        isFbInstance: (n) => fbTypeOf(typeOfName(n)),
+        userFunctions: userFunctionDefs,
+        strConv,
+        seq: exprSeq,
+        decls: [],
+        fnResult,
+    };
+    const X = createSTExprCompiler(exprEnv);
+    // The emitter parenthesises every operation; where the C syntax already
+    // supplies the parentheses (`if (…)`, `switch (…)`) the outer pair goes,
+    // or clang warns about `if ((a == b))`.
+    const stripOuter = (c) => {
+        if (!c.startsWith('(') || !c.endsWith(')')) return c;
+        let d = 0;
+        for (let i = 0; i < c.length; i++) {
+            if (c[i] === '(') d++;
+            else if (c[i] === ')' && --d === 0 && i !== c.length - 1) return c;
         }
-
-        let result = work
-            .replace(/\b[A-Za-z_][A-Za-z0-9_]*#([A-Za-z_][A-Za-z0-9_]*)\b/g, '$1') // TypeName#EnumValue → EnumValue
-            .replace(/\b16#([0-9A-Fa-f]+)/gi, '0x$1')  // IEC hex literal: 16#FF → 0xFF
-            .replace(/:=/g, '__ASSIGN__')               // protect assignments before = → == pass
-            .replace(/<>/g, '!=')                       // IEC not-equal → C not-equal
-            .replace(/(?<![:=<>!])=(?!=)/g, '==')       // comparison = → == (not :=, <=, >=, !=, ==)
-            .replace(/__ASSIGN__/g, '=')                // restore assignments
-            // Bitwise (IEC vendor extension) — must run BEFORE logical AND/OR/XOR/NOT
-            // so e.g. BAND doesn't get partially matched by the AND rule.
-            .replace(/\bBAND\b/gi, '&')
-            .replace(/\bBOR\b/gi, '|')
-            .replace(/\bBXOR\b/gi, '^^^')   // placeholder — XOR rewrite below collapses ^
-            .replace(/\bBNOT\b/gi, '~')
-            .replace(/\bAND\b/gi, '&&')
-            .replace(/\bOR\b/gi, '||')
-            .replace(/\bNOT\b/gi, '!')
-            .replace(/\bMOD\b/gi, '%')
-            .replace(/\bXOR\b/gi, '^')
-            .replace(/\^\^\^/g, '^')        // restore BXOR placeholder
-            .replace(/\bTRUE\b/gi, 'true')
-            .replace(/\bFALSE\b/gi, 'false');
-        // IEC time-duration literal → microsecond integer. Handles simple,
-        // fractional and compound forms (T#5ms, T#1.5s, T#1m30s, T#1h2m3s500ms);
-        // a malformed literal throws a transpile error in mapIECtoTimeUs.
-        result = result.replace(/\b(?:T|TIME)#(?:[\d._]+(?:MS|US|NS|D|H|M|S))+\b/gi, m => String(mapIECtoTimeUs(m)));
-        result = result.replace(/\bADR\s*\(\s*([^)]+?)\s*\)/gi, (_, inner) => `(&(${resolveVarsInExpr(inner.trim())}))`);
-        result = result.replace(/\bNULL\b/gi, 'NULL');
-        // x_TO_STRING FIRST and as a WHOLE call: it needs an output buffer
-        // appended, which the name-only rewrite below cannot do through its
-        // lookahead. Non-nested argument lists only, the same limit the
-        // named-argument rewrite above carries.
-        result = result.replace(/\b([A-Za-z]+)_TO_STRING\s*\(([^()]*)\)/g, (match, src, arg) => {
-            const ks = IEC_KRON_NAME[src.toUpperCase()];
-            if (!ks || ks === 'STRING') return match;
-            if (!strConv) {
-                throw new Error(
-                    `${src.toUpperCase()}_TO_STRING is only available inside a PROGRAM. ` +
-                    `A FUNCTION or FUNCTION_BLOCK has no PlcState field to hold the text.`);
-            }
-            const buf = strConvSymbol(strConv.progName, `st${strConv.next++}`);
-            return `KRON_${ks}_TO_STRING(${arg}, S->${buf}, ${STRING_SHM_BYTES})`;
-        });
-        // IEC 61131-3 type-conversion functions → KRON_ library names
-        // e.g. BYTE_TO_UINT(...) → KRON_BYTE_TO_UINT16(...)
-        result = result.replace(/\b([A-Za-z]+)_TO_([A-Za-z]+)(?=\s*\()/g, (match, src, dst) => {
-            const ks = IEC_KRON_NAME[src.toUpperCase()];
-            const kd = IEC_KRON_NAME[dst.toUpperCase()];
-            return (ks && kd) ? `KRON_${ks}_TO_${kd}` : match;
-        });
-        // IEC type cast functions: INT(x) → (int16_t)(x), DINT(x) → (int32_t)(x), etc.
-        const IEC_CAST_C = {
-            BOOL: 'bool', BYTE: 'uint8_t', WORD: 'uint16_t', DWORD: 'uint32_t', LWORD: 'uint64_t',
-            SINT: 'int8_t', INT: 'int16_t', DINT: 'int32_t', LINT: 'int64_t',
-            USINT: 'uint8_t', UINT: 'uint16_t', UDINT: 'uint32_t', ULINT: 'uint64_t',
-            REAL: 'float', LREAL: 'double',
-        };
-        result = result.replace(/\b(BOOL|BYTE|WORD|DWORD|LWORD|SINT|INT|DINT|LINT|USINT|UINT|UDINT|ULINT|REAL|LREAL)\s*\(/gi,
-            (match, typeName) => {
-                const ct = IEC_CAST_C[typeName.toUpperCase()];
-                return ct ? `(${ct})(` : match;
-            }
-        );
-        // IEC selection/range functions (MIN/MAX/LIMIT/SEL/MUX) → C conditionals.
-        // Runs BEFORE variable resolution so the arguments are resolved after.
-        result = expandSTSelectionCalls(result, isShadowedStdName);
-        result = resolveVarsInExpr(result);
-        // Restore protected strings. IEC single-quoted STRING literals become
-        // C double-quoted ones (a multi-char `'abc'` is an int in C); a
-        // double-quoted WSTRING is passed through unchanged.
-        return result.replace(/(\d+)/g, (_, i) => {
-            const tok = stringTokens[+i];
-            return tok.startsWith("'") ? iecStringToC(tok.slice(1, -1)) : tok;
-        });
+        return c.slice(1, -1);
     };
+    const exprC = (text) => X.expr(text).c;
+    const condC = (text, what) => {
+        const r = X.expr(text);
+        if (r.t !== null && r.t !== 'BOOL' && !(r.t === '#INT' && (r.lit === 0n || r.lit === 1n))) {
+            throw new STExprError(`${what} condition must be BOOL, got ${r.t.startsWith('#') ? 'a literal' : r.t}`);
+        }
+        return stripOuter(r.c);
+    };
+    // Top-level `;` / `:=` splitting (depth- and quote-aware).
+    const splitTop = (text, sep) => {
+        const parts = [];
+        let cur = '', depth = 0, q = null;
+        const t = String(text);
+        for (let i = 0; i < t.length; i++) {
+            const ch = t[i];
+            if (q) { cur += ch; if (ch === '$') { cur += t[++i] ?? ''; } else if (ch === q) q = null; continue; }
+            if (ch === "'" || ch === '"') { q = ch; cur += ch; continue; }
+            if (ch === '(' || ch === '[') depth++;
+            else if ((ch === ')' || ch === ']') && depth > 0) depth--;
+            if (depth === 0 && t.startsWith(sep, i)) { parts.push(cur); cur = ''; i += sep.length - 1; continue; }
+            cur += ch;
+        }
+        parts.push(cur);
+        return parts;
+    };
+    // One ST statement line (assignments and/or calls) → C, no trailing `;`.
+    const stmtC = (text) => splitTop(text, ';')
+        .map(p => p.trim())
+        .filter(Boolean)
+        .map(p => {
+            const parts = splitTop(p, ':=');
+            if (parts.length >= 2) return X.assign(parts[0], parts.slice(1).join(':='));
+            return X.callStatement(p);
+        })
+        .join('; ');
+
+    // Errors name the POU, an approximate source line and the statement.
+    const locate = (stmt) => {
+        const probe = restoreStr(stmt).trim().slice(0, 24);
+        const at = probe ? String(code).indexOf(probe) : -1;
+        return at < 0 ? '' : `, line ${String(code).slice(0, at).split('\n').length}`;
+    };
+    const kindLabel = { program: 'PROGRAM', function_block: 'FUNCTION_BLOCK', function: 'FUNCTION' }[category] || 'POU';
 
     lines.forEach(line => {
         const trimmed = line.trim();
         if (!trimmed) return;
+        try {
+            emitLine(trimmed);
+        } catch (e) {
+            if (e?.stLocated) throw e;
+            const msg = String(e?.message || e).replace(/^ST:\s*/, '');
+            const err = new Error(`ST ${kindLabel} ${parentName}${locate(trimmed)}: ${msg} — in "${restoreStr(trimmed)}"`);
+            err.stLocated = true;
+            throw err;
+        }
+    });
+    if (exprEnv.decls.length) out = exprEnv.decls.map(d => `    ${d}\n`).join('') + out;
+
+    return out || `    // ST parsing placeholder\n`;
+
+    function emitLine(trimmed) {
 
         // ── CASE x OF ────────────────────────────────────────────────────
         const caseOfMatch = trimmed.match(/^CASE\s+(.+?)\s+OF\s*;?\s*$/i);
         if (caseOfMatch) {
-            out += `${indent()}switch (${transformExpr(caseOfMatch[1])}) {\n`;
+            out += `${indent()}switch (${stripOuter(exprC(caseOfMatch[1]))}) {\n`;
             indentLevel++;
             blockStack.push({ kind: 'CASE', caseBodyOpen: false, hasDefault: false });
             return;
@@ -4994,7 +5744,7 @@ const transpileSTLogics = (code, stdFunctions = {}, parentName = '', category = 
                 frame.hasDefault = true;
                 const elseBody = trimmed.replace(/^ELSE\b\s*:?\s*/i, '').trim();
                 if (elseBody && elseBody !== ';') {
-                    let cl = transformExpr(elseBody);
+                    let cl = stmtC(elseBody);
                     if (!cl.endsWith(';')) cl += ';';
                     out += `${indent()}${cl}\n`;
                 }
@@ -5035,7 +5785,7 @@ const transpileSTLogics = (code, stdFunctions = {}, parentName = '', category = 
                 indentLevel++;
                 frame.caseBodyOpen = true;
                 if (bodyPart && bodyPart !== ';') {
-                    let cl = transformExpr(bodyPart);
+                    let cl = stmtC(bodyPart);
                     if (!cl.endsWith(';')) cl += ';';
                     out += `${indent()}${cl}\n`;
                 }
@@ -5051,15 +5801,27 @@ const transpileSTLogics = (code, stdFunctions = {}, parentName = '', category = 
             return;
         }
         if (/^END_FOR\s*;?$/i.test(trimmed)) {
+            const frame = topKind() === 'FOR' ? topFrame() : null;
             indentLevel = Math.max(1, indentLevel - 1);
             out += `${indent()}}\n`;
+            // The hidden-counter FOR is wrapped in its own block (see FOR below).
+            if (frame?.wrapped) { indentLevel = Math.max(1, indentLevel - 1); out += `${indent()}}\n`; }
+            if (frame?.exitLabel) out += `${indent()}${frame.exitLabel}: ;\n`;
             popIfTop('FOR');
             return;
         }
         if (/^END_WHILE\s*;?$/i.test(trimmed)) {
+            const frame = topKind() === 'WHILE' ? topFrame() : null;
             indentLevel = Math.max(1, indentLevel - 1);
             out += `${indent()}}\n`;
+            if (frame?.exitLabel) out += `${indent()}${frame.exitLabel}: ;\n`;
             popIfTop('WHILE');
+            return;
+        }
+        // REPEAT … UNTIL c; END_REPEAT — the loop already closed at UNTIL, so
+        // END_REPEAT itself emits nothing (it used to reach C verbatim).
+        if (/^END_REPEAT\s*;?$/i.test(trimmed)) {
+            if (topKind() === 'REPEAT') throw new Error('ST: END_REPEAT without UNTIL <condition>.');
             return;
         }
 
@@ -5067,7 +5829,7 @@ const transpileSTLogics = (code, stdFunctions = {}, parentName = '', category = 
         const elsifMatch = trimmed.match(/^(?:ELSIF|ELSE\s+IF)\s+(.+?)\s+THEN\s*;?\s*$/i);
         if (elsifMatch) {
             indentLevel = Math.max(1, indentLevel - 1);
-            out += `${indent()}} else if (${transformExpr(elsifMatch[1])}) {\n`;
+            out += `${indent()}} else if (${condC(elsifMatch[1], 'ELSIF')}) {\n`;
             indentLevel++;
             return;
         }
@@ -5083,33 +5845,43 @@ const transpileSTLogics = (code, stdFunctions = {}, parentName = '', category = 
         // ── IF ... THEN ───────────────────────────────────────────────────
         const ifMatch = trimmed.match(/^IF\s+(.+?)\s+THEN\s*;?\s*$/i);
         if (ifMatch) {
-            out += `${indent()}if (${transformExpr(ifMatch[1])}) {\n`;
+            out += `${indent()}if (${condC(ifMatch[1], 'IF')}) {\n`;
             indentLevel++;
             blockStack.push({ kind: 'IF' });
             return;
         }
 
         // ── FOR ... TO ... BY ... DO (BY clause first — more specific) ────
+        // ⚠️ The loop runs on a HIDDEN int64_t counter and assigns the control
+        // variable at the top of every iteration. Iterating the control
+        // variable itself never terminated whenever `end` is the top of its
+        // type: `FOR k := 0 TO 255` on a USINT wraps 255 → 0 and `<= 255`
+        // holds for ever; an unsigned count-down to 0 likewise. End and step
+        // are evaluated once, before the first iteration (IEC forbids the
+        // body from changing them). After the loop the control variable holds
+        // the last value it was given (IEC leaves it implementation-defined).
+        const forHeader = (vn, start, end, step) => {
+            const cv = X.lvalue(vn).c;
+            const n = labelSeq.next++;
+            const i = `__for_i${n}`, e = `__for_e${n}`, st = `__for_s${n}`;
+            const stepExpr = step === null ? '1' : exprC(step).trim();
+            let cond;
+            if (/^\+?\s*\d+(?:\.\d+)?$/.test(stepExpr)) cond = `${i} <= ${e}`;
+            else if (/^-\s*\d+(?:\.\d+)?$/.test(stepExpr)) cond = `${i} >= ${e}`;
+            else cond = `(${st} >= 0 ? ${i} <= ${e} : ${i} >= ${e})`;
+            out += `${indent()}{\n`;
+            indentLevel++;
+            out += `${indent()}const int64_t ${e} = (int64_t)(${exprC(end)});\n`;
+            out += `${indent()}const int64_t ${st} = (int64_t)(${stepExpr});\n`;
+            out += `${indent()}for (int64_t ${i} = (int64_t)(${exprC(start)}); ${cond}; ${i} += ${st}) {\n`;
+            indentLevel++;
+            out += `${indent()}${cv} = (__typeof__(${cv}))${i};\n`;
+            blockStack.push({ kind: 'FOR', wrapped: true });
+        };
         const forByMatch = trimmed.match(/^FOR\s+(\w+)\s*:=\s*(.+?)\s+TO\s+(.+?)\s+BY\s+(.+?)\s+DO\s*;?\s*$/i);
         if (forByMatch) {
             const [, vn, start, end, step] = forByMatch;
-            const cv = varMap[vn] || vn;
-            const stepExpr = transformExpr(step).trim();
-            const endExpr = transformExpr(end);
-            // Loop condition depends on the step SIGN: a negative BY counts down
-            // (cv >= end). Literal steps get the right operator directly; a
-            // variable step gets a runtime sign check.
-            let cond;
-            if (/^-\s*\d+(?:\.\d+)?$/.test(stepExpr)) {
-                cond = `${cv} >= ${endExpr}`;
-            } else if (/^\+?\s*\d+(?:\.\d+)?$/.test(stepExpr)) {
-                cond = `${cv} <= ${endExpr}`;
-            } else {
-                cond = `((${stepExpr}) >= 0 ? (${cv} <= ${endExpr}) : (${cv} >= ${endExpr}))`;
-            }
-            out += `${indent()}for (${cv} = ${transformExpr(start)}; ${cond}; ${cv} += ${stepExpr}) {\n`;
-            indentLevel++;
-            blockStack.push({ kind: 'FOR' });
+            forHeader(vn, start, end, step);
             return;
         }
 
@@ -5117,17 +5889,14 @@ const transpileSTLogics = (code, stdFunctions = {}, parentName = '', category = 
         const forMatch = trimmed.match(/^FOR\s+(\w+)\s*:=\s*(.+?)\s+TO\s+(.+?)\s+DO\s*;?\s*$/i);
         if (forMatch) {
             const [, vn, start, end] = forMatch;
-            const cv = varMap[vn] || vn;
-            out += `${indent()}for (${cv} = ${transformExpr(start)}; ${cv} <= ${transformExpr(end)}; ${cv}++) {\n`;
-            indentLevel++;
-            blockStack.push({ kind: 'FOR' });
+            forHeader(vn, start, end, null);
             return;
         }
 
         // ── WHILE ... DO ──────────────────────────────────────────────────
         const whileMatch = trimmed.match(/^WHILE\s+(.+?)\s+DO\s*;?\s*$/i);
         if (whileMatch) {
-            out += `${indent()}while (${transformExpr(whileMatch[1])}) {\n`;
+            out += `${indent()}while (${condC(whileMatch[1], 'WHILE')}) {\n`;
             indentLevel++;
             blockStack.push({ kind: 'WHILE' });
             return;
@@ -5144,23 +5913,56 @@ const transpileSTLogics = (code, stdFunctions = {}, parentName = '', category = 
         // ── UNTIL (do-while end) ──────────────────────────────────────────
         const untilMatch = trimmed.match(/^UNTIL\s+(.+?)\s*;?\s*$/i);
         if (untilMatch) {
+            const frame = topKind() === 'REPEAT' ? topFrame() : null;
             indentLevel = Math.max(1, indentLevel - 1);
-            out += `${indent()}} while (!(${transformExpr(untilMatch[1])}));\n`;
+            out += `${indent()}} while (!(${condC(untilMatch[1], 'UNTIL')}));\n`;
+            if (frame?.exitLabel) out += `${indent()}${frame.exitLabel}: ;\n`;
             popIfTop('REPEAT');
             return;
         }
 
-        // ── EXIT → break ──────────────────────────────────────────────────
+        // ── EXIT → break / goto ───────────────────────────────────────────
+        // ⚠️ A C `break` leaves the innermost switch OR loop, IEC EXIT always
+        // leaves the loop: EXIT inside a CASE inside a FOR only ended the
+        // switch and the loop kept going. With a CASE between the EXIT and its
+        // loop, jump to a label placed right after that loop instead.
         if (/^EXIT\s*;?\s*$/i.test(trimmed)) {
-            out += `${indent()}break;\n`;
+            let loopIdx = -1, crossesCase = false;
+            for (let k = blockStack.length - 1; k >= 0; k--) {
+                const kind = blockStack[k].kind;
+                if (kind === 'FOR' || kind === 'WHILE' || kind === 'REPEAT') { loopIdx = k; break; }
+                if (kind === 'CASE') crossesCase = true;
+            }
+            if (loopIdx < 0) throw new Error('ST: EXIT outside of a FOR / WHILE / REPEAT loop.');
+            if (crossesCase) {
+                const loop = blockStack[loopIdx];
+                if (!loop.exitLabel) loop.exitLabel = `__exit_${labelSeq.next++}`;
+                out += `${indent()}goto ${loop.exitLabel};\n`;
+            } else {
+                out += `${indent()}break;\n`;
+            }
+            return;
+        }
+        // CONTINUE → continue (a C switch does not capture `continue`).
+        if (/^CONTINUE\s*;?\s*$/i.test(trimmed)) {
+            if (!blockStack.some(f => ['FOR', 'WHILE', 'REPEAT'].includes(f.kind))) {
+                throw new Error('ST: CONTINUE outside of a FOR / WHILE / REPEAT loop.');
+            }
+            out += `${indent()}continue;\n`;
             return;
         }
 
         // ── RETURN ────────────────────────────────────────────────────────
         if (/^RETURN\b/i.test(trimmed)) {
             const retVal = trimmed.replace(/^RETURN\s*/i, '').replace(/;$/, '').trim();
-            if (retVal) {
-                out += `${indent()}return ${transformExpr(retVal)};\n`;
+            if (retVal && fnResult?.isString) {
+                // Copied into the result buffer: `RETURN local;` would
+                // otherwise hand back a pointer into this call's stack frame.
+                out += `${indent()}{ ${X.assign(fnResult.name, retVal)}; ${stringFnReturn} }\n`;
+            } else if (retVal) {
+                out += `${indent()}return ${exprC(retVal)};\n`;
+            } else if (fnResult?.isString) {
+                out += `${indent()}${stringFnReturn}\n`;
             } else if (fnReturnVar) {
                 // IEC RETURN carries no value — a non-void FUNCTION returns the
                 // current result variable (FuncName := … assignments target it).
@@ -5180,7 +5982,8 @@ const transpileSTLogics = (code, stdFunctions = {}, parentName = '', category = 
         if (fbCallMatch) {
             const instName = fbCallMatch[1];
             const argStr = fbCallMatch[2];
-            const fbType = varTypeMap[instName];
+            // Case-insensitive: `T1(…)` calls the instance declared `t1`.
+            const fbType = typeOfName(instName);
             const isFB = fbType && (
                 stdFunctions[fbType] !== undefined ||
                 HAL_BLOCK_TYPES.has(fbType) ||
@@ -5191,7 +5994,20 @@ const transpileSTLogics = (code, stdFunctions = {}, parentName = '', category = 
             // args (`:=`/`=>`), an empty arg list, or POSITIONAL args
             // (`inst(a, b)` — mapped onto the FB's input pins in order).
             if (isFB) {
-                const cInst = varMap[instName];
+                const cInst = varMapLower[instName.toLowerCase()];
+                // User FB: pin names resolve through its declared variables
+                // (any case, C-keyword names mangled); InOut pins get a
+                // copy-back after the call.
+                const userFbInfo = userFBTypes.has(fbType) ? memberCtx?.types?.get(String(fbType).toLowerCase()) : null;
+                const pinMember = (pin) => {
+                    if (userFbInfo) {
+                        const mem = userFbInfo.members.get(String(pin).toLowerCase());
+                        if (!mem) throw new Error(`ST: ${fbType} has no pin "${pin}" (call on ${instName}).`);
+                        return cIdent(mem.name);
+                    }
+                    return cStructPin(fbType, canonicalPinName(fbType, pin));
+                };
+                const inOutCopyBack = [];
                 // Top-level comma split — depth- and string-aware so nested
                 // calls/casts and string literals stay intact.
                 const args = [];
@@ -5243,23 +6059,26 @@ const transpileSTLogics = (code, stdFunctions = {}, parentName = '', category = 
                     const outM = a.match(/^([A-Za-z_][A-Za-z0-9_]*)\s*=>\s*([\s\S]+)$/);
                     if (outM) {
                         const userPin = outM[1];
-                        const target  = outM[2].trim();
-                        const member  = cStructPin(fbType, canonicalPinName(fbType, userPin));
-                        const lhs     = transformExpr(target);
-                        outputCaptures.push(`${lhs} = ${cInst}.${member}`);
+                        const target  = restoreStr(outM[2].trim());
+                        const member  = pinMember(userPin);
+                        // A STRING output is copied into the target's own array.
+                        const outType = userFbInfo
+                            ? userFbInfo.members.get(userPin.toLowerCase())?.type
+                            : stdPinTypeForExpr(fbType, canonicalPinName(fbType, userPin));
+                        outputCaptures.push(X.assignC(target, `${cInst}.${member}`, outType ?? null));
                         return;
                     }
                     const m = a.match(/^([A-Za-z_][A-Za-z0-9_]*)\s*:=\s*([\s\S]+)$/);
                     if (!m) return;
                     const userPin  = m[1];
-                    const rawValue = m[2].trim();
+                    const rawValue = restoreStr(m[2].trim());
                     const pinName  = canonicalPinName(fbType, userPin);
 
                     // Motion FB Axis pin: passed as 2nd Call arg, not a struct field
                     if (isMotion && pinName === 'Axis') {
                         axisExpr = IDENTIFIER_REF_REGEX.test(rawValue)
-                            ? `&(${resolveVarsInExpr(rawValue)})`
-                            : transformExpr(rawValue);
+                            ? `&(${X.lvalue(rawValue).c})`
+                            : exprC(rawValue);
                         return;
                     }
 
@@ -5267,25 +6086,37 @@ const transpileSTLogics = (code, stdFunctions = {}, parentName = '', category = 
                     let value;
                     if (pinName === 'Port_ID') {
                         const portNum = resolveHardwarePortSymbol(rawValue);
-                        value = portNum !== null ? portNum : transformExpr(rawValue);
+                        value = portNum !== null ? portNum : exprC(rawValue);
                     } else if (isPointerInputType(inputType)) {
                         if (/^NULL$/i.test(rawValue)) value = 'NULL';
-                        else if (IDENTIFIER_REF_REGEX.test(rawValue)) value = `&(${resolveVarsInExpr(rawValue)})`;
-                        else value = transformExpr(rawValue);
-                    } else if (inputType === 'TIME') {
-                        // Only convert actual T#/TIME# LITERALS. A variable (or
-                        // expression) passed to PT must go through transformExpr —
-                        // mapIECtoTimeUs never returns null, so it used to turn
-                        // `PT := myDelay` into the literal 10000.
-                        value = /^(?:T|TIME|LTIME|LT)#/i.test(rawValue)
-                            ? String(mapIECtoTimeUs(rawValue))
-                            : transformExpr(rawValue);
+                        else if (IDENTIFIER_REF_REGEX.test(rawValue)) value = `&(${X.lvalue(rawValue).c})`;
+                        else value = exprC(rawValue);
                     } else {
-                        value = transformExpr(rawValue);
+                        // A TIME pin included: a T#/TIME# literal and a
+                        // variable/expression both go through the compiler
+                        // (`PT := myDelay` once became the literal 10000).
+                        const userMemT = userFbInfo?.members.get(userPin.toLowerCase())?.type;
+                        value = X.value(rawValue, userMemT ?? inputType ?? null, `${instName}.${userPin}`);
                     }
 
-                    const member = cStructPin(fbType, pinName);
-                    out += `${indent()}${cInst}.${member} = ${value};\n`;
+                    const member = pinMember(userPin);
+                    // A user FB's STRING pin is an array member: copy into it.
+                    // (A standard block's STRING pin is a `const char *`
+                    // assigned here every scan — a plain `=` is right there.)
+                    const userMem = userFbInfo?.members.get(userPin.toLowerCase());
+                    const memIsString = isStringInputType(userMem?.type);
+                    out += memIsString
+                        ? `${indent()}${kronStrset(`${cInst}.${member}`, value)};\n`
+                        : `${indent()}${cInst}.${member} = ${value};\n`;
+                    // ⚠️ VAR_IN_OUT: the FB works on its own copy of the
+                    // variable, so the result has to be written back after the
+                    // call or the caller never sees the change.
+                    if (userMem?.inout) {
+                        if (!IDENTIFIER_REF_REGEX.test(rawValue)) {
+                            throw new Error(`ST: ${fbType}.${userPin} is VAR_IN_OUT and must be given a variable, got "${rawValue}".`);
+                        }
+                        inOutCopyBack.push(X.assignC(rawValue, `${cInst}.${member}`, userMem.type ?? null));
+                    }
                 });
 
                 if (isMotion) {
@@ -5303,33 +6134,47 @@ const transpileSTLogics = (code, stdFunctions = {}, parentName = '', category = 
                     out += `${indent()}${fbType}_Call(&${cInst});\n`;
                 }
 
+                inOutCopyBack.forEach(stmt => { out += `${indent()}${stmt};\n`; });
                 outputCaptures.forEach(stmt => { out += `${indent()}${stmt};\n`; });
                 return;
             }
         }
 
         // ── Regular statement (assignment, function call, etc.) ───────────
-        let cl = transformExpr(trimmed);
+        let cl = stmtC(trimmed);
         if (!cl.endsWith(';')) cl += ';';
         out += `${indent()}${cl}\n`;
-    });
-
-    return out || `    // ST parsing placeholder\n`;
+    }
 };
 
-const transpileLDLogics = (rungs, stdFunctions = {}, parentName = '', category = 'program', globalVarNames = [], inputShadowMap = null, rungIdxOffset = 0, cSymTypeMap = {}, localVarNames = new Set(), fbInstanceNames = new Set()) => {
+const transpileLDLogics = (rungs, stdFunctions = {}, parentName = '', category = 'program', globalVarNames = [], inputShadowMap = null, rungIdxOffset = 0, cSymTypeMap = {}, localVarNames = new Set(), fbInstanceNames = new Set(), ldCtx = {}) => {
     if (!rungs || rungs.length === 0) return `    // LD Implementation Empty\n`;
 
     let out = '';
+    const { memberCtx = null, nameTypes = new Map(), fnPtrParams = new Set(), declaredCanon = new Map() } = ldCtx || {};
 
-    // Returns true if a C expression represents a REAL (float) value:
-    // either a float literal (contains decimal point) or a REAL/LREAL variable.
-    const isRealExpr = (val) => {
-        if (!val) return false;
-        if (/^-?[0-9]*\.[0-9]+([eE][+-]?[0-9]+)?$/.test(val)) return true;
-        if (/^-?[0-9]+\.[0-9]*([eE][+-]?[0-9]+)?$/.test(val)) return true;
-        return ['REAL', 'LREAL'].includes(cSymTypeMap[val]);
+    // IEC type of a resolved C operand, or null when unknown: a float literal
+    // is REAL, an integer literal DINT (LINT past the int32 range), a
+    // variable whatever cSymTypeMap says (keyed by the exact resolved text —
+    // see buildCSymTypeMap), a cast `((T)(…))` its type.
+    const operandType = (val) => {
+        if (!val) return null;
+        const v = String(val).trim();
+        if (/^-?(?:\d+\.\d*|\.\d+)(?:[eE][+-]?\d+)?$/.test(v) || /^-?\d+[eE][+-]?\d+$/.test(v)) return 'REAL';
+        if (/^-?(?:\d+|0[xX][0-9A-Fa-f]+)$/.test(v)) {
+            const n = Number(v.replace(/^-?0[xX]/, m => (m.startsWith('-') ? '-0x' : '0x')));
+            return Number.isFinite(n) && (n > 2147483647 || n < -2147483648) ? 'LINT' : 'DINT';
+        }
+        if (v === 'true' || v === 'false') return 'BOOL';
+        if (cSymTypeMap[v]) return String(cSymTypeMap[v]).toUpperCase();
+        const cast = /^\(\((\w+)\)\(/.exec(v);
+        if (cast) {
+            const hit = Object.entries(IEC_SCALAR_C).find(([, c]) => c === cast[1]);
+            if (hit) return hit[0];
+        }
+        return null;
     };
+    const isRealExpr = (val) => ['REAL', 'LREAL'].includes(operandType(val));
 
     // Resolve a variable/signal name to its C symbol, respecting scope.
     // Handles simple names, array elements (var[idx]), struct members (var.member),
@@ -5339,17 +6184,28 @@ const transpileLDLogics = (rungs, stdFunctions = {}, parentName = '', category =
         const s = varName.trim();
         // Split base name from suffix (array index or struct member access)
         const sepIdx = s.search(/[[.]/);
-        const baseName = (sepIdx >= 0 ? s.slice(0, sepIdx) : s).replace(/\s+/g, '_');
-        const suffix = sepIdx >= 0 ? s.slice(sepIdx) : '';
+        const typedBase = (sepIdx >= 0 ? s.slice(0, sepIdx) : s).replace(/\s+/g, '_');
+        // IEC names are case-insensitive: resolve to the DECLARED spelling.
+        const baseName = declaredCanon.get(typedBase.toLowerCase()) || typedBase;
+        let suffix = sepIdx >= 0 ? s.slice(sepIdx) : '';
+        // `blink.q` → `blink.Q`, `fb.count` → the declared member spelling.
+        if (/^\.[A-Za-z_]/.test(suffix)) {
+            const m = /^((?:\.[A-Za-z_][A-Za-z0-9_]*)+)([\s\S]*)$/.exec(suffix);
+            const t = nameTypes.get(baseName.toLowerCase());
+            if (m && t) {
+                suffix = canonMemberPath(t, m[1].split('.').filter(Boolean), memberCtx).map(x => '.' + x).join('') + m[2];
+            }
+        }
         // EtherCAT PDO variables have no PlcState field — leave the name BARE
         // so the GPI access macro (#define ec_X (__gpi_snap->…)) applies.
-        if (EC_PDO_VAR_NAMES.has(baseName) && !localVarNames.has(baseName)) {
-            return baseName + suffix;
+        const ecName = ecPdoCanon(baseName);
+        if (ecName && !localVarNames.has(baseName)) {
+            return ecName + suffix;
         }
         if (category === 'program') {
             // All state lives in PlcState (hot-swap): globals and local program
             // vars are both fields reached via S->.
-            if (globalVarNames.includes(baseName)) return `S->${baseName}${suffix}`;
+            if (globalVarNames.includes(baseName)) return `S->${cIdent(baseName)}${suffix}`;
             // FB instance member access (blink.Q): the state field is
             // prog_<prog>_inst_<name>, mirroring the ST varMap logic.
             if (suffix.startsWith('.') && fbInstanceNames.has(baseName)) {
@@ -5361,11 +6217,13 @@ const transpileLDLogics = (rungs, stdFunctions = {}, parentName = '', category =
             // Locals (incl. FB-local FB instances) live in the instance struct;
             // GLOBALS referenced inside an FB's ladder are PlcState fields.
             if (!localVarNames.has(baseName) && globalVarNames.includes(baseName)) {
-                return `S->${baseName}${suffix}`;
+                return `S->${cIdent(baseName)}${suffix}`;
             }
-            return `instance->${baseName}${suffix}`;
+            return `instance->${cIdent(baseName)}${suffix}`;
         }
-        return s;
+        // FUNCTION: params/locals are plain C names; VAR_IN_OUT is a pointer.
+        if (!localVarNames.has(baseName) && globalVarNames.includes(baseName)) return `S->${cIdent(baseName)}${suffix}`;
+        return fnPtrParams.has(baseName) ? `(*${cIdent(baseName)})${suffix}` : `${cIdent(baseName)}${suffix}`;
     };
 
     // Resolve a value string: IEC time literal → us integer, numeric → as-is,
@@ -5384,14 +6242,25 @@ const transpileLDLogics = (rungs, stdFunctions = {}, parentName = '', category =
             }
             return null;
         }
-        if (s.toUpperCase().startsWith('T#') || s.toUpperCase().startsWith('TIME#')) {
+        if (isTimeLiteral(s)) {
             return mapIECtoTimeUs(s).toString();
         }
         // Quoted STRING literal ('…' IEC, "…" also accepted) → C string
         const strLit = quotedStringToC(s);
         if (strLit !== null) return strLit;
-        // IEC hex literal 16#FF → 0xFF
-        if (/^16#[0-9A-Fa-f]+$/i.test(s)) return '0x' + s.slice(3).toUpperCase();
+        // Typed literal `INT#5`, `REAL#1.5`, `DWORD#16#FF` → cast of the value.
+        const typed = /^([A-Za-z]+)#(.+)$/.exec(s);
+        if (typed && IEC_SCALAR_C[typed[1].toUpperCase()] && !/^(?:L?T|L?TIME)$/i.test(typed[1])) {
+            const inner = resolveVal(typed[2]);
+            if (inner === null) return null;
+            return `((${IEC_SCALAR_C[typed[1].toUpperCase()]})(${inner}))`;
+        }
+        // IEC radix / underscore literals: 16#FF_FF, 2#1010, 8#17, 1_000.
+        if (/^-?(?:(?:2|8|10|16)#[0-9A-Fa-f_]+|\d[\d_]*(?:\.[\d_]+)?(?:[eE][+-]?\d+)?)$/.test(s) && (/[#_]/.test(s) || /^-?0\d/.test(s))) {
+            const neg = s.startsWith('-');
+            const c = iecNumberToC(neg ? s.slice(1) : s);
+            if (c !== null) return (neg ? '-' : '') + c;
+        }
         // Binary literal 0b... → decimal (C99 doesn't support 0b).
         // NOTE: parse the DIGITS only — parseInt('0b101', 2) is 0.
         if (/^0[bB][01]+$/.test(s)) return parseInt(s.slice(2), 2).toString();
@@ -5491,9 +6360,9 @@ const transpileLDLogics = (rungs, stdFunctions = {}, parentName = '', category =
     // global-variable loop emits them); locals get the per-POU field.
     const getCallTarget = (instName) => {
         const i = (instName || '').trim().replace(/\s+/g, '_');
-        if (!localVarNames.has(i) && globalVarNames.includes(i)) return `S->${i}`;
+        if (!localVarNames.has(i) && globalVarNames.includes(i)) return `S->${cIdent(i)}`;
         if (category === 'program') return `S->prog_${parentName}_inst_${i}`;
-        if (category === 'function_block') return `instance->${i}`;
+        if (category === 'function_block') return `instance->${cIdent(i)}`;
         return i;
     };
 
@@ -5555,8 +6424,12 @@ const transpileLDLogics = (rungs, stdFunctions = {}, parentName = '', category =
         const sortedIndex = {};
         sorted.forEach((id, idx) => { sortedIndex[id] = idx; });
 
-        // Tracks which sorted block indices use REAL inline mode (for source-ref resolution)
+        // Sorted block indices whose math result lives in a rung-local scalar
+        // `_m_r<r>_b<i>_rout` (every non-int32 path) rather than a kronmath struct.
         const realInlineBlocks = new Set();
+        // sorted block index → IEC type of an inline block's result, so a block
+        // wired to it picks the right arithmetic width too.
+        const inlineOutType = new Map();
 
         // ⚠️ Stateless inline blocks (X_TO_Y conversions, MIN/MAX/LIMIT/SEL/MUX,
         // bitwise, comparisons) get NO PlcState instance — they are emitted as a
@@ -5720,13 +6593,17 @@ const transpileLDLogics = (rungs, stdFunctions = {}, parentName = '', category =
                 // known — the pin's own value, or the source block's output pin.
                 const argValues = {};
                 const argIsString = {};
+                // pin → IEC type of the operand (null = unknown); drives the
+                // int32 / int64 / float / double choice and the rotate width.
+                const argTypes = {};
                 const markStr = (pin, yes) => { if (yes) argIsString[pin] = true; };
                 if (data.values) {
                     Object.entries(data.values).forEach(([pinName, val]) => {
-                        if (['EN', 'ENO', 'OUT'].includes(pinName)) return;
+                        if (['EN', 'ENO', 'OUT', 'Q'].includes(pinName)) return;
                         const resolved = resolveVal(val);
                         if (resolved === null) return;
                         argValues[pinName] = resolved;
+                        argTypes[pinName] = operandType(resolved);
                         markStr(pinName, /^"/.test(resolved) ||
                             /^W?STRING$/i.test(String(cSymTypeMap[resolved] || '')));
                     });
@@ -5740,6 +6617,7 @@ const transpileLDLogics = (rungs, stdFunctions = {}, parentName = '', category =
                     if (!pinName || !inputPins.includes(pinName) || pinName === 'EN') return;
                     if (c.source && c.source.startsWith('terminal_left')) {
                         argValues[pinName] = 'true';
+                        argTypes[pinName] = 'BOOL';
                     } else if (sortedIndex[c.source] !== undefined) {
                         const sp = c.sourcePin || '';
                         if (sp.startsWith('out_') && !/^out_\d+$/.test(sp)) {
@@ -5751,66 +6629,95 @@ const transpileLDLogics = (rungs, stdFunctions = {}, parentName = '', category =
                             const inlineRef = inlineSourceRef(srcType, srcIdx, sp.slice(4), rungIdx);
                             if (inlineRef !== null) {
                                 argValues[pinName] = inlineRef;
+                                argTypes[pinName] = sp.slice(4) === 'ENO' ? 'BOOL' : (inlineOutType.get(srcIdx) || null);
                             } else {
                                 argValues[pinName] = `${getCallTarget(srcInstName)}.${sp.slice(4)}`;
+                                argTypes[pinName] = String(getOutputPinType(srcType, sp.slice(4), srcBlock?.data?.customData) || '').toUpperCase() || null;
                             }
                             markStr(pinName, /^W?STRING$/i.test(
                                 String(getOutputPinType(srcType, sp.slice(4), srcBlock?.data?.customData) || '')));
                         } else {
                             argValues[pinName] = `out_r${rungIdx}_b${sortedIndex[c.source]}`;
+                            argTypes[pinName] = 'BOOL';
                         }
                     }
                 });
 
                 const args = dataInputPins.map(pin => argValues[pin] || '0');
 
-                if (MATH_FB_BLOCKS.has(type)) {
-                    // ── Math FB: local struct + _Call (kronmath.h) ──
-                    // When inputs are REAL/LREAL or float literals, emit inline C expressions
-                    // (no struct needed — uses C operators and standard math functions).
+                // Arithmetic width for this block, from every operand and the
+                // OUT variable: LREAL → double, REAL → float, a 64-bit integer
+                // (or UDINT/DWORD/TIME/LTIME, which int32 cannot hold) → int64_t, else
+                // the int32 kronmath struct path.
+                // ⚠️ The type has to be read off EVERY operand: the old check only
+                // knew literals because cSymTypeMap never matched a resolved
+                // variable, and KRON_GT/KRON_LIMIT dispatch on their FIRST argument
+                // only, so `GT(5, r)` compared as int32.
+                const outRawCheck = data.values?.OUT;
+                const outVarCheck = outRawCheck ? (outRawCheck + '').replace(/[🌍🏠⊞⊡⊟]/g, '').trim() : '';
+                const outCSym = (outVarCheck && IDENTIFIER_REF_REGEX.test(outVarCheck)) ? resolveVar(outVarCheck) : null;
+                const kindOf = (types) => {
+                    const T = types.map(t => String(t || '').toUpperCase());
+                    if (T.includes('LREAL')) return 'f64';
+                    if (T.includes('REAL')) return 'f32';
+                    if (T.some(t => ['LINT', 'ULINT', 'LWORD', 'UDINT', 'DWORD', 'TIME', 'LTIME'].includes(t))) return 'i64';
+                    return 'i32';
+                };
+                const KIND_C = { f64: 'double', f32: 'float', i64: 'int64_t', i32: 'int32_t' };
+                const KIND_IEC = { f64: 'LREAL', f32: 'REAL', i64: 'LINT', i32: 'DINT' };
+
+                if (type === 'MOVE' && (argIsString.IN || operandType(outCSym) === 'STRING')) {
+                    // MOVE of text is a copy into the OUT variable's own array;
+                    // the numeric paths below would cast a pointer.
+                    out += `    ${bOut} = ${inExpr};\n`;
+                    if (outCSym) out += `    if (${bOut}) { ${kronStrset(outCSym, argValues.IN || '""')}; }\n`;
+                } else if (MATH_FB_BLOCKS.has(type)) {
                     const inputVals = dataInputPins.map(pin => argValues[pin] || '0');
-                    const outRawCheck = data.values?.OUT;
-                    const outVarCheck = outRawCheck ? (outRawCheck + '').replace(/[🌍🏠⊞⊡⊟]/g, '').trim() : '';
-                    const outCSym = outVarCheck ? resolveVar(outVarCheck) : null;
-                    const useReal = inputVals.some(isRealExpr) ||
-                        (outCSym && ['REAL', 'LREAL'].includes(cSymTypeMap[outCSym]));
+                    let kind = kindOf([...dataInputPins.map(p => argTypes[p]), outCSym ? operandType(outCSym) : null]);
+                    // <math.h> functions are floating point whatever the operand.
+                    if (MATH_UNARY_C[type]) kind = (kind === 'f64' || kind === 'i64') ? 'f64' : 'f32';
 
                     out += `    ${bOut} = ${inExpr};\n`;
 
-                    if (useReal) {
-                        // ── Inline REAL path: no struct, emit C float expressions ──
+                    if (kind !== 'i32') {
+                        // ── Inline path: no struct, a typed C expression ──
                         realInlineBlocks.add(idx);
+                        inlineOutType.set(idx, KIND_IEC[kind]);
+                        const ct = KIND_C[kind];
+                        const isF = kind === 'f32' || kind === 'f64';
+                        const fsuf = kind === 'f32' ? 'f' : '';
+                        const zero = kind === 'f32' ? '0.0f' : kind === 'f64' ? '0.0' : '0';
                         const localRout = `_m_r${rungIdx}_b${idx}_rout`;
-                        const fv = (v) => `(float)(${v})`;  // cast helper
-                        let realExpr = '0.0f';
+                        const cv = (v) => `(${ct})(${v})`;
+                        let expr;
                         if (MATH_FB_ARRAY_INPUT.has(type)) {
-                            // ADD, MUL, AVG — multi-input
-                            const fVals = inputVals.map(fv);
-                            if (type === 'ADD') realExpr = fVals.join(' + ');
-                            else if (type === 'MUL') realExpr = fVals.join(' * ');
-                            else if (type === 'AVG') realExpr = `(${fVals.join(' + ')}) / ${inputVals.length}.0f`;
+                            const vals = inputVals.map(cv);
+                            if (type === 'ADD') expr = vals.join(' + ');
+                            else if (type === 'MUL') expr = vals.join(' * ');
+                            else if (type === 'AVG') expr = `(${vals.join(' + ')}) / ${isF ? `${inputVals.length}.0${fsuf}` : inputVals.length}`;
                         } else {
-                            const a = fv(inputVals[0] || '0');
-                            const b = fv(inputVals[1] || '0');
-                            if (type === 'SUB')  realExpr = `${a} - ${b}`;
-                            else if (type === 'DIV')  realExpr = `(${b} != 0.0f) ? (${a} / ${b}) : 0.0f`;
-                            else if (type === 'MOD')  realExpr = `(${b} != 0.0f) ? fmodf(${a}, ${b}) : 0.0f`;
-                            else if (type === 'MOVE') realExpr = a;
-                            else if (type === 'NEG')  realExpr = `-${a}`;
-                            else if (type === 'ABS')  realExpr = `(${a} < 0.0f ? -${a} : ${a})`;
-                            else if (type === 'SQRT') realExpr = `(${a} >= 0.0f ? sqrtf(${a}) : 0.0f)`;
-                            else if (type === 'EXPT') realExpr = `powf(${a}, ${b})`;
+                            const a = cv(inputVals[0] || '0');
+                            const b = cv(inputVals[1] || '0');
+                            if (type === 'SUB') expr = `${a} - ${b}`;
+                            else if (type === 'DIV') expr = isF ? `(${b} != ${zero}) ? (${a} / ${b}) : ${zero}` : `KRON_IDIV(${a}, ${b})`;
+                            else if (type === 'MOD') expr = isF ? `(${b} != ${zero}) ? fmod${fsuf}(${a}, ${b}) : ${zero}` : `KRON_IMOD(${a}, ${b})`;
+                            else if (type === 'MOVE') expr = a;
+                            else if (type === 'NEG') expr = `-${a}`;
+                            else if (type === 'ABS') expr = `(${a} < ${zero} ? -${a} : ${a})`;
+                            else if (type === 'EXPT') expr = isF ? `pow${fsuf}(${a}, ${b})` : `(int64_t)llround(pow((double)${a}, (double)${b}))`;
+                            else if (type === 'SQRT') expr = `(${a} >= ${zero} ? sqrt${fsuf}(${a}) : ${zero})`;
+                            else if (MATH_UNARY_C[type]) expr = `${MATH_UNARY_C[type]}${fsuf}(${a})`;
                         }
-                        out += `    float ${localRout} = 0.0f;\n`;
+                        if (!expr) throw new Error(`LD: no ${kind} implementation for math block ${type} on rung ${rungIdx + 1}.`);
+                        out += `    ${ct} ${localRout} = ${zero};\n`;
                         out += `    if (${bOut}) {\n`;
-                        out += `        ${localRout} = ${realExpr};\n`;
+                        out += `        ${localRout} = ${expr};\n`;
                         if (dbgOut('OUT')) out += `        ${dbgOut('OUT')} = ${localRout};\n`;
-                        if (outVarCheck && IDENTIFIER_REF_REGEX.test(outVarCheck)) {
-                            out += `        ${resolveVar(outVarCheck)} = ${localRout};\n`;
-                        }
+                        if (outCSym) out += `        ${outCSym} = ${localRout};\n`;
                         out += `    }\n`;
                     } else {
                         // ── Integer path: struct + _Call (kronmath.h) ──
+                        inlineOutType.set(idx, 'DINT');
                         const structType = MATH_FB_STRUCT[type] || type;
                         const callFn = `${structType === type ? type : structType.replace('_FB', '')}_Call`;
                         const localVar = `_m_r${rungIdx}_b${idx}`;
@@ -5833,8 +6740,8 @@ const transpileLDLogics = (rungs, stdFunctions = {}, parentName = '', category =
                         out += `    ${callFn}(&${localVar});\n`;
                         if (dbgOut('OUT')) out += `    ${dbgOut('OUT')} = ${localVar}.OUT;\n`;
 
-                        if (outVarCheck && IDENTIFIER_REF_REGEX.test(outVarCheck)) {
-                            out += `    ${resolveVar(outVarCheck)} = ${localVar}.OUT;\n`;
+                        if (outCSym) {
+                            out += `    ${outCSym} = ${localVar}.OUT;\n`;
                         }
                         out += `    }\n`;
                     }
@@ -5848,40 +6755,77 @@ const transpileLDLogics = (rungs, stdFunctions = {}, parentName = '', category =
 
                 } else {
                     // ── Inline comparison/selection/range/bitwise/conversion ──
+                    // Plain C operators throughout: C's usual arithmetic
+                    // conversions pick the common type of BOTH operands, which
+                    // the archive's _Generic macros (keyed on one argument) did not.
+                    const A = (pin) => `(${argValues[pin] || '0'})`;
+                    const T = (pin) => String(argTypes[pin] || '').toUpperCase();
                     let resultExpr;
+                    let resultType = null;
                     if (type === 'MUX') {
                         // KRON_MUX expects (k, ARRAY-pointer, n) — dereferencing a
                         // scalar is a compile error. The 2-input XML block is a
                         // simple select: K != 0 picks IN1.
-                        resultExpr = `((${argValues['K'] || '0'}) ? (${argValues['IN1'] || '0'}) : (${argValues['IN0'] || '0'}))`;
+                        resultExpr = `(${A('K')} ? ${A('IN1')} : ${A('IN0')})`;
+                        resultType = KIND_IEC[kindOf([argTypes.IN0, argTypes.IN1])];
+                    } else if (type === 'SEL') {
+                        resultExpr = `(${A('G')} ? ${A('IN1')} : ${A('IN0')})`;
+                        resultType = KIND_IEC[kindOf([argTypes.IN0, argTypes.IN1])];
                     } else if (type === 'LIMIT') {
-                        // IEC LIMIT(MN, IN, MX); the KRON_LIMIT macro takes
-                        // (mn, in, mx) — FB_INPUTS order is (IN, MN, MX), so map
-                        // by NAME instead of position.
-                        resultExpr = `KRON_LIMIT(${argValues['MN'] || '0'}, ${argValues['IN'] || '0'}, ${argValues['MX'] || '0'})`;
-                    } else if (KRON_FN[type]) {
-                        // Text operands: KRON_EQ's _Generic dispatch would pick the
-                        // numeric overload and compare pointers, so lower to strcmp.
-                        // Ordering text has no meaning here and is refused instead.
+                        // IEC LIMIT(MN, IN, MX), by pin NAME (FB_INPUTS order is IN, MN, MX).
+                        resultExpr = `(${A('IN')} < ${A('MN')} ? ${A('MN')} : (${A('IN')} > ${A('MX')} ? ${A('MX')} : ${A('IN')}))`;
+                        resultType = KIND_IEC[kindOf([argTypes.IN, argTypes.MN, argTypes.MX])];
+                    } else if (type === 'MIN' || type === 'MAX') {
+                        const op = type === 'MIN' ? '<' : '>';
+                        resultExpr = `(${A('IN1')} ${op} ${A('IN2')} ? ${A('IN1')} : ${A('IN2')})`;
+                        resultType = KIND_IEC[kindOf([argTypes.IN1, argTypes.IN2])];
+                    } else if (['GT', 'GE', 'EQ', 'NE', 'LT', 'LE'].includes(type)) {
+                        // Text operands: a C `==` on two `char *` compares
+                        // addresses, so lower to strcmp. Ordering text has no
+                        // meaning here and is refused instead.
                         const textCmp = dataInputPins.some(pin => argIsString[pin]);
                         if (textCmp && (type === 'EQ' || type === 'NE')) {
                             const eq = `__kron_streq(${args[0]}, ${args[1]})`;
                             resultExpr = type === 'EQ' ? eq : `(!${eq})`;
-                        } else if (textCmp && ['GT', 'GE', 'LT', 'LE'].includes(type)) {
+                        } else if (textCmp) {
                             throw new Error(
                                 `${type} compares text on rung ${rungIdx + 1}: only EQ and NE work ` +
                                 `on STRING. Convert with STRING_TO_DINT / STRING_TO_REAL first.`);
                         } else {
-                            resultExpr = `${KRON_FN[type]}(${args.join(', ')})`;
+                            const op = { GT: '>', GE: '>=', EQ: '==', NE: '!=', LT: '<', LE: '<=' }[type];
+                            resultExpr = `(${A('IN1')} ${op} ${A('IN2')})`;
                         }
+                        resultType = 'BOOL';
+                    } else if (type === 'BNOT') {
+                        // BNOT on a BOOL is a logical NOT: `~true` is -2, i.e. TRUE.
+                        resultExpr = T('IN') === 'BOOL' ? `(!${A('IN')})` : `(~${A('IN')})`;
+                        resultType = T('IN') === 'BOOL' ? 'BOOL' : (T('IN') || 'DWORD');
+                    } else if (type === 'ROL' || type === 'ROR') {
+                        // Width of the OPERAND (BYTE 8 … LWORD 64): from the IN
+                        // value, else the OUT variable, else the pin's DWORD.
+                        const wt = IEC_BIT_WIDTH[T('IN')] > 1 ? T('IN')
+                            : (IEC_BIT_WIDTH[String(operandType(outCSym) || '').toUpperCase()] > 1
+                                ? String(operandType(outCSym)).toUpperCase() : 'DWORD');
+                        resultExpr = rotateExpr(type, argValues.IN || '0', argValues.N || '0', IEC_BIT_WIDTH[wt]);
+                        resultType = wt;
                     } else if (BITWISE_OP[type]) {
-                        if (args.length === 1) {
+                        if (dataInputPins.length === 1) {
                             resultExpr = `(${BITWISE_OP[type]}${args[0]})`;
                         } else {
                             resultExpr = `(${args[0]} ${BITWISE_OP[type]} ${args[1]})`;
                         }
+                        resultType = T(dataInputPins[0]) || 'DWORD';
+                    } else if (type === 'NORM_X') {
+                        // (VALUE - MIN) / (MAX - MIN), in double whatever the pins are.
+                        resultExpr = `(((double)${A('VALUE')} - ${A('MIN')}) / ((double)${A('MAX')} - ${A('MIN')}))`;
+                        resultType = 'LREAL';
+                    } else if (type === 'SCALE_X') {
+                        // VALUE * (MAX - MIN) + MIN
+                        resultExpr = `((double)${A('VALUE')} * ((double)${A('MAX')} - ${A('MIN')}) + ${A('MIN')})`;
+                        resultType = 'LREAL';
                     } else if (type.match(/^[A-Z]+_TO_[A-Z]+$/)) {
                         const [srcType, dstType] = type.split('_TO_');
+                        resultType = dstType;
                         if (dstType === 'STRING' || srcType === 'STRING') {
                             // Text cannot be a C cast: `(int32_t)(char*)` reads the
                             // pointer and `(char*)(int32_t)` invents one. Both
@@ -5900,13 +6844,22 @@ const transpileLDLogics = (rungs, stdFunctions = {}, parentName = '', category =
                             } else {
                                 resultExpr = `KRON_STRING_TO_${kd}(${args[0]})`;
                             }
+                        } else if ((srcType === 'REAL' || srcType === 'LREAL') && IEC_INT_TYPES.has(dstType)) {
+                            // ⚠️ IEC REAL_TO_INT ROUNDS; a C cast truncates (2.7 → 2).
+                            resultExpr = srcType === 'REAL'
+                                ? `((${mapType(dstType)})llrintf((float)(${args[0]})))`
+                                : `((${mapType(dstType)})llrint((double)(${args[0]})))`;
                         } else {
-                            // Numeric conversion — a C cast is exact and free
+                            // Other numeric conversions — a C cast is exact and free
                             resultExpr = `(${mapType(dstType)})(${args[0]})`;
                         }
                     } else {
-                        resultExpr = `/* unknown inline: ${type} */ 0`;
+                        // ⚠️ Never emit a placeholder: `/* unknown */ 0` compiled
+                        // into a plausible wrong program.
+                        throw new Error(`LD: block type "${type}" on rung ${rungIdx + 1} has no code generator ` +
+                            `(an EN/ENO inline block nothing implements).`);
                     }
+                    inlineOutType.set(idx, resultType);
 
                     // Publish the expression for any block wired to this one's
                     // OUT/Q pin (see inlineOutExpr above). Registered BEFORE the
@@ -5952,7 +6905,10 @@ const transpileLDLogics = (rungs, stdFunctions = {}, parentName = '', category =
                             out += `    if (${bOut}) { (void)(${resultExpr}); }\n`;
                         }
                         if (outAssigned) {
-                            out += `    if (${bOut}) { ${resolveVar(outVar)} = ${resultExpr}; }\n`;
+                            // Text result (x_TO_STRING, SEL/MUX of STRINGs): copy.
+                            out += (isToString || (hasTextArg && ['SEL', 'MUX'].includes(type)))
+                                ? `    if (${bOut}) { ${kronStrset(resolveVar(outVar), resultExpr)}; }\n`
+                                : `    if (${bOut}) { ${resolveVar(outVar)} = ${resultExpr}; }\n`;
                         }
                     }
 
@@ -5985,6 +6941,17 @@ const transpileLDLogics = (rungs, stdFunctions = {}, parentName = '', category =
                 }
 
                 const safeInst = instName.trim().replace(/\s+/g, '_');
+                // C member of a pin: a user FB's member is its declared name
+                // (mangled if it is a C keyword); a standard FB's goes through
+                // cStructPin (CTU.R → RESET).
+                const memberOf = (pin) => (isUserDefinedFB ? cIdent(pin) : cStructPin(type, pin));
+                // Pre-call input write. A USER FB's STRING pin is an array
+                // member and is copied into; a standard block's STRING pin is a
+                // `const char *` re-pointed here every scan (plain `=`).
+                const pinAssign = (cPin, pinName, rhs) => (isUserDefinedFB
+                    && isStringInputType(getInputPinMeta(type, pinName, data.customData).type)
+                    ? `    ${kronStrset(`${callTarget}.${cPin}`, rhs)};\n`
+                    : `    ${callTarget}.${cPin} = ${rhs};\n`);
                 // ⚠️ A motion FB's pin writes land INSIDE the request the axis
                 // engine may already own (AXIS_REF.Active/Buffer[] hold a pointer
                 // into this very instance, and a buffered command reads its
@@ -6001,14 +6968,14 @@ const transpileLDLogics = (rungs, stdFunctions = {}, parentName = '', category =
                         if (MOTION_FB_AXIS_PARAM.has(type) && pinName === 'Axis') return; // passed as 2nd call param
                         // Skip pins not in inputPins (e.g. old output pins removed from the standard)
                         if (inputPins.length > 0 && !inputPins.includes(pinName) && !isUserDefinedFB) return;
-                        const cPin = cStructPin(type, pinName);
+                        const cPin = memberOf(pinName);
                         const shadowSym = inputShadowMap?.get(`${safeInst}_${pinName}`);
                         if (shadowSym) {
                             out += `    ${callTarget}.${cPin} = S->${shadowSym};\n`;
                         } else {
                             const resolved = resolveInputPinValue(type, pinName, val, data.customData);
                             if (resolved !== null && resolved !== undefined) {
-                                out += `    ${callTarget}.${cPin} = ${resolved};\n`;
+                                out += pinAssign(cPin, pinName, resolved);
                             }
                         }
                     });
@@ -6021,7 +6988,7 @@ const transpileLDLogics = (rungs, stdFunctions = {}, parentName = '', category =
                         if (data.values?.[pinName] !== undefined && data.values[pinName] !== '') return;
                         const shadowSym = inputShadowMap.get(`${safeInst}_${pinName}`);
                         if (shadowSym) {
-                            const cPin = cStructPin(type, pinName);
+                            const cPin = memberOf(pinName);
                             out += `    ${callTarget}.${cPin} = S->${shadowSym};\n`;
                         }
                     });
@@ -6033,7 +7000,7 @@ const transpileLDLogics = (rungs, stdFunctions = {}, parentName = '', category =
                     if (data.values?.[pinName] !== undefined && data.values[pinName] !== '') return;
                     if (inputShadowMap?.get(`${safeInst}_${pinName}`)) return;
                     if (!getInputPinMeta(type, pinName, data.customData).passByReference) return;
-                    const cPin = cStructPin(type, pinName);
+                    const cPin = memberOf(pinName);
                     out += `    ${callTarget}.${cPin} = NULL;\n`;
                 });
 
@@ -6052,7 +7019,7 @@ const transpileLDLogics = (rungs, stdFunctions = {}, parentName = '', category =
                     // Handle is "in_<pinName>" — extract pin name
                     const pinName = tp.startsWith('in_') ? tp.slice(3) : null;
                     if (!pinName || !inputPins.includes(pinName)) return;
-                    const cPin = cStructPin(type, pinName);
+                    const cPin = memberOf(pinName);
                     if (c.source && c.source.startsWith('terminal_left')) {
                         const sourceExpr = getInputPinMeta(type, pinName, data.customData).passByReference
                             ? 'NULL'
@@ -6073,7 +7040,7 @@ const transpileLDLogics = (rungs, stdFunctions = {}, parentName = '', category =
                                 ? inlineRef
                                 : `${getCallTarget(srcInstName)}.${sp.slice(4)}`;
                             const sourceExpr = adaptExprForInputPin(type, pinName, srcRef, data.customData);
-                            out += `    ${callTarget}.${cPin} = ${sourceExpr};\n`;
+                            out += pinAssign(cPin, pinName, sourceExpr);
                         } else {
                             const sourceExpr = adaptExprForInputPin(type, pinName, `out_r${rungIdx}_b${sortedIndex[c.source]}`, data.customData);
                             out += `    ${callTarget}.${cPin} = ${sourceExpr};\n`;
@@ -6168,14 +7135,31 @@ const transpileLDLogics = (rungs, stdFunctions = {}, parentName = '', category =
                     const rawVal = data.values?.[pinName];
                     const varStr = rawVal ? (rawVal + '').replace(/[🌍🏠⊞⊡⊟]/g, '').trim() : '';
                     const isVarAssigned = varStr && IDENTIFIER_REF_REGEX.test(varStr);
+                    // A STRING output (Read_Sys_File.VALUE, a user FB's STRING
+                    // pin) is COPIED: the target and the shadow are arrays.
+                    const pinIsString = isStringInputType(getOutputPinType(type, pinName, data.customData));
+                    const assign = (lhs, rhs) => (pinIsString ? `${kronStrset(lhs, rhs)};` : `${lhs} = ${rhs};`);
                     if (isVarAssigned) {
-                        out += `    ${resolveVar(varStr)} = ${callTarget}.${pinName};\n`;
+                        out += `    ${assign(resolveVar(varStr), `${callTarget}.${memberOf(pinName)}`)}\n`;
                     }
                     // Always write to shadow tracking var so the variable table can show output values
                     if (category !== 'function_block') {
-                        out += `    S->prog_${parentName}_out_${safeInst}_${pinName} = ${callTarget}.${pinName};\n`;
+                        out += `    ${assign(`S->prog_${parentName}_out_${safeInst}_${pinName}`, `${callTarget}.${memberOf(pinName)}`)}\n`;
                     }
                 });
+                // ⚠️ VAR_IN_OUT of a user FB: the FB worked on its own copy, so
+                // the variable typed into the pin gets the result back.
+                if (isUserDefinedFB) {
+                    (data.customData.content.variables || []).filter(isInOutClass).forEach(v => {
+                        const raw = data.values?.[v.name];
+                        const vs = raw ? (raw + '').replace(/[🌍🏠⊞⊡⊟]/g, '').trim() : '';
+                        if (vs && IDENTIFIER_REF_REGEX.test(vs)) {
+                            out += isStringInputType(v.type)
+                                ? `    ${kronStrset(resolveVar(vs), `${callTarget}.${memberOf(v.name)}`)};\n`
+                                : `    ${resolveVar(vs)} = ${callTarget}.${memberOf(v.name)};\n`;
+                        }
+                    });
+                }
             }
         });
     });
@@ -6200,14 +7184,20 @@ const mapType = (iecType) => {
         'WORD': 'uint16_t',
         'DWORD': 'uint32_t',
         'LWORD': 'uint64_t',
-        'TIME': 'uint32_t',
-        'STRING': 'char*',
+        // IEC TIME/LTIME = kronstandard.h's TIME (int64_t microseconds).
+        // Spelled as the C type so a field never depends on that header.
+        'TIME': 'int64_t',
+        'LTIME': 'int64_t',
+        'STRING': STRING_C_TYPE,
+        'WSTRING': STRING_C_TYPE,
         'POINTER': 'void*',
         'VOID': 'void'
     };
     // Fallback to custom name — sanitized like the typedef emission ("My FB" →
     // typedef My_FB), so field declarations reference the real C type name.
-    return typeMap[iecType] || String(iecType || '').trim().replace(/\s+/g, '_');
+    // ⚠️ Upper-cased first: IEC type names are case-insensitive, and a
+    // lowercase `int` used to fall through and be emitted as C's own `int`.
+    return typeMap[String(iecType || '').trim().toUpperCase()] || String(iecType || '').trim().replace(/\s+/g, '_');
 };
 
 const transpileDataType = (dt) => {
@@ -6221,7 +7211,7 @@ const transpileDataType = (dt) => {
     } else if (dt.type === 'Structure') {
         code += `typedef struct {\n`;
         dt.content.members.forEach(member => {
-            code += `    ${mapType(member.type)} ${member.name};\n`;
+            code += `    ${mapType(member.type)} ${cIdent(member.name)};\n`;
         });
         code += `} ${dt.name};\n\n`;
     } else if (dt.type === 'Array') {

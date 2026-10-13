@@ -3,7 +3,6 @@
 package main
 
 import (
-	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -29,13 +28,9 @@ import (
 // Backing the mirror with a regular file in the loader-host's working
 // directory (the build dir) sidesteps all of it: mmap(MAP_SHARED) on a file
 // gives exactly the same coherent shared page the other platforms provide, the
-// agent reads it with the same ReadAt/WriteAt as Linux, and removeShmMirror
-// becomes a plain os.Remove. The loader-host creates it (host.c, __APPLE__
-// branch) using the identical name transformation below.
-type shmMirror struct {
-	f    *os.File
-	size int
-}
+// agent maps it with the same code as Linux (shmmirror_posix.go), and
+// removeShmMirror becomes a plain os.Remove. The loader-host creates it
+// (host.c, __APPLE__ branch) using the identical name transformation below.
 
 // mirrorPath maps the POSIX shm name emitted by the generated plc.c
 // ("/plc_runtime") onto the backing file the loader-host creates in its working
@@ -48,62 +43,8 @@ func mirrorPath(dir, name string) string {
 	return filepath.Join(dir, strings.TrimPrefix(name, "/")+".mirror")
 }
 
-// openShmMirror attaches to the mirror the running loader-host created. Fails
-// while the host is still starting — callers treat that as "not up yet" and
-// retry.
-func openShmMirror(dir, name string, size int, write bool) (*shmMirror, error) {
-	flag := os.O_RDONLY
-	if write {
-		flag = os.O_RDWR
-	}
-	f, err := os.OpenFile(mirrorPath(dir, name), flag, 0)
-	if err != nil {
-		return nil, err
-	}
-	// A file that exists but has not been sized yet means the host is between
-	// creat() and ftruncate(). Reporting that as "not up" keeps the caller in
-	// its retry loop instead of surfacing short reads as live values.
-	if st, err := f.Stat(); err == nil && st.Size() < int64(size) {
-		_ = f.Close()
-		return nil, fmt.Errorf("mirror not sized yet (%d of %d bytes)", st.Size(), size)
-	}
-	return &shmMirror{f: f, size: size}, nil
-}
-
-// checkBounds rejects an offset/length pair that falls outside the segment.
-// ⚠️ The offset comes from the client-supplied variable table and is not
-// validated upstream. Unlike the Windows implementation this path goes through
-// safe file I/O, so an out-of-range access was never memory-unsafe — but a
-// write past the end silently EXTENDS the backing file (a real on-disk file
-// here, not tmpfs), which is not something a mirror of a fixed-size segment
-// should ever do.
-func (m *shmMirror) checkBounds(off int64, n int) error {
-	if off < 0 || n < 0 || off+int64(n) > int64(m.size) {
-		return fmt.Errorf("access at 0x%x len %d out of mirror bounds (%d)", off, n, m.size)
-	}
-	return nil
-}
-
-func (m *shmMirror) ReadAt(b []byte, off int64) error {
-	if err := m.checkBounds(off, len(b)); err != nil {
-		return err
-	}
-	_, err := m.f.ReadAt(b, off)
-	return err
-}
-
-func (m *shmMirror) WriteAt(b []byte, off int64) error {
-	if err := m.checkBounds(off, len(b)); err != nil {
-		return err
-	}
-	n, err := m.f.WriteAt(b, off)
-	if err == nil && n != len(b) {
-		return fmt.Errorf("short write (%d of %d)", n, len(b))
-	}
-	return err
-}
-
-func (m *shmMirror) Close() { _ = m.f.Close() }
+// shmMirrorPath is what shmmirror_posix.go maps.
+func shmMirrorPath(dir, name string) string { return mirrorPath(dir, name) }
 
 // removeShmMirror drops a stale segment left by a previous run so a fresh cold
 // start never reads another generation's values.

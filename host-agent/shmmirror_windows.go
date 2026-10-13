@@ -4,6 +4,7 @@ package main
 
 import (
 	"fmt"
+	"sync/atomic"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
@@ -56,21 +57,19 @@ func (m *shmMirror) view() []byte {
 	return unsafe.Slice((*byte)(unsafe.Pointer(m.addr)), m.size)
 }
 
+// ReadAt copies a slot out, as one atomic load for an aligned 4/8-byte slot.
 func (m *shmMirror) ReadAt(b []byte, off int64) error {
 	if off < 0 || int(off)+len(b) > m.size {
 		return fmt.Errorf("read at 0x%x len %d out of mirror bounds (%d)", off, len(b), m.size)
 	}
-	copy(b, m.view()[off:])
+	loadScalarOrCopy(m.view(), int(off), b)
 	return nil
 }
 
-func (m *shmMirror) WriteAt(b []byte, off int64) error {
-	if off < 0 || int(off)+len(b) > m.size {
-		return fmt.Errorf("write at 0x%x len %d out of mirror bounds (%d)", off, len(b), m.size)
-	}
-	copy(m.view()[off:], b)
-	return nil
-}
+// Bytes is the whole mapped segment (the force-write mailbox works on it).
+// There is deliberately no WriteAt: writers post mailbox commands (SHM layout
+// v2) and never store into a slot or a flag byte.
+func (m *shmMirror) Bytes() []byte { return m.view() }
 
 func (m *shmMirror) Close() {
 	if m.addr != 0 {
@@ -108,4 +107,23 @@ func openFileMapping(access uint32, name *uint16) (windows.Handle, error) {
 		return 0, windows.ERROR_FILE_NOT_FOUND
 	}
 	return windows.Handle(r), nil
+}
+
+// loadScalarOrCopy — see shmmirror_posix.go (same contract).
+func loadScalarOrCopy(mem []byte, off int, dst []byte) {
+	p := unsafe.Pointer(&mem[off])
+	switch {
+	case len(dst) == 8 && uintptr(p)%8 == 0:
+		v := atomic.LoadUint64((*uint64)(p))
+		for i := 0; i < 8; i++ {
+			dst[i] = byte(v >> (8 * i))
+		}
+	case len(dst) == 4 && uintptr(p)%4 == 0:
+		v := atomic.LoadUint32((*uint32)(p))
+		for i := 0; i < 4; i++ {
+			dst[i] = byte(v >> (8 * i))
+		}
+	default:
+		copy(dst, mem[off:off+len(dst)])
+	}
 }

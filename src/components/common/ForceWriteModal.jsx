@@ -1,5 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { createPortal } from 'react-dom';
+import { formatTimeUs, parseTimeUs, isTimeType } from '../../utils/plcStandards';
 
 const INT_TYPES = new Set([
   'INT', 'DINT', 'UINT', 'UDINT', 'LINT', 'ULINT',
@@ -26,8 +27,9 @@ const formatInt = (n, fmt) => {
   }
 };
 
-const displayValue = (val) => {
+const displayValue = (val, isTime = false) => {
   if (val === null || val === undefined) return '---';
+  if (isTime && typeof val !== 'object') return formatTimeUs(val);
   if (typeof val === 'boolean') return val ? 'TRUE' : 'FALSE';
   if (typeof val === 'object') return JSON.stringify(val);
   return String(val);
@@ -43,12 +45,14 @@ const displayValue = (val) => {
  *  varType       string  — PLC type ('BOOL', 'INT', 'REAL', …)
  *  currentValue  any     — current live value (null if unknown)
  *  liveKey       string  — key passed to onConfirm
- *  allowPulse    boolean — offer the Pulse/Force choice (local hot-swap sim only)
- *  onConfirm     (key, value, mode) => void  — mode: 'pulse' | 'force'
+ *  allowPulse    boolean — offer the Pulse/Force choice (local sim and, since the
+ *                force-write mailbox, a remote PLC as well)
+ *  onConfirm     (key, value, mode) => void  — mode: 'pulse' | 'force' | 'unforce'
+ *                (unforce = Release: value is null, the force is dropped)
  */
 const ForceWriteModal = ({ isOpen, onClose, varName, varType, currentValue, liveKey, allowPulse, onConfirm }) => {
-  // Pulse (one-scan) is only meaningful in the local hot-swap sim. Callers that
-  // know their context pass `allowPulse`; the rest fall back to the flag App
+  // Pulse (write once, logic resumes) works wherever a runtime is live. Callers
+  // that know their context pass `allowPulse`; the rest fall back to the flag App
   // publishes on window (mirrors the existing window.stLiveCtx live-context
   // pattern) so every force entry point behaves consistently without threading
   // isSimulationMode through ReactFlow node data.
@@ -60,14 +64,16 @@ const ForceWriteModal = ({ isOpen, onClose, varName, varType, currentValue, live
   const [format, setFormat] = useState('dec'); // dec | hex | oct | bin
   const [error, setError] = useState('');
   // 'pulse' = apply for one scan then release (default when offered); 'force' =
-  // hold the value every scan. When pulse isn't available (remote PLC), always
-  // force.
+  // hold the value every scan. When pulse isn't offered, always force.
   const [mode, setMode] = useState('pulse');
 
   const type = (varType || '').toUpperCase();
   const isBool  = type === 'BOOL';
   const isInt   = INT_TYPES.has(type);
   const isFloat = FLOAT_TYPES.has(type);
+  // TIME/LTIME: signed 64-bit MICROseconds. Entered as an IEC duration
+  // (T#2h, -5s, 1m30s) or a bare integer µs count, sent as the exact µs count.
+  const isTime  = isTimeType(type);
 
   // Reset state when modal opens
   useEffect(() => {
@@ -77,6 +83,8 @@ const ForceWriteModal = ({ isOpen, onClose, varName, varType, currentValue, live
     setMode(pulseOK ? 'pulse' : 'force');
     if (isBool) {
       setBoolSelect(currentValue === true ? 'TRUE' : 'FALSE');
+    } else if (isTime && currentValue !== null && currentValue !== undefined && typeof currentValue !== 'object') {
+      setInputValue(formatTimeUs(currentValue));
     } else if (currentValue !== null && currentValue !== undefined) {
       setInputValue(String(currentValue));
     } else {
@@ -97,6 +105,15 @@ const ForceWriteModal = ({ isOpen, onClose, varName, varType, currentValue, live
     onClose();
   };
 
+  // Release ONE variable: drop its force and hand it back to the program
+  // (mailbox UNFORCE with no value). Before this the only way out of a Force
+  // was Stop, which also restarts the program and drops every other force.
+  // Harmless on a variable that is not forced.
+  const release = () => {
+    if (onConfirm) onConfirm(liveKey, null, 'unforce');
+    onClose();
+  };
+
   const handleSubmit = () => {
     if (isBool) {
       confirm(boolSelect === 'TRUE');
@@ -104,7 +121,14 @@ const ForceWriteModal = ({ isOpen, onClose, varName, varType, currentValue, live
     }
     const s = inputValue.trim();
     if (!s) { setError('Please enter a value'); return; }
-    if (isInt) {
+    if (isTime) {
+      const us = parseTimeUs(s);
+      if (us === null) { setError('Invalid duration — e.g. T#2h, T#-5s, 1m30s, or an integer µs count'); return; }
+      // Beyond ±2^53 a JS number would round: send the exact decimal string,
+      // which both agents parse as int64.
+      const asNum = Number(us);
+      confirm(Number.isSafeInteger(asNum) ? asNum : us.toString());
+    } else if (isInt) {
       const n = parseIntAny(s);
       if (isNaN(n)) { setError('Invalid integer value'); return; }
       confirm(n);
@@ -168,7 +192,7 @@ const ForceWriteModal = ({ isOpen, onClose, varName, varType, currentValue, live
             <span style={{ color: '#555', fontSize: 12 }}>:</span>
             <span style={{ color: '#4ec9b0', fontSize: 12 }}>{varType}</span>
             <span style={{ color: '#00e676', fontSize: 12, fontFamily: 'Consolas, monospace', marginLeft: 4 }}>
-              = {displayValue(currentValue)}
+              = {displayValue(currentValue, isTime)}
             </span>
           </div>
           <button
@@ -239,8 +263,21 @@ const ForceWriteModal = ({ isOpen, onClose, varName, varType, currentValue, live
           />
         )}
 
+        {/* ── TIME / LTIME ── */}
+        {isTime && (
+          <input
+            type="text"
+            autoFocus
+            value={inputValue}
+            onChange={(e) => { setInputValue(e.target.value); setError(''); }}
+            onKeyDown={sharedKeyDown}
+            placeholder="T#1s500ms, T#-5s, 1h30m, or µs"
+            style={inputStyle}
+          />
+        )}
+
         {/* ── STRING / other ── */}
-        {!isBool && !isInt && !isFloat && (
+        {!isBool && !isInt && !isFloat && !isTime && (
           <input
             type="text"
             autoFocus
@@ -283,7 +320,7 @@ const ForceWriteModal = ({ isOpen, onClose, varName, varType, currentValue, live
             <div style={{ color: '#777', fontSize: 10, marginTop: 5, lineHeight: 1.4 }}>
               {mode === 'pulse'
                 ? 'Writes the value for a single scan; the program keeps running from it.'
-                : 'Holds the value until you Stop the run (the program can’t change it).'}
+                : 'Holds the value until you Release it or Stop the run (the program can’t change it).'}
             </div>
           </div>
         )}
@@ -294,6 +331,12 @@ const ForceWriteModal = ({ isOpen, onClose, varName, varType, currentValue, live
             flex: 1, padding: '7px 0', background: 'transparent',
             border: '1px solid #444', color: '#999', borderRadius: 4, cursor: 'pointer', fontSize: 12
           }}>Cancel</button>
+          <button onClick={release}
+            title="Remove the force on this variable — the program controls it again. Other forces stay."
+            style={{
+              flex: 1, padding: '7px 0', background: 'transparent',
+              border: '1px solid #a5641a', color: '#e0a060', borderRadius: 4, cursor: 'pointer', fontSize: 12
+            }}>Release</button>
           <button onClick={handleSubmit} style={{
             flex: 2, padding: '7px 0', background: '#007acc', border: 'none',
             color: 'white', borderRadius: 4, cursor: 'pointer', fontSize: 12, fontWeight: 'bold'

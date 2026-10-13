@@ -15,6 +15,7 @@ import (
 	"encoding/binary"
 	"math"
 	"net/http"
+	"strconv"
 	"sync"
 	"time"
 )
@@ -37,6 +38,19 @@ func (am *APIManager) sharedRing() (*RingConsumer, error) {
 	am.ring = rc
 	am.ringCtl = newRingController(rc)
 	return rc, nil
+}
+
+// resizeRing (re)sizes the ring segment before a runtime start. When the shared
+// consumer has it mapped the resize goes through RingConsumer.Resize (shrink-
+// safe); otherwise ringMu is held across the truncate so a concurrent
+// sharedRing() cannot map the old, larger size in between.
+func (am *APIManager) resizeRing(bytes uint64) error {
+	am.ringMu.Lock()
+	defer am.ringMu.Unlock()
+	if am.ring != nil {
+		return am.ring.Resize(bytes)
+	}
+	return createRingSegment(am.shmName, bytes)
 }
 
 // ---- adaptive decimation controller ----------------------------------------
@@ -69,6 +83,11 @@ type ringController struct {
 	clients map[int]*ringClientStat
 	nextID  int
 	n       uint32
+	// running is true while a loop() goroutine exists. ⚠️ Only loop() itself
+	// clears it (under mu, when it finds no clients): unregister used to clear
+	// it, and a reconnect inside the 100 ms tick then started a SECOND loop
+	// while the first was still alive — each extra loop doubling the stride
+	// and the reclaim rate.
 	running bool
 }
 
@@ -81,10 +100,17 @@ func (c *ringController) register() int {
 	defer c.mu.Unlock()
 	id := c.nextID
 	c.nextID++
+	if len(c.clients) == 0 {
+		// First client after an idle period: start at full fidelity. The stride
+		// left over from the previous session measured a DIFFERENT link (maybe
+		// a congested one that is long gone); resuming at it delivered a thinned
+		// stream until the controller relaxed it back down.
+		c.n = 1
+	}
 	c.clients[id] = &ringClientStat{}
-	// Resume the producer immediately (don't wait for the first control tick) at
-	// the last-good stride — the runtime is PAUSED (stride_N=0) while no consumer
-	// is connected, so this is what starts capture.
+	// Resume the producer immediately (don't wait for the first control tick) —
+	// the runtime is PAUSED (stride_N=0) while no consumer is connected, so this
+	// is what starts capture.
 	if c.n < 1 {
 		c.n = 1
 	}
@@ -108,20 +134,21 @@ func (c *ringController) report(id int, dBps float64, backlog, readSeq uint64) {
 
 func (c *ringController) unregister(id int) {
 	c.mu.Lock()
+	defer c.mu.Unlock()
 	delete(c.clients, id)
-	idle := len(c.clients) == 0
-	if idle {
-		c.running = false
-		// PAUSE the producer: stride_N=0 tells the runtime to stop writing to the
-		// ring entirely while nobody is listening — no wasted scan cycles and the
-		// ring stops filling RAM. register() resumes it on the next connect.
-		// (c.n is kept as the last-good stride so the next client resumes there.)
-		c.rc.SetStrideN(0)
+	if len(c.clients) != 0 {
+		return
 	}
-	c.mu.Unlock()
-	if idle {
-		c.rc.ReclaimAll() // release the whole ring's pages while idle → RSS ~0
-	}
+	// PAUSE the producer: stride_N=0 tells the runtime to stop writing to the
+	// ring entirely while nobody is listening — no wasted scan cycles and the
+	// ring stops filling RAM. register() resumes it on the next connect.
+	c.rc.SetStrideN(0)
+	// Release the whole ring's pages while idle → RSS ~0.
+	// ⚠️ Under c.mu, NOT after releasing it: a register() slipping in between
+	// would resume the producer and then have its fresh records punched into
+	// holes. Holding c.mu makes "no clients" and the punch one atomic step
+	// (lock order c.mu → rc.mu, same as the control loop).
+	c.rc.ReclaimAll()
 }
 
 // loop is the ~100 ms control tick. AIMD-style: grow the stride fast when the
@@ -131,7 +158,8 @@ func (c *ringController) loop() {
 	defer t.Stop()
 	for range t.C {
 		c.mu.Lock()
-		if !c.running || len(c.clients) == 0 {
+		if len(c.clients) == 0 {
+			c.running = false // only the loop clears it, see the field comment
 			c.mu.Unlock()
 			return
 		}
@@ -166,12 +194,19 @@ func (c *ringController) loop() {
 			}
 		}
 
+		// ⚠️ The analytic floor applies only while there IS a backlog. With
+		// the backlog under ringFillLow the link is keeping up, and D then
+		// measures UTILISATION (what we chose to send), not capacity — at a high
+		// stride there is little to send, so D collapses and ceil(P/(α·D)) held
+		// the stride up by itself: a one-way trap. Below the low watermark we
+		// relax freely; if the link really can't take it, the backlog rises and
+		// the floor / grow-fast branches catch it.
 		switch {
 		case fill > ringFillHigh:
 			n *= 2 // grow-fast: backlog building, halve production now
-		case n < floor:
+		case fill > ringFillLow && n < floor:
 			n = floor // jump up to the sustainable rate
-		case fill < ringFillLow && n > floor && n > 1:
+		case fill < ringFillLow && n > 1:
 			// Shrink toward best fidelity — MULTIPLICATIVELY.
 			//
 			// ⚠️ This was `n--`, one step per 100 ms tick, against a grow branch
@@ -187,9 +222,6 @@ func (c *ringController) loop() {
 				dec = 1
 			}
 			n -= dec
-			if n < floor {
-				n = floor
-			}
 		}
 		if n < 1 {
 			n = 1
@@ -198,33 +230,54 @@ func (c *ringController) loop() {
 			n = ringNmax
 		}
 		c.n = n
-		c.mu.Unlock()
 		c.rc.SetStrideN(n)
 		// Release the pages of records every client has already drained, so the
 		// ring's resident memory tracks the live backlog (not the whole segment).
+		// Under c.mu for the same reason as unregister's ReclaimAll: the set of
+		// clients minRead was computed from must not change under the punch.
 		if minRead != ^uint64(0) {
 			c.rc.Reclaim(minRead)
 		}
+		c.mu.Unlock()
 	}
 }
 
 // ---- GET /api/v1/stream/ring ------------------------------------------------
 
-// Frame (little-endian, one per 5 ms that has ≥1 record):
+// ringFrameVersion is the /api/v1/stream/ring wire format (see RING_FORMAT.md
+// § "Wire frame").
+const ringFrameVersion = 2
+
+// Frame v2 (little-endian, one per 5 ms that has ≥1 record, plus one EMPTY frame
+// whenever the epoch changes so a client learns about a restart at once):
 //
 //	u32 frame_len       bytes after this field
+//	u16 version         2
+//	u16 header_len      bytes from `version` up to the first record (28)
 //	u32 record_count
 //	u32 stride_N        current decimation (client derives effective rate)
-//	u64 dropped_total   cumulative overwrite (lap) losses so far
+//	u64 dropped_total   cumulative records lost (lapped, overwritten, torn, stuck)
+//	u64 epoch           runtime generation; a change = Build & Send / restart:
+//	                    re-fetch /api/v1/ring/info, the payload layout may differ
 //	record_count × record:
 //	    u64 seq
 //	    u16 task_id
 //	    u16 payload_len
+//	    u32 scan        producer's scan counter for task_id (low 32 bits);
+//	                    consecutive records of one task differ by stride_N
 //	    u8  payload[payload_len]
+//
+// ⚠️ ?v=2 is REQUIRED: a v1 client would misread every v2 frame (the version
+// field sits where it expects record_count), so without it the request gets a
+// 400 that names the change instead of a stream it would decode into garbage.
 func (am *APIManager) handleRingStream(w http.ResponseWriter, r *http.Request) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		http.Error(w, "streaming not supported", http.StatusInternalServerError)
+		return
+	}
+	if r.URL.Query().Get("v") != strconv.Itoa(ringFrameVersion) {
+		jsonError(w, http.StatusBadRequest, "ring stream frame format v2 required: add ?v=2 (frames now carry version, epoch and a per-record scan counter — see RING_FORMAT.md)")
 		return
 	}
 	rc, err := am.sharedRing()
@@ -249,7 +302,8 @@ func (am *APIManager) handleRingStream(w http.ResponseWriter, r *http.Request) {
 	// Start from the producer's CURRENT position: no pre-connect history (the
 	// producer was paused while idle anyway), and — since valid seqs are ≥ 1 —
 	// never try to read seq 0 out of an uninitialised slot.
-	readSeq := rc.WriteSeq()
+	var cur RingCursor
+	cur.Reset(rc.WriteSeq())
 	var droppedTotal uint64
 	lastEpoch := rc.Epoch()
 	var recs []RingRecord
@@ -264,9 +318,11 @@ func (am *APIManager) handleRingStream(w http.ResponseWriter, r *http.Request) {
 			// epoch change (runtime restarted) → resync to the new generation's
 			// current write position (write_seq continues monotonically across
 			// restarts, so starting from "now" skips the old run's records).
+			epochChanged := false
 			if e := rc.Epoch(); e != lastEpoch {
 				lastEpoch = e
-				readSeq = rc.WriteSeq()
+				cur.Reset(rc.WriteSeq())
+				epochChanged = true
 			}
 			// bound the frame: at most ringMaxFrameBytes worth of records this tick
 			stride := rc.RecordStride()
@@ -279,27 +335,13 @@ func (am *APIManager) handleRingStream(w http.ResponseWriter, r *http.Request) {
 			}
 			var dropped uint64
 			recs = recs[:0]
-			readSeq, dropped, recs = rc.Drain(readSeq, recs, maxRecs)
+			dropped, recs = rc.DrainCursor(&cur, recs, maxRecs, time.Now())
 			droppedTotal += dropped
-			if len(recs) == 0 {
-				ctl.report(id, dBps, rc.WriteSeq()-readSeq, readSeq)
+			if len(recs) == 0 && !epochChanged {
+				ctl.report(id, dBps, backlogOf(rc.WriteSeq(), cur.ReadSeq), cur.ReadSeq)
 				continue
 			}
-
-			// pack the frame
-			frame = frame[:0]
-			frame = appendU32(frame, 0) // frame_len placeholder
-			frame = appendU32(frame, uint32(len(recs)))
-			frame = appendU32(frame, rc.StrideN())
-			frame = appendU64(frame, droppedTotal)
-			for i := range recs {
-				frame = appendU64(frame, recs[i].Seq)
-				frame = appendU16(frame, recs[i].TaskID)
-				frame = appendU16(frame, uint16(len(recs[i].Payload)))
-				frame = append(frame, recs[i].Payload...)
-			}
-			binary.LittleEndian.PutUint32(frame[0:4], uint32(len(frame)-4))
-
+			frame = appendRingFrame(frame[:0], recs, rc.StrideN(), droppedTotal, lastEpoch)
 			// measure delivery time = link rate (TCP backpressure shows here)
 			t0 := time.Now()
 			if _, err := w.Write(frame); err != nil {
@@ -315,9 +357,44 @@ func (am *APIManager) handleRingStream(w http.ResponseWriter, r *http.Request) {
 					dBps = 0.7*dBps + 0.3*inst // EWMA
 				}
 			}
-			ctl.report(id, dBps, rc.WriteSeq()-readSeq, readSeq)
+			ctl.report(id, dBps, backlogOf(rc.WriteSeq(), cur.ReadSeq), cur.ReadSeq)
 		}
 	}
+}
+
+// ringFrameHeaderLen is the v2 frame header after frame_len: version, header_len,
+// record_count, stride_N, dropped_total, epoch.
+const ringFrameHeaderLen = 2 + 2 + 4 + 4 + 8 + 8
+
+// appendRingFrame encodes one v2 frame (see the format above handleRingStream).
+func appendRingFrame(frame []byte, recs []RingRecord, strideN uint32, dropped, epoch uint64) []byte {
+	start := len(frame)
+	frame = appendU32(frame, 0) // frame_len placeholder
+	frame = appendU16(frame, ringFrameVersion)
+	frame = appendU16(frame, ringFrameHeaderLen)
+	frame = appendU32(frame, uint32(len(recs)))
+	frame = appendU32(frame, strideN)
+	frame = appendU64(frame, dropped)
+	frame = appendU64(frame, epoch)
+	for i := range recs {
+		frame = appendU64(frame, recs[i].Seq)
+		frame = appendU16(frame, recs[i].TaskID)
+		frame = appendU16(frame, uint16(len(recs[i].Payload)))
+		frame = appendU32(frame, recs[i].Scan)
+		frame = append(frame, recs[i].Payload...)
+	}
+	binary.LittleEndian.PutUint32(frame[start:start+4], uint32(len(frame)-start-4))
+	return frame
+}
+
+// backlogOf is write_seq - readSeq, clamped at 0: a resize that invalidated the
+// layout, or a producer whose write_seq was reset, must not report a wrapped
+// uint64 backlog that pins the stride at Nmax.
+func backlogOf(w, readSeq uint64) uint64 {
+	if w <= readSeq {
+		return 0
+	}
+	return w - readSeq
 }
 
 // ---- GET /api/v1/ring/info --------------------------------------------------
@@ -331,6 +408,9 @@ func (am *APIManager) handleRingInfo(w http.ResponseWriter, r *http.Request) {
 	} else {
 		info["available"] = true
 		info["record_stride"] = rc.RecordStride()
+		info["ring_version"] = rc.Version()
+		info["epoch"] = rc.Epoch()
+		info["frame_version"] = ringFrameVersion
 		info["nslots"] = rc.Nslots()
 		info["stride_n"] = rc.StrideN()
 		info["write_seq"] = rc.WriteSeq()

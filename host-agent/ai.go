@@ -122,7 +122,7 @@ type aiChatReq struct {
 //     a `thinking` content block. Measured on claude-opus-5 (the packaged
 //     sign-in default): one agent turn spent the entire 4096 thinking and came
 //     back as content=[thinking] with no text and no tool_use — i.e. the DEAD
-//     TURN the frontend has to defend against (§8), except nothing was wrong
+//     TURN the frontend has to defend against (src/CLAUDE.md), except nothing was wrong
 //     with the history. The user saw the agent go quiet mid-task.
 //   - A tool call that rewrites a POU carries the whole program in its
 //     arguments; a real esc_control ST body is ~19 KB ≈ 6k tokens on its own.
@@ -612,7 +612,7 @@ func callAnthropic(ctx context.Context, req aiChatReq, oauthToken string) (aiMes
 	// outright and names its limit ("max_tokens: 32000 > 8192, which is the
 	// maximum allowed..."). Clamp to what it reported and retry once, so raising
 	// the default cannot make an older/smaller model unusable. The model list is
-	// a LIVE catalogue (§8) — we cannot hold a per-model cap table that stays
+	// a LIVE catalogue (src/CLAUDE.md) — we cannot hold a per-model cap table that stays
 	// true, and the provider is telling us the answer.
 	if lim, ok := parseMaxTokensLimit(err); ok && lim < req.MaxTokens {
 		payload["max_tokens"] = lim

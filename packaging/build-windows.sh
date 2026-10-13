@@ -53,7 +53,7 @@ trap cleanup EXIT
 rm -rf "$TMP"
 mkdir -p "$PAYLOAD" "$CACHE"
 
-# Single source of truth for the version: package.json (§4 of CLAUDE.md).
+# Single source of truth for the version: package.json (CLAUDE.md).
 VERSION="$(node -p "require('$ROOT/package.json').version")"
 
 # ⚠️ Serialise the Vite build. Both scripts emit into the SAME dist/ tree, so
@@ -73,7 +73,7 @@ echo "==> 1/6 Frontend (v$VERSION)"
 frontend_build
 
 echo "==> 2/6 Host agent (windows/amd64)"
-# ⚠️ Release invariant: this cross-build must keep succeeding (CLAUDE.md §4).
+# ⚠️ Release invariant: this cross-build must keep succeeding (CLAUDE.md).
 ( cd "$ROOT/host-agent" && GOOS=windows GOARCH=amd64 \
     go build -ldflags "-X main.appVersion=$VERSION" -o "$PAYLOAD/kron-host-agent.exe" . )
 

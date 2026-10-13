@@ -156,7 +156,7 @@ The agent has **no access to the local disk until the user grants it** with the 
 | `write_file` | Overwrite/create a text file. **Only declared while `allowWrite`.** |
 
 - ⚠️ **The tools are DECLARED to the model only while access is granted** (`FS_TOOL_DEFS` / `FS_WRITE_TOOL_DEFS` are kept OUT of `TOOL_DEFS` and appended in `runTurn`). Declaring them always and refusing at call time was rejected: a model that sees a tool retries it and then explains the failure as a project defect instead of naming the permission it needs. The toggle invalidates the prompt cache once — the right trade.
-- ⚠️ **`resolveInRoot` (AiAgentPanel) is the WHOLE guard** — the host agent's `/api/host/read-file|write-file|list-dir` deliberately do not sandbox (files.go, §12: same-machine trust). It normalizes `.`/`..` into segments and requires the root's segments to be a prefix (case-insensitively on Windows), so `../`, an absolute path elsewhere, and a sibling with a shared prefix all fail. Relative paths resolve against the root. It bounds the MODEL, not a hostile process.
+- ⚠️ **`resolveInRoot` (AiAgentPanel) is the WHOLE guard** — the host agent's `/api/host/read-file|write-file|list-dir` deliberately do not sandbox (files.go, CLAUDE.md security model: same-machine trust). It normalizes `.`/`..` into segments and requires the root's segments to be a prefix (case-insensitively on Windows), so `../`, an absolute path elsewhere, and a sibling with a shared prefix all fail. Relative paths resolve against the root. It bounds the MODEL, not a hostile process.
 - ⚠️ **The I/O runs in the panel, not the executor** — like `watch_live_variables`, `runTurn` awaits the host call and injects `args.__fs = {result|error}`; `applyToolCall` only unwraps it, and a missing `__fs` is reported as "not granted" rather than a silent success.
 - Every file operation also posts a **note into the thread** (`📄 Read …`, `💾 Wrote …`, `🚫 …`) — a file the agent touched must never be invisible. Permission state rides `<project-context>` (volatile ⇒ never the cached system prompt), so a model with no file tools tells the user about the button instead of claiming the editor cannot read files.
 
@@ -169,7 +169,7 @@ The agent has **no access to the local disk until the user grants it** with the 
 | `delete_pou` | Explicit-request only (prompt rule). |
 | `set_st_code` | Replaces the POU's ST: on a unified/SCL POU the body goes into a single `lang:'ST'` rung. Takes ONLY plain statements (no PROGRAM/VAR wrappers, no METHOD — enforced by prompt + recovery strip). |
 | `set_ladder` | Replaces ALL rungs with compiled ladder from the DSL — full spec in §6. |
-| `add_variable` / `update_variable` / `remove_variable` | Local (needs `pou`) or global scope. Types funnel through `resolveVarType`: a scalar IEC type, an existing data-type/FB name, or a one-shot inline `ARRAY[m..n] OF T` that is auto-recovered into a real named data type. Anything else is rejected with instructions to call `create_data_type`. Reserved names (e.g. `S`, the PlcState pointer) are rejected. **`retain: true`** marks the variable RETENTIVE (CLAUDE.md §17) — see below. |
+| `add_variable` / `update_variable` / `remove_variable` | Local (needs `pou`) or global scope. Types funnel through `resolveVarType`: a scalar IEC type, an existing data-type/FB name, or a one-shot inline `ARRAY[m..n] OF T` that is auto-recovered into a real named data type. Anything else is rejected with instructions to call `create_data_type`. Reserved names (e.g. `S`, the PlcState pointer) are rejected. **`retain: true`** marks the variable RETENTIVE (src/services/CLAUDE.md) — see below. |
 | `create_data_type` | Builds the exact `dataTypes` shape the human editors produce (`{name, type:'Array'|'Structure'|'Enumerated', content}`). |
 
 ### `retain` — the one variable field with restart semantics
@@ -264,7 +264,7 @@ The system prompt routes STRICTLY per rung, not per POU:
 
 - boolean interlocks + timers/counters/edges → **ladder** (`set_ladder`, with `fb`) — "timers and counters BELONG in ladder; do NOT switch to ST for them";
 - math/expressions, loops/CASE, motion (MC_*), multi-FB interactions, strings/arrays → **ST** (`set_st_code`);
-- mixing both in one POU is normal — it's one rung list (the unified model, see CLAUDE.md §7).
+- mixing both in one POU is normal — it's one rung list (the unified model, see src/CLAUDE.md).
 
 ---
 
@@ -280,7 +280,7 @@ The system prompt routes STRICTLY per rung, not per POU:
 
 ## 8. System prompt policies (summary)
 
-Built by `buildSystemPrompt(libraryData, agentMode)` — **stable** (rules + library block names only). The live project overview (board, open POU, POU/global/data-type lists, project blocks) travels separately via `buildProjectContext` → the `context` request field → a trailing `<project-context>` block, so Anthropic prompt caching keeps the big prefix cached across turns (see CLAUDE.md §8). ⚠️ Never put per-turn/per-project text back into `buildSystemPrompt`. Key policies (see the source for exact wording):
+Built by `buildSystemPrompt(libraryData, agentMode)` — **stable** (rules + library block names only). The live project overview (board, open POU, POU/global/data-type lists, project blocks) travels separately via `buildProjectContext` → the `context` request field → a trailing `<project-context>` block, so Anthropic prompt caching keeps the big prefix cached across turns (see src/CLAUDE.md). ⚠️ Never put per-turn/per-project text back into `buildSystemPrompt`. Key policies (see the source for exact wording):
 
 - **Clarify-first:** on a material ambiguity, ask 1–3 short questions and emit NO tool calls that turn. Never ask the user to write the code — clarify *requirements* only, once.
 - **"Block" terminology:** a user-named "block" matching a standard block (mc_power→MC_Power) is an FB *instance* of that type — never a plain BOOL with that name.
@@ -318,7 +318,7 @@ Adding a tool:
 3. If it needs panel-side context (library, live values, compiler), inject it as an `args.__*` key in the panel loop and document it in §2.
 4. If it authors editor structures, match the human-editing shape exactly and extend `experiments/agent-check/sample.mjs` to assert it + compile.
 5. Update the system prompt only if the model needs routing/ordering rules for it.
-6. Update this file and CLAUDE.md §8.
+6. Update this file and src/CLAUDE.md.
 
 Known deliberate limits (do not "fix" casually):
 

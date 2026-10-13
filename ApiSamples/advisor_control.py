@@ -24,6 +24,7 @@ import queue
 import threading
 import time
 import tkinter as tk
+import urllib.error
 from tkinter import ttk
 
 from kron_client import KronClient, add_common_args
@@ -82,15 +83,29 @@ class Worker(threading.Thread):
             if not self.client:
                 continue
             try:
-                self._flush()
+                self._authed(self._flush)
                 if time.monotonic() - last_poll >= POLL_PERIOD_S:
                     last_poll = time.monotonic()
-                    values = self.client.variables()
+                    values = self._authed(self.client.variables)
                     self.events.put(("values", {a: values.get(n)
                                                 for a, n in self.by_addr.items()}))
             except Exception as e:  # noqa: BLE001 — surface anything to the UI
-                self.client = None
+                # Giving up: leave the boat stopped, not at the last slider
+                # value, and release the forces this client can no longer hold.
+                self._zero_and_drop(release_forces=True)
                 self.events.put(("error", f"connection lost: {e}"))
+
+    def _authed(self, fn):
+        """Run fn; on 401 re-authenticate ONCE and retry. Tokens expire (8 h)
+        and are revoked when a deploy changes the API password, so a long
+        session must not die on the first 401."""
+        try:
+            return fn()
+        except urllib.error.HTTPError as e:
+            if e.code != 401:
+                raise
+            self.client.auth()
+            return fn()
 
     def _flush(self):
         with self.lock:
@@ -131,15 +146,30 @@ class Worker(threading.Thread):
         except Exception as e:  # noqa: BLE001
             self.events.put(("error", str(e)))
 
-    def _zero_and_drop(self):
-        """Leave the boat stopped and centred, never at the last slider value."""
+    def _zero_and_drop(self, release_forces=False):
+        """Leave the boat stopped and centred, never at the last slider value.
+
+        Best effort, each step on its own: write both commands to 0 (with one
+        re-auth on 401) and, when giving up on a broken connection, release
+        the forces so nothing stays pinned by a client that is gone. A step
+        that fails must not skip the next one. (A deliberate Disconnect keeps
+        the zeros forced, as before — "Release forces" is the user's call.)"""
         if self.client:
-            try:
-                with self.lock:
-                    self.pending = {DRIVE_ADDR: 0.0, RUDDER_ADDR: 0.0}
-                self._flush()
-            except Exception:  # noqa: BLE001 — best effort on the way out
-                pass
+            with self.lock:
+                self.pending = {}
+            for addr in (DRIVE_ADDR, RUDDER_ADDR):
+                name = self.by_addr.get(addr)
+                if not name:
+                    continue
+                try:
+                    self._authed(lambda n=name: self.client.write(n, 0.0))
+                except Exception:  # noqa: BLE001 — best effort on the way out
+                    pass
+            if release_forces:
+                try:
+                    self._authed(self.client.clear_forces)
+                except Exception:  # noqa: BLE001
+                    pass
         self.client = None
 
 

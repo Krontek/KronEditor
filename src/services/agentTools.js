@@ -47,7 +47,7 @@ const isValidIecName = (n) => IEC_NAME_RE.test(String(n || '').trim());
 // (e.g. "no member named prog_X_rxBuffer in struct PlcState").
 const SCALAR_IEC_TYPES = new Set([
   'BOOL', 'SINT', 'INT', 'DINT', 'LINT', 'USINT', 'UINT', 'UDINT', 'ULINT',
-  'REAL', 'LREAL', 'BYTE', 'WORD', 'DWORD', 'LWORD', 'TIME', 'STRING',
+  'REAL', 'LREAL', 'BYTE', 'WORD', 'DWORD', 'LWORD', 'TIME', 'LTIME', 'STRING',
 ]);
 
 export function findPOU(struct, name) {
@@ -196,7 +196,7 @@ function pouTargetError(struct, raw) {
 // Globals a POU actually mentions — scanned over its ST code and every ladder
 // block's variable/pin values. Returned by read_pou so the model can see the
 // declaration of a name it meets in the logic instead of assuming it's missing.
-// ── Retentive (RETAIN) variables (CLAUDE.md §17) ────────────────────────────
+// ── Retentive (RETAIN) variables (src/services/CLAUDE.md) ────────────────────────────
 // The declaration side is the variable's CLASS, matched case-insensitively like
 // every other identifier in this codebase.
 const isRetainClass = (v) => String(v?.class || '').toLowerCase() === 'retain';
@@ -574,7 +574,7 @@ export const TOOL_DEFS = [
       '5s on-delay: rungs: [{ "branches": [[{"contact":"Sensor"}]], "fb": { "type":"TON", "instance":"delayTimer", "inputs": {"PT":"T#5s"}, "outputs": {"ET":"elapsed"} }, "outputs": [{"coil":"Lamp"}] }]. ' +
       'Counter with reset: rungs: [{ "branches": [[{"contact":"PartSensor"}]], "fb": { "type":"CTU", "instance":"partCounter", "inputs": {"PV":"100","R":"ResetBtn"} }, "outputs": [{"coil":"BatchDone"}] }]. ' +
       'STRING pins (a file path, a device name) take QUOTED text: {"PATH":"\'/sys/class/hwmon/hwmon2/fan1_input\'"}. An unquoted word is used as text too, unless a variable of that name is declared — then it reads that variable. ' +
-      'Read_Sys_File / Read_Hwmon return the file text on VALUE (a STRING): compare it in an ST rung with = or <>, or convert it with a STRING_TO_x block. A STRING has no live value, so publish a converted number or a comparison result. ' +
+      'Read_Sys_File / Read_Hwmon return the file text on VALUE (a STRING): compare it in an ST rung with = or <>, or convert it with a STRING_TO_x block. A STRING is a read-only live value (at most 63 bytes; longer text is truncated), so to force or trend it publish a converted number or a comparison result. ' +
       'Note: inline math/move/compare (ADD, MOVE, GT, …) and motion (MC_*) do NOT go in ladder — write those in an ST rung (set_st_code).',
     parameters: S({
       pou: str('Target LD POU name'),

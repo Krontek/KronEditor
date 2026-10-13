@@ -28,7 +28,7 @@ func (s *Server) handleWritePLCFiles(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	buildDir := s.paths.BuildDir()
+	buildDir := s.paths.SimBuildDir() // only the local sim flow writes through here
 	writes := []struct {
 		name    string
 		content string
@@ -183,14 +183,17 @@ func (s *Server) handleWriteFile(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
-// handleDeleteFile removes ONE file, and only from inside the app-data dir.
+// handleDeleteFile removes ONE file, and only from inside <AppDataDir>/esi.
 //
 // ⚠️ Deliberately narrower than read-file/write-file, which take any absolute
 // path. Those are recoverable mistakes; an unbounded delete is not, and nothing
-// in the editor needs one — the only caller is the ESI library, whose files
-// live in <AppDataDir>/esi. Containment is checked on the RESOLVED path (after
+// in the editor needs one — the only caller is the ESI library
+// (EsiLibraryService.js), whose files live in <AppDataDir>/esi. ⚠️ Scoped to
+// esi/, NOT the whole app-data dir: that also holds the Claude OAuth tokens,
+// known_hosts and the build dir's retain.dat, none of which a web page should
+// be able to destroy. Containment is checked on the RESOLVED path (after
 // symlinks and ".." are collapsed) and demands a separator-aligned prefix, so
-// "<appdata>x/evil" cannot pass as "<appdata>/…". Directories are refused.
+// "<esi>x/evil" cannot pass as "<esi>/…". Directories are refused.
 func (s *Server) handleDeleteFile(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeError(w, http.StatusMethodNotAllowed, "POST required")
@@ -201,9 +204,10 @@ func (s *Server) handleDeleteFile(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	root, err := filepath.EvalSymlinks(s.paths.AppDataDir)
+	root, err := filepath.EvalSymlinks(filepath.Join(s.paths.AppDataDir, "esi"))
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "app data dir unavailable: "+err.Error())
+		// No ESI library yet means there is nothing this endpoint may delete.
+		writeError(w, http.StatusNotFound, "ESI library dir unavailable: "+err.Error())
 		return
 	}
 	target, err := filepath.EvalSymlinks(req.Path)
@@ -212,7 +216,7 @@ func (s *Server) handleDeleteFile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !withinDir(root, target) { // ollama.go: separator-aligned prefix test
-		writeError(w, http.StatusForbidden, "refusing to delete outside the app data directory")
+		writeError(w, http.StatusForbidden, "refusing to delete outside the ESI library directory")
 		return
 	}
 	info, err := os.Stat(target)

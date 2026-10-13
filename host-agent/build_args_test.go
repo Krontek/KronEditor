@@ -1,6 +1,27 @@
 package main
 
-import "testing"
+import (
+	"bytes"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+)
+
+// The endpoint takes no compiler flags at all; any are refused before a
+// build dir is even created.
+func TestBuildRefusesCompilerArgs(t *testing.T) {
+	body, _ := json.Marshal(map[string]any{
+		"sources":      map[string]string{"a.c": "int main(void){return 0;}"},
+		"compilerArgs": []string{"-O2"},
+		"compiler":     "clang",
+	})
+	rec := httptest.NewRecorder()
+	handleBuild(rec, httptest.NewRequest(http.MethodPost, "/api/host/build", bytes.NewReader(body)))
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("want 400, got %d: %s", rec.Code, rec.Body)
+	}
+}
 
 // The output-containment check on req.Output is worthless if compilerArgs can
 // redirect the compiler anyway, which is exactly what an unfiltered passthrough

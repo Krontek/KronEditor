@@ -1,7 +1,9 @@
 import React, { useState, useCallback, useRef, useEffect } from 'react';
 import { useTranslation } from 'react-i18next';
 import ForceWriteModal from './common/ForceWriteModal';
-import { formatTimeUs, normalizeTimeLiteral } from '../utils/plcStandards';
+import ForcedMarker, { useForcedSet } from './common/ForcedMarker';
+import { isKeyForced } from '../utils/forcedVars';
+import { formatTimeUs, normalizeTimeLiteral, isTimeType } from '../utils/plcStandards';
 import { liveGet, liveResolveKey, findVarByName } from '../utils/iecNames';
 import { ErrorCodeService } from '../services/ErrorCodeService';
 import ReactFlow, {
@@ -454,6 +456,9 @@ const BlockNode = ({ id, data, selected }) => {
   const { setNodes } = useReactFlow();
   const edges = useEdges();
   const { variables = [], globalVars = [], dataTypes = [], hwPortVars = [], liveVariables = null, errorCodeService = null } = data; // Receive vars from data context
+  // Forced keys come through context, NOT node data: nothing live may enter
+  // mapBlocksToNodes' deps (src/CLAUDE.md), and the set changes rarely.
+  const forcedSet = useForcedSet();
 
   // Build map of array type names → their definitions for validation
   const arrayTypeMap = React.useMemo(() => {
@@ -553,6 +558,7 @@ const BlockNode = ({ id, data, selected }) => {
     }
     const isLiveActive = liveVariables && lookupKey && liveVariables[lookupKey] !== undefined;
     const canForce = !!data.onForceWrite && isLiveActive;
+    const contactForced = !!isLiveActive && isKeyForced(forcedSet, lookupKey);
     const allVars = [...variables, ...globalVars];
     const varDef = findVarByName(allVars, instanceName);
     const varType = varDef?.type || 'BOOL';
@@ -606,17 +612,22 @@ const BlockNode = ({ id, data, selected }) => {
               transform: 'translateX(-50%)',
               background: liveVariables[lookupKey] ? '#00e676' : '#252526',
               color: liveVariables[lookupKey] ? '#000' : '#888',
-              border: `1px solid ${liveVariables[lookupKey] ? '#00e676' : '#888'}`,
+              border: `1px solid ${contactForced ? '#ff1744' : liveVariables[lookupKey] ? '#00e676' : '#888'}`,
               padding: '1px 4px',
               borderRadius: 4,
               fontSize: 8,
               fontWeight: 'bold',
               zIndex: 20,
               cursor: canForce ? 'pointer' : 'default',
-              whiteSpace: 'nowrap'
+              whiteSpace: 'nowrap',
+              display: 'inline-flex',
+              alignItems: 'center',
             }}
           >
             {liveVariables[lookupKey] ? 'TRUE' : 'FALSE'}
+            {contactForced && (
+              <ForcedMarker compact onClick={canForce ? () => setForceModal({ liveKey: lookupKey, varName: instanceName, varType, currentValue: liveVariables?.[lookupKey] }) : undefined} />
+            )}
           </div>
         )}
         {/* Interactive Controls (Top) */}
@@ -950,7 +961,7 @@ const BlockNode = ({ id, data, selected }) => {
             const handleId = `in_${pin.name}`;
             const connected = isHandleConnected(handleId, 'target');
             const normalizedPinType = normalizeEditorPinType(pin.type);
-            const isTime = normalizedPinType === 'TIME';
+            const isTime = isTimeType(normalizedPinType);
             const val = data.values?.[pin.name] || '';
 
             const safeProgName = (data.parentName || "").trim().replace(/\s+/g, '_');
@@ -958,10 +969,11 @@ const BlockNode = ({ id, data, selected }) => {
             const shadowKey = `prog_${safeProgName}_in_${safeInstName}_${pin.name}`;
             const hasShadow = !!(liveVariables && liveVariables[shadowKey] !== undefined);
             // IEC 61131-3 Time Literal Regex
-            // Matches T#..., TIME#... with units d, h, m, s, ms. 
+            // Matches T#…, TIME#…, LT#…, LTIME#… (TIME is signed 64-bit µs, so
+            // a leading sign is legal) with units d, h, m, s, ms, us, ns.
             // Case insensitive.
-            const TIME_FORMAT_REGEX = /^(T|TIME)#-?(\d+(\.\d+)?(ms|d|h|m|s)_?)+$/i;
-            const TIME_CHAR_REGEX = /^[0-9tihmds._#-]*$/i;
+            const TIME_FORMAT_REGEX = /^(LTIME|TIME|LT|T)#[-+]?(\d+(\.\d+)?(ms|us|ns|d|h|m|s)_?)+$/i;
+            const TIME_CHAR_REGEX = /^[0-9tihmdsluen._#+-]*$/i;
 
             const cleanVal = val.replace(/[🌍🏠⊞⊡⊟]/g, '').trim();
             const baseValName = cleanVal.split(/[\[.]/)[0];
@@ -984,6 +996,14 @@ const BlockNode = ({ id, data, selected }) => {
             if (liveVariables && pinLiveVal === undefined) pinLiveVal = liveGet(liveVariables, `prog__${baseValName}`);
             if (liveVariables && pinLiveVal === undefined) pinLiveVal = liveVariables[shadowKey];
             const pinHasLive = pinLiveVal !== undefined;
+            // The key the badge's value came from (same resolution order), for
+            // the force marker.
+            const pinLiveKey = liveVariables
+              ? (liveResolveKey(liveVariables, `prog_${safeProgName}_${baseValName}`)
+                || liveResolveKey(liveVariables, `prog__${baseValName}`)
+                || (liveVariables[shadowKey] !== undefined ? shadowKey : null))
+              : null;
+            const pinForced = pinHasLive && isKeyForced(forcedSet, pinLiveKey);
             // ⚠️ A pin with no variable on it still HAS a value (its shadow field),
             // and hiding the badge until something is assigned is what made block
             // I/O invisible in a running simulation. In an EDITABLE live view
@@ -1017,7 +1037,7 @@ const BlockNode = ({ id, data, selected }) => {
                       const varLiveVal = pinLiveVal;
                       const hasLive = pinHasLive;
                       const liveStr = hasLive
-                        ? (typeof varLiveVal === 'boolean' ? (varLiveVal ? '1' : '0') : (pin.type === 'TIME' ? formatTimeUs(varLiveVal) : String(varLiveVal)))
+                        ? (typeof varLiveVal === 'boolean' ? (varLiveVal ? '1' : '0') : (isTimeType(pin.type) ? formatTimeUs(varLiveVal) : String(varLiveVal)))
                         : '---';
                       // Open the force/pulse dialog for whatever this badge is showing:
                       // the variable assigned to the pin, else the pin's own shadow field.
@@ -1035,7 +1055,7 @@ const BlockNode = ({ id, data, selected }) => {
                           forceCurrent = liveVariables?.[forceKey];
                           forceName = cleanedVal;
                         }
-                        const modalVarType = normalizedPinType === 'TIME' ? 'INT' : (normalizedPinType === 'ANY' ? 'INT' : normalizedPinType);
+                        const modalVarType = normalizedPinType === 'ANY' ? 'INT' : normalizedPinType;
                         setForceModal({ liveKey: forceKey, varName: forceName, varType: modalVarType, currentValue: forceCurrent });
                       };
                       return (
@@ -1068,7 +1088,7 @@ const BlockNode = ({ id, data, selected }) => {
                           minWidth: 36,
                           fontSize: 9,
                           background: hasLive ? 'rgba(0,230,118,0.12)' : 'transparent',
-                          border: `1px solid ${hasLive ? 'rgba(0,230,118,0.4)' : '#444'}`,
+                          border: `1px solid ${pinForced ? '#ff1744' : hasLive ? 'rgba(0,230,118,0.4)' : '#444'}`,
                           color: hasLive ? '#00e676' : '#555',
                           padding: '0px 3px',
                           borderRadius: 2,
@@ -1079,6 +1099,9 @@ const BlockNode = ({ id, data, selected }) => {
                           whiteSpace: 'nowrap'
                         }}>
                           {liveStr}
+                          {pinForced && (
+                            <ForcedMarker compact onClick={data.onForceWrite ? openForceModal : undefined} />
+                          )}
                         </span>
                       );
                     })()}
@@ -1108,7 +1131,7 @@ const BlockNode = ({ id, data, selected }) => {
                           forceCurrent = liveVariables?.[forceKey];
                           forceName = cleanedVal;
                         }
-                        const modalVarType = normalizedPinType === 'TIME' ? 'INT' : (normalizedPinType === 'ANY' ? 'INT' : normalizedPinType);
+                        const modalVarType = normalizedPinType === 'ANY' ? 'INT' : normalizedPinType;
                         setForceModal({ liveKey: forceKey, varName: forceName, varType: modalVarType, currentValue: forceCurrent });
                       }}
                       onChange={(e) => {
@@ -1202,7 +1225,7 @@ const BlockNode = ({ id, data, selected }) => {
             const lv = liveVariables;
             let outLiveVal;
             // ⚠️ The KEY the value came from, kept so a force-write addresses the same
-            // slot the badge is displaying (§7: a force addresses its slot BY KEY, and
+            // slot the badge is displaying (CLAUDE.md: a force addresses its slot BY KEY, and
             // IEC names are case-insensitive — hence liveResolveKey, never the raw name).
             let outLiveKey = null;
             let outForceName = `${data.instanceName || data.type}.${pin.name}`;
@@ -1222,6 +1245,7 @@ const BlockNode = ({ id, data, selected }) => {
               }
             }
             const hasLive = outLiveVal !== undefined;
+            const outForced = hasLive && isKeyForced(forcedSet, outLiveKey);
             // Same policy as the input pins: a value that EXISTS is shown, whether
             // or not a variable was assigned to the pin — an unassigned OUT/Q still
             // produces one, which is exactly what its shadow field holds.
@@ -1231,7 +1255,7 @@ const BlockNode = ({ id, data, selected }) => {
             const liveDisplay = hasLive
               ? (typeof outLiveVal === 'boolean'
                 ? (outLiveVal ? '1' : '0')
-                : pin.type === 'TIME' ? formatTimeUs(outLiveVal) : String(outLiveVal))
+                : isTimeType(pin.type) ? formatTimeUs(outLiveVal) : String(outLiveVal))
               : null;
 
             return (
@@ -1293,7 +1317,7 @@ const BlockNode = ({ id, data, selected }) => {
                               setForceModal({
                                 liveKey: outLiveKey,
                                 varName: outForceName,
-                                varType: (t === 'TIME' || t === 'ANY') ? 'INT' : t,
+                                varType: t === 'ANY' ? 'INT' : t,
                                 currentValue: outLiveVal,
                               });
                               return;
@@ -1311,7 +1335,7 @@ const BlockNode = ({ id, data, selected }) => {
                             minWidth: 36,
                             fontSize: 9,
                             background: isError ? 'rgba(255,23,68,0.15)' : (hasLive ? 'rgba(0,230,118,0.12)' : 'transparent'),
-                            border: `1px solid ${isError ? 'rgba(255,23,68,0.5)' : (hasLive ? 'rgba(0,230,118,0.4)' : '#444')}`,
+                            border: `1px solid ${outForced ? '#ff1744' : isError ? 'rgba(255,23,68,0.5)' : (hasLive ? 'rgba(0,230,118,0.4)' : '#444')}`,
                             color: isError ? '#ff1744' : (hasLive ? '#00e676' : '#555'),
                             padding: '0px 3px',
                             borderRadius: 2,
@@ -1329,6 +1353,12 @@ const BlockNode = ({ id, data, selected }) => {
                             cursor: errInfo ? 'help' : 'default'
                           }}>
                           {hasLive ? liveDisplay : '---'}
+                          {outForced && (
+                            <ForcedMarker compact onClick={data.onForceWrite ? () => {
+                              const t = normalizeEditorPinType(pin.type);
+                              setForceModal({ liveKey: outLiveKey, varName: outForceName, varType: t === 'ANY' ? 'INT' : t, currentValue: outLiveVal });
+                            } : undefined} />
+                          )}
                         </span>
                       );
                     })()}
@@ -1620,8 +1650,8 @@ const RungContainer = ({
           type: block.data.label || block.type,
           values: block.data.values || {},
           onUpdate: (id, val) => onUpdateBlockRef.current(id, val),
-          // ⚠️ Pass `mode` through: the force flag has THREE values (§6 — normal,
-          // FORCE, PULSE) and ForceWriteModal lets the user pick. Dropping the third
+          // ⚠️ Pass `mode` through: the force-write mailbox has distinct ops
+          // (CLAUDE.md — FORCE, PULSE, UNFORCE) and ForceWriteModal lets the user pick. Dropping the third
           // argument here silently collapsed every Pulse into a pinned Force.
           onForceWrite: (key, val, mode) => onForceWriteRef.current?.(key, val, mode),
           variables: variables,

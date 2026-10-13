@@ -58,6 +58,10 @@ func main() {
 	srv := NewServer(cfg, ipc, pm, hmi)
 	// Wire the crash-restart watchdog so it knows when AutoRun is on.
 	pm.SetAutoRunGetter(srv.AutoRunEnabled)
+	// A force-write to a stopped runtime fails at once ("not running") instead
+	// of burning the whole ack timeout. pm.Status takes pm.mu; the write path
+	// never calls this while holding a lock the pre-start hook needs.
+	ipc.SetRuntimeAlive(func() bool { _, running := pm.Status(); return running })
 	// Everything that must be established between "old runtime stopped" and
 	// "new runtime spawned" hangs off this ONE hook, because it is the only
 	// point all four start paths share (StartRuntime, the ConnectRPC Start, the
@@ -66,7 +70,15 @@ func main() {
 	//     runtime's final shm sync would overwrite them;
 	//   • the capture-ring segment — sized here and not in StartRuntime, which
 	//     three of the four paths bypass (see Server.SizeRingSegment).
+	//   • stale force flags — zeroed only when a DIFFERENT variable table was
+	//     deployed since the last start (flags are index-keyed, see
+	//     IPCManager.ClearForcesIfTableChanged), before the initials land;
+	//   • the force-write mailbox — every pending command dropped and the
+	//     mailbox unpublished, so nothing posted to the previous runtime is
+	//     ever applied by the next one (which re-publishes it at init).
 	pm.SetPreStartHook(func() {
+		ipc.ClearForcesIfTableChanged()
+		ipc.ResetMailbox()
 		ipc.WriteInitialValues()
 		srv.SizeRingSegment()
 	})

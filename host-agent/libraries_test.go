@@ -336,7 +336,7 @@ func TestInstallKrontekHeadersPreservesSiblingSubtrees(t *testing.T) {
 // unconditionally, which was invisible while KronHAL was a cloned repo (the
 // wipe was always followed by a fresh copy). Once KronHAL stopped being a repo
 // nothing staged HAL/ any more, so a *successful* Build Libraries run silently
-// deleted all five committed kronhal_*.h files — the headers CLAUDE.md §1 calls
+// deleted all five committed kronhal_*.h files — the headers CLAUDE.md calls
 // the source of truth. They survived only because git tracked them.
 func TestInstallKrontekHeadersLeavesUnbuiltScopesAlone(t *testing.T) {
 	s, resources := newTestServer(t)
@@ -491,7 +491,7 @@ func TestLibraryTargetsMacOnlyOnDarwin(t *testing.T) {
 }
 
 // The same data-loss shape as the HAL case above, but for a single file: no
-// Krontek repo ships kronsystem.h — it is authored in-repo (CLAUDE.md §14) —
+// Krontek repo ships kronsystem.h — it is authored in-repo (src/services/CLAUDE.md) —
 // so the top-level wipe deleted it on every successful run, taking all 25
 // SYSTEM/TIMERS blocks with it. Observed live: a Build Libraries run left
 // `git status` reporting `D resources/krontek-include/kronsystem.h`.

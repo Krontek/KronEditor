@@ -644,7 +644,7 @@ export const COMM_PROTO_BLOCKS = {
 // on the header) and they compile, but the `_Call` does nothing — and some
 // report SUCCESS while doing it: `PCM_Output` sets `OK = EN` on the RPi and
 // Jetson HALs, which is exactly the "indistinguishable from a working read"
-// trap §10 of CLAUDE.md forbids. A human dragging one at least sees the block
+// trap resources/krontek-include/CLAUDE.md forbids. A human dragging one at least sees the block
 // is unfinished; the AI agent has no such cue, so the note rides the catalog.
 // Keep in sync with `kronhal_*.h` — delete an entry when its body lands.
 const BLOCK_NOTES = {

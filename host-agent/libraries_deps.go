@@ -368,7 +368,7 @@ func patchSoemMacosxOsalDefs(path string) error {
 // clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, …) does not exist on
 // Darwin at all (verified — it is a Linux/glibc-only POSIX extension; the
 // loader-host's hotswap_host.c hit the same gap and used mach_wait_until
-// for its high-resolution case, see CLAUDE.md §6 "macOS simulation"). SOEM's
+// for its high-resolution case, see host-agent/CLAUDE.md "macOS simulation"). SOEM's
 // own sleep is not hard-real-time critical enough to need mach_wait_until,
 // so the portable fallback is used instead: convert the absolute monotonic
 // deadline to a relative duration against "now" and hand that to nanosleep.

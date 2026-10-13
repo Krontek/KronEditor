@@ -8,11 +8,15 @@ import (
 	"html"
 	"io"
 	"log/slog"
+	"mime"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
+
+	"github.com/krontek/hotswaplib/shmcmd"
 )
 
 // ---------------------------------------------------------------------------
@@ -123,7 +127,11 @@ func (hm *HMIManager) loadConfig(cfg *HMIConfig) {
 			Salt:         ud.Salt,
 		})
 	}
-	hm.users.LoadUsers(userList)
+	if hm.users.LoadUsers(userList) {
+		// Users, roles or passwords changed: a session issued under the old
+		// set (a removed user, a demoted role) must not live on for its TTL.
+		hm.sessions.Clear()
+	}
 
 	permMap := make(map[string]*pagePermCache)
 	defaultPerm := &pagePermCache{
@@ -193,8 +201,8 @@ type hmiCompJSON struct {
 }
 
 type hmiAuthJSON struct {
-	Users     []hmiUserJSON            `json:"users"`
-	PagePerms map[string]hmiPermJSON   `json:"pagePerms"`
+	Users     []hmiUserJSON          `json:"users"`
+	PagePerms map[string]hmiPermJSON `json:"pagePerms"`
 }
 
 type hmiUserJSON struct {
@@ -220,7 +228,9 @@ func (hm *HMIManager) LoadJSON(data []byte) error {
 		hm.config = nil
 		hm.permMap = nil
 		hm.mu.Unlock()
-		hm.users.LoadUsers(nil)
+		if hm.users.LoadUsers(nil) {
+			hm.sessions.Clear()
+		}
 		hm.log.Info("HMI config cleared (empty layout)")
 		return nil
 	}
@@ -236,7 +246,9 @@ func (hm *HMIManager) LoadJSON(data []byte) error {
 		hm.config = nil
 		hm.permMap = nil
 		hm.mu.Unlock()
-		hm.users.LoadUsers(nil)
+		if hm.users.LoadUsers(nil) {
+			hm.sessions.Clear()
+		}
 		hm.log.Info("HMI config cleared (no pages)")
 		return nil
 	}
@@ -277,12 +289,12 @@ func (hm *HMIManager) LoadJSON(data []byte) error {
 
 	hm.loadConfig(cfg)
 
-	// Persist to disk so the config survives server restarts.
+	// Persist to disk so the config survives server restarts. Atomic (a torn
+	// file would drop every user on the next boot) and 0600: it holds the
+	// users' password hashes and salts.
 	if hm.persistPath != "" {
-		if err := os.MkdirAll(filepath.Dir(hm.persistPath), 0755); err == nil {
-			if werr := os.WriteFile(hm.persistPath, data, 0644); werr != nil {
-				hm.log.Warn("Failed to persist HMI layout to disk", "path", hm.persistPath, "err", werr)
-			}
+		if werr := writeFileAtomic(hm.persistPath, data, 0600); werr != nil {
+			hm.log.Warn("Failed to persist HMI layout to disk", "path", hm.persistPath, "err", werr)
 		}
 	}
 
@@ -484,15 +496,29 @@ func (hm *HMIManager) handleLoginPage(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprint(w, loginHTML(errMsg, base))
 }
 
-// handleLoginSubmit processes the login form.
+// handleLoginSubmit processes a login: POST {"username":…,"password":…}.
+//
+// ⚠️ JSON only (415 otherwise). A form-encoded POST is a "simple" request any
+// web page can fire cross-site without a preflight; requiring
+// application/json forces a preflight that the origin check refuses. The
+// login page submits through fetch for that reason.
 func (hm *HMIManager) handleLoginSubmit(w http.ResponseWriter, r *http.Request) {
 	base := hmiBase(r)
-	username := r.FormValue("username")
-	password := r.FormValue("password")
+	if !requireJSONBody(w, r) {
+		return
+	}
+	var body struct {
+		Username string `json:"username"`
+		Password string `json:"password"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 64<<10)).Decode(&body); err != nil {
+		jsonError(w, http.StatusBadRequest, "invalid JSON")
+		return
+	}
 
-	u, ok := hm.users.Authenticate(username, password)
+	u, ok := hm.users.Authenticate(body.Username, body.Password)
 	if !ok {
-		http.Redirect(w, r, base+"/login?error=Invalid+credentials", http.StatusSeeOther)
+		jsonError(w, http.StatusUnauthorized, "Invalid credentials")
 		return
 	}
 
@@ -505,7 +531,51 @@ func (hm *HMIManager) handleLoginSubmit(w http.ResponseWriter, r *http.Request) 
 		SameSite: http.SameSiteLaxMode,
 		MaxAge:   int(sessionTTL.Seconds()),
 	})
-	http.Redirect(w, r, base+"/", http.StatusSeeOther)
+	jsonOK(w, map[string]any{"ok": true, "redirect": base + "/"})
+}
+
+// requireJSONBody answers 415 unless the request declares a JSON body. See
+// handleLoginSubmit for why this is a CSRF control and not pedantry.
+func requireJSONBody(w http.ResponseWriter, r *http.Request) bool {
+	mt, _, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
+	if err != nil || mt != "application/json" {
+		jsonError(w, http.StatusUnsupportedMediaType, "Content-Type must be application/json")
+		return false
+	}
+	return true
+}
+
+// hmiOriginGuard is the dedicated HMI listener's version of the main server's
+// corsMiddleware (CLAUDE.md): a request carrying an Origin is served only
+// when it is the panel's own origin or a local/private one; anything else is
+// refused with 403 before the handler runs — on every method, since a simple
+// cross-site POST arrives without a preflight. Requests without an Origin
+// (curl, native clients) pass. Same-origin is allowed explicitly because the
+// operator may reach the panel by a plain DNS name, which
+// isAllowedCORSOrigin alone would reject.
+func hmiOriginGuard(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		origin := r.Header.Get("Origin")
+		if origin == "" {
+			next.ServeHTTP(w, r)
+			return
+		}
+		w.Header().Add("Vary", "Origin")
+		if !sameOrigin(origin, r) && !isAllowedCORSOrigin(origin) {
+			http.Error(w, "origin not allowed", http.StatusForbidden)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// sameOrigin reports whether origin names the host this request was sent to.
+func sameOrigin(origin string, r *http.Request) bool {
+	u, err := url.Parse(origin)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") {
+		return false
+	}
+	return strings.EqualFold(u.Host, r.Host)
 }
 
 // handleLogout clears the session cookie.
@@ -636,6 +706,10 @@ func (hm *HMIManager) handleAPILayout(w http.ResponseWriter, r *http.Request) {
 
 // handleAPIVariables returns the current value of all variables.
 func (hm *HMIManager) handleAPIVariables(w http.ResponseWriter, r *http.Request) {
+	if !hm.IsLoaded() {
+		jsonError(w, http.StatusServiceUnavailable, "no HMI deployed")
+		return
+	}
 	if hm.users.Count() > 0 {
 		if _, ok := sessionFromRequest(r, hm.sessions); !ok {
 			jsonError(w, http.StatusUnauthorized, "not authenticated")
@@ -659,21 +733,37 @@ func (hm *HMIManager) handleAPIVariables(w http.ResponseWriter, r *http.Request)
 
 // handleAPIWrite force-writes a variable (operator+ required).
 func (hm *HMIManager) handleAPIWrite(w http.ResponseWriter, r *http.Request) {
-	if hm.users.Count() > 0 {
-		sess, ok := sessionFromRequest(r, hm.sessions)
-		if !ok {
-			jsonError(w, http.StatusUnauthorized, "not authenticated")
-			return
-		}
-		if sess.Role < RoleOperator {
-			jsonError(w, http.StatusForbidden, "insufficient role")
-			return
-		}
+	if !hm.IsLoaded() {
+		jsonError(w, http.StatusServiceUnavailable, "no HMI deployed")
+		return
+	}
+	// Writes need an identity. With no HMI user defined the panel stays
+	// readable (an open display is a legitimate setup), but nobody may force
+	// a value through it: an unauthenticated write endpoint on the plant
+	// network is a remote control for anyone who can reach the port.
+	if hm.users.Count() == 0 {
+		jsonError(w, http.StatusForbidden, "HMI writes require at least one HMI user")
+		return
+	}
+	sess, ok := sessionFromRequest(r, hm.sessions)
+	if !ok {
+		jsonError(w, http.StatusUnauthorized, "not authenticated")
+		return
+	}
+	if sess.Role < RoleOperator {
+		jsonError(w, http.StatusForbidden, "insufficient role")
+		return
+	}
+	if !requireJSONBody(w, r) {
+		return
 	}
 
 	var body struct {
 		Key   string          `json:"key"`
 		Value json.RawMessage `json:"value"`
+		// mode: "force" (default), "pulse" or "unforce". A momentary button
+		// sends force TRUE on press and unforce FALSE on release.
+		Mode string `json:"mode"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		jsonError(w, http.StatusBadRequest, "invalid JSON")
@@ -697,8 +787,13 @@ func (hm *HMIManager) handleAPIWrite(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, http.StatusForbidden, "variable is not addressed (not writable via HMI)")
 		return
 	}
-	if err := hm.ipc.WriteVariable(body.Key, body.Value); err != nil {
+	op, err := shmcmd.ParseOp(body.Mode)
+	if err != nil {
 		jsonError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if err := hm.ipc.WriteVariableMode(body.Key, body.Value, op); err != nil {
+		jsonError(w, shmcmd.HTTPStatus(err), err.Error())
 		return
 	}
 	jsonOK(w, map[string]bool{"ok": true})
@@ -714,12 +809,14 @@ func (hm *HMIManager) handleAPIUsersGet(w http.ResponseWriter, r *http.Request) 
 // ---------------------------------------------------------------------------
 
 func loginHTML(errMsg, base string) string {
-	errBlock := ""
-	if errMsg != "" {
-		// errMsg comes straight from the ?error= query parameter on BOTH
-		// listeners — escape it or it is reflected XSS on the login page.
-		errBlock = `<div class="err">` + html.EscapeString(errMsg) + `</div>`
+	// errMsg comes straight from the ?error= query parameter on BOTH
+	// listeners — escape it or it is reflected XSS on the login page.
+	errText := html.EscapeString(errMsg)
+	errHidden := ""
+	if errMsg == "" {
+		errHidden = " hidden"
 	}
+	baseJS, _ := json.Marshal(base)
 	return `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -745,8 +842,8 @@ button:hover{background:#0090ee}
 <div class="card">
   <h1>KronHMI</h1>
   <p class="sub">Sign in to access the control panel</p>
-  ` + errBlock + `
-  <form method="POST" action="` + base + `/login">
+  <div class="err" id="err"` + errHidden + `>` + errText + `</div>
+  <form id="login" method="POST" action="` + base + `/login">
     <label>Username</label>
     <input name="username" type="text" autocomplete="username" autofocus required>
     <label>Password</label>
@@ -755,6 +852,28 @@ button:hover{background:#0090ee}
   </form>
   <p class="logo">KronEditor PLC</p>
 </div>
+<script>
+// The login endpoint accepts JSON only (a CSRF control, see handleLoginSubmit),
+// so the form is submitted through fetch instead of a native form POST.
+const BASE = ` + string(baseJS) + `;
+document.getElementById('login').addEventListener('submit', async (ev) => {
+  ev.preventDefault();
+  const f = ev.target, err = document.getElementById('err');
+  try {
+    const r = await fetch(BASE + '/login', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({username: f.username.value, password: f.password.value}),
+    });
+    const data = await r.json().catch(() => ({}));
+    if (r.ok) { window.location.href = BASE + '/'; return; }
+    err.textContent = data.error || ('Sign-in failed (HTTP ' + r.status + ')');
+  } catch (e) {
+    err.textContent = 'Sign-in failed: ' + e;
+  }
+  err.hidden = false;
+});
+</script>
 </body>
 </html>`
 }
@@ -853,17 +972,75 @@ let currentPage = 0;
 let variables = {};
 
 function resolveVar(expr){
-  if(!expr)return null;
+  if(typeof expr!=='string'||!expr)return null;
   const t=expr.trim();const d=t.indexOf('.');
   if(d>0){const p=t.slice(0,d).replace(/\s+/g,'_');const v=t.slice(d+1).replace(/\s+/g,'_');return 'prog_'+p+'_'+v;}
   return t.replace(/\s+/g,'_');
 }
 function getVal(expr){const k=resolveVar(expr);return k?variables[k]:undefined;}
-function fmtVal(v,dec){if(v===null||v===undefined)return'---';if(typeof v==='boolean')return v?'TRUE':'FALSE';const n=Number(v);return isNaN(n)?String(v):n.toFixed(Number(dec)||0);}
+// ⚠️ Every component prop comes from /deploy/hmi-layout, an unauthenticated
+// upload, so NOTHING from it may reach innerHTML or free-form CSS: text goes
+// through textContent, numbers through num()/nz(), colours through the strict
+// col() whitelist (a free CSS value carries url(...) beacons), enumerations
+// through fixed sets. The DOM is built with createElement only.
+const COLOR_RE=/^(#[0-9a-fA-F]{3,8}|[a-zA-Z]{1,30}|(rgb|rgba|hsl|hsla)\(\s*-?[0-9.]+%?(\s*[,\s\/]\s*-?[0-9.]+%?){2,3}\s*\))$/;
+function col(v,d){return(typeof v==='string'&&COLOR_RE.test(v.trim()))?v.trim():d;}
+function num(v,d){if(v===null||v===undefined||v==='')return d;const n=Number(v);return isFinite(n)?n:d;}
+function nz(v,d){return num(v,0)||d;}  // mirrors the old "p.x || default" semantics
+function dec(v){return Math.min(20,Math.max(0,Math.floor(num(v,0))));}
+function txt(v){return(v===null||v===undefined)?'':String(v);}
+function fw(v){const s=txt(v);return/^(normal|bold|bolder|lighter|[1-9]00)$/.test(s)?s:'normal';}
+function mk(tag,css,kids){
+  const e=document.createElement(tag);
+  if(css)for(const k in css){if(css[k]!==undefined&&css[k]!==null)e.style.setProperty(k,String(css[k]));}
+  (kids||[]).forEach(c=>{if(c!==null&&c!==undefined&&c!==false)e.appendChild(typeof c==='string'?document.createTextNode(c):c);});
+  return e;
+}
+function span(text,css){return mk('span',css,[txt(text)]);}
+function fmtVal(v,d){if(v===null||v===undefined)return'---';if(typeof v==='boolean')return v?'TRUE':'FALSE';const n=Number(v);return isNaN(n)?String(v):n.toFixed(dec(d));}
 function isOn(v){return v===true||v===1||v==='TRUE'||v==='1';}
 
-async function sendWrite(key,value){
-  try{await fetch(BASE+'/api/write',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({key,value})});}catch(e){}
+// Writes are SERIALISED PER KEY: a momentary press (force TRUE) and its
+// release (unforce FALSE) must reach the PLC in that order, and two fetches in
+// flight can complete in either order. The server answers only after the
+// runtime applied the command, so chaining on the response is exact.
+const writeChains={};
+function sendWrite(key,value,mode){
+  const prev=writeChains[key]||Promise.resolve();
+  const next=prev.then(async()=>{
+    try{
+      const r=await fetch(BASE+'/api/write',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({key,value,mode:mode||'force'})});
+      if(!r.ok){let m=r.statusText;try{m=(await r.json()).error||m;}catch(e){}console.warn('HMI write '+key+': '+m);}
+    }catch(e){console.warn('HMI write '+key+': '+e);}
+  });
+  writeChains[key]=next;
+  next.then(()=>{if(writeChains[key]===next)delete writeChains[key];});
+  return next;
+}
+// Momentary button: press = force TRUE (held while pressed), release = unforce
+// writing FALSE once, so the logic owns the bit again. Pointer capture keeps
+// the release on this element even when the finger/cursor slides off, and
+// pointercancel (touch scroll, alt-tab, lost capture) counts as a release — a
+// missed release would leave the bit forced TRUE.
+function bindMomentary(btn,lk,onCol,offCol){
+  let down=false;
+  btn.style.touchAction='none';
+  btn.addEventListener('pointerdown',e=>{
+    if(down||e.button>0)return;
+    down=true;
+    try{btn.setPointerCapture(e.pointerId);}catch(_){}
+    btn.style.background=onCol;
+    sendWrite(lk,true,'force');
+  });
+  const release=()=>{
+    if(!down)return;
+    down=false;
+    btn.style.background=offCol;
+    sendWrite(lk,false,'unforce');
+  };
+  btn.addEventListener('pointerup',release);
+  btn.addEventListener('pointercancel',release);
+  btn.addEventListener('lostpointercapture',release);
 }
 
 async function loadLayout(){
@@ -878,11 +1055,11 @@ async function loadLayout(){
 
 function buildPageTabs(){
   const bar=document.getElementById('page-tabs');
-  bar.innerHTML='';
+  bar.textContent='';
   pages.forEach((pg,i)=>{
     const btn=document.createElement('button');
     btn.className='ptab'+(i===currentPage?' active':'');
-    btn.textContent=pg.name;
+    btn.textContent=txt(pg.name);
     btn.onclick=()=>{currentPage=i;document.querySelectorAll('.ptab').forEach((b,j)=>b.className='ptab'+(j===i?' active':''));renderPage(i);};
     bar.appendChild(btn);
   });
@@ -891,75 +1068,123 @@ function buildPageTabs(){
 function renderPage(idx){
   const pg=pages[idx];
   const canvas=document.getElementById('hmi-canvas');
-  canvas.style.width=(pg.canvasW||1280)+'px';
-  canvas.style.height=(pg.canvasH||800)+'px';
-  canvas.innerHTML='';
+  if(!pg){canvas.textContent='';return;}
+  canvas.style.width=nz(pg.canvasW,1280)+'px';
+  canvas.style.height=nz(pg.canvasH,800)+'px';
+  canvas.textContent='';
   (pg.components||[]).forEach(comp=>renderComp(canvas,comp,pg.canWrite||false));
   updateLive();
 }
 
 function renderComp(canvas,comp,pageCanWrite){
-  const p=comp.props||{};
+  const p=(comp.props&&typeof comp.props==='object')?comp.props:{};
   const canWrite=pageCanWrite&&comp.canWrite&&MY_LEVEL>=2;
-  const el=document.createElement('div');
+  const cid=txt(comp.id);
+  const W=num(comp.w,0),H=num(comp.h,0);
+  const fs=(v,d)=>nz(v,d)+'px';
+  const full={width:'100%',height:'100%'};
+  const el=mk('div',{left:num(comp.x,0)+'px',top:num(comp.y,0)+'px',width:W+'px',height:H+'px'});
   el.className='hmi-comp';
-  el.id='comp_'+comp.id;
-  el.style.cssText='left:'+comp.x+'px;top:'+comp.y+'px;width:'+comp.w+'px;height:'+comp.h+'px';
+  el.id='comp_'+cid;
 
   switch(comp.type){
     case'LED':{
-      const s=Math.min(comp.w,comp.h)*0.68;
-      el.innerHTML='<div class="led-wrap"><div class="led-circle" id="led_'+comp.id+'" style="width:'+s+'px;height:'+s+'px"></div>'+(p.label&&p.label.trim?p.label.trim()?'<span style="font-size:'+(p.fontSize||11)+'px;color:#aaa">'+p.label+'</span>':''  :'' )+'</div>';
+      const s=Math.min(W,H)*0.68;
+      const c=mk('div',{width:s+'px',height:s+'px'});c.className='led-circle';c.id='led_'+cid;
+      const lbl=(typeof p.label==='string'&&p.label.trim())?span(p.label,{'font-size':fs(p.fontSize,11),color:'#aaa'}):null;
+      const w=mk('div',null,[c,lbl]);w.className='led-wrap';
+      el.appendChild(w);
       break;}
     case'ALARM':{
-      const sz=Math.min(comp.w,comp.h)*0.7;
-      el.innerHTML='<div style="width:100%;height:100%;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:4px"><svg id="alarm_'+comp.id+'" width="'+sz+'" height="'+sz+'" viewBox="0 0 24 24"><path d="M12 2L1 21h22L12 2z" fill="'+(p.inactiveColor||'#2a2a2a')+'" stroke="#444" stroke-width="1"/><text x="12" y="17" text-anchor="middle" fill="#fff" font-size="7" font-weight="bold">!</text></svg>'+(p.label?'<span id="alarmlbl_'+comp.id+'" style="font-size:'+(p.fontSize||12)+'px;font-weight:600">'+p.label+'</span>':'')+'</div>';
+      const sz=Math.min(W,H)*0.7;const NS='http://www.w3.org/2000/svg';
+      const svg=document.createElementNS(NS,'svg');
+      svg.id='alarm_'+cid;svg.setAttribute('width',String(sz));svg.setAttribute('height',String(sz));svg.setAttribute('viewBox','0 0 24 24');
+      const path=document.createElementNS(NS,'path');
+      path.setAttribute('d','M12 2L1 21h22L12 2z');path.setAttribute('fill',col(p.inactiveColor,'#2a2a2a'));path.setAttribute('stroke','#444');path.setAttribute('stroke-width','1');
+      const t=document.createElementNS(NS,'text');
+      [['x','12'],['y','17'],['text-anchor','middle'],['fill','#fff'],['font-size','7'],['font-weight','bold']].forEach(a=>t.setAttribute(a[0],a[1]));
+      t.textContent='!';
+      svg.appendChild(path);svg.appendChild(t);
+      let lbl=null;
+      if(p.label){lbl=span(p.label,{'font-size':fs(p.fontSize,12),'font-weight':'600'});lbl.id='alarmlbl_'+cid;}
+      el.appendChild(mk('div',Object.assign({display:'flex','flex-direction':'column','align-items':'center','justify-content':'center',gap:'4px'},full),[svg,lbl]));
       break;}
     case'NUMERIC_DISPLAY':{
-      el.innerHTML='<div class="num-display" style="background:'+(p.background||'#0a0f14')+';border:1px solid '+(p.borderColor||'#1e2a38')+'"><span id="num_'+comp.id+'" style="font-size:'+Math.min(p.fontSize||24,comp.h*.7)+'px;color:'+(p.color||'#4ec9b0')+';font-weight:700">---</span>'+(p.unit?'<span style="font-size:'+Math.max((p.fontSize||24)*.45,10)+'px;color:#666">'+p.unit+'</span>':'')+'</div>';
+      const f=nz(p.fontSize,24);
+      const n=span('---',{'font-size':Math.min(f,H*.7)+'px',color:col(p.color,'#4ec9b0'),'font-weight':'700'});n.id='num_'+cid;
+      const u=p.unit?span(p.unit,{'font-size':Math.max(f*.45,10)+'px',color:'#666'}):null;
+      const d=mk('div',{background:col(p.background,'#0a0f14'),border:'1px solid '+col(p.borderColor,'#1e2a38')},[n,u]);d.className='num-display';
+      el.appendChild(d);
       break;}
     case'PROGRESS':{
-      el.innerHTML='<div style="width:100%;height:100%;display:flex;flex-direction:column;justify-content:center;gap:2px">'+(p.label?'<span style="font-size:10px;color:#777;padding-left:2px">'+p.label+'</span>':'')+'<div class="progress-bar" style="flex:1;background:'+(p.background||'#1a1a1a')+';border:1px solid '+(p.borderColor||'#2a2a2a')+'"><div id="prog_'+comp.id+'" class="progress-fill" style="background:'+(p.color||'#007acc')+';width:0%"></div>'+(p.showValue?'<div id="progval_'+comp.id+'" class="progress-val">0</div>':'')+'</div></div>';
+      const fill=mk('div',{background:col(p.color,'#007acc'),width:'0%'});fill.className='progress-fill';fill.id='prog_'+cid;
+      let pv=null;if(p.showValue){pv=mk('div',null,['0']);pv.className='progress-val';pv.id='progval_'+cid;}
+      const bar=mk('div',{flex:'1',background:col(p.background,'#1a1a1a'),border:'1px solid '+col(p.borderColor,'#2a2a2a')},[fill,pv]);bar.className='progress-bar';
+      const lbl=p.label?span(p.label,{'font-size':'10px',color:'#777','padding-left':'2px'}):null;
+      el.appendChild(mk('div',Object.assign({display:'flex','flex-direction':'column','justify-content':'center',gap:'2px'},full),[lbl,bar]));
       break;}
     case'BUTTON':{
       const disabled=!canWrite;
-      el.innerHTML='<div class="hmi-btn" id="btn_'+comp.id+'" style="background:'+(p.offColor||'#252525')+';border:1px solid '+(p.borderColor||'#3a3a3a')+';border-radius:'+(p.borderRadius||3)+'px;cursor:'+(disabled?'not-allowed':'pointer')+';opacity:'+(disabled?.6:1)+'"><span style="font-size:'+(p.fontSize||13)+'px;color:'+(p.textColor||'#fff')+';font-weight:500;pointer-events:none">'+(p.label||'Button')+'</span></div>';
+      const btn=mk('div',{background:col(p.offColor,'#252525'),border:'1px solid '+col(p.borderColor,'#3a3a3a'),'border-radius':nz(p.borderRadius,3)+'px',cursor:disabled?'not-allowed':'pointer',opacity:disabled?'.6':'1'},
+        [span(p.label||'Button',{'font-size':fs(p.fontSize,13),color:col(p.textColor,'#fff'),'font-weight':'500','pointer-events':'none'})]);
+      btn.className='hmi-btn';btn.id='btn_'+cid;
+      el.appendChild(btn);
       if(!disabled){
-        const btn=el.querySelector('#btn_'+comp.id);const lk=resolveVar(p.variable);
+        const lk=resolveVar(p.variable);
         if(lk){if(p.mode==='toggle'){btn.onclick=()=>sendWrite(lk,!isOn(variables[lk]));}
-        else{btn.onmousedown=()=>{btn.style.background=p.onColor||'#007acc';sendWrite(lk,true);};btn.onmouseup=btn.onmouseleave=()=>{btn.style.background=p.offColor||'#252525';sendWrite(lk,false);};}
+        else{bindMomentary(btn,lk,col(p.onColor,'#007acc'),col(p.offColor,'#252525'));}
         }
       }break;}
     case'TOGGLE_BUTTON':{
       const disabled=!canWrite;
-      el.innerHTML='<div class="hmi-btn" id="tbtn_'+comp.id+'" style="background:'+(p.offColor||'#252525')+';border:1px solid '+(p.borderColor||'#3a3a3a')+';border-radius:'+(p.borderRadius||3)+'px;cursor:'+(disabled?'not-allowed':'pointer')+';opacity:'+(disabled?.6:1)+'"><span id="tbtnlbl_'+comp.id+'" style="font-size:'+(p.fontSize||13)+'px;color:'+(p.textColor||'#fff')+';font-weight:600;letter-spacing:.06em;pointer-events:none">'+(p.labelOff||'OFF')+'</span></div>';
-      if(!disabled){const lk=resolveVar(p.variable);if(lk)el.querySelector('#tbtn_'+comp.id).onclick=()=>sendWrite(lk,!isOn(variables[lk]));}
+      const lbl=span(p.labelOff||'OFF',{'font-size':fs(p.fontSize,13),color:col(p.textColor,'#fff'),'font-weight':'600','letter-spacing':'.06em','pointer-events':'none'});lbl.id='tbtnlbl_'+cid;
+      const btn=mk('div',{background:col(p.offColor,'#252525'),border:'1px solid '+col(p.borderColor,'#3a3a3a'),'border-radius':nz(p.borderRadius,3)+'px',cursor:disabled?'not-allowed':'pointer',opacity:disabled?'.6':'1'},[lbl]);
+      btn.className='hmi-btn';btn.id='tbtn_'+cid;
+      el.appendChild(btn);
+      if(!disabled){const lk=resolveVar(p.variable);if(lk)btn.onclick=()=>sendWrite(lk,!isOn(variables[lk]));}
       break;}
     case'SWITCH':{
-      const tw=Math.min(comp.w*.56,54),th=Math.min(comp.h*.52,28),thumb=th-4;
+      const tw=Math.min(W*.56,54),th=Math.min(H*.52,28),thumb=th-4;
       const disabled=!canWrite;
-      el.innerHTML='<div style="width:100%;height:100%;display:flex;align-items:center;justify-content:center;gap:8px"><div id="sw_'+comp.id+'" class="sw-track" style="width:'+tw+'px;height:'+th+'px;background:'+(p.offColor||'#333')+';cursor:'+(disabled?'not-allowed':'pointer')+'"><div id="swt_'+comp.id+'" class="sw-thumb" style="top:2px;left:2px;width:'+thumb+'px;height:'+thumb+'px"></div></div>'+(p.label?'<span style="font-size:'+(p.fontSize||12)+'px;color:#aaa">'+p.label+'</span>':'')+'</div>';
-      if(!disabled){const lk=resolveVar(p.variable);const sw=el.querySelector('#sw_'+comp.id);sw.__tw=tw;sw.__thumb=thumb;if(lk)sw.onclick=()=>sendWrite(lk,!isOn(variables[lk]));}
+      const knob=mk('div',{top:'2px',left:'2px',width:thumb+'px',height:thumb+'px'});knob.className='sw-thumb';knob.id='swt_'+cid;
+      const sw=mk('div',{width:tw+'px',height:th+'px',background:col(p.offColor,'#333'),cursor:disabled?'not-allowed':'pointer'},[knob]);sw.className='sw-track';sw.id='sw_'+cid;
+      sw.__tw=tw;sw.__thumb=thumb;
+      const lbl=p.label?span(p.label,{'font-size':fs(p.fontSize,12),color:'#aaa'}):null;
+      el.appendChild(mk('div',Object.assign({display:'flex','align-items':'center','justify-content':'center',gap:'8px'},full),[sw,lbl]));
+      if(!disabled){const lk=resolveVar(p.variable);if(lk)sw.onclick=()=>sendWrite(lk,!isOn(variables[lk]));}
       break;}
     case'SLIDER':{
       const disabled=!canWrite;
       const lk=resolveVar(p.variable);
-      el.innerHTML='<div style="width:100%;height:100%;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:2px;padding:0 8px"><input id="slider_'+comp.id+'" type="range" min="'+(p.min||0)+'" max="'+(p.max||100)+'" step="'+(p.step||1)+'" value="'+(p.min||0)+'" '+(disabled?'disabled':'')+' style="width:100%;accent-color:'+(p.thumbColor||'#007acc')+';">'+(p.showValue?'<span id="slv_'+comp.id+'" style="font-size:10px;color:#888;font-family:monospace">'+(p.min||0)+'</span>':'')+'</div>';
-      if(!disabled&&lk){const sl=el.querySelector('#slider_'+comp.id);sl.oninput=e=>{const sv=document.getElementById('slv_'+comp.id);if(sv)sv.textContent=e.target.value;sendWrite(lk,Number(e.target.value));};}
+      const mn=nz(p.min,0);
+      const sl=mk('input',{width:'100%','accent-color':col(p.thumbColor,'#007acc')});
+      sl.id='slider_'+cid;sl.type='range';sl.min=String(mn);sl.max=String(nz(p.max,100));sl.step=String(nz(p.step,1));sl.value=String(mn);sl.disabled=disabled;
+      let sv=null;if(p.showValue){sv=span(String(mn),{'font-size':'10px',color:'#888','font-family':'monospace'});sv.id='slv_'+cid;}
+      el.appendChild(mk('div',Object.assign({display:'flex','flex-direction':'column','align-items':'center','justify-content':'center',gap:'2px',padding:'0 8px'},full),[sl,sv]));
+      if(!disabled&&lk){sl.oninput=e=>{if(sv)sv.textContent=e.target.value;sendWrite(lk,Number(e.target.value));};}
       break;}
     case'LABEL':{
-      el.innerHTML='<div class="lbl-comp" style="background:'+(p.background||'transparent')+';justify-content:'+(p.align==='center'?'center':p.align==='right'?'flex-end':'flex-start')+'"><span id="lbl_'+comp.id+'" style="font-size:'+(p.fontSize||13)+'px;font-weight:'+(p.fontWeight||'normal')+';color:'+(p.color||'#d4d4d4')+';white-space:nowrap;overflow:hidden;text-overflow:ellipsis">'+(p.text||'')+'</span></div>';
+      const lbl=span(p.text,{'font-size':fs(p.fontSize,13),'font-weight':fw(p.fontWeight),color:col(p.color,'#d4d4d4'),'white-space':'nowrap',overflow:'hidden','text-overflow':'ellipsis'});lbl.id='lbl_'+cid;
+      const box=mk('div',{background:col(p.background,'transparent'),'justify-content':p.align==='center'?'center':p.align==='right'?'flex-end':'flex-start'},[lbl]);box.className='lbl-comp';
+      el.appendChild(box);
       break;}
     case'RECTANGLE':{
-      el.innerHTML='<div style="width:100%;height:100%;background:'+(p.background||'transparent')+';border:'+(p.borderWidth||1)+'px solid '+(p.borderColor||'#444')+';border-radius:'+(p.borderRadius||0)+'px">'+(p.label?'<span style="font-size:'+(p.fontSize||11)+'px;color:'+(p.labelColor||'#888')+';padding:2px 6px">'+p.label+'</span>':'')+'</div>';break;}
+      const lbl=p.label?span(p.label,{'font-size':fs(p.fontSize,11),color:col(p.labelColor,'#888'),padding:'2px 6px'}):null;
+      el.appendChild(mk('div',Object.assign({background:col(p.background,'transparent'),border:nz(p.borderWidth,1)+'px solid '+col(p.borderColor,'#444'),'border-radius':nz(p.borderRadius,0)+'px'},full),[lbl]));
+      break;}
     case'CIRCLE':{
-      const sz=Math.min(comp.w,comp.h);
-      el.innerHTML='<div style="width:100%;height:100%;display:flex;align-items:center;justify-content:center"><div style="width:'+sz+'px;height:'+sz+'px;border-radius:50%;background:'+(p.background||'transparent')+';border:'+(p.borderWidth||1)+'px solid '+(p.borderColor||'#444')+'"></div></div>';break;}
+      const sz=Math.min(W,H);
+      const c=mk('div',{width:sz+'px',height:sz+'px','border-radius':'50%',background:col(p.background,'transparent'),border:nz(p.borderWidth,1)+'px solid '+col(p.borderColor,'#444')});
+      el.appendChild(mk('div',Object.assign({display:'flex','align-items':'center','justify-content':'center'},full),[c]));
+      break;}
     case'LINE':{
       const horiz=(p.orientation||'horizontal')==='horizontal';
-      el.innerHTML='<div style="width:100%;height:100%;display:flex;align-items:center;justify-content:center"><div style="width:'+(horiz?'100%':(p.thickness||1)+'px')+';height:'+(horiz?(p.thickness||1)+'px':'100%')+';background:'+(p.color||'#444')+'"></div></div>';break;}
+      const t=nz(p.thickness,1)+'px';
+      const l=mk('div',{width:horiz?'100%':t,height:horiz?t:'100%',background:col(p.color,'#444')});
+      el.appendChild(mk('div',Object.assign({display:'flex','align-items':'center','justify-content':'center'},full),[l]));
+      break;}
     default:
-      el.innerHTML='<div style="width:100%;height:100%;display:flex;align-items:center;justify-content:center;border:1px dashed #333;color:#444;font-size:11px">'+comp.type+'</div>';
+      el.appendChild(mk('div',Object.assign({display:'flex','align-items':'center','justify-content':'center',border:'1px dashed #333',color:'#444','font-size':'11px'},full),[txt(comp.type)]));
   }
   canvas.appendChild(el);
 }
@@ -967,19 +1192,20 @@ function renderComp(canvas,comp,pageCanWrite){
 function updateLive(){
   const pg=pages[currentPage];if(!pg)return;
   (pg.components||[]).forEach(comp=>{
-    const p=comp.props||{};
+    const p=(comp.props&&typeof comp.props==='object')?comp.props:{};
+    const cid=txt(comp.id);
     const val=getVal(p.variable);
     const on=isOn(val);
     switch(comp.type){
-      case'LED':{const c=document.getElementById('led_'+comp.id);if(c){c.style.background=on?(p.onColor||'#00e676'):(p.offColor||'#1a1a1a');c.style.boxShadow=on?'0 0 12px '+(p.onColor||'#00e676')+',0 0 20px '+(p.onColor||'#00e676')+'55':'inset 0 2px 6px rgba(0,0,0,.5)';}break;}
-      case'ALARM':{const a=document.getElementById('alarm_'+comp.id);if(a){const path=a.querySelector('path');if(path)path.setAttribute('fill',on?(p.activeColor||'#f14c4c'):(p.inactiveColor||'#2a2a2a'));}const lbl=document.getElementById('alarmlbl_'+comp.id);if(lbl)lbl.style.color=on?(p.activeColor||'#f14c4c'):'#555';break;}
-      case'NUMERIC_DISPLAY':{const n=document.getElementById('num_'+comp.id);if(n)n.textContent=fmtVal(val,p.decimals);break;}
-      case'PROGRESS':{const mn=Number(p.min)||0,mx=Number(p.max)||100,v=Math.min(mx,Math.max(mn,Number(val)||mn));const pct=mx>mn?((v-mn)/(mx-mn))*100:0;const bar=document.getElementById('prog_'+comp.id);if(bar)bar.style.width=pct+'%';const pv=document.getElementById('progval_'+comp.id);if(pv)pv.textContent=v.toFixed(0);break;}
-      case'TOGGLE_BUTTON':{const tb=document.getElementById('tbtn_'+comp.id);const tl=document.getElementById('tbtnlbl_'+comp.id);if(tb)tb.style.background=on?(p.onColor||'#007a4d'):(p.offColor||'#252525');if(tl)tl.textContent=on?(p.labelOn||'ON'):(p.labelOff||'OFF');break;}
-      case'BUTTON':{if(p.mode==='toggle'){const btn=document.getElementById('btn_'+comp.id);if(btn)btn.style.background=on?(p.onColor||'#007acc'):(p.offColor||'#252525');}break;}
-      case'SWITCH':{const sw=document.getElementById('sw_'+comp.id);const swt=document.getElementById('swt_'+comp.id);if(sw&&swt){sw.style.background=on?(p.onColor||'#007acc'):(p.offColor||'#333');const tw=sw.__tw||54,thumb=sw.__thumb||24;swt.style.left=on?(tw-thumb-2)+'px':'2px';}break;}
-      case'SLIDER':{const sl=document.getElementById('slider_'+comp.id);if(sl&&val!==undefined)sl.value=Number(val);const sv=document.getElementById('slv_'+comp.id);if(sv&&val!==undefined)sv.textContent=Number(val).toFixed(0);break;}
-      case'LABEL':{const lbl=document.getElementById('lbl_'+comp.id);if(lbl){if(p.variable&&val!==undefined){const n=Number(val);lbl.textContent=isNaN(n)?String(val):n.toFixed(p.decimals||0)+(p.unit?' '+p.unit:'');}else lbl.textContent=p.text||'';}break;}
+      case'LED':{const c=document.getElementById('led_'+cid);if(c){const oc=col(p.onColor,'#00e676');c.style.background=on?oc:col(p.offColor,'#1a1a1a');c.style.boxShadow=on?'0 0 12px '+oc+',0 0 20px '+oc+'55':'inset 0 2px 6px rgba(0,0,0,.5)';}break;}
+      case'ALARM':{const a=document.getElementById('alarm_'+cid);if(a){const path=a.querySelector('path');if(path)path.setAttribute('fill',on?col(p.activeColor,'#f14c4c'):col(p.inactiveColor,'#2a2a2a'));}const lbl=document.getElementById('alarmlbl_'+cid);if(lbl)lbl.style.color=on?col(p.activeColor,'#f14c4c'):'#555';break;}
+      case'NUMERIC_DISPLAY':{const n=document.getElementById('num_'+cid);if(n)n.textContent=fmtVal(val,p.decimals);break;}
+      case'PROGRESS':{const mn=nz(p.min,0),mx=nz(p.max,100),v=Math.min(mx,Math.max(mn,num(val,mn)));const pct=mx>mn?((v-mn)/(mx-mn))*100:0;const bar=document.getElementById('prog_'+cid);if(bar)bar.style.width=pct+'%';const pv=document.getElementById('progval_'+cid);if(pv)pv.textContent=v.toFixed(0);break;}
+      case'TOGGLE_BUTTON':{const tb=document.getElementById('tbtn_'+cid);const tl=document.getElementById('tbtnlbl_'+cid);if(tb)tb.style.background=on?col(p.onColor,'#007a4d'):col(p.offColor,'#252525');if(tl)tl.textContent=on?txt(p.labelOn||'ON'):txt(p.labelOff||'OFF');break;}
+      case'BUTTON':{if(p.mode==='toggle'){const btn=document.getElementById('btn_'+cid);if(btn)btn.style.background=on?col(p.onColor,'#007acc'):col(p.offColor,'#252525');}break;}
+      case'SWITCH':{const sw=document.getElementById('sw_'+cid);const swt=document.getElementById('swt_'+cid);if(sw&&swt){sw.style.background=on?col(p.onColor,'#007acc'):col(p.offColor,'#333');const tw=sw.__tw||54,thumb=sw.__thumb||24;swt.style.left=on?(tw-thumb-2)+'px':'2px';}break;}
+      case'SLIDER':{if(val===null||val===undefined)break;const sl=document.getElementById('slider_'+cid);if(sl)sl.value=String(num(val,0));const sv=document.getElementById('slv_'+cid);if(sv)sv.textContent=num(val,0).toFixed(0);break;}
+      case'LABEL':{const lbl=document.getElementById('lbl_'+cid);if(lbl){if(p.variable&&val!==undefined){if(val===null){lbl.textContent='---';}else{const n=Number(val);lbl.textContent=isNaN(n)?String(val):n.toFixed(dec(p.decimals))+(p.unit?' '+txt(p.unit):'');}}else lbl.textContent=txt(p.text);}break;}
     }
   });
 }
