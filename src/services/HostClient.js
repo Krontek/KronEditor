@@ -149,12 +149,11 @@ export class HostClient {
   async liveSubscribe(prefixes = [], names = []) {
     return _post(this._p('/api/host/live-subscribe'), { prefixes, names });
   }
-  // mode: 'force' (hold every scan, default), 'pulse' (write once, the logic
-  // resumes from it on the same scan) or 'unforce' (release; a non-null value
-  // is also written once). Resolves only after the runtime applied it.
-  async writeVariable(name, value, mode = 'force') {
+  // One-shot write: applied once, the PLC logic owns the value again from the
+  // same scan. Resolves only after the runtime applied it.
+  async writeVariable(name, value) {
     return _post(this._p('/api/host/write-variable'), {
-      name, value: value === null || value === undefined ? '' : String(value), mode,
+      name, value: value === null || value === undefined ? '' : String(value),
     });
   }
 
@@ -237,7 +236,9 @@ export class HostClient {
   }
   async pollHmiWrites() {
     const j = await _post(this._p('/api/host/poll-hmi-writes'), {});
-    return j.writes || [];
+    // Only key + value: a stale `mode` from an old HMI page is dropped — every
+    // write is one-shot.
+    return (j.writes || []).map(w => ({ key: w.key, value: w.value }));
   }
 
   // ── AI Agent (local models via Ollama) ─────────────────────────────────────
@@ -369,12 +370,6 @@ export class HostClient {
   }
   async hotswapStop() {
     return _post(this._p('/api/host/hotswap/stop'), {});
-  }
-
-  // Release EVERY force of the running local hot-swap sim (one CLEAR_ALL
-  // mailbox command; resolves after the runtime applied it).
-  async hotswapClearForces() {
-    return _post(this._p('/api/host/hotswap/clear-forces'), {});
   }
 
   // Field hot-swap (deployed KronServer target)

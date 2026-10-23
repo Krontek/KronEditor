@@ -6,7 +6,7 @@ import (
 )
 
 // IEC TIME/LTIME are signed 64-bit microseconds (kronstandard.h). The pollers
-// and the force-write encoder used to treat TIME as a uint32, so T#2h wrapped
+// and the write encoder used to treat TIME as a uint32, so T#2h wrapped
 // and T#-5s could not be represented at all.
 func TestTimeIsSigned64BitMicroseconds(t *testing.T) {
 	for _, typ := range []string{"TIME", "LTIME", "time"} {

@@ -8,6 +8,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"strconv"
 	"sync/atomic"
@@ -98,47 +99,37 @@ func (s *PLCService) Stop(_ context.Context, _ *connect.Request[plcv1.StopReques
 	return connect.NewResponse(&plcv1.StopResponse{}), nil
 }
 
-// WriteVar posts a force-write command and returns once the runtime applied it.
-// req.mode selects force (default) / pulse / unforce.
+// WriteVar posts a one-shot write and returns once the runtime applied it.
+// req.mode must be empty or "write" (forcing was removed — see
+// shmcmd.CheckWriteMode).
 func (s *PLCService) WriteVar(_ context.Context, req *connect.Request[plcv1.WriteVarRequest]) (*connect.Response[plcv1.WriteVarResponse], error) {
 	name := req.Msg.GetName()
 	if name == "" {
 		return nil, connect.NewError(connect.CodeInvalidArgument, nil)
 	}
-	op, err := shmcmd.ParseOp(req.Msg.GetMode())
-	if err != nil {
+	if err := shmcmd.CheckWriteMode(req.Msg.GetMode()); err != nil {
 		return nil, connect.NewError(connect.CodeInvalidArgument, err)
 	}
 	v := req.Msg.GetValue()
-	if v == nil && op != shmcmd.OpUnforce {
-		return nil, connect.NewError(connect.CodeInvalidArgument, nil)
+	if v == nil {
+		return nil, connect.NewError(connect.CodeInvalidArgument, errors.New("value is required"))
 	}
-	// Re-marshal the protobuf Value to JSON for ipc.WriteVariableMode. A
-	// 64-bit integer arrives as a decimal STRING (a Value number is a double)
-	// and normalizeRawValue parses it exactly.
-	var raw []byte
-	if v != nil {
-		if raw, err = json.Marshal(v.AsInterface()); err != nil {
-			return nil, connect.NewError(connect.CodeInvalidArgument, err)
-		}
+	// Re-marshal the protobuf Value to JSON for ipc.WriteVariable. A 64-bit
+	// integer arrives as a decimal STRING (a Value number is a double) and
+	// normalizeRawValue parses it exactly.
+	raw, err := json.Marshal(v.AsInterface())
+	if err != nil {
+		return nil, connect.NewError(connect.CodeInvalidArgument, err)
 	}
-	if err := s.ipc.WriteVariableMode(name, json.RawMessage(raw), op); err != nil {
+	if err := s.ipc.WriteVariable(name, json.RawMessage(raw)); err != nil {
 		slog.Warn("Failed to write variable", "name", name, "err", err)
 		return nil, connect.NewError(connectCodeFor(err), err)
 	}
-	slog.Info("Variable written", "name", name, "mode", req.Msg.GetMode())
+	slog.Info("Variable written", "name", name)
 	return connect.NewResponse(&plcv1.WriteVarResponse{}), nil
 }
 
-// ClearAllForces removes all force flags.
-func (s *PLCService) ClearAllForces(_ context.Context, _ *connect.Request[plcv1.ClearAllForcesRequest]) (*connect.Response[plcv1.ClearAllForcesResponse], error) {
-	if err := s.ipc.ClearAllForces(); err != nil {
-		return nil, connect.NewError(connectCodeFor(err), err)
-	}
-	return connect.NewResponse(&plcv1.ClearAllForcesResponse{}), nil
-}
-
-// connectCodeFor maps a force-write failure to a ConnectRPC code.
+// connectCodeFor maps a write failure to a ConnectRPC code.
 func connectCodeFor(err error) connect.Code {
 	switch shmcmd.KindOf(err) {
 	case shmcmd.KindNotRunning, shmcmd.KindNotReady, shmcmd.KindMismatch:

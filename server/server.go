@@ -4,7 +4,6 @@
 //   /plc.v1.PLCService/Start
 //   /plc.v1.PLCService/Stop
 //   /plc.v1.PLCService/WriteVar
-//   /plc.v1.PLCService/ClearAllForces
 //   /plc.v1.PLCService/StreamVars  ← server streaming, pushes every 50 ms
 //
 // HTTP endpoints (unchanged):
@@ -16,9 +15,8 @@
 //   POST /api/v1/auth              → authenticate, receive bearer token
 //   GET  /api/v1/variables         → all addressed variables
 //   GET  /api/v1/variables/{name}  → single addressed variable
-//   POST /api/v1/variables/{name}  → write addressed variable
+//   POST /api/v1/variables/{name}  → write addressed variable (one-shot)
 //   GET  /api/v1/stream            → SSE stream (addressed only, 50 ms)
-//   POST /api/v1/forces/clear      → clear force flags
 
 package main
 
@@ -32,7 +30,6 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
-	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -468,9 +465,6 @@ func (s *Server) loadStoredVariableTable() {
 			"path", path, "err", err)
 		return
 	}
-	// Whatever force flags survived in /dev/shm were set against this same
-	// table, so the first start after an agent restart must keep them.
-	s.ipc.MarkTableStarted()
 	slog.Info("variable_table.json loaded on startup",
 		"path", path, "variables", s.ipc.VariableCount())
 }
@@ -866,36 +860,6 @@ func streamVarMatcher(q url.Values) func(string) bool {
 	}
 }
 
-// forcedStreamKey is the reserved /stream/vars key carrying the forced set:
-// a JSON array of variable names (sorted), e.g. "__forced": ["prog__x"]. No
-// variable can collide with it — every table name starts with "prog_".
-const forcedStreamKey = "__forced"
-
-// forcedResendEvery bounds how stale a client's forced set can be if it missed
-// a change event (the key is otherwise sent only when the set changes).
-const forcedResendEvery = 2 * time.Second
-
-// forcedTracker decides when a stream carries the forced set: on the first
-// event of a connection (so a fresh or reconnected client learns it), whenever
-// it changes (an empty list included — that is how a client learns the last
-// force was released) and at least every forcedResendEvery.
-type forcedTracker struct {
-	last     []string
-	sent     bool
-	lastSent time.Time
-}
-
-func (t *forcedTracker) next(cur []string, now time.Time) ([]string, bool) {
-	if t.sent && slices.Equal(cur, t.last) && now.Sub(t.lastSent) < forcedResendEvery {
-		return nil, false
-	}
-	if cur == nil {
-		cur = []string{}
-	}
-	t.last, t.sent, t.lastSent = cur, true, now
-	return cur, true
-}
-
 // handleSSEVars pushes variable values every streamInterval (50 ms) via
 // Server-Sent Events. Used by Tauri/WebKit clients where fetch streaming is
 // buffered end-to-end. Cadence is intentionally fixed — this is the editor
@@ -913,7 +877,6 @@ func (s *Server) handleSSEVars(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("X-Accel-Buffering", "no") // disable nginx buffering
 
 	match := streamVarMatcher(r.URL.Query())
-	var ft forcedTracker
 	slog.Info("SSE stream started", "remote", r.RemoteAddr, "filtered", match != nil)
 	ticker := time.NewTicker(streamInterval)
 	heartbeat := time.NewTicker(25 * time.Second)
@@ -939,12 +902,6 @@ func (s *Server) handleSSEVars(w http.ResponseWriter, r *http.Request) {
 			// integer past 2^53 travels as a decimal string instead.
 			for k, v := range vars {
 				vars[k] = jsonSafe64(v)
-			}
-			// The forced set ignores the subscription on purpose: the
-			// editor's force list must show EVERY forced variable, not
-			// only the ones on screen.
-			if forced, send := ft.next(s.ipc.ForcedVariables(false), time.Now()); send {
-				vars[forcedStreamKey] = forced
 			}
 			data, err := json.Marshal(vars)
 			if err != nil {

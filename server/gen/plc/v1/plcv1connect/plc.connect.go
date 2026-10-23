@@ -39,9 +39,6 @@ const (
 	PLCServiceStopProcedure = "/plc.v1.PLCService/Stop"
 	// PLCServiceWriteVarProcedure is the fully-qualified name of the PLCService's WriteVar RPC.
 	PLCServiceWriteVarProcedure = "/plc.v1.PLCService/WriteVar"
-	// PLCServiceClearAllForcesProcedure is the fully-qualified name of the PLCService's ClearAllForces
-	// RPC.
-	PLCServiceClearAllForcesProcedure = "/plc.v1.PLCService/ClearAllForces"
 	// PLCServiceStreamVarsProcedure is the fully-qualified name of the PLCService's StreamVars RPC.
 	PLCServiceStreamVarsProcedure = "/plc.v1.PLCService/StreamVars"
 )
@@ -52,10 +49,9 @@ type PLCServiceClient interface {
 	Start(context.Context, *connect.Request[v1.StartRequest]) (*connect.Response[v1.StartResponse], error)
 	// Stop gracefully terminates the PLC runtime.
 	Stop(context.Context, *connect.Request[v1.StopRequest]) (*connect.Response[v1.StopResponse], error)
-	// WriteVar force-writes a variable value into shared memory.
+	// WriteVar writes a variable value ONCE (the PLC logic owns it again from
+	// the same scan) and returns after the runtime applied it.
 	WriteVar(context.Context, *connect.Request[v1.WriteVarRequest]) (*connect.Response[v1.WriteVarResponse], error)
-	// ClearAllForces removes all force flags so the PLC resumes normal sync.
-	ClearAllForces(context.Context, *connect.Request[v1.ClearAllForcesRequest]) (*connect.Response[v1.ClearAllForcesResponse], error)
 	// StreamVars pushes all variable values every 50 ms (server streaming).
 	StreamVars(context.Context, *connect.Request[v1.StreamVarsRequest]) (*connect.ServerStreamForClient[v1.VarsUpdate], error)
 }
@@ -89,12 +85,6 @@ func NewPLCServiceClient(httpClient connect.HTTPClient, baseURL string, opts ...
 			connect.WithSchema(pLCServiceMethods.ByName("WriteVar")),
 			connect.WithClientOptions(opts...),
 		),
-		clearAllForces: connect.NewClient[v1.ClearAllForcesRequest, v1.ClearAllForcesResponse](
-			httpClient,
-			baseURL+PLCServiceClearAllForcesProcedure,
-			connect.WithSchema(pLCServiceMethods.ByName("ClearAllForces")),
-			connect.WithClientOptions(opts...),
-		),
 		streamVars: connect.NewClient[v1.StreamVarsRequest, v1.VarsUpdate](
 			httpClient,
 			baseURL+PLCServiceStreamVarsProcedure,
@@ -106,11 +96,10 @@ func NewPLCServiceClient(httpClient connect.HTTPClient, baseURL string, opts ...
 
 // pLCServiceClient implements PLCServiceClient.
 type pLCServiceClient struct {
-	start          *connect.Client[v1.StartRequest, v1.StartResponse]
-	stop           *connect.Client[v1.StopRequest, v1.StopResponse]
-	writeVar       *connect.Client[v1.WriteVarRequest, v1.WriteVarResponse]
-	clearAllForces *connect.Client[v1.ClearAllForcesRequest, v1.ClearAllForcesResponse]
-	streamVars     *connect.Client[v1.StreamVarsRequest, v1.VarsUpdate]
+	start      *connect.Client[v1.StartRequest, v1.StartResponse]
+	stop       *connect.Client[v1.StopRequest, v1.StopResponse]
+	writeVar   *connect.Client[v1.WriteVarRequest, v1.WriteVarResponse]
+	streamVars *connect.Client[v1.StreamVarsRequest, v1.VarsUpdate]
 }
 
 // Start calls plc.v1.PLCService.Start.
@@ -128,11 +117,6 @@ func (c *pLCServiceClient) WriteVar(ctx context.Context, req *connect.Request[v1
 	return c.writeVar.CallUnary(ctx, req)
 }
 
-// ClearAllForces calls plc.v1.PLCService.ClearAllForces.
-func (c *pLCServiceClient) ClearAllForces(ctx context.Context, req *connect.Request[v1.ClearAllForcesRequest]) (*connect.Response[v1.ClearAllForcesResponse], error) {
-	return c.clearAllForces.CallUnary(ctx, req)
-}
-
 // StreamVars calls plc.v1.PLCService.StreamVars.
 func (c *pLCServiceClient) StreamVars(ctx context.Context, req *connect.Request[v1.StreamVarsRequest]) (*connect.ServerStreamForClient[v1.VarsUpdate], error) {
 	return c.streamVars.CallServerStream(ctx, req)
@@ -144,10 +128,9 @@ type PLCServiceHandler interface {
 	Start(context.Context, *connect.Request[v1.StartRequest]) (*connect.Response[v1.StartResponse], error)
 	// Stop gracefully terminates the PLC runtime.
 	Stop(context.Context, *connect.Request[v1.StopRequest]) (*connect.Response[v1.StopResponse], error)
-	// WriteVar force-writes a variable value into shared memory.
+	// WriteVar writes a variable value ONCE (the PLC logic owns it again from
+	// the same scan) and returns after the runtime applied it.
 	WriteVar(context.Context, *connect.Request[v1.WriteVarRequest]) (*connect.Response[v1.WriteVarResponse], error)
-	// ClearAllForces removes all force flags so the PLC resumes normal sync.
-	ClearAllForces(context.Context, *connect.Request[v1.ClearAllForcesRequest]) (*connect.Response[v1.ClearAllForcesResponse], error)
 	// StreamVars pushes all variable values every 50 ms (server streaming).
 	StreamVars(context.Context, *connect.Request[v1.StreamVarsRequest], *connect.ServerStream[v1.VarsUpdate]) error
 }
@@ -177,12 +160,6 @@ func NewPLCServiceHandler(svc PLCServiceHandler, opts ...connect.HandlerOption) 
 		connect.WithSchema(pLCServiceMethods.ByName("WriteVar")),
 		connect.WithHandlerOptions(opts...),
 	)
-	pLCServiceClearAllForcesHandler := connect.NewUnaryHandler(
-		PLCServiceClearAllForcesProcedure,
-		svc.ClearAllForces,
-		connect.WithSchema(pLCServiceMethods.ByName("ClearAllForces")),
-		connect.WithHandlerOptions(opts...),
-	)
 	pLCServiceStreamVarsHandler := connect.NewServerStreamHandler(
 		PLCServiceStreamVarsProcedure,
 		svc.StreamVars,
@@ -197,8 +174,6 @@ func NewPLCServiceHandler(svc PLCServiceHandler, opts ...connect.HandlerOption) 
 			pLCServiceStopHandler.ServeHTTP(w, r)
 		case PLCServiceWriteVarProcedure:
 			pLCServiceWriteVarHandler.ServeHTTP(w, r)
-		case PLCServiceClearAllForcesProcedure:
-			pLCServiceClearAllForcesHandler.ServeHTTP(w, r)
 		case PLCServiceStreamVarsProcedure:
 			pLCServiceStreamVarsHandler.ServeHTTP(w, r)
 		default:
@@ -220,10 +195,6 @@ func (UnimplementedPLCServiceHandler) Stop(context.Context, *connect.Request[v1.
 
 func (UnimplementedPLCServiceHandler) WriteVar(context.Context, *connect.Request[v1.WriteVarRequest]) (*connect.Response[v1.WriteVarResponse], error) {
 	return nil, connect.NewError(connect.CodeUnimplemented, errors.New("plc.v1.PLCService.WriteVar is not implemented"))
-}
-
-func (UnimplementedPLCServiceHandler) ClearAllForces(context.Context, *connect.Request[v1.ClearAllForcesRequest]) (*connect.Response[v1.ClearAllForcesResponse], error) {
-	return nil, connect.NewError(connect.CodeUnimplemented, errors.New("plc.v1.PLCService.ClearAllForces is not implemented"))
 }
 
 func (UnimplementedPLCServiceHandler) StreamVars(context.Context, *connect.Request[v1.StreamVarsRequest], *connect.ServerStream[v1.VarsUpdate]) error {

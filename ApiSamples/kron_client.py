@@ -18,8 +18,7 @@ variable_table.json happens to expose.
 Endpoints used (server/API.md is the full reference):
     POST /api/v1/auth                -> bearer token (8 h)
     GET  /api/v1/variables[/{name}]  -> read
-    POST /api/v1/variables/{name}    -> write (force / pulse / unforce), acked
-    POST /api/v1/forces/clear        -> release all forces
+    POST /api/v1/variables/{name}    -> one-shot write, acked
     GET|POST /api/v1/runtime[...]    -> status / start / stop / config
     GET  /api/v1/stream              -> SSE snapshots (latest value per tick)
     GET  /api/v1/ring/info           -> capture-ring header + payload layout
@@ -79,23 +78,17 @@ class KronClient:
         """One variable with metadata: {name, value, type, address}."""
         return self._request("GET", f"/api/v1/variables/{name}")
 
-    def write(self, name, value, mode="force"):
-        """Write a value; returns once the PLC runtime has APPLIED it.
+    def write(self, name, value):
+        """Write a value ONCE; returns once the PLC runtime has APPLIED it.
 
-        mode: "force" (default — pinned until released), "pulse" (written once,
-        the program owns it from the same scan) or "unforce" (release the pin;
-        a non-None value is also written once). Errors: 409 runtime not running
-        or runtime/server version mismatch, 503 command mailbox full, 504 the
-        runtime did not acknowledge in time (nothing was applied).
-        A 64-bit integer beyond +-2**53 is sent as a decimal string, exactly.
+        The program owns the value again from that same scan (forcing was
+        removed), so write inputs/setpoints the logic only reads. Errors: 409
+        runtime not running or runtime/server version mismatch, 503 command
+        mailbox full, 504 the runtime did not acknowledge in time (nothing was
+        applied). A 64-bit integer beyond +-2**53 is sent as a decimal string,
+        exactly.
         """
-        body = {"value": value}
-        if mode != "force":
-            body["mode"] = mode
-        return self._request("POST", f"/api/v1/variables/{name}", body)
-
-    def clear_forces(self):
-        return self._request("POST", "/api/v1/forces/clear")
+        return self._request("POST", f"/api/v1/variables/{name}", {"value": value})
 
     # ── runtime ──────────────────────────────────────────────────────────────
     def runtime(self):

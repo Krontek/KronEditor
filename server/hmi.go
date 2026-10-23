@@ -731,14 +731,14 @@ func (hm *HMIManager) handleAPIVariables(w http.ResponseWriter, r *http.Request)
 	jsonOK(w, vars)
 }
 
-// handleAPIWrite force-writes a variable (operator+ required).
+// handleAPIWrite writes a variable once (operator+ required).
 func (hm *HMIManager) handleAPIWrite(w http.ResponseWriter, r *http.Request) {
 	if !hm.IsLoaded() {
 		jsonError(w, http.StatusServiceUnavailable, "no HMI deployed")
 		return
 	}
 	// Writes need an identity. With no HMI user defined the panel stays
-	// readable (an open display is a legitimate setup), but nobody may force
+	// readable (an open display is a legitimate setup), but nobody may write
 	// a value through it: an unauthenticated write endpoint on the plant
 	// network is a remote control for anyone who can reach the port.
 	if hm.users.Count() == 0 {
@@ -761,8 +761,8 @@ func (hm *HMIManager) handleAPIWrite(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		Key   string          `json:"key"`
 		Value json.RawMessage `json:"value"`
-		// mode: "force" (default), "pulse" or "unforce". A momentary button
-		// sends force TRUE on press and unforce FALSE on release.
+		// mode: optional, "" or "write" only — forcing was removed, and a
+		// "force"/"pulse"/"unforce" request is refused (400).
 		Mode string `json:"mode"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
@@ -776,7 +776,7 @@ func (hm *HMIManager) handleAPIWrite(w http.ResponseWriter, r *http.Request) {
 	}
 	// HMI writes are restricted to ADDRESSED variables — mirroring the read
 	// feed (handleAPIVariables) and the REST API. Without this, any internal
-	// variable could be force-written by name from a crafted request.
+	// variable could be written by name from a crafted request.
 	//
 	// KNOWN GAP: per-page writeRoles are only enforced in the UI (canWrite in
 	// the layout response); a server-side variable→page mapping is not
@@ -787,12 +787,11 @@ func (hm *HMIManager) handleAPIWrite(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, http.StatusForbidden, "variable is not addressed (not writable via HMI)")
 		return
 	}
-	op, err := shmcmd.ParseOp(body.Mode)
-	if err != nil {
+	if err := shmcmd.CheckWriteMode(body.Mode); err != nil {
 		jsonError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	if err := hm.ipc.WriteVariableMode(body.Key, body.Value, op); err != nil {
+	if err := hm.ipc.WriteVariable(body.Key, body.Value); err != nil {
 		jsonError(w, shmcmd.HTTPStatus(err), err.Error())
 		return
 	}
@@ -1000,16 +999,16 @@ function span(text,css){return mk('span',css,[txt(text)]);}
 function fmtVal(v,d){if(v===null||v===undefined)return'---';if(typeof v==='boolean')return v?'TRUE':'FALSE';const n=Number(v);return isNaN(n)?String(v):n.toFixed(dec(d));}
 function isOn(v){return v===true||v===1||v==='TRUE'||v==='1';}
 
-// Writes are SERIALISED PER KEY: a momentary press (force TRUE) and its
-// release (unforce FALSE) must reach the PLC in that order, and two fetches in
+// Writes are SERIALISED PER KEY: a momentary press (write TRUE) and its
+// release (write FALSE) must reach the PLC in that order, and two fetches in
 // flight can complete in either order. The server answers only after the
-// runtime applied the command, so chaining on the response is exact.
+// runtime applied the write, so chaining on the response is exact.
 const writeChains={};
-function sendWrite(key,value,mode){
+function sendWrite(key,value){
   const prev=writeChains[key]||Promise.resolve();
   const next=prev.then(async()=>{
     try{
-      const r=await fetch(BASE+'/api/write',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({key,value,mode:mode||'force'})});
+      const r=await fetch(BASE+'/api/write',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({key,value})});
       if(!r.ok){let m=r.statusText;try{m=(await r.json()).error||m;}catch(e){}console.warn('HMI write '+key+': '+m);}
     }catch(e){console.warn('HMI write '+key+': '+e);}
   });
@@ -1017,11 +1016,12 @@ function sendWrite(key,value,mode){
   next.then(()=>{if(writeChains[key]===next)delete writeChains[key];});
   return next;
 }
-// Momentary button: press = force TRUE (held while pressed), release = unforce
-// writing FALSE once, so the logic owns the bit again. Pointer capture keeps
-// the release on this element even when the finger/cursor slides off, and
-// pointercancel (touch scroll, alt-tab, lost capture) counts as a release — a
-// missed release would leave the bit forced TRUE.
+// Momentary button: press = write TRUE once, release = write FALSE once. Both
+// are one-shot writes (forcing was removed), so the logic owns the bit between
+// them: logic that assigns the variable every scan overrides the press. Pointer
+// capture keeps the release on this element even when the finger/cursor slides
+// off, and pointercancel (touch scroll, alt-tab, lost capture) counts as a
+// release — a missed release would leave the bit TRUE.
 function bindMomentary(btn,lk,onCol,offCol){
   let down=false;
   btn.style.touchAction='none';
@@ -1030,13 +1030,13 @@ function bindMomentary(btn,lk,onCol,offCol){
     down=true;
     try{btn.setPointerCapture(e.pointerId);}catch(_){}
     btn.style.background=onCol;
-    sendWrite(lk,true,'force');
+    sendWrite(lk,true);
   });
   const release=()=>{
     if(!down)return;
     down=false;
     btn.style.background=offCol;
-    sendWrite(lk,false,'unforce');
+    sendWrite(lk,false);
   };
   btn.addEventListener('pointerup',release);
   btn.addEventListener('pointercancel',release);

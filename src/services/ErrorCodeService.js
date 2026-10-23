@@ -25,6 +25,13 @@ export class ErrorCodeService {
     // tell "documented: nothing to report" from "this block is undocumented".
     /** @type {Map<string, string>} */
     this.notes = new Map();
+    // <shared> codes per library, and the library each block was catalogued
+    // in. MC_ReadAxisError.AxisErrorID carries an AXIS-level code (the shared
+    // 100 = MC_ERR_AXIS), not a code of the block, so it resolves here.
+    /** @type {Map<string, Map<number, {code:number, name:string, text:string}>>} */
+    this.shared = new Map();
+    /** @type {Map<string, string>} */
+    this.blockLibrary = new Map();
 
     this.errorFiles = [
       '/libraries/errors/motion_errors.xml',
@@ -71,10 +78,13 @@ export class ErrorCodeService {
       const e = ErrorCodeService._parseError(el);
       if (e) shared.set(e.code, e);
     }
+    const library = doc.documentElement?.getAttribute('library') || '';
+    if (library && shared.size > 0) this.shared.set(library, shared);
 
     for (const block of doc.querySelectorAll('block')) {
       const blockType = block.getAttribute('type');
       if (!blockType) continue;
+      if (library) this.blockLibrary.set(blockType, library);
 
       const errors = new Map();
       for (const uses of block.querySelectorAll('uses')) {
@@ -141,10 +151,19 @@ export class ErrorCodeService {
    * Look up error description for a given block type and error code.
    * @param {string} blockType - e.g. 'MC_MoveAbsolute', 'HAL_UART_Send'
    * @param {number} errorCode - e.g. 1, 2, 100
+   * @param {string} [pinName] - 'AxisErrorID' resolves against the library's shared (axis-level) codes
    * @returns {{code:number, name:string, text:string}|null}
    */
-  lookup(blockType, errorCode) {
+  lookup(blockType, errorCode, pinName) {
     if (!errorCode || errorCode === 0) return null;
+    if (pinName === 'AxisErrorID') {
+      for (const key of ErrorCodeService._candidates(blockType)) {
+        const lib = this.blockLibrary.get(key);
+        const hit = lib && this.shared.get(lib)?.get(errorCode);
+        if (hit) return hit;
+      }
+      return null;
+    }
     for (const key of ErrorCodeService._candidates(blockType)) {
       const hit = this.catalog.get(key)?.get(errorCode);
       if (hit) return hit;

@@ -6,10 +6,9 @@ import VariableManager from './VariableManager';
 import RungEditorNew from './RungEditorNew';
 import ResourceEditor from './ResourceEditor';
 import DragDropManager from '../utils/DragDropManager';
-import ForceWriteModal from './common/ForceWriteModal';
-import { liveGet, liveResolveKey, memberGet, liveEntriesWithPrefix, findVarByName, hasVarNamed } from '../utils/iecNames';
-import { useForcedSet } from './common/ForcedMarker';
-import { isKeyForced, stLiveKeyAt, ensureForcedDecorationStyle } from '../utils/forcedVars';
+import WriteValueModal from './common/WriteValueModal';
+import { liveGet, memberGet, liveEntriesWithPrefix, findVarByName, hasVarNamed } from '../utils/iecNames';
+import { stLiveKeyAt } from '../utils/stLiveKey';
 
 // IEC scalar (elementary) types — anything else (FB instances like TON/CTU,
 // UDTs, ARRAY[...]) is a COMPOSITE whose live value is a struct/array, shown in
@@ -88,7 +87,7 @@ const EditorPane = ({
   parentName = "",
   isRunning = false,
   isSimulationMode = false,
-  onForceWrite = null,
+  onWriteVariable = null,
   onAddToWatchTable = null,
   hwPortVars = [],
   errorCodeService = null,
@@ -115,9 +114,8 @@ const EditorPane = ({
   const [variablePaneHeight, setVariablePaneHeight] = useState(250); // Default px
   const [isResizingVarPane, setIsResizingVarPane] = useState(false);
 
-  // ST Editor Force Write Modal state
-  const [stForceWriteData, setStForceWriteData] = useState(null);
-  const forcedSet = useForcedSet();
+  // ST editor write-value dialog state
+  const [stWriteData, setStWriteData] = useState(null);
 
   // Refs for checking current state in callbacks/providers without dependencies
   const variablesRef = useRef(variables);
@@ -405,11 +403,10 @@ const EditorPane = ({
           };
         };
         // Push an inline badge after the [startCol, endCol) range on a 1-based line.
-        // A FORCED value's badge gets `live-var-forced` (red frame + "F").
-        const pushDec = (lineNo, startCol, endCol, style, forced = false) => {
+        const pushDec = (lineNo, startCol, endCol, style) => {
           decs.push({
             range: new monacoInstance.Range(lineNo, startCol, lineNo, endCol),
-            options: { className: style.hl, after: { content: ` ${style.text}`, inlineClassName: forced ? `${style.txt} live-var-forced` : style.txt } },
+            options: { className: style.hl, after: { content: ` ${style.text}`, inlineClassName: style.txt } },
           });
         };
 
@@ -445,7 +442,6 @@ const EditorPane = ({
               const mm = line.slice(j + 1).match(/^[a-zA-Z_][a-zA-Z0-9_]*/);
               const member = mm && mm[0];
               let mv;
-              let memberKey;
               if (valM && typeof valM === 'object') {
                 // Local sim: FB decoded to an object {Q, ET, …}.
                 mv = member ? memberGet(valM, member) : undefined;
@@ -455,11 +451,10 @@ const EditorPane = ({
                 const fk = `prog_${safeProgName}_${word}.${member}`;
                 const fkVal = liveGet(liveVariables, fk);
                 mv = fkVal !== undefined ? fkVal : liveGet(liveVariables, `prog__${word}.${member}`);
-                memberKey = liveResolveKey(liveVariables, fk) || liveResolveKey(liveVariables, `prog__${word}.${member}`);
               }
               if (member && mv !== undefined && typeof mv !== 'object') {
                 const memStartCol = j + 2;                // 1-based col of member's first char
-                pushDec(i + 1, memStartCol, memStartCol + member.length, primStyle(mv), isKeyForced(forcedSet, memberKey));
+                pushDec(i + 1, memStartCol, memStartCol + member.length, primStyle(mv));
               }
               continue;
             }
@@ -480,8 +475,7 @@ const EditorPane = ({
             }
 
             // Primitive scalar — badge right after the identifier.
-            const scalarKey = liveResolveKey(liveVariables, progKey) || liveResolveKey(liveVariables, globalKey);
-            pushDec(i + 1, match.index + 1, afterIdx + 1, primStyle(val), isKeyForced(forcedSet, scalarKey));
+            pushDec(i + 1, match.index + 1, afterIdx + 1, primStyle(val));
           }
         });
 
@@ -496,7 +490,7 @@ const EditorPane = ({
     validate();
     const disposable = model.onDidChangeContent(validate);
     return () => disposable.dispose();
-  }, [variables, globalVars, code, fileType, monacoInstance, liveVariables, parentName, forcedSet]);
+  }, [variables, globalVars, code, fileType, monacoInstance, liveVariables, parentName]);
 
   // --- AUTOCOMPLETE PROVIDER ---
   useEffect(() => {
@@ -698,7 +692,6 @@ const EditorPane = ({
     // ── Register IEC 61131-3 Structured Text language & plc-dark theme ──
     registerIECSTLanguage(monaco);
 
-    ensureForcedDecorationStyle();
     // Inject CSS for live variable inline decorations (only once)
     if (!document.getElementById('inline-live-var-style')) {
       const style = document.createElement('style');
@@ -750,84 +743,44 @@ const EditorPane = ({
       document.head.appendChild(style);
     }
 
-    // Add mouse down listener for live variable manipulation
+    // Double-click on an identifier while live opens the write-value dialog
+    // (one-shot write). Resolution is case-insensitive and understands members
+    // (`fb.Q` → the flat key `prog_<P>_fb.Q`) — utils/stLiveKey.
     editor.onMouseDown((e) => {
-      // We only care if we are in simulation mode and we have liveVariables and onForceWrite
-      if (!window.liveVariablesRef || !window.onForceWriteRef) return;
-
-      const liveVars = window.liveVariablesRef;
-
-      // A single click on a FORCED value's badge (its red "F") opens the force
-      // dialog — Release is there. The badge is Monaco injected text, so the
-      // clicked identifier is the one ending at the click position.
-      const el = e.target.element;
-      if (el && el.classList && el.classList.contains('live-var-forced') && e.target.position) {
-        const pos = e.target.position;
-        const line = editor.getModel()?.getLineContent(pos.lineNumber) || '';
-        const safeProg = (window.parentNameRef || '').trim().replace(/\s+/g, '_');
-        const hit = stLiveKeyAt(line, pos.column, liveVars, safeProg);
-        if (hit && hit.key) {
-          const v = findVarByName([...(window.variablesRef || []), ...(window.globalVarsRef || [])], hit.name);
-          window.setStForceWriteDataFn({
-            varName: hit.name,
-            varType: v ? v.type : (typeof liveVars[hit.key] === 'boolean' ? 'BOOL' : 'INT'),
-            currentValue: liveVars[hit.key],
-            liveKey: hit.key,
-          });
-          return;
-        }
-      }
-
+      if (!window.liveVariablesRef || !window.onWriteVariableRef) return;
       // Ensure click target is text
       if (e.target.type !== monaco.editor.MouseTargetType.CONTENT_TEXT) return;
-
       // Require double click for manipulation to avoid interfering with normal text selection
       if (e.event.detail !== 2) return;
 
-      const position = e.target.position;
-      const model = editor.getModel();
-      const wordInfo = model.getWordAtPosition(position);
-
-      if (!wordInfo) return;
-      const word = wordInfo.word;
-
-      const safeProgName = (window.parentNameRef || "").trim().replace(/\s+/g, '_');
-      const progKey = `prog_${safeProgName}_${word}`;
-      const globalKey = `prog__${word}`;
-
-      let lookupKey = null;
-      if (liveVars[progKey] !== undefined) {
-        lookupKey = progKey;
-      } else if (liveVars[globalKey] !== undefined) {
-        lookupKey = globalKey;
-      }
-
-      if (lookupKey) {
-        // Find variable type
-        const allVars = [...window.variablesRef, ...window.globalVarsRef];
-        const v = allVars.find(vari => vari.name === word);
-        const vType = v ? v.type : 'BOOL';
-
-        // Open Modal
-        window.setStForceWriteDataFn({
-          varName: word,
-          varType: vType,
-          currentValue: liveVars[lookupKey],
-          liveKey: lookupKey
-        });
-      }
+      const liveVars = window.liveVariablesRef;
+      const pos = e.target.position;
+      if (!pos) return;
+      const line = editor.getModel()?.getLineContent(pos.lineNumber) || '';
+      const safeProg = (window.parentNameRef || '').trim().replace(/\s+/g, '_');
+      const hit = stLiveKeyAt(line, pos.column, liveVars, safeProg);
+      if (!hit || !hit.key) return;
+      const value = liveVars[hit.key];
+      if (value !== null && typeof value === 'object') return; // composite: no single slot
+      const v = findVarByName([...(window.variablesRef || []), ...(window.globalVarsRef || [])], hit.name);
+      window.setStWriteDataFn({
+        varName: hit.name,
+        varType: v ? v.type : (typeof value === 'boolean' ? 'BOOL' : 'INT'),
+        currentValue: value,
+        liveKey: hit.key,
+      });
     });
   };
 
   // Sync refs to window for the monaco callback to access current state
   useEffect(() => {
     window.liveVariablesRef = liveVariables;
-    window.onForceWriteRef = onForceWrite;
+    window.onWriteVariableRef = onWriteVariable;
     window.parentNameRef = parentName;
     window.variablesRef = variables;
     window.globalVarsRef = globalVars;
-    window.setStForceWriteDataFn = setStForceWriteData;
-  }, [liveVariables, onForceWrite, parentName, variables, globalVars]);
+    window.setStWriteDataFn = setStWriteData;
+  }, [liveVariables, onWriteVariable, parentName, variables, globalVars]);
 
   useEffect(() => {
     if (!monacoInstance || !window.stEditor || fileType !== 'ST') return;
@@ -1009,7 +962,7 @@ const EditorPane = ({
             disabled={isRunning}
             isRunning={isRunning}
             isSimulationMode={isSimulationMode}
-            onForceWrite={onForceWrite}
+            onWriteVariable={onWriteVariable}
             onAddToWatchTable={onAddToWatchTable}
             projectStructure={projectStructure}
           />
@@ -1045,7 +998,7 @@ const EditorPane = ({
             liveVariables={liveVariables}
             parentName={parentName}
             readOnly={logicEditLocked}
-            onForceWrite={onForceWrite}
+            onWriteVariable={onWriteVariable}
             programType={fileType}
             hwPortVars={hwPortVars}
             errorCodeService={errorCodeService}
@@ -1095,7 +1048,7 @@ const EditorPane = ({
             liveVariables={liveVariables}
             isRunning={isRunning}
             isSimulationMode={isSimulationMode}
-            onForceWrite={onForceWrite}
+            onWriteVariable={onWriteVariable}
           />
         ) : (
           <div style={{ padding: 20, color: '#aaa', textAlign: 'center' }}>
@@ -1104,18 +1057,17 @@ const EditorPane = ({
         )}
       </div>
 
-      {/* Force Write Modal for ST Editor */}
-      {stForceWriteData && (
-        <ForceWriteModal
+      {/* Write-value dialog for the ST editor */}
+      {stWriteData && (
+        <WriteValueModal
           isOpen={true}
-          onClose={() => setStForceWriteData(null)}
-          varName={stForceWriteData.varName}
-          varType={stForceWriteData.varType}
-          currentValue={stForceWriteData.currentValue}
-          liveKey={stForceWriteData.liveKey}
-          allowPulse
-          onConfirm={(key, val, mode) => {
-            if (onForceWrite) onForceWrite(key, val, mode);
+          onClose={() => setStWriteData(null)}
+          varName={stWriteData.varName}
+          varType={stWriteData.varType}
+          currentValue={stWriteData.currentValue}
+          liveKey={stWriteData.liveKey}
+          onConfirm={(key, val) => {
+            if (onWriteVariable) onWriteVariable(key, val);
           }}
         />
       )}

@@ -12,8 +12,9 @@ link watchdog and the drive outputs so it is obvious why a slider "does
 nothing".
 
 Variables are resolved BY ADDRESS, not by name, so a renamed variable keeps
-working as long as its address stays. Every REST write is a FORCE: the value
-stays pinned until "Release forces" (which releases every force on the PLC).
+working as long as its address stays. Every REST write is ONE-SHOT: the PLC
+keeps the value only because its logic reads these commands and never
+assigns them.
 
 Usage:
     python3 advisor_control.py --host 192.168.1.104 --password krontek
@@ -91,8 +92,8 @@ class Worker(threading.Thread):
                                                 for a, n in self.by_addr.items()}))
             except Exception as e:  # noqa: BLE001 — surface anything to the UI
                 # Giving up: leave the boat stopped, not at the last slider
-                # value, and release the forces this client can no longer hold.
-                self._zero_and_drop(release_forces=True)
+                # value.
+                self._zero_and_drop()
                 self.events.put(("error", f"connection lost: {e}"))
 
     def _authed(self, fn):
@@ -137,23 +138,16 @@ class Worker(threading.Thread):
             elif kind == "disconnect":
                 self._zero_and_drop()
                 self.events.put(("disconnected", None))
-            elif kind == "clear":
-                if self.client:
-                    self.client.clear_forces()
-                    self.events.put(("info", "all forces released — PLC owns the values again"))
             elif kind == "quit":
                 self._zero_and_drop()
         except Exception as e:  # noqa: BLE001
             self.events.put(("error", str(e)))
 
-    def _zero_and_drop(self, release_forces=False):
+    def _zero_and_drop(self):
         """Leave the boat stopped and centred, never at the last slider value.
 
-        Best effort, each step on its own: write both commands to 0 (with one
-        re-auth on 401) and, when giving up on a broken connection, release
-        the forces so nothing stays pinned by a client that is gone. A step
-        that fails must not skip the next one. (A deliberate Disconnect keeps
-        the zeros forced, as before — "Release forces" is the user's call.)"""
+        Best effort, each command on its own: write both to 0 (with one
+        re-auth on 401); a write that fails must not skip the next one."""
         if self.client:
             with self.lock:
                 self.pending = {}
@@ -164,11 +158,6 @@ class Worker(threading.Thread):
                 try:
                     self._authed(lambda n=name: self.client.write(n, 0.0))
                 except Exception:  # noqa: BLE001 — best effort on the way out
-                    pass
-            if release_forces:
-                try:
-                    self._authed(self.client.clear_forces)
-                except Exception:  # noqa: BLE001
                     pass
         self.client = None
 
@@ -213,8 +202,6 @@ class App:
         btns.pack(fill="x", **pad)
         ttk.Button(btns, text="STOP / centre  (Space)", command=self.zero).pack(
             side="left", fill="x", expand=True)
-        ttk.Button(btns, text="Release forces", command=lambda: self.worker.post("clear")).pack(
-            side="left", padx=(8, 0))
 
         # ── status ──
         mon = ttk.LabelFrame(root, text="PLC status")
@@ -305,7 +292,7 @@ class App:
                 run = "RUNNING" if p["running"] else "runtime STOPPED"
                 self.status.set(f"connected {p['base']} — {run} — "
                                 f"drive={p['drive']} rudder={p['rudder']}")
-                # Start from a known state instead of whatever was forced last.
+                # Start from a known state instead of whatever was written last.
                 self.zero()
             elif kind == "disconnected":
                 self.connected = False

@@ -19,7 +19,6 @@ import (
 	"log/slog"
 	"math"
 	"os"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -65,20 +64,23 @@ const maxStringBytes = 1024
 //
 //	{
 //	  "variables": [
-//	    { "name": "motor_speed",  "offset": 0,  "type": "float32", "size": 4, "force_flag_offset": 32768 },
-//	    { "name": "pump_status",  "offset": 4,  "type": "bool",    "size": 1, "force_flag_offset": 32769 },
-//	    { "name": "error_code",   "offset": 8,  "type": "int32",   "size": 4, "force_flag_offset": 32770 },
-//	    { "name": "temperature",  "offset": 12, "type": "float64", "size": 8, "force_flag_offset": 32771 }
+//	    { "name": "motor_speed",  "offset": 0,  "type": "float32", "size": 4, "mb_index": 0 },
+//	    { "name": "pump_status",  "offset": 4,  "type": "bool",    "size": 1, "mb_index": 1 },
+//	    { "name": "error_code",   "offset": 8,  "type": "int32",   "size": 4, "mb_index": 2 },
+//	    { "name": "temperature",  "offset": 16, "type": "float64", "size": 8, "mb_index": 3 }
 //	  ]
 //	}
 type Variable struct {
-	Name            string          `json:"name"`
-	Offset          int             `json:"offset"`                      // Byte offset inside shared memory
-	Type            VarType         `json:"type"`                        // Variable type
-	Size            int             `json:"size"`                        // Size in bytes
-	ForceFlagOffset int             `json:"force_flag_offset,omitempty"` // Byte offset of force flag (0 = not supported)
-	Address         string          `json:"address,omitempty"`           // IEC address (e.g. %MW0) — non-empty = exposed via REST API
-	InitialValue    json.RawMessage `json:"initial_value,omitempty"`     // Initial value from editor
+	Name   string  `json:"name"`
+	Offset int     `json:"offset"` // Byte offset inside shared memory
+	Type   VarType `json:"type"`   // Variable type
+	Size   int     `json:"size"`   // Size in bytes
+	// MbIndex is the variable's index in the write mailbox (what a command
+	// carries). A pointer because 0 is a valid index: nil = the table predates
+	// SHM layout v3 (no index) and the variable cannot be written.
+	MbIndex      *int            `json:"mb_index,omitempty"`
+	Address      string          `json:"address,omitempty"`       // IEC address (e.g. %MW0) — non-empty = exposed via REST API
+	InitialValue json.RawMessage `json:"initial_value,omitempty"` // Initial value from editor
 }
 
 // VariableTable is the root structure for the symbol table.
@@ -87,8 +89,8 @@ type VariableTable struct {
 	APIPasswordHash string      `json:"api_password_hash,omitempty"`
 	APIPasswordSalt string      `json:"api_password_salt,omitempty"`
 	Ring            *RingConfig `json:"ring,omitempty"`
-	// ShmLayout is present from SHM layout v2 on (force-write mailbox,
-	// naturally aligned slots). Absent = a table built for a v1 runtime.
+	// ShmLayout is present from SHM layout v2 on (write mailbox, naturally
+	// aligned slots). Absent = a table built for a v1 runtime.
 	ShmLayout *ShmLayout `json:"shm_layout,omitempty"`
 	// Tasks is informational; only interval_us is used (ack timeout).
 	Tasks []struct {
@@ -150,16 +152,10 @@ type IPCManager struct {
 	apiPasswordGen      uint64
 	onAPIPasswordChange func()
 
-	// flagLayoutSig fingerprints which variable owns which force-flag byte in
-	// the loaded table; startedFlagSig is the fingerprint the runtime last
-	// started with. See ClearForcesIfTableChanged.
-	flagLayoutSig  string
-	startedFlagSig string
-
-	// mbox is the force-write command mailbox (SHM layout v2). nil when the
-	// segment is too small to hold one (unit tests with a tiny segment).
-	// ⚠️ Writers NEVER store into a data slot or a flag byte any more: the
-	// runtime owns both and applies posted commands at a scan boundary.
+	// mbox is the write-command mailbox (SHM layout v3). nil when the segment
+	// is too small to hold one (unit tests with a tiny segment).
+	// ⚠️ Writers NEVER store into a data slot while a runtime runs: the
+	// runtime owns the slots and applies posted commands at a scan boundary.
 	mbox *shmcmd.Mailbox
 	// runtimeAlive reports whether the runtime process runs, so a write to a
 	// stopped PLC fails at once instead of after the ack timeout.
@@ -170,11 +166,6 @@ type IPCManager struct {
 	// from one table ends when it moves (/api/v1/stream/buffered).
 	tableGen uint64
 }
-
-// forceFlagsBase is where the transpiler starts the force-flag region
-// (FORCE_FLAGS_BASE in CTranspilerService.js): flag bytes run from here up to
-// the command mailbox, data grows from 0 below it.
-const forceFlagsBase = shmcmd.ForceFlagsBase
 
 // ensureShmDir makes /dev/shm usable on minimal images (BusyBox/Yocto init
 // often never creates it), where O_CREAT on /dev/shm/<name> fails with ENOENT
@@ -251,10 +242,10 @@ func NewIPCManager(shmName string, shmSize int) (*IPCManager, error) {
 		if mb, err := shmcmd.New(mem); err == nil {
 			m.mbox = mb
 		} else {
-			slog.Warn("Force-write mailbox unavailable", "err", err)
+			slog.Warn("Write mailbox unavailable", "err", err)
 		}
 	} else {
-		slog.Warn("Shared memory too small for the force-write mailbox — writes are refused", "size", shmSize, "need", shmcmd.SegmentSize)
+		slog.Warn("Shared memory too small for the write mailbox — writes are refused", "size", shmSize, "need", shmcmd.SegmentSize)
 	}
 	return m, nil
 }
@@ -294,7 +285,6 @@ type parsedVariableTable struct {
 	table     VariableTable
 	vars      map[string]Variable
 	addressed map[string]Variable
-	flagSig   string
 }
 
 // LoadVariableTable reads the JSON file from disk and updates the symbol table.
@@ -323,7 +313,7 @@ func (m *IPCManager) ParseVariableTable(data []byte) (*parsedVariableTable, erro
 
 	// Validate table consistency.
 	newVars := make(map[string]Variable, len(table.Variables))
-	var sig strings.Builder
+	mbOwner := make(map[int]string, len(table.Variables))
 	for _, v := range table.Variables {
 		if v.Name == "" {
 			return nil, fmt.Errorf("empty variable name detected")
@@ -351,23 +341,32 @@ func (m *IPCManager) ParseVariableTable(data []byte) (*parsedVariableTable, erro
 			return nil, fmt.Errorf("variable '%s' exceeds shared memory bounds (offset=%d size=%d shm_size=%d)",
 				v.Name, v.Offset, v.Size, m.shmSize)
 		}
-		// Force flag is a single byte; 0 means "no force flag". Its index is
-		// what a mailbox command carries, so it must sit in the flag region —
-		// below the mailbox, which a v2 runtime owns. Validate at load time so
-		// write paths can trust it.
-		if v.ForceFlagOffset < 0 || v.ForceFlagOffset >= m.shmSize ||
-			(v.ForceFlagOffset > 0 && (v.ForceFlagOffset < forceFlagsBase || v.ForceFlagOffset >= shmcmd.MailboxBase)) {
-			return nil, fmt.Errorf("variable '%s' force flag outside the flag region (force_flag_offset=%d, region [%d,%d))",
-				v.Name, v.ForceFlagOffset, forceFlagsBase, shmcmd.MailboxBase)
+		// Data slots live in [0, DataEnd); the runtime owns the mailbox above.
+		if v.Offset+v.Size > shmcmd.DataEnd {
+			return nil, fmt.Errorf("variable '%s' overlaps the write mailbox (offset=%d size=%d, data region [0,%d))",
+				v.Name, v.Offset, v.Size, shmcmd.DataEnd)
 		}
-		if v.Offset+v.Size > forceFlagsBase {
-			return nil, fmt.Errorf("variable '%s' overlaps the force-flag region (offset=%d size=%d)", v.Name, v.Offset, v.Size)
+		// mb_index is what a mailbox command carries. The runtime bounds-checks
+		// it too (nvars), but validating here turns a corrupt table into a
+		// deploy error instead of writes that land on the wrong variable.
+		if v.MbIndex != nil {
+			idx := *v.MbIndex
+			if idx < 0 || (table.ShmLayout != nil && idx >= table.ShmLayout.NVars) {
+				nvars := -1
+				if table.ShmLayout != nil {
+					nvars = table.ShmLayout.NVars
+				}
+				return nil, fmt.Errorf("variable '%s' mailbox index out of range (mb_index=%d, nvars=%d)", v.Name, idx, nvars)
+			}
+			if other, dup := mbOwner[idx]; dup {
+				return nil, fmt.Errorf("variables '%s' and '%s' share mailbox index %d", other, v.Name, idx)
+			}
+			mbOwner[idx] = v.Name
 		}
 		if _, dup := newVars[v.Name]; dup {
 			return nil, fmt.Errorf("duplicate variable name: %s", v.Name)
 		}
 		newVars[v.Name] = v
-		fmt.Fprintf(&sig, "%s|%d|%d|%d|%s\n", v.Name, v.Offset, v.Size, v.ForceFlagOffset, v.Type)
 	}
 
 	addressed := make(map[string]Variable, len(newVars))
@@ -376,7 +375,7 @@ func (m *IPCManager) ParseVariableTable(data []byte) (*parsedVariableTable, erro
 			addressed[name] = v
 		}
 	}
-	return &parsedVariableTable{table: table, vars: newVars, addressed: addressed, flagSig: sig.String()}, nil
+	return &parsedVariableTable{table: table, vars: newVars, addressed: addressed}, nil
 }
 
 // ApplyVariableTable installs a table returned by ParseVariableTable.
@@ -392,7 +391,6 @@ func (m *IPCManager) ApplyVariableTable(pt *parsedVariableTable) {
 	}
 	hook := m.onAPIPasswordChange
 	m.ringConfig = pt.table.Ring
-	m.flagLayoutSig = pt.flagSig
 	m.ackTimeout = ackTimeoutFor(&pt.table)
 	m.tableGen++
 	m.mu.Unlock()
@@ -402,7 +400,7 @@ func (m *IPCManager) ApplyVariableTable(pt *parsedVariableTable) {
 	}
 }
 
-// ackTimeoutFor sizes the force-write ack timeout from the table's slowest
+// ackTimeoutFor sizes the write ack timeout from the table's slowest
 // task (see shmcmd.TimeoutFor).
 func ackTimeoutFor(t *VariableTable) time.Duration {
 	var maxUs int64
@@ -432,64 +430,7 @@ func (m *IPCManager) APIPasswordGen() uint64 {
 	return m.apiPasswordGen
 }
 
-// MarkTableStarted records the loaded table as the one the runtime runs with,
-// without clearing anything. Used at agent startup for the rehydrated table:
-// the flags in /dev/shm (if any survived) were set against that same table.
-func (m *IPCManager) MarkTableStarted() {
-	m.mu.Lock()
-	m.startedFlagSig = m.flagLayoutSig
-	m.mu.Unlock()
-}
-
-// ClearForcesIfTableChanged zeroes the WHOLE force-flag region when the loaded
-// table maps flags differently from the one the runtime last started with.
-// Called from the pre-start hook (old runtime stopped, new one not spawned).
-//
-// ⚠️ A flag's byte is FORCE_FLAGS_BASE + the variable's INDEX, not something
-// tied to its name: after a redeploy that inserted or removed a variable, a
-// flag left set by the old table pins a DIFFERENT variable of the new one —
-// forced, invisibly, and ClearAllForces (which walks the NEW table) cannot
-// reach a byte the new table no longer names. A crash-restart or a restart with
-// the same table keeps its forces (same layout ⇒ same meaning; the new runtime
-// reloads each surviving forced value from its slot in plc_mb_init).
-//
-// ⚠️ This is the ONE place a writer still stores into the flag bytes directly,
-// which the v2 protocol otherwise forbids (the runtime owns them). It is safe
-// only because it runs from the pre-start hook: the previous runtime has
-// exited and the next one has not been spawned, so there is no consumer to
-// race — a mailbox command would have nobody to apply it. Do not call it from
-// anywhere a runtime may be running.
-func (m *IPCManager) ClearForcesIfTableChanged() {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if m.flagLayoutSig == m.startedFlagSig {
-		return
-	}
-	m.startedFlagSig = m.flagLayoutSig
-	if m.mem == nil || len(m.mem) <= forceFlagsBase {
-		return
-	}
-	cleared := shmcmd.ClearFlags(m.mem, m.dataByteMaskLocked())
-	slog.Info("Variable table changed since last start — force-flag region cleared", "flags_cleared", cleared)
-}
-
-// dataByteMaskLocked returns a predicate for "off is a byte the loaded table
-// uses as DATA" (a project whose data region overran the flag base — the
-// transpiler refuses that, but the table is an untrusted upload, and a flag
-// clear must never zero somebody's value). Caller holds m.mu.
-func (m *IPCManager) dataByteMaskLocked() func(int) bool {
-	isData := make([]bool, len(m.mem))
-	for _, v := range m.vars {
-		for i := v.Offset; i < v.Offset+v.Size && i < len(isData); i++ {
-			if i >= 0 {
-				isData[i] = true
-			}
-		}
-	}
-	return func(off int) bool { return off < len(isData) && isData[off] }
-}
-
-// ResetMailbox drops every pending force-write command and unpublishes the
+// ResetMailbox drops every pending write command and unpublishes the
 // mailbox until the next runtime initialises it. Pre-start hook ONLY: a
 // command posted against the previous runtime (and table) must never be
 // applied by the next one — its writer has already been told it failed.
@@ -656,23 +597,15 @@ func decodeValue(t VarType, b []byte) (any, error) {
 
 // Write operations
 
-// WriteVariable force-writes (FORCE: write once and hold) — the historical
-// behaviour of every write endpoint. See WriteVariableMode.
-func (m *IPCManager) WriteVariable(name string, rawVal json.RawMessage) error {
-	return m.WriteVariableMode(name, rawVal, shmcmd.OpForce)
-}
-
-// WriteVariableMode posts one command to the runtime's force-write mailbox and
-// returns only after the runtime has APPLIED it (or with an *shmcmd.Error
-// saying why not — map it with shmcmd.HTTPStatus). op is OpForce, OpPulse
-// (write once, logic owns it from the same scan) or OpUnforce (release; a
-// non-empty rawVal is also written once).
+// WriteVariable posts one ONE-SHOT write to the runtime's mailbox and returns
+// only after the runtime has APPLIED it (or with an *shmcmd.Error saying why
+// not — map it with shmcmd.HTTPStatus). The logic owns the value again from the
+// same scan: there is no forcing (removed with SHM layout v3).
 //
-// ⚠️ Nothing here stores into the data slot or the flag byte. The old "copy
-// value, then set flag" pair raced plc_shm_sync: a sync between the two
-// stores overwrote the new value and the flag then pinned the OLD one — while
-// the request returned 200.
-func (m *IPCManager) WriteVariableMode(name string, rawVal json.RawMessage, op shmcmd.Op) error {
+// ⚠️ Nothing here stores into the data slot. A direct store raced
+// plc_shm_sync, which overwrote it from PlcState on the next scan — the write
+// was lost while the request returned 200.
+func (m *IPCManager) WriteVariable(name string, rawVal json.RawMessage) error {
 	m.mu.RLock()
 	v, ok := m.vars[name]
 	mb, alive, timeout := m.mbox, m.runtimeAlive, m.ackTimeout
@@ -682,60 +615,28 @@ func (m *IPCManager) WriteVariableMode(name string, rawVal json.RawMessage, op s
 		return fmt.Errorf("variable not found: %s", name)
 	}
 	if mb == nil {
-		return &shmcmd.Error{Kind: shmcmd.KindMismatch, Msg: "shared memory segment too small for the force-write mailbox (start KronServer with -shm-size 65536)"}
+		return &shmcmd.Error{Kind: shmcmd.KindMismatch, Msg: "shared memory segment too small for the write mailbox (start KronServer with -shm-size 65536)"}
 	}
-	if v.ForceFlagOffset == 0 {
-		return &shmcmd.Error{Kind: shmcmd.KindInvalid, Msg: fmt.Sprintf("variable '%s' has no force slot", name)}
+	if v.MbIndex == nil {
+		return &shmcmd.Error{Kind: shmcmd.KindInvalid, Msg: fmt.Sprintf("variable '%s' has no mailbox index — rebuild with the current editor (Build & Send)", name)}
 	}
-	var encoded []byte
-	hasValue := op != shmcmd.OpUnforce || (len(rawVal) > 0 && string(rawVal) != "null")
-	if hasValue {
-		var err error
-		encoded, err = encodeValue(v.Type, rawVal)
-		if err != nil {
-			return &shmcmd.Error{Kind: shmcmd.KindInvalid, Msg: fmt.Sprintf("value encode error (%s): %v", name, err)}
-		}
-		if len(encoded) != v.Size {
-			return &shmcmd.Error{Kind: shmcmd.KindInvalid, Msg: fmt.Sprintf("encode size mismatch: expected %d, produced %d", v.Size, len(encoded))}
-		}
+	if len(rawVal) == 0 || string(rawVal) == "null" {
+		return &shmcmd.Error{Kind: shmcmd.KindInvalid, Msg: fmt.Sprintf("missing value for '%s'", name)}
 	}
-	err := mb.Post(shmcmd.Command{
-		Index: uint32(v.ForceFlagOffset - forceFlagsBase),
-		Op:    op,
-		Value: encoded,
-	}, shmcmd.WaitOptions{Timeout: timeout, Alive: alive})
+	encoded, err := encodeValue(v.Type, rawVal)
 	if err != nil {
+		return &shmcmd.Error{Kind: shmcmd.KindInvalid, Msg: fmt.Sprintf("value encode error (%s): %v", name, err)}
+	}
+	if len(encoded) != v.Size {
+		return &shmcmd.Error{Kind: shmcmd.KindInvalid, Msg: fmt.Sprintf("encode size mismatch: expected %d, produced %d", v.Size, len(encoded))}
+	}
+	if err := mb.Post(shmcmd.Command{
+		Index: uint32(*v.MbIndex),
+		Value: encoded,
+	}, shmcmd.WaitOptions{Timeout: timeout, Alive: alive}); err != nil {
 		return err
 	}
-	slog.Debug("Force-write applied", "name", name, "type", v.Type, "op", op)
-	return nil
-}
-
-// ClearAllForces releases every force. With a runtime running it is ONE
-// mailbox command (the runtime owns the flags); with none running the flag
-// bytes are cleared directly — there is no consumer to race, and a command
-// would sit unapplied until the next start drops it anyway.
-func (m *IPCManager) ClearAllForces() error {
-	m.mu.RLock()
-	mb, alive, timeout := m.mbox, m.runtimeAlive, m.ackTimeout
-	m.mu.RUnlock()
-
-	if alive != nil && !alive() {
-		m.mu.Lock()
-		if m.mem != nil {
-			shmcmd.ClearFlags(m.mem, m.dataByteMaskLocked())
-		}
-		m.mu.Unlock()
-		slog.Info("All force flags cleared (runtime stopped)")
-		return nil
-	}
-	if mb == nil {
-		return &shmcmd.Error{Kind: shmcmd.KindMismatch, Msg: "shared memory segment too small for the force-write mailbox"}
-	}
-	if err := mb.Post(shmcmd.Command{Op: shmcmd.OpClearAll}, shmcmd.WaitOptions{Timeout: timeout, Alive: alive}); err != nil {
-		return err
-	}
-	slog.Info("All force flags cleared")
+	slog.Debug("Write applied", "name", name, "type", v.Type)
 	return nil
 }
 
@@ -892,36 +793,6 @@ func (m *IPCManager) ReadAddressedVariables() (map[string]any, error) {
 	return result, nil
 }
 
-// ForcedVariables returns the sorted names of every variable whose force-flag
-// byte marks a held value (RING_FORMAT.md § "Variable segment": 0x81). The flag
-// bytes are RUNTIME-owned; this only reads them, one byte load each, against
-// the CURRENT table. addressedOnly restricts it to the REST scope.
-func (m *IPCManager) ForcedVariables(addressedOnly bool) []string {
-	m.mu.RLock()
-	vars := m.vars
-	if addressedOnly {
-		vars = m.addressedVars
-	}
-	mem := m.mem
-	m.mu.RUnlock()
-	return forcedNames(mem, vars)
-}
-
-// forcedNames is ForcedVariables over an explicit table (split out for tests).
-func forcedNames(mem []byte, vars map[string]Variable) []string {
-	out := []string{}
-	if mem == nil {
-		return out
-	}
-	for name, v := range vars {
-		if v.ForceFlagOffset > 0 && shmcmd.IsForced(mem, v.ForceFlagOffset) {
-			out = append(out, name)
-		}
-	}
-	sort.Strings(out)
-	return out
-}
-
 // IsAddressed returns true if the variable is marked as addressed.
 func (m *IPCManager) IsAddressed(name string) bool {
 	m.mu.RLock()
@@ -974,11 +845,6 @@ func (m *IPCManager) WriteInitialValues() {
 			continue
 		}
 		if len(encoded) != v.Size {
-			continue
-		}
-		// A force that survives this restart (same table) keeps its forced
-		// value in the slot: the new runtime reloads it from there.
-		if v.ForceFlagOffset > 0 && v.ForceFlagOffset < len(mem) && mem[v.ForceFlagOffset] != 0 {
 			continue
 		}
 		m.mu.Lock()

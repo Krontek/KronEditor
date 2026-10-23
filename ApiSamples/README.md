@@ -10,12 +10,14 @@ takes those flags.
 
 | File | What it shows |
 |---|---|
-| `kron_client.py` | Shared client: auth, read/write, force clear, runtime control, SSE, capture ring. Import it, don't copy it. |
-| `01_read_write.py` | Log in, list every addressed variable with type + address, force-write one, release forces. |
+| `kron_client.py` | Shared client: auth, read/write, runtime control, SSE, capture ring. Import it, don't copy it. |
+| `01_read_write.py` | Log in, list every addressed variable with type + address, write one. |
 | `02_stream_snapshot.py` | `/api/v1/stream` SSE. Reports snapshots/s vs changes/s — the gap is aliasing. |
 | `03_ring_capture.py` | `/api/v1/stream/ring` lossless capture, with decimation vs real loss kept apart. Optional CSV. |
-| `Onemotorcontrol.py` | Larger tkinter GUI: write-side demo (force-write, runtime start/stop, AutoRun, cadence). |
+| `Onemotorcontrol.py` | Larger tkinter GUI: write-side demo (write, runtime start/stop, AutoRun, cadence). |
 | `advisor_control.py` | tkinter sliders for the advisor boat project: `%MD52` drive / `%MD56` rudder, -100..+100, with RC-switch status. |
+| `motion_control.py` | tkinter panel for the single-axis motion project (`motionrpi3bplus.xml`): MC_Power, Reset, MoveAbsolute, MoveVelocity, Halt, Stop — parameters, command buttons, status lamps. STOP latches (axis stays in Stopping while `Execute` is TRUE). Floating-point position slider with "Move on change" (latest position + Execute edge every cycle); chart of set vs. actual position (`%ML137`). |
+| `shm_logger.c` | Runs ON the target (C — BusyBox targets have no Python): samples variables straight from `/dev/shm/plc_runtime` at a fixed period (default 1 ms) into CSV, read-only, one atomic load per slot. `motion_control.py`'s Log start/stop cross-compiles it with the bundled clang (`ApiSamples/build/`), resolves offsets from the target's `variable_table.json` and runs it over SSH. Values change only as often as the owning task refreshes the shm mirror. |
 | `ml0_ring_viewer.py` | tkinter viewer for N variables from `%ML0` over the capture ring. |
 | `ml0_sequence_check.py` | Correctness trial: does the ring really deliver **every** scan, in order? |
 | `test_*.py` | Offline tests of the decoders — synthetic frames, no device needed. |
@@ -37,14 +39,14 @@ Notes that bite:
   (`T#2h` = `7200000000`, `T#-5s` = `-5000000`), addressed as `%ML`. Beyond
   ±2^53 a REST/SSE value is a decimal string; `kron_client.time_us()` /
   `format_iec_time()` handle both.
-- A REST write is a **force** by default: the value is pinned until released.
-  Send `{"value": v, "mode": "pulse"}` to write once and let the program own it
-  from the same scan, or `"mode": "unforce"` to release one variable (with a
-  non-null value, also written once). `POST /api/v1/forces/clear`
-  (`01_read_write.py --clear-forces`) releases **every** force on the PLC —
-  including ones set from the editor or by another client.
-- A write returns **only after the PLC runtime applied it** (force-write
-  mailbox, SHM layout v2). `409` = runtime not running, still starting, or a
+- A REST write is **one-shot**: the value is written once and the program owns
+  it again from the same scan — a variable the logic assigns every scan is
+  overwritten at once, so write inputs/setpoints the logic only reads.
+  **Forcing was removed**: `"mode": "force"`/`"pulse"`/`"unforce"` is refused
+  with `400`. A momentary signal (e.g. an edge-triggered `Reset`) is two
+  writes: `True`, then `False`.
+- A write returns **only after the PLC runtime applied it** (write mailbox,
+  SHM layout v3). `409` = runtime not running, still starting, or a
   runtime/KronServer version mismatch (redeploy KronServer *and* Build & Send);
   `503` = mailbox full; `504` = the runtime did not acknowledge in time — the
   write was **not** applied.

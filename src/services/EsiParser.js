@@ -150,7 +150,10 @@ function parseStartupSdos(deviceEl) {
         .reduce((acc, b) => (acc * 256) + (parseInt(b, 16) || 0), 0) >>> 0;
     }
 
-    sdos.push({ index, subindex, value, byteSize, comment, transition, truncated });
+    /* ESI rows default to 'next' (CODESYS' default for startup parameters): an
+     * InitCmd the drive refuses is logged and skipped. User-added rows default to
+     * 'abort' (SlaveConfigPage), the generated PDO mapping is always 'abort'. */
+    sdos.push({ index, subindex, value, byteSize, comment, transition, truncated, onError: 'next' });
   }
   return sdos;
 }

@@ -67,15 +67,9 @@ func (r *fakeRuntime) consume() {
 
 func (r *fakeRuntime) apply(e int) uint32 {
 	w := atomic.LoadUint32(r.u32p(e + entOp))
-	op, sz, has := Op(w), int(w>>8&0xff), w>>16&0xff
+	op, sz := w&0xff, int(w>>8&0xff)
 	idx := atomic.LoadUint32(r.u32p(e + entIndex))
-	if op == OpClearAll {
-		for i := uint32(0); i < r.nvars; i++ {
-			r.mem[ForceFlagsBase+int(i)] = 0
-		}
-		return stApplied
-	}
-	if op < OpForce || op > OpUnforce {
+	if op != OpWrite {
 		return stBadOp
 	}
 	if idx >= r.nvars {
@@ -85,21 +79,13 @@ func (r *fakeRuntime) apply(e int) uint32 {
 	if n == 0 {
 		return stReadOnly
 	}
-	writes := op != OpUnforce || has != 0
-	if writes && sz != n {
+	if sz != n {
 		return stBadSize
 	}
-	if op == OpForce {
-		r.mem[ForceFlagsBase+int(idx)] = FlagForced
-	} else {
-		r.mem[ForceFlagsBase+int(idx)] = 0
-	}
-	if writes {
-		v := atomic.LoadUint64(r.u64p(e + entValue))
-		r.mu.Lock()
-		binary.LittleEndian.PutUint64(r.state[idx][:], v)
-		r.mu.Unlock()
-	}
+	v := atomic.LoadUint64(r.u64p(e + entValue))
+	r.mu.Lock()
+	binary.LittleEndian.PutUint64(r.state[idx][:], v)
+	r.mu.Unlock()
 	return stApplied
 }
 
@@ -154,7 +140,7 @@ func TestConcurrentWritersAllApplied(t *testing.T) {
 			defer w.Done()
 			for i := 0; i < 200; i++ {
 				idx := uint32(g)
-				if err := m.Post(Command{Index: idx, Op: OpForce, Value: val32(uint32(i))}, WaitOptions{Timeout: 2 * time.Second}); err != nil {
+				if err := m.Post(Command{Index: idx, Value: val32(uint32(i))}, WaitOptions{Timeout: 2 * time.Second}); err != nil {
 					// a burst can momentarily fill the mailbox; that is a clean refusal
 					if KindOf(err) != KindFull {
 						t.Errorf("post: %v", err)
@@ -174,45 +160,67 @@ func TestConcurrentWritersAllApplied(t *testing.T) {
 		if got != 199 {
 			t.Errorf("writer %d: final value %d, want 199 (ordering lost)", g, got)
 		}
-		if r.mem[ForceFlagsBase+g] != FlagForced {
-			t.Errorf("writer %d: flag %#x, want forced", g, r.mem[ForceFlagsBase+g])
-		}
 	}
 	if p := m.Pending(); p != 0 {
 		t.Errorf("pending after all acks: %d", p)
 	}
 }
 
-func TestUnforceAndClearAll(t *testing.T) {
+func TestRejections(t *testing.T) {
 	r, m := newRuntime(t, 4)
+	r.sizes[2] = 0 // read-only (STRING)
 	r.init(LayoutVersion)
 	stop := make(chan struct{})
 	wg := r.run(stop, 200*time.Microsecond, 1)
 	defer func() { close(stop); wg.Wait() }()
 	opt := WaitOptions{Timeout: time.Second}
-	if err := m.Post(Command{Index: 1, Op: OpForce, Value: val32(7)}, opt); err != nil {
+	if err := m.Post(Command{Index: 1, Value: val32(7)}, opt); err != nil {
 		t.Fatal(err)
 	}
-	if err := m.Post(Command{Index: 1, Op: OpUnforce, Value: val32(0)}, opt); err != nil {
-		t.Fatal(err)
+	if got := binary.LittleEndian.Uint32(r.state[1][:4]); got != 7 {
+		t.Fatalf("write not applied: %d", got)
 	}
-	if r.mem[ForceFlagsBase+1] != 0 {
-		t.Fatal("unforce left the flag set")
-	}
-	if err := m.Post(Command{Index: 2, Op: OpForce, Value: val32(1)}, opt); err != nil {
-		t.Fatal(err)
-	}
-	if err := m.Post(Command{Op: OpClearAll}, opt); err != nil {
-		t.Fatal(err)
-	}
-	if r.mem[ForceFlagsBase+2] != 0 {
-		t.Fatal("clear-all left a flag set")
-	}
-	if err := m.Post(Command{Index: 3, Op: OpForce, Value: []byte{1, 2}}, opt); KindOf(err) != KindRejected {
+	if err := m.Post(Command{Index: 3, Value: []byte{1, 2}}, opt); KindOf(err) != KindRejected {
 		t.Fatalf("size mismatch: got %v, want a rejection", err)
 	}
-	if err := m.Post(Command{Index: 9, Op: OpForce, Value: val32(1)}, opt); KindOf(err) != KindInvalid {
+	if err := m.Post(Command{Index: 2, Value: val32(1)}, opt); KindOf(err) != KindRejected {
+		t.Fatalf("read-only: got %v, want a rejection", err)
+	}
+	if err := m.Post(Command{Index: 9, Value: val32(1)}, opt); KindOf(err) != KindInvalid {
 		t.Fatalf("index past nvars: got %v", err)
+	}
+	if err := m.Post(Command{Index: 0}, opt); KindOf(err) != KindInvalid {
+		t.Fatalf("empty value: got %v", err)
+	}
+}
+
+// The v2 op codes FORCE (1), UNFORCE (3) and CLEAR_ALL (4) are gone: a v3
+// consumer refuses them instead of half-applying a hold it no longer has.
+func TestOnlyWriteOpIsAccepted(t *testing.T) {
+	r, m := newRuntime(t, 2)
+	r.init(LayoutVersion)
+	seq, err := m.post(Command{Index: 0, Value: val32(1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	e := MailboxBase + HeaderBytes + int(seq%Capacity)*EntryBytes
+	atomic.StoreUint32((*uint32)(unsafe.Pointer(&r.mem[e+entOp])), 1|4<<8) // v2 FORCE
+	r.consume()
+	if err := m.result(e, seq); KindOf(err) != KindRejected {
+		t.Fatalf("v2 FORCE op: got %v, want a rejection", err)
+	}
+}
+
+func TestCheckWriteMode(t *testing.T) {
+	for _, ok := range []string{"", "write"} {
+		if err := CheckWriteMode(ok); err != nil {
+			t.Errorf("%q: %v", ok, err)
+		}
+	}
+	for _, bad := range []string{"force", "pulse", "unforce", "release", "x"} {
+		if err := CheckWriteMode(bad); err == nil {
+			t.Errorf("%q accepted", bad)
+		}
 	}
 }
 
@@ -221,7 +229,7 @@ func TestTimeoutCancelsSoALateRuntimeNeverApplies(t *testing.T) {
 	r.init(LayoutVersion)
 	// No consumer running.
 	start := time.Now()
-	err := m.Post(Command{Index: 0, Op: OpForce, Value: val32(5)}, WaitOptions{Timeout: 50 * time.Millisecond})
+	err := m.Post(Command{Index: 0, Value: val32(5)}, WaitOptions{Timeout: 50 * time.Millisecond})
 	if KindOf(err) != KindTimeout || HTTPStatus(err) != 504 {
 		t.Fatalf("got %v, want a 504 timeout", err)
 	}
@@ -230,7 +238,7 @@ func TestTimeoutCancelsSoALateRuntimeNeverApplies(t *testing.T) {
 	}
 	// The runtime wakes up afterwards: the command is consumed (ack moves) but NOT applied.
 	r.consume()
-	if r.mem[ForceFlagsBase] != 0 || r.state[0] != [8]byte{} {
+	if r.state[0] != [8]byte{} {
 		t.Fatal("a cancelled command was applied late")
 	}
 	if p := m.Pending(); p != 0 {
@@ -243,30 +251,30 @@ func TestFullMailbox(t *testing.T) {
 	r.init(LayoutVersion)
 	// Fill without consuming: post directly (the wait would time out).
 	for i := 0; i < Capacity; i++ {
-		if _, err := m.post(Command{Index: 0, Op: OpForce, Value: val32(uint32(i))}); err != nil {
+		if _, err := m.post(Command{Index: 0, Value: val32(uint32(i))}); err != nil {
 			t.Fatalf("post %d: %v", i, err)
 		}
 	}
-	_, err := m.post(Command{Index: 0, Op: OpForce, Value: val32(1)})
+	_, err := m.post(Command{Index: 0, Value: val32(1)})
 	if KindOf(err) != KindFull || HTTPStatus(err) != 503 {
 		t.Fatalf("got %v, want a 503 full", err)
 	}
 	r.consume() // one lap
-	if _, err := m.post(Command{Index: 0, Op: OpForce, Value: val32(99)}); err != nil {
+	if _, err := m.post(Command{Index: 0, Value: val32(99)}); err != nil {
 		t.Fatalf("after drain: %v", err)
 	}
 }
 
 func TestVersionMismatchAndNotReady(t *testing.T) {
 	r, m := newRuntime(t, 2)
-	err := m.Post(Command{Index: 0, Op: OpForce, Value: val32(1)}, WaitOptions{Timeout: 20 * time.Millisecond})
+	err := m.Post(Command{Index: 0, Value: val32(1)}, WaitOptions{Timeout: 20 * time.Millisecond})
 	if KindOf(err) != KindNotReady {
 		t.Fatalf("uninitialised: got %v", err)
 	}
-	r.init(3)
-	err = m.Post(Command{Index: 0, Op: OpForce, Value: val32(1)}, WaitOptions{Timeout: 20 * time.Millisecond})
+	r.init(2) // a v2 (force-era) runtime
+	err = m.Post(Command{Index: 0, Value: val32(1)}, WaitOptions{Timeout: 20 * time.Millisecond})
 	if KindOf(err) != KindMismatch || HTTPStatus(err) != 409 {
-		t.Fatalf("version 3: got %v", err)
+		t.Fatalf("version 2: got %v", err)
 	}
 	// Garbage where the magic should be: a v1 runtime with >28k variables.
 	binary.LittleEndian.PutUint32(r.mem[MailboxBase:], 0x01010101)
@@ -282,14 +290,14 @@ func TestStoppedRuntimeFailsFast(t *testing.T) {
 	alive.Store(true)
 	go func() { time.Sleep(30 * time.Millisecond); alive.Store(false) }()
 	start := time.Now()
-	err := m.Post(Command{Index: 0, Op: OpForce, Value: val32(1)}, WaitOptions{Timeout: 2 * time.Second, Alive: alive.Load})
+	err := m.Post(Command{Index: 0, Value: val32(1)}, WaitOptions{Timeout: 2 * time.Second, Alive: alive.Load})
 	if KindOf(err) != KindNotRunning {
 		t.Fatalf("got %v, want not-running", err)
 	}
 	if time.Since(start) > 500*time.Millisecond {
 		t.Fatalf("took %v — a stop must not cost the full timeout", time.Since(start))
 	}
-	if err := m.Post(Command{Index: 0, Op: OpForce, Value: val32(1)}, WaitOptions{Alive: alive.Load}); KindOf(err) != KindNotRunning {
+	if err := m.Post(Command{Index: 0, Value: val32(1)}, WaitOptions{Alive: alive.Load}); KindOf(err) != KindNotRunning {
 		t.Fatalf("already stopped: got %v", err)
 	}
 }
@@ -297,13 +305,13 @@ func TestStoppedRuntimeFailsFast(t *testing.T) {
 func TestResetDropsPending(t *testing.T) {
 	r, m := newRuntime(t, 2)
 	r.init(LayoutVersion)
-	if _, err := m.post(Command{Index: 0, Op: OpForce, Value: val32(3)}); err != nil {
+	if _, err := m.post(Command{Index: 0, Value: val32(3)}); err != nil {
 		t.Fatal(err)
 	}
 	m.Reset()
 	r.init(LayoutVersion)
 	r.consume()
-	if r.mem[ForceFlagsBase] != 0 {
+	if r.state[0] != [8]byte{} {
 		t.Fatal("a command posted before the restart reached the new runtime")
 	}
 }
@@ -348,35 +356,13 @@ func TestWaitsForAStartingRuntime(t *testing.T) {
 	wg := r.run(stop, 200*time.Microsecond, 1)
 	defer func() { close(stop); wg.Wait() }()
 	alive := func() bool { return true }
-	if err := m.Post(Command{Index: 0, Op: OpForce, Value: val32(9)}, WaitOptions{Timeout: time.Second, Alive: alive}); err != nil {
+	if err := m.Post(Command{Index: 0, Value: val32(9)}, WaitOptions{Timeout: time.Second, Alive: alive}); err != nil {
 		t.Fatalf("write during start-up: %v", err)
 	}
 	// A v1 runtime never initialises: reported once the timeout is spent.
 	_, m2 := newRuntime(t, 2)
-	err := m2.Post(Command{Index: 0, Op: OpForce, Value: val32(9)}, WaitOptions{Timeout: 40 * time.Millisecond, Alive: alive})
+	err := m2.Post(Command{Index: 0, Value: val32(9)}, WaitOptions{Timeout: 40 * time.Millisecond, Alive: alive})
 	if KindOf(err) != KindNotReady {
 		t.Fatalf("v1 runtime: %v", err)
-	}
-}
-
-func TestIsForced(t *testing.T) {
-	mem := newSeg(t)
-	mem[ForceFlagsBase] = FlagForced
-	mem[ForceFlagsBase+1] = 1 // v1 runtime FORCE
-	mem[ForceFlagsBase+2] = 2 // v1 PULSE — transient, not a force
-	mem[ForceFlagsBase+3] = 0
-	want := []bool{true, true, false, false}
-	for i, w := range want {
-		if got := IsForced(mem, ForceFlagsBase+i); got != w {
-			t.Errorf("flag %d: IsForced = %v, want %v", i, got, w)
-		}
-	}
-	// No flag (offset 0), a data offset and the mailbox are never "forced".
-	mem[0] = FlagForced
-	mem[MailboxBase] = FlagForced
-	for _, off := range []int{0, 100, MailboxBase, SegmentSize + 5, -1} {
-		if IsForced(mem, off) {
-			t.Errorf("offset %d reported forced", off)
-		}
 	}
 }

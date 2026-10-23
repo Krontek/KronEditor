@@ -3,8 +3,6 @@ import { lazy, Suspense } from 'react';
 const EtherCATEditor = lazy(() => import('./components/EtherCATEditor'));
 import SlaveConfigPage from './components/SlaveConfigPage';
 import { hasVarNamed } from './utils/iecNames';
-import { ForcedContext } from './components/common/ForcedMarker';
-import { splitForcedPayload, nextForcedSet, EMPTY_FORCED } from './utils/forcedVars';
 import EditorPane from './components/EditorPane';
 import Toolbox from './components/Toolbox';
 import AiAgentPanel from './components/AiAgentPanel';
@@ -488,29 +486,16 @@ function App() {
   // Every key the target has STREAMED — it streams its own deployed variable
   // table, so each one has an SHM slot. remoteVarKeysRef is filled only by a
   // Build & Send in this browser session; after a reload it is empty and
-  // gating force-writes on it alone silently dropped every one of them.
+  // gating writes on it alone silently dropped every one of them.
   const remoteStreamedKeysRef = React.useRef(new Set());
   // FB INPUT-pin shadow keys of the last Build & Send (debugDefaults.isPinShadow).
   const remotePinShadowInKeysRef = React.useRef(new Set());
-  // The FORCED set (live keys whose value a force holds), from the reserved
-  // `__forced` key both runtimes stream (utils/forcedVars). Never a variable:
-  // it is split off before anything reaches liveVariables.
-  const [forcedSet, setForcedSet] = useState(EMPTY_FORCED);
-  const forcedSetRef = React.useRef(EMPTY_FORCED);
-  useEffect(() => { forcedSetRef.current = forcedSet; }, [forcedSet]);
-  const applyForcedList = React.useCallback((list) => {
-    // A late event after Stop must not resurrect the set the stop cleared;
-    // a missed one costs at most the 2 s periodic resend.
-    if (!list || !isRunningRef.current) return;
-    setForcedSet(prev => nextForcedSet(prev, list));
-  }, []);
-  const onRemoteVars = React.useCallback((payload) => {
-    const { vars, forced } = splitForcedPayload(payload);
-    applyForcedList(forced);
+  const onRemoteVars = React.useCallback((vars) => {
+    if (!vars) return;
     Object.assign(liveVarsRef.current, vars);
     for (const k of Object.keys(vars)) remoteStreamedKeysRef.current.add(k);
     liveVarsDirtyRef.current = true;
-  }, [applyForcedList]);
+  }, []);
 
   // Persist settings
   useEffect(() => {
@@ -555,16 +540,6 @@ function App() {
     document.body.style.cursor = busy ? 'progress' : '';
     return () => { document.body.style.cursor = ''; };
   }, [compileBusy, isRunning]);
-  // Publish "a runtime is live" so ForceWriteModal can offer the Pulse write
-  // mode without threading the run state through every force entry point
-  // (watch table, ladder canvas, ST editor). Since the force-write mailbox
-  // (SHM layout v2) a remote PLC supports Pulse too, not only the local sim; a
-  // KronServer predating it refuses the `mode` field loudly.
-  useEffect(() => {
-    window.__kronSimActive = isRunning;
-    return () => { window.__kronSimActive = false; };
-  }, [isRunning, isSimulationMode]);
-
   useEffect(() => {
     if (!plcAddress || !connectionEnabled) {
       setIsPlcConnected(false);
@@ -1202,10 +1177,6 @@ function App() {
       if (pou?.name) prefixes.add(`prog_${pou.name.trim().replace(/\s+/g, '_')}_`);
     });
     (watchTable || []).forEach(e => { if (e.liveKey) names.add(e.liveKey); });
-    // Forced variables stay subscribed wherever they live, so the Force list
-    // can show their CURRENT value (the forced set itself ignores the
-    // subscription). Changes rarely: only when a force is set or released.
-    forcedSet.forEach(k => names.add(k));
     // The local sim feeds the HMI server from liveVariables, so an unsubscribed
     // widget binding would freeze the HMI, not just the editor.
     (hmiLayout?.pages || []).forEach(pg => (pg.components || []).forEach(c => {
@@ -1259,9 +1230,6 @@ function App() {
       if (!msg || msg.topic !== 'simulation-output') return;
       try {
         const parsed = typeof msg.data === 'string' ? JSON.parse(msg.data) : msg.data;
-        // The forced set rides BESIDE vars (never inside — the agent also
-        // feeds vars to the HMI server). Absent = unchanged.
-        if (parsed && Array.isArray(parsed.__forced)) applyForcedList(parsed.__forced);
         if (parsed.vars) {
           Object.assign(liveVarsRef.current, parsed.vars);
           liveVarsDirtyRef.current = true;
@@ -1276,14 +1244,7 @@ function App() {
       }
     });
     return () => stop();
-  }, [addLog, t, applyForcedList]);
-
-  // Nothing runs → nothing is forced as far as the editor can tell: covers
-  // Stop, a crash, a dropped remote stream (it clears isRunning) and a
-  // project switch. A re-attached stream re-sends the set on its first event.
-  useEffect(() => {
-    if (!isRunning) setForcedSet(EMPTY_FORCED);
-  }, [isRunning]);
+  }, [addLog, t]);
 
   // --- Re-attach to a local simulation left running by a previous session ---
   // The simulation runs as a separate host-agent process with its own /proc
@@ -1371,7 +1332,6 @@ function App() {
     remotePinShadowInKeysRef.current = new Set();
     liveVarsRef.current = {};
     setLiveVariables({});
-    setForcedSet(EMPTY_FORCED);
   };
   // Opening a project replaces the running one's UI — say so before stopping it.
   const confirmStopSimForSwitch = () => !isLocalSimRunning() ||
@@ -1769,19 +1729,19 @@ function App() {
         addLog('info', `HMI available at http://${plcAddress}/hmi/`);
         setIsRunning(true);
 
-        // Auto force-write literal-valued FB input shadow variables so the PLC
-        // runtime sees the user-specified defaults from the block pin inputs.
+        // Auto-write literal-valued FB input shadow variables (one-shot) so the
+        // PLC runtime sees the user-specified defaults from the block pin inputs.
         const shadowWrites = Object.entries(preStartVars)
           .filter(([k, v]) =>
             remoteVarKeysRef.current.includes(k) &&
             // ONLY real FB input-pin shadows, by the transpiler's flag. The old
             // `k.includes('_in_')` also matched user variables (`in_speed`, a
-            // program `X_in_Y`) and FORCE-pinned them on the real PLC.
+            // program `X_in_Y`) and overwrote them on the real PLC.
             remotePinShadowInKeysRef.current.has(k) &&
             v !== 0 && v !== false && v !== null && v !== undefined
           )
           .map(([k, v]) => client.writeVar(k, v).catch((e) => {
-            addLog('error', categorize(ERROR_CATEGORY.RUNTIME, `Auto force-write failed for '${k}': ${e.message}`));
+            addLog('error', categorize(ERROR_CATEGORY.RUNTIME, `Auto-write failed for '${k}': ${e.message}`));
           }));
         if (shadowWrites.length > 0) await Promise.all(shadowWrites);
 
@@ -1822,9 +1782,8 @@ function App() {
           stopStreamRef.current();
           stopStreamRef.current = null;
         }
-        // Send stop + clear forces (fire-and-forget; errors just logged).
+        // Send stop (fire-and-forget; errors just logged).
         plcClientRef.current.stop().catch((e) => addLog('error', categorize(ERROR_CATEGORY.RUNTIME, `Stop failed: ${e.message}`)));
-        plcClientRef.current.clearAllForces().catch(() => {});
         // Re-check server status immediately so connection indicator stays green.
         if (plcAddress && connectionEnabled) {
           host.checkServerStatus(plcAddress)
@@ -1840,28 +1799,27 @@ function App() {
     }
   };
 
-  // mode: 'force' (hold, default), 'pulse' (write once, the logic owns it from
-  // the same scan) or 'unforce' (release the hold; a non-null value is also
-  // written once). Both the local sim and a remote PLC support all three now:
-  // every write goes through the runtime's force-write mailbox and resolves
-  // only after the runtime APPLIED it (SHM layout v2).
+  // One-shot write: the value is applied once and the PLC logic owns the
+  // variable again from the same scan. Both the local sim and a remote PLC go
+  // through the runtime's write mailbox and resolve only after the runtime
+  // APPLIED it (SHM layout v2).
   //
   // ⚠️ Writes are SERIALISED PER KEY (a promise chain): a momentary HMI button
-  // sends force TRUE on press and unforce FALSE on release, and two requests in
-  // flight may complete in either order — a release overtaken by its own press
-  // would leave the bit forced TRUE.
-  const forceChainsRef = React.useRef(new Map());
-  const handleForceWrite = useCallback((key, value, mode = 'force') => {
+  // writes TRUE on press and FALSE on release, and two requests in flight may
+  // complete in either order — a release overtaken by its own press would
+  // leave the bit TRUE.
+  const writeChainsRef = React.useRef(new Map());
+  const handleWriteVariable = useCallback((key, value) => {
     if (!isRunning) return Promise.resolve();
-    const chains = forceChainsRef.current;
+    const chains = writeChainsRef.current;
     const prev = chains.get(key) || Promise.resolve();
-    const next = prev.then(() => doForceWrite(key, value, mode));
+    const next = prev.then(() => doWriteVariable(key, value));
     chains.set(key, next);
     next.finally(() => { if (chains.get(key) === next) chains.delete(key); });
     return next;
   }, [isRunning, isSimulationMode, addLog]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  const doForceWrite = async (key, value, mode) => {
+  const doWriteVariable = async (key, value) => {
     if (plcClientRef.current && !isSimulationMode) {
       const normalizedValue = (() => {
         if (value === null || value === undefined) return null;
@@ -1876,54 +1834,25 @@ function App() {
         return Number.isFinite(asNumber) ? asNumber : value;
       })();
 
-      // Remote force write — only keys with an SHM slot on the target (FB
-      // instance objects have none). Say so instead of dropping it silently.
-      // A key the target reports FORCED has a slot by definition (the force
-      // list unforces variables that may not be on screen).
-      if (!remoteVarKeysRef.current.includes(key) && !remoteStreamedKeysRef.current.has(key)
-          && !forcedSetRef.current.has(key)) {
-        addLog('warning', `Force write skipped for '${key}': the target has no slot for it (not streamed by the deployed program — Build & Send may be needed).`);
+      // Remote write — only keys with an SHM slot on the target (FB instance
+      // objects have none). Say so instead of dropping it silently.
+      if (!remoteVarKeysRef.current.includes(key) && !remoteStreamedKeysRef.current.has(key)) {
+        addLog('warning', `Write skipped for '${key}': the target has no slot for it (not streamed by the deployed program — Build & Send may be needed).`);
         return;
       }
       try {
-        await plcClientRef.current.writeVar(key, normalizedValue, mode);
-        if (mode === 'unforce') addLog('info', `Released '${key}' — the program controls it again.`);
+        await plcClientRef.current.writeVar(key, normalizedValue);
       } catch (e) {
-        addLog('error', categorize(ERROR_CATEGORY.RUNTIME, `Force write failed for '${key}': ${e.message}`));
+        addLog('error', categorize(ERROR_CATEGORY.RUNTIME, `Write failed for '${key}': ${e.message}`));
       }
     } else {
       try {
-        await host.writeVariable(key, value, mode);
-        if (mode === 'unforce') addLog('info', `Released '${key}' — the program controls it again.`);
+        await host.writeVariable(key, value);
       } catch (err) {
-        addLog('error', categorize(ERROR_CATEGORY.RUNTIME, `Force write failed for '${key}': ${err.message || err}`));
+        addLog('error', categorize(ERROR_CATEGORY.RUNTIME, `Write failed for '${key}': ${err.message || err}`));
       }
     }
   };
-
-  // Unforce All (Force list): ONE command that releases every force — the
-  // remote ClearAllForces, or the local sim's CLEAR_ALL mailbox command.
-  const handleUnforceAll = useCallback(async () => {
-    if (!isRunning) return;
-    try {
-      if (plcClientRef.current && !isSimulationMode) {
-        await plcClientRef.current.clearAllForces();
-      } else {
-        await host.hotswapClearForces();
-      }
-      addLog('info', t('forces.unforceAllDone'));
-    } catch (e) {
-      addLog('error', categorize(ERROR_CATEGORY.RUNTIME, t('forces.unforceAllFailed', { error: e?.message || e })));
-    }
-  }, [isRunning, isSimulationMode, addLog, t]);
-
-  // The FORCED indicator opens the Force list tab (and makes sure the output
-  // panel is tall enough to show it).
-  const [outputTabRequest, setOutputTabRequest] = useState(null);
-  const openForceList = useCallback(() => {
-    setOutputTabRequest({ tab: 'forces', n: Date.now() });
-    setLayout(prev => (prev.consoleHeight < 140 ? { ...prev, consoleHeight: 220 } : prev));
-  }, []);
 
   // Auto-start/stop local HMI server when simulation runs
   useEffect(() => {
@@ -1948,14 +1877,15 @@ function App() {
       try {
         const writes = await host.pollHmiWrites();
         if (Array.isArray(writes)) {
-          // In arrival order; handleForceWrite chains per key, so a press
-          // and its release can never overtake each other.
-          writes.forEach((w) => handleForceWrite(w.key, w.value, w.mode || 'force'));
+          // In arrival order; handleWriteVariable chains per key, so a press
+          // and its release can never overtake each other. A stale `mode`
+          // from an old HMI page is ignored — every write is one-shot.
+          writes.forEach((w) => handleWriteVariable(w.key, w.value));
         }
       } catch (_) {}
     }, 200);
     return () => clearInterval(interval);
-  }, [isRunning, isSimulationMode, handleForceWrite]);
+  }, [isRunning, isSimulationMode, handleWriteVariable]);
 
   const checkTaskAssignments = () => {
     const tasks = projectStructure?.taskConfig?.tasks || [];
@@ -2853,8 +2783,8 @@ function App() {
     try {
       // STATE CARRY-OVER: snapshot the last live values BEFORE stopping. After
       // the restart, every scalar that still exists (same live key) in the new
-      // build is re-injected as a PULSE (one-scan write, then the logic owns
-      // it) — so a counter at 35 resumes from 35 instead of resetting, which
+      // build is re-injected as a one-shot write (the logic owns it from the
+      // same scan) — so a counter at 35 resumes from 35 instead of resetting, which
       // is what an operator expects from an "online" layout change. FB-internal
       // edge memory isn't carried (not in SHM); a NEW instance starts fresh.
       const preserved = { ...(liveVarsRef.current || {}) };
@@ -2907,7 +2837,7 @@ function App() {
         if (newDefaults[key]?.isPinShadow) continue;
         const v = preserved[key];
         if (v === null || v === undefined || typeof v === 'object') continue; // composites/NaN
-        try { await host.writeVariable(key, v, 'pulse'); carried++; } catch { /* type changed / no slot — skip */ }
+        try { await host.writeVariable(key, v); carried++; } catch { /* type changed / no slot — skip */ }
       }
       addLog('success', `Simulation restarted with the new code — ${carried} variable value(s) carried over.`);
     } catch (e) {
@@ -3110,7 +3040,6 @@ function App() {
   };
 
   return (
-    <ForcedContext.Provider value={forcedSet}>
     <div style={{ 
       display: 'flex', 
       flexDirection: 'column', 
@@ -3139,7 +3068,10 @@ function App() {
           <img src={PlcIcon} alt="Logo" style={{ height: '18px', marginRight: '8px', pointerEvents: 'none' }} />
           <span>KronEditor</span>
           {isProjectOpen && (
-            <span style={{ marginLeft: '10px', color: '#888', fontWeight: 400 }}>
+            <span
+              title={currentFilePath || undefined}
+              style={{ marginLeft: '10px', color: '#888', fontWeight: 400, userSelect: 'text', cursor: 'text', pointerEvents: 'auto' }}
+            >
               — {currentFilePath || 'Untitled'}
             </span>
           )}
@@ -3315,20 +3247,6 @@ function App() {
               <StopIcon />
             </button>
 
-            {/* FORCED (n): CODESYS-style "forces are active" warning — values are
-                held, not computed. Impossible to miss on purpose; opens the
-                Force list (Output panel), where each force can be released. */}
-            {isRunning && forcedSet.size > 0 && (
-              <button
-                className="tb-btn tb-text kron-forced-indicator"
-                onClick={openForceList}
-                title={t('forces.indicatorTitle', { count: forcedSet.size })}
-              >
-                <span className="kron-forced-indicator-f">F</span>
-                <span>{t('forces.indicator', { count: forcedSet.size })}</span>
-              </button>
-            )}
-
             {/* ── Right-aligned group: status ──────────────────────────── */}
             <div style={{ flex: 1 }} />
 
@@ -3500,7 +3418,7 @@ function App() {
                     hmiLayout={hmiLayout}
                     onLayoutChange={setHmiLayout}
                     liveVariables={isRunning ? liveVariables : null}
-                    onForceWrite={isRunning ? handleForceWrite : null}
+                    onWriteVariable={isRunning ? handleWriteVariable : null}
                     projectStructure={projectStructure}
                   />
                 ) : activeItem ? (
@@ -3549,7 +3467,7 @@ function App() {
                           isRunning={isRunning}
                           isSimulationMode={isSimulationMode}
                           allowLiveEdit={hotSwapLive}
-                          onForceWrite={isRunning ? handleForceWrite : null}
+                          onWriteVariable={isRunning ? handleWriteVariable : null}
                           onAddToWatchTable={addToWatchTable}
                           hwPortVars={hwPortVars}
                           errorCodeService={errorCodeService}
@@ -3583,15 +3501,12 @@ function App() {
                   onWatchTableAdd={addToWatchTable}
                   onWatchTableRemove={removeFromWatchTable}
                   onWatchTableUpdate={updateWatchTableEntry}
-                  onForceWrite={isRunning ? handleForceWrite : null}
+                  onWriteVariable={isRunning ? handleWriteVariable : null}
                   liveVariables={liveVariables}
                   isRunning={isRunning}
                   projectStructure={projectStructure}
                   errorCodeService={errorCodeService}
                   onAskAgent={askAgentAbout}
-                  forcedSet={forcedSet}
-                  onUnforceAll={isRunning ? handleUnforceAll : null}
-                  tabRequest={outputTabRequest}
                 />
               </div>
 
@@ -3764,7 +3679,6 @@ function App() {
       />
 
     </div>
-    </ForcedContext.Provider>
   );
 }
 

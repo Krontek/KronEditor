@@ -137,37 +137,38 @@ const strConvSymbol = (progName, tag) => `prog_${progName}_sconv_${tag}`;
 const countStringConvCalls = (code) => ((stripIecComments(code, { blankStrings: true })
     .match(/\b[A-Za-z]+_TO_STRING\s*\(/g)) || []).length;
 
-// ── Shared-memory mirror: one emitter per direction ─────────────────────────
-// ⚠️ Both plc_shm_sync/pull and their per-task twins in generateMainLoop are
-// generated from these, so the two copies cannot drift apart.
-//
-// SHM layout v2 (the byte contract is server/RING_FORMAT.md § "Variable
-// segment"): data slots from 0 at NATURAL alignment, one runtime-owned flag
-// byte per variable from SHM_FORCE_FLAGS_BASE, and the force-write command
-// mailbox at SHM_MAILBOX_BASE. Writers (KronServer, the host agent) never touch
-// a slot or a flag any more — they post a command and wait for its ack.
+// ── Shared-memory mirror ────────────────────────────────────────────────────
+// SHM layout v3 (the byte contract is server/RING_FORMAT.md § "Variable
+// segment"): data slots from 0 at NATURAL alignment up to SHM_DATA_END, and the
+// write-command mailbox at SHM_MAILBOX_BASE. The mirror is one-way: the runtime
+// copies PlcState → slots after every scan (plc_shm_sync) and NEVER reads a slot
+// back. A write from outside (KronServer, the host agent) is a mailbox command
+// the runtime applies to PlcState at the start of a scan and acknowledges.
+// There is no forcing (holding a value against the logic) — it was removed in
+// v3 together with the per-variable flag bytes and the __plc_fv shadow, so a
+// write is always one-shot: the logic owns the value again from that scan.
 //
 // A STRING variable is a `kron_string_t` (char[64]) holding the text, and the
 // slot carries the same TEXT: copy the characters, NUL-pad the rest. The scan
 // is bounded by the slot, so a buffer something filled without a terminator
-// (a block's own VALUE) can never be over-read. Two consequences, both
-// deliberate:
-//   - the mirror is written UNCONDITIONALLY for text, ignoring the force flag,
-//     because a string cannot be forced (see below) and honouring a stray flag
-//     would freeze the display;
-//   - text is NEVER pulled back: a 64-byte copy cannot be applied atomically
-//     between scans the way a scalar is, and a STRING pin of a standard block
-//     is a `const char *` the runtime does not own. STRING is a read-only
-//     live value (KronServer encodeValue, writeHotSwapVariable, the UI and the
-//     mailbox's PLC_MB_ST_READ_ONLY all refuse a write).
+// (a block's own VALUE) can never be over-read. STRING is a read-only live
+// value: a 64-byte copy cannot be applied atomically between scans the way a
+// scalar is, and a STRING pin of a standard block is a `const char *` the
+// runtime does not own (KronServer encodeValue, writeHotSwapVariable, the UI
+// and the mailbox's PLC_MB_ST_READ_ONLY all refuse a write).
 // ⚠️ Text is the one slot NOT copied atomically (64 bytes cannot be): a reader
 // racing this memcpy can see half of the old line and half of the new one. A
 // torn display line is tolerable for a read-only diagnostic; anything that
 // needs a consistent value must not be a STRING.
-const SHM_LAYOUT_VERSION = 2;
+//
+// ⚠️ Keep the per-variable sync line a plain store. The v2 line (flag load +
+// select between PlcState and the forced shadow) sent clang's SLP vectorizer
+// superlinear on ~1600 variables: a 2.4 MB plc.c took 16 s at -O2/-O3 instead
+// of ~4 s, on every Build & Send and every hot-swap.
+const SHM_LAYOUT_VERSION = 3;
 const SHM_TOTAL_SIZE = 65536;      // must match PLC_SHM_SIZE and KronServer's -shm-size
-const SHM_FORCE_FLAGS_BASE = 32768;
 const SHM_MAILBOX_BASE = 61440;    // 0xF000: the top 4 KiB of the segment
+const SHM_DATA_END = SHM_MAILBOX_BASE; // data slots live in [0, SHM_DATA_END)
 const SHM_MAILBOX_CAP = 64;
 // Natural-width carrier for a scalar slot. Every slot is aligned to its own
 // width (max 8), so these loads/stores are single-copy atomic on every target —
@@ -175,35 +176,22 @@ const SHM_MAILBOX_CAP = 64;
 const SHM_SCALAR_C = { 1: 'uint8_t', 2: 'uint16_t', 4: 'uint32_t', 8: 'uint64_t' };
 const shmScalarC = (size) => SHM_SCALAR_C[size] || null;
 
-const shmSyncLine = ({ c_symbol, offset, size, flagOffset, isString }) => isString
+const shmSyncLine = ({ c_symbol, offset, size, isString }) => isString
     ? `    { const char *__s = (const char *)(S->${c_symbol}); size_t __n = 0u;` +
       ` while (__n < ${size - 1}u && __s[__n]) __n++;` +
       ` if (__n) memcpy(__plc_shm + ${offset}, __s, __n);` +
       ` memset(__plc_shm + ${offset} + __n, 0, ${size}u - __n); }\n`
-    // A FORCED slot shows the forced value (kept in S->__plc_fv, which only the
-    // mailbox consumer writes), never whatever the logic computed this scan.
-    : `    PLC_SLOT_ST(${offset}, (PLC_FLAG_LD(${flagOffset}) == PLC_FLAG_FORCED) ? (const void*)(S->__plc_fv + ${offset}) : (const void*)&(S->${c_symbol}), ${shmScalarC(size)});\n`;
+    : `    PLC_SLOT_ST(${offset}, &(S->${c_symbol}), ${shmScalarC(size)});\n`;
 
-// ⚠️ The forced value is re-injected from S->__plc_fv, NOT from the data slot.
-// The slot is a display: plc_shm_sync on ANOTHER task thread may have read the
-// flag as 0 just before the consumer forced it and store the stale computed
-// value afterwards — re-reading the slot would then pin that stale value, the
-// exact race the mailbox exists to remove. Any flag value other than 0 /
-// PLC_FLAG_FORCED was written by an outdated writer (v1 KronServer/agent).
-const shmPullLine = ({ c_symbol, offset, size, flagOffset, isString }) => isString
-    ? ''
-    : `    { uint8_t __f = PLC_FLAG_LD(${flagOffset}); if (__f) { if (__f == PLC_FLAG_FORCED) PLC_COPY_IN(&(S->${c_symbol}), S->__plc_fv + ${offset}, ${shmScalarC(size)}); else plc_mb_foreign(${flagOffset}u, __f); } }\n`;
-
-// ── Force-write command mailbox (runtime = the ONLY consumer) ──────────────
-// Writers used to store the value into the data slot and then set the flag
-// byte. A plc_shm_sync between those two stores overwrote the new value, the
-// flag then pinned the OLD one, and the request still returned 200. Now a
-// writer posts {seq, index, op, size, value} into this mailbox, publishing seq
-// LAST (release); the runtime drains it at the start of every plc_shm_pull,
-// applies each command (PlcState + forced value + slot + flag — the runtime
-// OWNS the flag bytes now) and publishes `ack`. The writer returns success only
-// after the ack. Byte layout: server/RING_FORMAT.md § "Force-write mailbox";
-// the Go writer is hotswaplib/shmcmd, shared by KronServer and the host agent.
+// ── Write-command mailbox (runtime = the ONLY consumer) ─────────────────────
+// A writer storing straight into a slot raced plc_shm_sync, which overwrites
+// the slot from PlcState every scan — the write was lost while the request
+// returned 200. Now a writer posts {seq, index, op, size, value} into this
+// mailbox, publishing seq LAST (release); the runtime drains it at the start of
+// every scan (plc_shm_pull), writes each value into PlcState and the slot, and
+// publishes `ack`. The writer returns success only after the ack. Byte layout:
+// server/RING_FORMAT.md § "Write mailbox"; the Go writer is hotswaplib/shmcmd,
+// shared by KronServer and the host agent.
 //
 // ⚠️ Every task thread runs plc_shm_pull, so consumption is a TRY-lock in the
 // segment itself: a thread that finds it taken simply skips (the holder
@@ -213,25 +201,18 @@ const shmPullLine = ({ c_symbol, offset, size, flagOffset, isString }) => isStri
 // twice across a swap (no thread is ever inside pull while the barrier holds).
 const generateShmMailbox = (shmEntries) => {
     let c = '';
-    c += `#include <stdio.h>\n`;
     c += `#define PLC_SHM_LAYOUT_VERSION ${SHM_LAYOUT_VERSION}u\n`;
-    c += `#define PLC_FORCE_FLAGS_BASE ${SHM_FORCE_FLAGS_BASE}u\n`;
-    // Flag byte values (runtime-written): 0 = the logic owns the value,
-    // PLC_FLAG_FORCED = re-injected from S->__plc_fv every scan. PULSE is no
-    // longer a stored state — it is applied once when its command is consumed.
-    // Anything else came from an outdated writer and is cleared + counted.
-    c += `#define PLC_FLAG_FORCED 0x81u\n`;
     c += `#define PLC_MB_BASE ${SHM_MAILBOX_BASE}u\n`;
     c += `#define PLC_MB_MAGIC 0x424D524Bu /* "KRMB" */\n`;
     c += `#define PLC_MB_HDR 64u\n`;
     c += `#define PLC_MB_CAP ${SHM_MAILBOX_CAP}u\n`;
     c += `#define PLC_MB_ENTRY 32u\n`;
     c += `#define PLC_MB_NVARS ${shmEntries.length}u\n`;
-    c += `#define PLC_MB_OP_FORCE 1u\n#define PLC_MB_OP_PULSE 2u\n#define PLC_MB_OP_UNFORCE 3u\n#define PLC_MB_OP_CLEAR_ALL 4u\n`;
+    // The only command: write once. Code 2 = v2's PULSE (same meaning); v2's
+    // FORCE (1) / UNFORCE (3) / CLEAR_ALL (4) are refused as BAD_OP.
+    c += `#define PLC_MB_OP_WRITE 2u\n`;
     c += `#define PLC_MB_ST_CLAIMED 1u\n#define PLC_MB_ST_APPLIED 2u\n#define PLC_MB_ST_BAD_INDEX 3u\n#define PLC_MB_ST_BAD_SIZE 4u\n#define PLC_MB_ST_READ_ONLY 5u\n#define PLC_MB_ST_BAD_OP 6u\n`;
-    c += `#define PLC_FLAG_LD(f) __atomic_load_n(__plc_shm + (f), __ATOMIC_ACQUIRE)\n`;
     c += `#define PLC_SLOT_ST(off, src, T) do { T __v; memcpy(&__v, (src), sizeof(T)); __atomic_store_n((T *)(__plc_shm + (off)), __v, __ATOMIC_RELAXED); } while (0)\n`;
-    c += `#define PLC_COPY_IN(dst, src, T) do { T __v = __atomic_load_n((const T *)(src), __ATOMIC_RELAXED); memcpy((dst), &__v, sizeof(T)); } while (0)\n`;
     // Atomic store of an n-byte scalar to an n-aligned address.
     c += `static void plc_mb_put(uint8_t *d, const uint8_t *s, int n) {\n`;
     c += `    switch (n) {\n`;
@@ -240,7 +221,8 @@ const generateShmMailbox = (shmEntries) => {
     c += `    case 4: { uint32_t v; memcpy(&v, s, 4); __atomic_store_n((uint32_t *)d, v, __ATOMIC_RELAXED); } break;\n`;
     c += `    case 8: { uint64_t v; memcpy(&v, s, 8); __atomic_store_n((uint64_t *)d, v, __ATOMIC_RELAXED); } break;\n`;
     c += `    default: break;\n    }\n}\n`;
-    // index → (slot offset, PlcState address, size); -1 = read-only (STRING).
+    // index (the table's mb_index) → (slot offset, PlcState address, size);
+    // -1 = read-only (STRING), 0 = unknown index.
     c += `static int plc_mb_target(uint32_t i, uint32_t *off, void **st) {\n`;
     c += `    switch (i) {\n`;
     shmEntries.forEach((e, i) => {
@@ -249,40 +231,19 @@ const generateShmMailbox = (shmEntries) => {
             : `    case ${i}u: *off = ${e.offset}u; *st = (void *)&(S->${e.c_symbol}); return ${e.size};\n`;
     });
     c += `    default: (void)off; (void)st; return 0;\n    }\n}\n`;
-    // A flag byte this runtime never writes: an outdated writer (a v1
-    // KronServer or host agent) stored value + flag directly. Its write is
-    // dropped — honouring it would bring back the race — and said out loud.
-    c += `static void plc_mb_foreign(uint32_t flag, uint8_t v) {\n`;
-    c += `    static int warned = 0;\n`;
-    c += `    if (!__atomic_compare_exchange_n(__plc_shm + flag, &v, (uint8_t)0, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) return;\n`;
-    c += `    __atomic_fetch_add((uint32_t *)(__plc_shm + PLC_MB_BASE + 44u), 1u, __ATOMIC_RELAXED);\n`;
-    c += `    if (!__atomic_exchange_n(&warned, 1, __ATOMIC_RELAXED))\n`;
-    c += `        fprintf(stderr, "[plc] ignored a force flag written directly into shared memory: the writer predates the force-write mailbox (SHM layout v%u) - redeploy KronServer (server/build.sh + Deploy Server to Target)\\n", PLC_SHM_LAYOUT_VERSION);\n`;
-    c += `}\n`;
     c += `static uint32_t plc_mb_apply(const uint8_t *e) {\n`;
     c += `    uint32_t idx; memcpy(&idx, e + 8, 4);\n`;
-    c += `    uint8_t op = e[16], sz = e[17], has = e[18];\n`;
-    c += `    const uint8_t *val = e + 24;\n`;
-    c += `    if (op == PLC_MB_OP_CLEAR_ALL) {\n`;
-    c += `        for (uint32_t i = 0; i < PLC_MB_NVARS; i++) __atomic_store_n(__plc_shm + PLC_FORCE_FLAGS_BASE + i, (uint8_t)0, __ATOMIC_RELEASE);\n`;
-    c += `        return PLC_MB_ST_APPLIED;\n    }\n`;
-    c += `    if (op < PLC_MB_OP_FORCE || op > PLC_MB_OP_UNFORCE) return PLC_MB_ST_BAD_OP;\n`;
+    c += `    uint8_t op = e[16], sz = e[17];\n`;
+    c += `    if (op != PLC_MB_OP_WRITE) return PLC_MB_ST_BAD_OP;\n`;
     c += `    uint32_t off = 0; void *st = 0;\n`;
     c += `    int n = plc_mb_target(idx, &off, &st);\n`;
     c += `    if (n == 0) return PLC_MB_ST_BAD_INDEX;\n`;
     c += `    if (n < 0) return PLC_MB_ST_READ_ONLY;\n`;
-    c += `    int writes = (op != PLC_MB_OP_UNFORCE) || has;\n`;
-    c += `    if (writes && sz != (uint8_t)n) return PLC_MB_ST_BAD_SIZE;\n`;
-    c += `    uint8_t *flag = __plc_shm + PLC_FORCE_FLAGS_BASE + idx;\n`;
-    c += `    if (op == PLC_MB_OP_FORCE) {\n`;
-    // forced value FIRST, then the flag with release: a pull on another task
-    // that acquire-loads FORCED is guaranteed to read the new forced value.
-    c += `        plc_mb_put(S->__plc_fv + off, val, n);\n`;
-    c += `        __atomic_store_n(flag, (uint8_t)PLC_FLAG_FORCED, __ATOMIC_RELEASE);\n`;
-    c += `    } else {\n`;
-    c += `        __atomic_store_n(flag, (uint8_t)0, __ATOMIC_RELEASE);\n`;
-    c += `    }\n`;
-    c += `    if (writes) { memcpy(st, val, (size_t)n); plc_mb_put(__plc_shm + off, val, n); }\n`;
+    c += `    if (sz != (uint8_t)n) return PLC_MB_ST_BAD_SIZE;\n`;
+    // The slot too, so a reader sees the written value before this task's
+    // sync — the logic may still overwrite both later in the same scan.
+    c += `    memcpy(st, e + 24, (size_t)n);\n`;
+    c += `    plc_mb_put(__plc_shm + off, e + 24, n);\n`;
     c += `    return PLC_MB_ST_APPLIED;\n`;
     c += `}\n`;
     c += `static void plc_mb_consume(void) {\n`;
@@ -313,18 +274,6 @@ const generateShmMailbox = (shmEntries) => {
     c += `    if (!__plc_shm) return;\n`;
     c += `    uint8_t *mb = __plc_shm + PLC_MB_BASE;\n`;
     c += `    __atomic_store_n((uint32_t *)(mb + 0), 0u, __ATOMIC_RELEASE); /* unpublished while re-initialising */\n`;
-    // A force that survived a crash-restart with the SAME table (KronServer
-    // clears the flags when the table changed): its slot still shows the forced
-    // value, because plc_shm_sync wrote S->__plc_fv there — reload it.
-    c += `    for (uint32_t i = 0; i < PLC_MB_NVARS; i++) {\n`;
-    c += `        uint8_t f = __atomic_load_n(__plc_shm + PLC_FORCE_FLAGS_BASE + i, __ATOMIC_RELAXED);\n`;
-    c += `        if (!f) continue;\n`;
-    c += `        uint32_t off = 0; void *st = 0;\n`;
-    c += `        int n = plc_mb_target(i, &off, &st);\n`;
-    c += `        if (f != PLC_FLAG_FORCED || n <= 0) { __atomic_store_n(__plc_shm + PLC_FORCE_FLAGS_BASE + i, (uint8_t)0, __ATOMIC_RELAXED); continue; }\n`;
-    c += `        memcpy(S->__plc_fv + off, __plc_shm + off, (size_t)n);\n`;
-    c += `        memcpy(st, __plc_shm + off, (size_t)n);\n`;
-    c += `    }\n`;
     // Anything posted while no runtime was consuming belongs to nobody: its
     // writer has timed out (and been told so) — drop it, never apply it late.
     c += `    __atomic_store_n((uint64_t *)(mb + 32), __atomic_load_n((uint64_t *)(mb + 24), __ATOMIC_ACQUIRE), __ATOMIC_RELAXED);\n`;
@@ -999,12 +948,12 @@ export const transpileToC = (projectStructure, standardHeaders = [], boardId = n
     };
 
     // Shared memory offset tracker — each scalar PLC variable gets its own slot.
-    // Data grows from 0, one runtime-owned flag byte per variable from
-    // SHM_FORCE_FLAGS_BASE, and the command mailbox owns the top of the segment
-    // (SHM layout v2 — server/RING_FORMAT.md § "Variable segment").
-    const FORCE_FLAGS_BASE = SHM_FORCE_FLAGS_BASE;
+    // Data grows from 0 up to SHM_DATA_END; the command mailbox owns the top of
+    // the segment (SHM layout v3 — server/RING_FORMAT.md § "Variable segment").
     let shmOffset = 0;
-    const shmEntries = []; // {c_symbol, offset, size, flagOffset, isString} → plc_shm_sync()
+    // {c_symbol, offset, size, isString} → plc_shm_sync(); the ARRAY POSITION is
+    // the variable's mailbox index (mb_index in the variable table).
+    const shmEntries = [];
     const tryAssignShm = (type, c_symbol) => {
         const size = IEC_TYPE_SIZES[type?.toUpperCase()];
         if (!size) return {}; // FB, user-defined type or unknown — no SHM slot
@@ -1016,22 +965,18 @@ export const transpileToC = (projectStructure, standardHeaders = [], boardId = n
         // consumer follows automatically.
         const align = Math.min(size, 8);
         const offset = (shmOffset + align - 1) & ~(align - 1);
-        const flagOffset = FORCE_FLAGS_BASE + shmEntries.length;
-        // Data region must stay below the force-flag region, and the flag region
-        // below the mailbox — otherwise the generated copies silently corrupt
-        // neighbouring variables / the command mailbox.
-        if (offset + size > FORCE_FLAGS_BASE) {
-            throw new Error(`Too many/too large variables for shared memory: data region exceeds ${FORCE_FLAGS_BASE} bytes at variable "${c_symbol}". Reduce the number/size of monitored variables (e.g. large arrays).`);
-        }
-        if (flagOffset >= SHM_MAILBOX_BASE) {
-            throw new Error(`Too many variables for shared memory: force-flag region reaches the command mailbox at ${SHM_MAILBOX_BASE} at variable "${c_symbol}". Reduce the number of monitored variables.`);
+        // Data must stay below the mailbox — otherwise the generated copies
+        // silently corrupt the command mailbox.
+        if (offset + size > SHM_DATA_END) {
+            throw new Error(`Too many/too large variables for shared memory: data region exceeds ${SHM_DATA_END} bytes at variable "${c_symbol}". Reduce the number/size of monitored variables (e.g. large arrays).`);
         }
         shmOffset = offset + size;
-        // The flag rides on the ENTRY, not a closure: generateMainLoop emits a
-        // second copy of these functions from the same array and would
-        // otherwise have no way to tell text from a number.
-        shmEntries.push({ c_symbol, offset, size, flagOffset, isString: isStringInputType(type) });
-        return { offset, size, force_flag_offset: flagOffset };
+        const mbIndex = shmEntries.length;
+        // isString rides on the ENTRY, not a closure: generateMainLoop emits
+        // plc_shm_sync from this array and has no other way to tell text from
+        // a number.
+        shmEntries.push({ c_symbol, offset, size, isString: isStringInputType(type) });
+        return { offset, size, mb_index: mbIndex };
     };
 
     // Parse a Variable Manager initial value into the JS value stored in
@@ -1839,13 +1784,6 @@ ${ecCfgEarly.motionIncludes ? ecCfgEarly.motionIncludes + '\n' : ''}${ecCfgEarly
     // instances/UDTs without anyone updating the hot-swap layout guard".
     // stateFields is fully finalized by this point — every push site runs
     // earlier than this in transpilePOUSource/this function.
-    // Forced values live HERE, in PlcState, at the same offset as the
-    // variable's data slot — not in the slot itself (see shmPullLine for the
-    // race that rules the slot out). PlcState is host-owned under hot-swap, so
-    // a force survives a logic swap; only the mailbox consumer writes it.
-    if (shmEntries.length > 0) {
-        stateFields.push(`_Alignas(8) uint8_t __plc_fv[${Math.max(8, Math.ceil(shmOffset / 8) * 8)}];`);
-    }
     const plcStateLayoutHash = fnv1a64Hex(stateFields.join('\n'));
 
     // --- 6. BUILD SERVER VARIABLES ARRAY ---
@@ -1873,7 +1811,7 @@ ${ecCfgEarly.motionIncludes ? ecCfgEarly.motionIncludes + '\n' : ''}${ecCfgEarly
             offset: info.offset,
             size: info.size,
             type: IEC_TO_SERVER_TYPE[info.type?.toUpperCase()] ?? 'int32',
-            force_flag_offset: info.force_flag_offset,
+            mb_index: info.mb_index,
             address: info.address || '',
             initial_value: info.defaultValue,
         }));
@@ -1882,11 +1820,10 @@ ${ecCfgEarly.motionIncludes ? ecCfgEarly.motionIncludes + '\n' : ''}${ecCfgEarly
     variableTable.shmSize = shmOffset;
     if (shmEntries.length > 0) {
         // ⚠️ Linux AND Windows AND macOS. The mirror is how the editor
-        // reads/forces live variables, so gating it on __linux__ alone is what
+        // reads/writes live variables, so gating it on __linux__ alone is what
         // made local simulation Linux-only. The platforms differ ONLY in how
-        // the shared segment is created; everything below (pull/sync, force
-        // flags) is byte-identical, because the agent addresses it purely by
-        // offset.
+        // the shared segment is created; everything below (sync, mailbox) is
+        // byte-identical, because the agent addresses it purely by offset.
         //
         // ⚠️ __APPLE__ must stay in this guard even though the branch below
         // creates nothing on macOS: in a hot-swap build the LOADER-HOST owns
@@ -1894,7 +1831,7 @@ ${ecCfgEarly.motionIncludes ? ecCfgEarly.motionIncludes + '\n' : ''}${ecCfgEarly
         // declaration plus the plc_shm_name/plc_shm_size exports the host
         // dlsym's. Drop __APPLE__ and those exports vanish, the host's dlsym
         // returns NULL, and the sim runs perfectly while the editor shows no
-        // live values and every force-write silently does nothing.
+        // live values and every write silently does nothing.
         source += `\n#if defined(__linux__) || defined(_WIN32) || defined(__APPLE__)\n`;
         source += `#define PLC_SHM_SIZE ${SHM_TOTAL_SIZE}\n`;
         source += `static void plc_mb_init(void);\n`;
@@ -1950,15 +1887,6 @@ ${ecCfgEarly.motionIncludes ? ecCfgEarly.motionIncludes + '\n' : ''}${ecCfgEarly
         source += `#endif\n`;
         source += `#endif\n`;
         source += generateShmMailbox(shmEntries);
-        source += `static void plc_shm_pull(void) {\n`;
-        source += `    if (!__plc_shm) return;\n`;
-        source += `    plc_mb_consume();\n`;
-        shmEntries.forEach(e => { source += shmPullLine(e); });
-        source += `}\n`;
-        source += `static void plc_shm_sync(void) {\n`;
-        source += `    if (!__plc_shm) return;\n`;
-        shmEntries.forEach(e => { source += shmSyncLine(e); });
-        source += `}\n`;
         source += `#endif /* __linux__ || _WIN32 */\n\n`;
     }
 
@@ -2021,16 +1949,15 @@ ${ecCfgEarly.motionIncludes ? ecCfgEarly.motionIncludes + '\n' : ''}${ecCfgEarly
         exec_time_key: `prog____exec_us_${pt.name}`,
     }));
     variableTable.base_tick_us = mainLoop.baseTickUs;
-    // SHM layout v2 descriptor for the force-write writers (KronServer and the
-    // host agent). A table WITHOUT it was built for the v1 runtime; the writers
-    // also verify the mailbox magic/version in the segment itself, so a table
-    // and a runtime from different builds cannot silently disagree.
+    // SHM layout descriptor for the mailbox writers (KronServer and the host
+    // agent). The writers also verify the mailbox magic/version in the segment
+    // itself, so a table and a runtime from different builds cannot silently
+    // disagree.
     // max_task_interval_us sizes the writer's ack timeout.
     if (shmEntries.length > 0) {
         variableTable.shm_layout = {
             version: SHM_LAYOUT_VERSION,
             size: SHM_TOTAL_SIZE,
-            force_flags_base: SHM_FORCE_FLAGS_BASE,
             mailbox_offset: SHM_MAILBOX_BASE,
             mailbox_capacity: SHM_MAILBOX_CAP,
             nvars: shmEntries.length,
@@ -2654,7 +2581,11 @@ const generateEtherCATConfig = (buses, busConfigs, globalSimMode = false) => {
             }
             return { ...sdo, byteSize: size };
         });
-        const allSdos = [...pdoMapSdos, ...userSdos];
+        // ⚠️ on_error: the generated PDO-mapping SDOs are ALWAYS abort (a half-written
+        // mapping is worse than no bus); a user row carries its own policy, and a row
+        // without one (older project, cached ESI device) is abort too — never silently
+        // relaxed. Only 'next' is emitted as anything other than the zero default.
+        const allSdos = [...pdoMapSdos.map(s => ({ ...s, onError: 'abort' })), ...userSdos];
         if (allSdos.length > KRON_EC_MAX_SDO) {
             throw new Error(
                 `EtherCAT slave "${slave.name || `Slave_${si + 1}`}" needs ${allSdos.length} startup SDOs ` +
@@ -2668,6 +2599,7 @@ const generateEtherCATConfig = (buses, busConfigs, globalSimMode = false) => {
             initCode += `    __ec_cfg.slaves[${si}].sdo_inits[${di}].subindex  = ${(sdo.subindex || 0) & 0xFF};\n`;
             initCode += `    __ec_cfg.slaves[${si}].sdo_inits[${di}].value     = 0x${((sdo.value || 0) >>> 0).toString(16).toUpperCase().padStart(8, '0')}UL;\n`;
             initCode += `    __ec_cfg.slaves[${si}].sdo_inits[${di}].byte_size = ${Math.min(4, Math.max(1, parseInt(sdo.byteSize) || 1))};\n`;   // resolveSdoByteSize for user rows; generated PDO-mapping SDOs carry their own
+            initCode += `    __ec_cfg.slaves[${si}].sdo_inits[${di}].on_error  = ${sdo.onError === 'next' ? 'KRON_EC_SDO_ON_ERROR_NEXT' : 'KRON_EC_SDO_ON_ERROR_ABORT'};\n`;
         });
         if (allSdos.length > 0) initCode += `    __ec_cfg.slaves[${si}].sdo_count = ${allSdos.length};\n`;
     });
@@ -3195,6 +3127,19 @@ ${gpiInCopyBack}        atomic_store_explicit(&__gpi, back, memory_order_release
 
         clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &__next, NULL);
     }
+    /* \u26a0\ufe0f STOP = SAFE STATE. Leaving the loop with the last outputs still in
+     * the slaves' RxPDOs kept every output energised (and every drive enabled)
+     * after a Stop. Zero the whole staging image \u2014 every RxPDO entry, and with
+     * it each CiA402 control word (0 = Disable voltage) \u2014 and transmit it for a
+     * few cycles, BEFORE the master is closed. The logic's __gpi_out and the
+     * axis bridge are deliberately not copied in again. */
+    memset(&__gpi_hw, 0, sizeof __gpi_hw);
+    for (int __k = 0; __k < 3; __k++) {
+        kron_ec_pdo_write(&__ec_cfg);
+        kron_ec_pdo_read(&__ec_cfg);
+        struct timespec __cy = { (time_t)(__ec_ns / 1000000000UL), (long)(__ec_ns % 1000000000UL) };
+        clock_nanosleep(CLOCK_MONOTONIC, 0, &__cy, NULL);
+    }
     return NULL;
 }
 `;
@@ -3228,7 +3173,7 @@ ${gpiInCopyBack}        atomic_store_explicit(&__gpi, back, memory_order_release
     const hostGlueEc =
 `\n/* ── EtherCAT master (hot-swap: host-owned, survives a logic swap) ── */\n` +
 `#if defined(__linux__)\n` +
-`#include <pthread.h>\n#include <time.h>\n#include <stdatomic.h>\n` +
+`#include <pthread.h>\n#include <time.h>\n#include <stdatomic.h>\n#include <string.h>\n` +
 `#include "kronethercatmaster.h"\n#include "kron_hal.h"\n` +
 (hasAxes ? `#include "kron_pi.h"\n#include "kronmotion.h"\nextern KRON_PROCESS_IMAGE Kron_PI;\n` : '') +
 axisLockMacros +
@@ -3696,23 +3641,20 @@ const generateMainLoop = (projectStructure, config, boardId = null, shmEnabled =
           `#endif\n`
         : '';
 
-    // Per-task SHM pull/sync functions — each task calls its own named version.
-    // All currently include the full variable set; partition per-task in future if needed.
+    // SHM pull/sync — ONE copy shared by every task. ⚠️ Never emit a copy per
+    // task again: each held the full variable set, so N tasks multiplied the
+    // biggest functions in plc.c (and the compile time) by N for nothing.
+    // pull drains the mailbox FIRST, so a write takes effect on this very scan
+    // (see generateShmMailbox); there is nothing per-variable to pull.
     if (shmEnabled && shmEntries.length > 0) {
-        taskGroups.forEach(tg => {
-            // See generateShmMailbox for the command protocol: the mailbox is
-            // drained FIRST, so a command takes effect on this very scan.
-            mainSrc += `static void plc_shm_pull_${tg.taskName}(void) {\n`;
-            mainSrc += `    if (!__plc_shm) return;\n`;
-            mainSrc += `    plc_mb_consume();\n`;
-            shmEntries.forEach(e => { mainSrc += shmPullLine(e); });
-            mainSrc += `}\n`;
-            mainSrc += `static void plc_shm_sync_${tg.taskName}(void) {\n`;
-            mainSrc += `    if (!__plc_shm) return;\n`;
-            shmEntries.forEach(e => { mainSrc += shmSyncLine(e); });
-            mainSrc += `}\n`;
-        });
-        mainSrc += `\n`;
+        mainSrc += `static void plc_shm_pull(void) {\n`;
+        mainSrc += `    if (!__plc_shm) return;\n`;
+        mainSrc += `    plc_mb_consume();\n`;
+        mainSrc += `}\n`;
+        mainSrc += `static void plc_shm_sync(void) {\n`;
+        mainSrc += `    if (!__plc_shm) return;\n`;
+        shmEntries.forEach(e => { mainSrc += shmSyncLine(e); });
+        mainSrc += `}\n\n`;
     }
 
     // --- LOSSLESS CAPTURE RING codegen (addressed variables) ---
@@ -3835,7 +3777,7 @@ const generateMainLoop = (projectStructure, config, boardId = null, shmEnabled =
     // after dlopen'ing this translation unit as logic.so. Hot-swappable.
     taskGroups.forEach((tg, ti) => {
         mainSrc += `void plc_task_body_${ti}(void) {\n`;
-        if (shmEnabled) mainSrc += `    plc_shm_pull_${tg.taskName}();\n`;
+        if (shmEnabled) mainSrc += `    plc_shm_pull();\n`;
         if (gpiMutexEnabled) mainSrc += `    __gpi_snap = atomic_load_explicit(&__gpi, memory_order_acquire);\n`;
         if (ti === motionTaskIdx) mainSrc += axisReadPhase;
         tg.programs.forEach(pName => {
@@ -3854,7 +3796,7 @@ const generateMainLoop = (projectStructure, config, boardId = null, shmEnabled =
         // trajectory core answers on the same one, which is what makes a new
         // target take effect next cycle with no profile to re-plan.
         if (ti === motionTaskIdx) mainSrc += axisWritePhase;
-        if (shmEnabled) mainSrc += `    plc_shm_sync_${tg.taskName}();\n`;
+        if (shmEnabled) mainSrc += `    plc_shm_sync();\n`;
         // Capture ring: append this task's addressed vars AFTER shm sync (values
         // final for the scan). No-op unless this task has addressed vars.
         if (ringEnabled && ringTasks.find((t) => t.taskId === ti)) {
@@ -3871,6 +3813,21 @@ const generateMainLoop = (projectStructure, config, boardId = null, shmEnabled =
     // In-binary thread loop — normal (non-hot-swap) build only. The loader-host
     // provides its own loop in a hot-swap build.
     mainSrc += `#ifndef PLC_HOTSWAP\n`;
+    // Sleeps toward an absolute deadline in <= 50 ms slices, re-checking
+    // plc_stop between them — same rule as hotswaphost/host.c scan_sleep_until.
+    // One sleep to the deadline made a Stop wait out a whole task interval
+    // (past KronServer's 5 s grace for a slow task), so the runtime was
+    // SIGKILLed and never reached PLC_Cleanup — outputs stayed energised.
+    mainSrc += `static void plc_sleep_until(const struct timespec *__dl) {\n`;
+    mainSrc += `    for (;;) {\n`;
+    mainSrc += `        if (plc_stop) return;\n`;
+    mainSrc += `        struct timespec __now; clock_gettime(CLOCK_MONOTONIC, &__now);\n`;
+    mainSrc += `        long long __d = ((long long)__dl->tv_sec - (long long)__now.tv_sec) * 1000000000LL + ((long long)__dl->tv_nsec - (long long)__now.tv_nsec);\n`;
+    mainSrc += `        if (__d <= 0) return;\n`;
+    mainSrc += `        if (__d <= 50000000LL) { clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, __dl, NULL); return; }\n`;
+    mainSrc += `        struct timespec __sl = { 0, 50000000L }; clock_nanosleep(CLOCK_MONOTONIC, 0, &__sl, NULL);\n`;
+    mainSrc += `    }\n`;
+    mainSrc += `}\n`;
     taskGroups.forEach((tg, ti) => {
         const isIoTask = hasEc && (tg.intervalUs === fastestIntervalUs);
         mainSrc += `static void* plc_task_${tg.taskName}(void *arg) {\n`;
@@ -3892,7 +3849,7 @@ const generateMainLoop = (projectStructure, config, boardId = null, shmEnabled =
         mainSrc += `          us_tick = (uint64_t)__ts.tv_sec * 1000000ULL + (uint64_t)__ts.tv_nsec / 1000ULL; }\n`;
         mainSrc += `        plc_task_body_${ti}();\n`;
         if (!gpiMutexEnabled && isIoTask && ecPdoWriteCode) mainSrc += ecPdoWriteCode;
-        mainSrc += `        clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &__next, NULL);\n`;
+        mainSrc += `        plc_sleep_until(&__next);\n`;
         mainSrc += `    }\n`;
         mainSrc += `    return NULL;\n`;
         mainSrc += `}\n\n`;
@@ -3901,22 +3858,19 @@ const generateMainLoop = (projectStructure, config, boardId = null, shmEnabled =
 
     // Linux main(): spawn all task threads (normal build only).
     mainSrc += `#ifndef PLC_HOTSWAP\n`;
-    if (retainEnabled) {
-        // ⚠️ Installed ONLY for a project that has retained variables. Without a
-        // handler SIGTERM terminates the process outright, so KronServer's Stop
-        // (SIGTERM → 5 s → SIGKILL, server/process.go) would skip PLC_Cleanup and
-        // lose everything written since the last periodic flush. Gating it on
-        // retain keeps the stop semantics of every other project unchanged.
-        mainSrc += `#include <signal.h>\n`;
-        mainSrc += `static void plc_on_term(int sig) { (void)sig; plc_stop = 1; }\n`;
-    }
+    // ⚠️ ALWAYS installed. Without a handler SIGTERM terminates the process
+    // outright, so KronServer's Stop (SIGTERM → 5 s → SIGKILL,
+    // server/process.go) skipped PLC_Cleanup: no final retain flush and — the
+    // safety problem — no HAL_Cleanup / EtherCAT safe state, so a stopped PLC
+    // left every output at its last level. The loops below leave on plc_stop
+    // and main() runs PLC_Cleanup, which drives the outputs low.
+    mainSrc += `#include <signal.h>\n`;
+    mainSrc += `static void plc_on_term(int sig) { (void)sig; plc_stop = 1; }\n`;
     mainSrc += `int main() {\n`;
     mainSrc += `    { struct sched_param __sp = { .sched_priority = sched_get_priority_max(SCHED_FIFO) };\n`;
     mainSrc += `      sched_setscheduler(0, SCHED_FIFO, &__sp); }\n`;
-    if (retainEnabled) {
-        mainSrc += `    signal(SIGTERM, plc_on_term);\n`;
-        mainSrc += `    signal(SIGINT,  plc_on_term);\n`;
-    }
+    mainSrc += `    signal(SIGTERM, plc_on_term);\n`;
+    mainSrc += `    signal(SIGINT,  plc_on_term);\n`;
     mainSrc += `    PLC_Init();\n`;
     if (shmEnabled) {
         mainSrc += `    plc_shm_init();\n`;
@@ -3966,7 +3920,7 @@ const generateMainLoop = (projectStructure, config, boardId = null, shmEnabled =
     // ⚠️ Dispatch through plc_task_body_<i>, exactly like the Linux threads —
     // NOT the bare program functions. The body wrapper is what runs the SHM
     // pull/sync pair, so calling the programs directly left the mirror (and
-    // therefore every live value and force-write) permanently empty.
+    // therefore every live value and write) permanently empty.
     taskGroups.forEach((tg, ti) => {
         mainSrc += `        if (us_tick / ${tg.intervalUs} != __prev_us / ${tg.intervalUs}) { plc_task_body_${ti}(); }\n`;
     });
@@ -4492,7 +4446,7 @@ const GENERATED_FB_OUTPUT_TYPES = {};
 // Types are the struct fields in kronethercatmaster.h.
 const EC_FB_OUTPUT_TYPES = {
     'EC_GetMasterState': { 'ErrorID': 'WORD', 'State': 'BYTE', 'SlaveCount': 'UINT' },
-    'EC_GetSlaveState':  { 'ErrorID': 'WORD', 'State': 'BYTE' },
+    'EC_GetSlaveState':  { 'ErrorID': 'WORD', 'State': 'BYTE', 'SdoIndex': 'WORD', 'SdoSubIndex': 'BYTE', 'SdoAbortCode': 'DWORD' },
     'EC_ResetBus':       { 'ErrorID': 'WORD' },
     'EC_ReadSDO':        { 'ErrorID': 'WORD', 'Value': 'DWORD' },
     'EC_WriteSDO':       { 'ErrorID': 'WORD' },
@@ -4840,7 +4794,7 @@ const FB_OUTPUTS = {
     'NORM_X': ['ENO', 'OUT'], 'SCALE_X': ['ENO', 'OUT'],
     // EtherCAT diagnostics
     'EC_GetMasterState': ['Valid', 'Error', 'ErrorID', 'State', 'Operational', 'SlaveCount'],
-    'EC_GetSlaveState':  ['Valid', 'Error', 'ErrorID', 'State', 'LinkUp'],
+    'EC_GetSlaveState':  ['Valid', 'Error', 'ErrorID', 'State', 'LinkUp', 'SdoIndex', 'SdoSubIndex', 'SdoAbortCode'],
     'EC_ResetBus':       ['Done', 'Busy', 'Error', 'ErrorID'],
     'EC_ReadSDO':        ['Done', 'Busy', 'Error', 'ErrorID', 'Value'],
     'EC_WriteSDO':       ['Done', 'Busy', 'Error', 'ErrorID'],
@@ -5258,6 +5212,9 @@ export const getStandardFBPins = (type) => {
     const pins = new Set(['en', 'eno']);
     (FB_INPUTS[keyIn] || []).forEach((p) => pins.add(p.toLowerCase()));
     (FB_OUTPUTS[keyOut] || []).forEach((p) => pins.add(p.toLowerCase()));
+    // Motion FBs: Axis is deliberately absent from FB_INPUTS (it is the 2nd
+    // _Call argument, not a struct field) but is a valid named argument.
+    if ([...MOTION_FB_AXIS_PARAM].some((k) => k.toLowerCase() === tl)) pins.add('axis');
     return pins;
 };
 // Returns the C struct member name for a given editor pin name and block type.
@@ -5353,7 +5310,7 @@ const FB_INPUT_TYPES = {
 };
 // EtherCAT diagnostics. Without these the non-trigger pins get no writable
 // input shadow var, so — unlike every other FB — a literal typed into
-// SlaveAddress/Index/SubIndex could not be monitored or forced from the editor,
+// SlaveAddress/Index/SubIndex could not be monitored or written from the editor,
 // and an LD auto-declare on such a pin had no type to work from.
 FB_INPUT_TYPES['EC_GetSlaveState'] = { 'SlaveAddress': 'UINT' };
 FB_INPUT_TYPES['EC_ReadSDO']       = { 'SlaveAddress': 'UINT', 'Index': 'WORD', 'SubIndex': 'BYTE', 'ByteSize': 'BYTE' };

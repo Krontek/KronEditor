@@ -10,7 +10,7 @@ const POU_CATS = [
     { key: 'functions', label: 'Function' },
 ];
 
-const ResourceEditor = ({ content, onContentChange, availablePrograms = [], derivedTypes = [], userDefinedTypes = [], liveVariables = null, isRunning = false, isSimulationMode = false, onForceWrite = null }) => {
+const ResourceEditor = ({ content, onContentChange, availablePrograms = [], derivedTypes = [], userDefinedTypes = [], liveVariables = null, isRunning = false, isSimulationMode = false, onWriteVariable = null }) => {
     const { t } = useTranslation();
     const [tab, setTab] = useState('globals'); // 'globals' | 'addressed'
 
@@ -130,7 +130,7 @@ const ResourceEditor = ({ content, onContentChange, availablePrograms = [], deri
                             liveVariables={liveVariables}
                             disabled={isRunning}
                             isSimulationMode={isSimulationMode}
-                            onForceWrite={onForceWrite}
+                            onWriteVariable={onWriteVariable}
                             projectStructure={content.projectStructure}
                         />
                     </div>

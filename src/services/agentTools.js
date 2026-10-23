@@ -574,8 +574,9 @@ export const TOOL_DEFS = [
       '5s on-delay: rungs: [{ "branches": [[{"contact":"Sensor"}]], "fb": { "type":"TON", "instance":"delayTimer", "inputs": {"PT":"T#5s"}, "outputs": {"ET":"elapsed"} }, "outputs": [{"coil":"Lamp"}] }]. ' +
       'Counter with reset: rungs: [{ "branches": [[{"contact":"PartSensor"}]], "fb": { "type":"CTU", "instance":"partCounter", "inputs": {"PV":"100","R":"ResetBtn"} }, "outputs": [{"coil":"BatchDone"}] }]. ' +
       'STRING pins (a file path, a device name) take QUOTED text: {"PATH":"\'/sys/class/hwmon/hwmon2/fan1_input\'"}. An unquoted word is used as text too, unless a variable of that name is declared — then it reads that variable. ' +
-      'Read_Sys_File / Read_Hwmon return the file text on VALUE (a STRING): compare it in an ST rung with = or <>, or convert it with a STRING_TO_x block. A STRING is a read-only live value (at most 63 bytes; longer text is truncated), so to force or trend it publish a converted number or a comparison result. ' +
-      'Note: inline math/move/compare (ADD, MOVE, GT, …) and motion (MC_*) do NOT go in ladder — write those in an ST rung (set_st_code).',
+      'Read_Sys_File / Read_Hwmon return the file text on VALUE (a STRING): compare it in an ST rung with = or <>, or convert it with a STRING_TO_x block. A STRING is a read-only live value (at most 63 bytes; longer text is truncated), so to write or trend it publish a converted number or a comparison result. ' +
+      'Motion FBs (MC_Power, MC_MoveAbsolute, MC_Reset, …) CAN be the rung fb: pass the axis as fb.inputs.Axis = the name of an existing AXIS_REF global (never auto-declared), e.g. rungs: [{ "branches": [[{"contact":"PowerOn"}]], "fb": { "type":"MC_Power", "instance":"fbPower", "inputs": {"Axis":"Axis_1","EnablePositive":"TRUE","EnableNegative":"TRUE"}, "outputs": {"ErrorID":"PowerErrId"} }, "outputs": [{"coil":"Power_Status"}] }]. ' +
+      'Note: inline math/move/compare (ADD, MOVE, GT, …) do NOT go in ladder — write those in an ST rung (set_st_code).',
     parameters: S({
       pou: str('Target LD POU name'),
       rungs: {
@@ -596,7 +597,7 @@ export const TOOL_DEFS = [
           fb: S({
             type: str('Block type, e.g. TON, TOF, TP, CTU, CTD, R_TRIG, SR, RS, or a project function block name (see list_blocks)'),
             instance: str('Instance variable name (auto-declared with the FB type if missing), e.g. "delayTimer"'),
-            inputs: { type: 'object', description: 'Non-trigger input pins by NAME: literal ("T#5s", "100") or a variable name ("ResetBtn"). The trigger pin (IN/CU/…) comes from the rung power flow — do not set it here.', additionalProperties: { type: 'string' } },
+            inputs: { type: 'object', description: 'Non-trigger input pins by NAME: literal ("T#5s", "100") or a variable name ("ResetBtn"). A motion FB also takes its axis here: "Axis": "<AXIS_REF global>". The trigger pin (IN/CU/Execute/Enable/…) comes from the rung power flow — do not set it here.', additionalProperties: { type: 'string' } },
             outputs: { type: 'object', description: 'Optional captures: output pin name → variable name to store it into (e.g. {"ET":"elapsed","CV":"count"}).', additionalProperties: { type: 'string' } },
           }, ['type', 'instance']),
           outputs: {
@@ -1653,7 +1654,9 @@ const LD_X0 = 60;    // first column x (just right of the left rail)
 // Keep in sync with RungContainer: MIN_RUNG_HEIGHT and the node boxes.
 const LD_MIDDLE_Y = 75;                                    // = MIN_RUNG_HEIGHT (150) / 2
 const LD_CONTACT_Y = LD_MIDDLE_Y - 27 / 2;                 // contact/coil box is 27×27, handle at top:50%
-// An FB's power handle is its TRIGGER ROW, not its middle: instance bar (~17)
+// An FB's power handle is its TRIGGER ROW — always the FIRST pin row, because
+// RungContainer's BlockNode draws the powerPins() trigger/output first (EN/ENO
+// with executionControl). Not its middle: instance bar (~17)
 // + label bar (~21) + body top padding (8) + half a pin row (~9). Approximate
 // by nature (row height depends on the pin's controls) — the editor's magnet
 // (POWER_SNAP_DRAG = 16px) absorbs the residual, and any drag re-snaps it
@@ -1807,7 +1810,23 @@ function compileLadderRung(r, idx, ctx = {}) {
     if (!isHwBlock && FB_TRIGGER_PIN[fb.type] === 'EN' && !SYSTEM_FB_TYPES.has(fb.type)) throw new Error(`rung ${idx + 1}: "${fb.type}" is an inline math/move/compare operation — express it in an ST rung (set_st_code) instead of ladder`);
     fbDef = resolveFbBlockDef(ctx.struct, ctx.library, fb.type, ctx.hardware);
     if (!fbDef) throw new Error(`rung ${idx + 1}: unknown block type "${fb.type}" — call list_blocks to see available types`);
-    if ((fbDef.inputs || []).some((p) => p.type === 'AXIS_REF')) throw new Error(`rung ${idx + 1}: "${fb.type}" is a motion FB (needs an Axis) — author motion in an ST rung (set_st_code)`);
+    // Motion FBs (MC_*): the AXIS_REF pin is not a wire but the 2nd argument
+    // of `MC_xxx_Call(&inst, &axis)` — the transpiler's LD path reads it from
+    // data.values.Axis, exactly where a human-dropped block keeps it. It must
+    // name an EXISTING AXIS_REF variable: auto-declaring one would compile
+    // against an axis no slave drives (a motion FB that silently never moves).
+    const axisPins = new Set((fbDef.inputs || []).filter((p) => p.type === 'AXIS_REF').map((p) => p.name));
+    const axisNames = {}; // pin → declared spelling
+    for (const pin of axisPins) {
+      const axis = (fb.inputs || {})[pin];
+      if (!axis || !isValidIecName(String(axis))) throw new Error(`rung ${idx + 1}: "${fb.type}" needs fb.inputs.${pin} = the name of an AXIS_REF global (e.g. "Axis_1")`);
+      if (ctx.struct) {
+        const found = findVarByName(ctx.pou?.content?.variables || [], String(axis)) || findVarByName(getGlobals(ctx.struct), String(axis));
+        const axes = getGlobals(ctx.struct).filter((v) => String(v.type).trim().toUpperCase() === 'AXIS_REF').map((v) => v.name);
+        if (!found || String(found.type).trim().toUpperCase() !== 'AXIS_REF') throw new Error(`rung ${idx + 1}: ${fb.type}.${pin} "${axis}" is not a declared AXIS_REF variable (AXIS_REF globals: ${axes.join(', ') || 'none — enable an axis on an EtherCAT slave and add its AXIS_REF global first'})`);
+        axisNames[pin] = found.name;
+      } else axisNames[pin] = String(axis);
+    }
     const inputNames = (fbDef.inputs || []).map((p) => p.name);
     const outputNames = (fbDef.outputs || []).map((p) => p.name);
     // Shared with buildBlockCatalog so the pins the model is TOLD about are
@@ -1826,6 +1845,7 @@ function compileLadderRung(r, idx, ctx = {}) {
     const isIdentRef = (v) => isValidIecName(String(v)) && !/^(true|false)$/i.test(String(v));
     for (const [pin, val] of Object.entries(fb.inputs || {})) {
       if (!inputNames.includes(pin)) throw new Error(`rung ${idx + 1}: "${fb.type}" has no input pin "${pin}" (inputs: ${inputNames.join(', ') || 'none'})`);
+      if (axisPins.has(pin)) { fbValues[pin] = axisNames[pin]; continue; } // validated above, never auto-declared
       fbValues[pin] = String(val);
       // ⚠️ A STRING pin's value is TEXT unless a variable of that name is
       // already declared (the transpiler applies the same rule). Auto-declaring

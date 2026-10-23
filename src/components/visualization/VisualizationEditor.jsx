@@ -15,7 +15,7 @@ const VisualizationEditor = ({
     hmiLayout,
     onLayoutChange,
     liveVariables = null,
-    onForceWrite = null,
+    onWriteVariable = null,
     projectStructure = null,
 }) => {
     const [currentPageIdx, setCurrentPageIdx] = useState(0);
@@ -326,7 +326,7 @@ const VisualizationEditor = ({
                                 onResize={handleResize}
                                 onDelete={handleDelete}
                                 liveVariables={liveVariables}
-                                onWrite={onForceWrite}
+                                onWrite={onWriteVariable}
                                 projectStructure={projectStructure}
                                 isPreview={isPreview}
                                 canvasW={canvasW}

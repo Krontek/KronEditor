@@ -20,7 +20,7 @@
 // Categories shown as the leading word(s) of every formatted line. Keep these
 // in sync with the actual pipeline stage that can throw into each catch site
 // (App.jsx handleBuild / handleBuildAndSend / handleToggleSimulation /
-// handleStartExecution / handleStopExecution / force-write / stream errors).
+// handleStartExecution / handleStopExecution / variable-write / stream errors).
 export const ERROR_CATEGORY = {
     TRANSPILE: 'Transpile',
     COMPILE: 'Compile',
@@ -124,7 +124,7 @@ export const formatCompileFailure = (category, err) => {
 /**
  * Prefix an already-short, single-line message with its pipeline category —
  * for failures that are NOT raw compiler dumps (Transpile throws, Deploy HTTP
- * errors, Runtime start/stop/stream/force-write errors), which are already
+ * errors, Runtime start/stop/stream/write errors), which are already
  * one line and just need the "what stage failed" context up front. A no-op
  * if the message is already tagged (avoids "Deploy error: Deploy error: …"
  * when a lower-level catch already categorized it).

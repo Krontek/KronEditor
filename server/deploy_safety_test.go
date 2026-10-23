@@ -16,10 +16,12 @@ import (
 )
 
 // newTestIPC builds an IPCManager over a plain byte slice — no /dev/shm — so
-// table/flag logic can be tested without a real segment.
+// table logic can be tested without a real segment.
 func newTestIPC(size int) *IPCManager {
 	return &IPCManager{shmSize: size, mem: make([]byte, size), vars: map[string]Variable{}}
 }
+
+func intPtr(i int) *int { return &i }
 
 func tableJSON(t *testing.T, vars []Variable, pwHash string) []byte {
 	t.Helper()
@@ -89,7 +91,7 @@ func TestRejectedVariableTableKeepsDeployedFile(t *testing.T) {
 	dir := t.TempDir()
 	ipc := newTestIPC(65536)
 	s := &Server{cfg: Config{DeployDir: dir}, ipc: ipc}
-	good := tableJSON(t, []Variable{{Name: "a", Offset: 0, Type: VarInt32, Size: 4, ForceFlagOffset: forceFlagsBase}}, "")
+	good := tableJSON(t, []Variable{{Name: "a", Offset: 0, Type: VarInt32, Size: 4, MbIndex: intPtr(0)}}, "")
 
 	post := func(body []byte) int {
 		req := httptest.NewRequest(http.MethodPost, "/deploy/variable-table", strings.NewReader(string(body)))
@@ -110,53 +112,6 @@ func TestRejectedVariableTableKeepsDeployedFile(t *testing.T) {
 	}
 	if ipc.VariableCount() != 1 {
 		t.Fatalf("in-memory table changed: %d vars", ipc.VariableCount())
-	}
-}
-
-// Force flags are index-keyed: a DIFFERENT table must start with a clean flag
-// region, the SAME table (crash-restart, plain restart) must keep its forces.
-func TestForceFlagsClearedOnlyWhenTheTableChanges(t *testing.T) {
-	ipc := newTestIPC(65536)
-	load := func(vars []Variable) {
-		pt, err := ipc.ParseVariableTable(tableJSON(t, vars, ""))
-		if err != nil {
-			t.Fatal(err)
-		}
-		ipc.ApplyVariableTable(pt)
-	}
-	v1 := []Variable{
-		{Name: "a", Offset: 0, Type: VarBool, Size: 1, ForceFlagOffset: forceFlagsBase},
-		{Name: "b", Offset: 1, Type: VarBool, Size: 1, ForceFlagOffset: forceFlagsBase + 1},
-	}
-	load(v1)
-	ipc.MarkTableStarted()
-	ipc.mem[forceFlagsBase+1] = 1 // "b" forced
-	ipc.mem[forceFlagsBase+500] = 1
-
-	ipc.ClearForcesIfTableChanged() // same table → keep
-	if ipc.mem[forceFlagsBase+1] != 1 {
-		t.Fatal("force flag cleared although the table did not change")
-	}
-
-	// Redeploy with a variable inserted before "b": flag index 1 now means "x".
-	load([]Variable{
-		{Name: "a", Offset: 0, Type: VarBool, Size: 1, ForceFlagOffset: forceFlagsBase},
-		{Name: "x", Offset: 1, Type: VarBool, Size: 1, ForceFlagOffset: forceFlagsBase + 1},
-		{Name: "b", Offset: 2, Type: VarBool, Size: 1, ForceFlagOffset: forceFlagsBase + 2},
-	})
-	ipc.mem[5] = 42 // data below the region is untouched
-	ipc.ClearForcesIfTableChanged()
-	if ipc.mem[forceFlagsBase+1] != 0 || ipc.mem[forceFlagsBase+500] != 0 {
-		t.Fatal("stale force flags survived a table change")
-	}
-	if ipc.mem[5] != 42 {
-		t.Fatal("data region was touched")
-	}
-	// A second start with that same new table keeps new forces.
-	ipc.mem[forceFlagsBase+2] = 1
-	ipc.ClearForcesIfTableChanged()
-	if ipc.mem[forceFlagsBase+2] != 1 {
-		t.Fatal("forces cleared on a restart with an unchanged table")
 	}
 }
 

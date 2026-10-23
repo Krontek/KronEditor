@@ -174,11 +174,11 @@ func readHostPid(buildDir string) int {
 const windowsStaticRuntimeFlag = "-static"
 
 type ShmSpec struct {
-	Key      string
-	Offset   uint64
-	VType    string
-	Size     int    // slot width from the variable table; only STRING needs it
-	ForceOff uint64 // force-flag byte offset (0 = none; real flags live at >= 32768)
+	Key     string
+	Offset  uint64
+	VType   string
+	Size    int // slot width from the variable table; only STRING needs it
+	MbIndex int // write-mailbox index (the table's mb_index); -1 = not writable
 }
 
 // HotSwapState owns the running loader-host process + the SHM poller.
@@ -212,10 +212,10 @@ type HotSwapState struct {
 	curGen int
 
 	// runGen counts loader-host runs (bumped under mu at every run): the
-	// force-write mailbox mapping belongs to ONE run, since each cold start
+	// write mailbox mapping belongs to ONE run, since each cold start
 	// recreates the mirror.
 	runGen uint64
-	// ackTimeout bounds a force-write's wait for the runtime's ack; derived
+	// ackTimeout bounds a write's wait for the runtime's ack; derived
 	// from the built variable table's slowest task.
 	ackTimeout time.Duration
 }
@@ -304,15 +304,18 @@ func buildShmSpecs(variableTableJSON string) []ShmSpec {
 		if vType == "" {
 			vType = "BOOL"
 		}
-		forceOff, _ := em["force_flag_offset"].(float64)
+		mbIndex := -1
+		if mi, ok := em["mb_index"].(float64); ok && mi >= 0 {
+			mbIndex = int(mi)
+		}
 		sz, _ := em["size"].(float64)
-		specs = append(specs, ShmSpec{Key: key, Offset: uint64(off), VType: vType, Size: int(sz), ForceOff: uint64(forceOff)})
+		specs = append(specs, ShmSpec{Key: key, Offset: uint64(off), VType: vType, Size: int(sz), MbIndex: mbIndex})
 	}
 	return specs
 }
 
 // mailboxWriter is the agent's ONE writer handle on the running loader-host's
-// force-write mailbox. One per process on purpose: the mailbox serialises its
+// write mailbox. One per process on purpose: the mailbox serialises its
 // writers with an in-process mutex, so two handles would let two requests
 // claim the same sequence number.
 //
@@ -328,7 +331,7 @@ type mailboxWriter struct {
 	gen    uint64 // HotSwapState.runGen the mapping belongs to
 }
 
-// shmAckTimeout sizes the force-write ack timeout from variables.json (its
+// shmAckTimeout sizes the write ack timeout from variables.json (its
 // shm_layout.max_task_interval_us, else the tasks' interval_us).
 func shmAckTimeout(variableTableJSON string) time.Duration {
 	var vt struct {
@@ -354,19 +357,15 @@ func shmAckTimeout(variableTableJSON string) time.Duration {
 	return shmcmd.TimeoutFor(maxUs)
 }
 
-// writeHotSwapVariable posts a force-write command into the hot-swap
-// loader-host's mirror (the DEFAULT sim runtime) and answers only after the
-// runtime APPLIED it — the same mailbox protocol KronServer uses on target
-// (hotswaplib/shmcmd; SHM layout v2).
+// writeHotSwapVariable posts a one-shot write into the hot-swap loader-host's
+// mirror (the DEFAULT sim runtime) and answers only after the runtime APPLIED
+// it — the same mailbox protocol KronServer uses on target (hotswaplib/shmcmd;
+// SHM layout v3). The logic owns the value again from that same scan (a
+// counter seeded to 0 counts on); there is no forcing.
 //
-// ⚠️ It used to store the value into the slot and then set the flag byte. A
-// plc_shm_sync between the two stores overwrote the new value, the flag then
-// pinned the OLD one, and the editor was told it worked. Nothing here touches
-// a slot or a flag any more: the runtime owns both.
-//
-// req.Mode: "force" (default, hold every scan), "pulse" (write once, the logic
-// resumes from it on the same scan — e.g. a counter seeded to 0 counts on) or
-// "unforce" (release; a non-empty value is also written once).
+// ⚠️ Never store into the slot directly: plc_shm_sync rewrites it from
+// PlcState every scan, so the write was lost while the editor was told it
+// worked. Only the runtime writes slots.
 func (s *Server) writeHotSwapVariable(w http.ResponseWriter, req writeVariableReq) {
 	s.hotswap.mu.Lock()
 	running := s.hotswap.cmd != nil
@@ -396,27 +395,18 @@ func (s *Server) writeHotSwapVariable(w http.ResponseWriter, req writeVariableRe
 		writeError(w, http.StatusBadRequest, "STRING variables are read-only: "+req.Name)
 		return
 	}
-	op, err := shmcmd.ParseOp(req.Mode)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
+	if spec.MbIndex < 0 {
+		writeError(w, http.StatusBadRequest, fmt.Sprintf("%s has no mailbox index (mb_index) — rebuild the simulation", req.Name))
 		return
 	}
-	if spec.ForceOff < shmcmd.ForceFlagsBase || spec.ForceOff >= shmcmd.MailboxBase {
-		writeError(w, http.StatusBadRequest, fmt.Sprintf("%s has no force slot (force_flag_offset %d) — rebuild the simulation", req.Name, spec.ForceOff))
+	data, ok := encodeValue(spec.VType, req.Value)
+	if !ok {
+		writeError(w, http.StatusBadRequest, fmt.Sprintf("Cannot encode %q as %s", req.Value, spec.VType))
 		return
-	}
-	var data []byte
-	if op != shmcmd.OpUnforce || strings.TrimSpace(req.Value) != "" {
-		var ok bool
-		if data, ok = encodeValue(spec.VType, req.Value); !ok {
-			writeError(w, http.StatusBadRequest, fmt.Sprintf("Cannot encode %q as %s", req.Value, spec.VType))
-			return
-		}
 	}
 
 	if status, err := s.postHotSwapCommand(runGen, timeout, shmcmd.Command{
-		Index: uint32(spec.ForceOff - shmcmd.ForceFlagsBase),
-		Op:    op,
+		Index: uint32(spec.MbIndex),
 		Value: data,
 	}); err != nil {
 		writeError(w, status, err.Error())
@@ -457,32 +447,6 @@ func (s *Server) postHotSwapCommand(runGen uint64, timeout time.Duration, cmd sh
 		return shmcmd.HTTPStatus(err), err
 	}
 	return http.StatusOK, nil
-}
-
-// handleHotSwapClearForces releases EVERY force of the running hot-swap sim —
-// the local twin of KronServer's ClearAllForces: one CLEAR_ALL mailbox
-// command, answered after the runtime applied it (the runtime owns the flags).
-//
-//	POST /api/host/hotswap/clear-forces
-func (s *Server) handleHotSwapClearForces(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		writeError(w, http.StatusMethodNotAllowed, "POST required")
-		return
-	}
-	s.hotswap.mu.Lock()
-	running := s.hotswap.cmd != nil
-	runGen := s.hotswap.runGen
-	timeout := s.hotswap.ackTimeout
-	s.hotswap.mu.Unlock()
-	if !running {
-		writeError(w, http.StatusConflict, "No simulation running")
-		return
-	}
-	if status, err := s.postHotSwapCommand(runGen, timeout, shmcmd.Command{Op: shmcmd.OpClearAll}); err != nil {
-		writeError(w, status, err.Error())
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
 func swapResultPath(buildDir string) string { return filepath.Join(buildDir, "swap_result") }
@@ -1219,7 +1183,7 @@ func (s *Server) handleHotSwapRun(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "alreadyRunning": true, "pid": s.hotswap.pid})
 		return
 	}
-	s.hotswap.runGen++ // invalidates the force-write mailbox mapping of the previous run
+	s.hotswap.runGen++ // invalidates the write mailbox mapping of the previous run
 	// Fresh mirror each run. This MUST happen after the already-running
 	// early-return above: the poller opens the mirror by path each tick, so
 	// removing it while a host is live would silently kill the live stream.
@@ -1591,9 +1555,6 @@ func (s *Server) hotswapPoller(specs []ShmSpec, stop <-chan struct{}) {
 		}
 	}()
 
-	hasFlags := specsHaveFlags(specs)
-	var ft forcedTracker
-
 	time.Sleep(150 * time.Millisecond)
 	ticker := time.NewTicker(200 * time.Millisecond)
 	defer ticker.Stop()
@@ -1606,7 +1567,7 @@ func (s *Server) hotswapPoller(specs []ShmSpec, stop <-chan struct{}) {
 		if !built || planGen != s.live.Gen() {
 			rebuild()
 		}
-		if len(plan) == 0 && !hasFlags {
+		if len(plan) == 0 {
 			continue // nothing subscribed — the next tick re-checks
 		}
 		if mirror == nil {
@@ -1624,21 +1585,9 @@ func (s *Server) hotswapPoller(specs []ShmSpec, stop <-chan struct{}) {
 				anyOK = true
 			}
 		}
-		// The forced set covers EVERY variable, whatever the subscription.
-		forced, flagsOK := readForcedKeys(mirror.ReadAt, specs)
-		if anyOK || flagsOK {
-			ev := map[string]any{"vars": vars}
-			if flagsOK {
-				if f, send := ft.next(forced, time.Now()); send {
-					ev[forcedEventKey] = f
-				}
-			}
-			if len(vars) > 0 || ev[forcedEventKey] != nil {
-				s.events.Emit("simulation-output", ev)
-			}
-			if len(vars) > 0 {
-				broadcastPlcVars(vars)
-			}
+		if anyOK {
+			s.events.Emit("simulation-output", map[string]any{"vars": vars})
+			broadcastPlcVars(vars)
 			continue
 		}
 		mirror.Close()

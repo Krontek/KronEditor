@@ -17,7 +17,7 @@
       </Outputs>
     </Block>
 
-    <Block type="EC_GetSlaveState" description="Returns the state of a specific EtherCAT slave node. SlaveAddress is 1-based." class="FunctionBlock">
+    <Block type="EC_GetSlaveState" description="Returns the state of a specific EtherCAT slave node. SlaveAddress is 1-based. SdoIndex/SdoSubIndex/SdoAbortCode name the last startup SDO the slave refused (0 = none; SdoAbortCode 0 = no answer). Error with ErrorID 2 = an 'Abort' startup SDO was refused and the slave was held in PRE-OP." class="FunctionBlock">
       <Inputs>
         <Variable name="Enable"       type="BOOL" default="FALSE"/>
         <Variable name="SlaveAddress" type="UINT" default="1"/>
@@ -28,6 +28,9 @@
         <Variable name="ErrorID" type="WORD"/>
         <Variable name="State"   type="BYTE"/>
         <Variable name="LinkUp"  type="BOOL"/>
+        <Variable name="SdoIndex"     type="WORD"/>
+        <Variable name="SdoSubIndex"  type="BYTE"/>
+        <Variable name="SdoAbortCode" type="DWORD"/>
       </Outputs>
     </Block>
 

@@ -1,27 +1,28 @@
-// Package shmcmd is the WRITER side of the force-write command mailbox in the
-// PLC variable segment (SHM layout v2). KronServer (target) and the host agent
+// Package shmcmd is the WRITER side of the write-command mailbox in the PLC
+// variable segment (SHM layout v3). KronServer (target) and the host agent
 // (local hot-swap simulation) both use it, so the two can never disagree on the
 // protocol. The consumer is generated C (CTranspilerService.js,
 // generateShmMailbox); the byte contract is server/RING_FORMAT.md §
-// "Variable segment" and § "Force-write mailbox".
+// "Variable segment" and § "Write mailbox".
 //
-// Why a mailbox: writers used to store the value into the data slot and then set
-// the force-flag byte. A plc_shm_sync landing between the two stores overwrote
-// the new value, the flag then pinned the OLD one, and the request still
-// returned 200. Now a writer never touches a slot or a flag: it posts a command,
-// the runtime applies it at a scan boundary and acknowledges it, and only the
-// ack turns into a success.
+// Why a mailbox: a writer storing straight into the data slot races the
+// runtime's plc_shm_sync, which overwrites the slot from PlcState every scan —
+// the write was lost while the request returned 200. Now a writer never touches
+// a slot: it posts a command, the runtime writes PlcState (and the slot) at a
+// scan boundary and acknowledges it, and only the ack turns into a success.
+// There is exactly ONE command, a one-shot write: the logic owns the value
+// again from that same scan. (Forcing — holding a value against the logic —
+// was removed in v3.)
 //
 // Segment layout (all integers little-endian):
 //
-//	[0, 32768)          data slots, naturally aligned (offsets from the table)
-//	[32768, 61440)      one flag byte per variable index — RUNTIME-OWNED
+//	[0, 61440)          data slots, naturally aligned (offsets from the table)
 //	[61440, 65536)      mailbox: 64-byte header + Capacity × 32-byte entries
 //
 // Header (at MailboxBase):
 //
 //	+0  u32 magic "KRMB"     runtime, published LAST at init (release)
-//	+4  u16 version (2)      runtime
+//	+4  u16 version (3)      runtime
 //	+6  u16 header bytes     runtime (64)
 //	+8  u32 capacity         runtime (64)
 //	+12 u32 entry bytes      runtime (32)
@@ -29,18 +30,17 @@
 //	+20 u32 consumer lock    runtime-private try-lock (task threads)
 //	+24 u64 head             WRITER — last posted seq
 //	+32 u64 ack              runtime — last consumed seq (release)
-//	+40 u32 reserved
-//	+44 u32 foreign flags    runtime — count of flag bytes an outdated writer set
+//	+40 u64 reserved
 //
 // Entry (at MailboxBase + 64 + (seq % capacity) × 32):
 //
 //	+0  u64 seq      writer, published LAST (release); == seq ⇔ entry valid
-//	+8  u32 index    variable index = force_flag_offset - ForceFlagsBase
+//	+8  u32 index    variable index = the table's mb_index
 //	+12 u32 status   0 pending → runtime CAS 1 (claimed) → final status;
 //	                 a writer that times out CASes 0 → Cancelled instead
-//	+16 u8  op       Force / Pulse / Unforce / ClearAll
+//	+16 u8  op       OpWrite (the only one)
 //	+17 u8  size     value bytes (must equal the variable's size)
-//	+18 u8  has      Unforce only: 1 = also write the value once
+//	+18 u8  reserved (0)
 //	+24 u8[8] value  little-endian scalar
 package shmcmd
 
@@ -55,17 +55,16 @@ import (
 
 // Layout constants — must match CTranspilerService.js (SHM_* constants).
 const (
-	LayoutVersion  = 2
-	SegmentSize    = 65536
-	ForceFlagsBase = 32768
-	MailboxBase    = 61440
-	HeaderBytes    = 64
-	Capacity       = 64
-	EntryBytes     = 32
-	Magic          = 0x424D524B // "KRMB"
-	// FlagForced is the only non-zero flag value a v2 runtime writes. Any
-	// other non-zero byte was set by an outdated (v1) writer.
-	FlagForced = 0x81
+	LayoutVersion = 3
+	SegmentSize   = 65536
+	MailboxBase   = 61440
+	// DataEnd bounds the data slots: [0, DataEnd). The v2 force-flag region
+	// [32768, 61440) is data space since v3.
+	DataEnd     = MailboxBase
+	HeaderBytes = 64
+	Capacity    = 64
+	EntryBytes  = 32
+	Magic       = 0x424D524B // "KRMB"
 
 	offMagic   = 0
 	offVersion = 4
@@ -75,41 +74,29 @@ const (
 	offNvars   = 16
 	offHead    = 24
 	offAck     = 32
-	offForeign = 44
 
 	entSeq    = 0
 	entIndex  = 8
 	entStatus = 12
 	entOp     = 16
 	entSize   = 17
-	entHas    = 18
 	entValue  = 24
 
-	// ClearAllIndex is the index carried by an OpClearAll command (ignored).
-	ClearAllIndex = 0xFFFFFFFF
+	// OpWrite is the mailbox's only command: write the value once; the logic
+	// owns it again from the same scan. Code 2 = v2's PULSE, the same meaning.
+	OpWrite = 2
 )
 
-// Op is a mailbox command.
-type Op uint8
-
-const (
-	OpForce    Op = 1 // write once AND hold (re-injected every scan)
-	OpPulse    Op = 2 // write once, logic owns the value from the same scan
-	OpUnforce  Op = 3 // release the hold; with a value, also write it once
-	OpClearAll Op = 4 // release every hold
-)
-
-// ParseOp maps the API spelling ("force", "pulse", "unforce"; "" = force).
-func ParseOp(s string) (Op, error) {
-	switch s {
-	case "", "force":
-		return OpForce, nil
-	case "pulse":
-		return OpPulse, nil
-	case "unforce", "release":
-		return OpUnforce, nil
+// CheckWriteMode refuses the v2 force API's "mode" field (force / pulse /
+// unforce): forcing was removed, and silently degrading a FORCE request to a
+// one-shot write would report success for something that did not happen.
+// Empty and "write" are accepted.
+func CheckWriteMode(mode string) error {
+	switch mode {
+	case "", "write":
+		return nil
 	}
-	return 0, fmt.Errorf("unknown write mode %q (want force, pulse or unforce)", s)
+	return fmt.Errorf("write mode %q is not supported: forcing was removed — every write is a one-shot write (omit \"mode\")", mode)
 }
 
 // Entry status words.
@@ -173,11 +160,10 @@ func errf(k Kind, format string, a ...any) error {
 	return &Error{Kind: k, Msg: fmt.Sprintf(format, a...)}
 }
 
-// Command is one request.
+// Command is one write request.
 type Command struct {
-	Index uint32 // variable index (force_flag_offset - ForceFlagsBase)
-	Op    Op
-	Value []byte // little-endian scalar, 1/2/4/8 bytes; empty for OpClearAll / a bare OpUnforce
+	Index uint32 // variable index (the table's mb_index)
+	Value []byte // little-endian scalar, 1/2/4/8 bytes
 }
 
 // WaitOptions bounds the wait for the runtime's ack.
@@ -241,7 +227,7 @@ func (m *Mailbox) u16(off int) uint16 {
 	return *(*uint16)(unsafe.Pointer(&m.mem[off]))
 }
 
-// Probe checks that a v2 runtime has initialised the mailbox.
+// Probe checks that a v3 runtime has initialised the mailbox.
 func (m *Mailbox) Probe() error {
 	return m.probe()
 }
@@ -249,10 +235,10 @@ func (m *Mailbox) Probe() error {
 func (m *Mailbox) probe() error {
 	mag := atomic.LoadUint32(m.u32p(MailboxBase + offMagic))
 	if mag == 0 {
-		return errf(KindNotReady, "the PLC runtime has not initialised the force-write mailbox: it is still starting, or it predates SHM layout v%d (rebuild it: Build & Send, or restart the simulation)", LayoutVersion)
+		return errf(KindNotReady, "the PLC runtime has not initialised the write mailbox: it is still starting, or it predates SHM layout v%d (rebuild it: Build & Send, or restart the simulation)", LayoutVersion)
 	}
 	if mag != Magic {
-		return errf(KindMismatch, "runtime/server protocol mismatch: no force-write mailbox at 0x%x (found 0x%08x) — redeploy KronServer (server/build.sh + Deploy Server to Target) and Build & Send so both are current", MailboxBase, mag)
+		return errf(KindMismatch, "runtime/server protocol mismatch: no write mailbox at 0x%x (found 0x%08x) — redeploy KronServer (server/build.sh + Deploy Server to Target) and Build & Send so both are current", MailboxBase, mag)
 	}
 	if v := m.u16(MailboxBase + offVersion); v != LayoutVersion {
 		return errf(KindMismatch, "runtime/server protocol mismatch: the runtime speaks SHM layout v%d, this writer v%d — redeploy KronServer (server/build.sh + Deploy Server to Target) and Build & Send so both match", v, LayoutVersion)
@@ -264,12 +250,6 @@ func (m *Mailbox) probe() error {
 		return errf(KindMismatch, "runtime/server protocol mismatch: mailbox entry size %d, expected %d — redeploy KronServer and Build & Send", e, EntryBytes)
 	}
 	return nil
-}
-
-// ForeignFlagWrites is how many flag bytes an outdated writer set directly
-// (the runtime ignored and cleared each one).
-func (m *Mailbox) ForeignFlagWrites() uint32 {
-	return atomic.LoadUint32(m.u32p(MailboxBase + offForeign))
 }
 
 // Pending is the number of posted-but-unacknowledged commands.
@@ -301,20 +281,8 @@ func (m *Mailbox) Post(cmd Command, opt WaitOptions) error {
 	if opt.Alive != nil && !opt.Alive() {
 		return errf(KindNotRunning, "PLC runtime is not running")
 	}
-	switch cmd.Op {
-	case OpForce, OpPulse:
-		if n := len(cmd.Value); n != 1 && n != 2 && n != 4 && n != 8 {
-			return errf(KindInvalid, "value must be 1, 2, 4 or 8 bytes (got %d)", n)
-		}
-	case OpUnforce:
-		if n := len(cmd.Value); n != 0 && n != 1 && n != 2 && n != 4 && n != 8 {
-			return errf(KindInvalid, "value must be empty or 1, 2, 4 or 8 bytes (got %d)", n)
-		}
-	case OpClearAll:
-		cmd.Index = ClearAllIndex
-		cmd.Value = nil
-	default:
-		return errf(KindInvalid, "unknown op %d", cmd.Op)
+	if n := len(cmd.Value); n != 1 && n != 2 && n != 4 && n != 8 {
+		return errf(KindInvalid, "value must be 1, 2, 4 or 8 bytes (got %d)", n)
 	}
 	timeout := opt.Timeout
 	if timeout <= 0 {
@@ -322,9 +290,9 @@ func (m *Mailbox) Post(cmd Command, opt WaitOptions) error {
 	}
 
 	// A runtime that was JUST started publishes the mailbox from its init a
-	// few ms later (the editor force-writes pin defaults right after Start),
-	// so "not initialised" is waited out while the process is alive — and
-	// only then reported, as a runtime that predates layout v2.
+	// few ms later (the editor writes pin defaults right after Start), so
+	// "not initialised" is waited out while the process is alive — and only
+	// then reported, as a runtime that predates layout v3.
 	deadline := time.Now().Add(timeout)
 	for {
 		seq, err := m.post(cmd)
@@ -347,10 +315,8 @@ func (m *Mailbox) post(cmd Command) (uint64, error) {
 	if err := m.probe(); err != nil {
 		return 0, err
 	}
-	if cmd.Op != OpClearAll {
-		if nv := atomic.LoadUint32(m.u32p(MailboxBase + offNvars)); cmd.Index >= nv {
-			return 0, errf(KindInvalid, "variable index %d outside the runtime's %d variables — the deployed variable table does not match the running program (Build & Send)", cmd.Index, nv)
-		}
+	if nv := atomic.LoadUint32(m.u32p(MailboxBase + offNvars)); cmd.Index >= nv {
+		return 0, errf(KindInvalid, "variable index %d outside the runtime's %d variables — the deployed variable table does not match the running program (Build & Send)", cmd.Index, nv)
 	}
 	headP, ackP := m.u64p(MailboxBase+offHead), m.u64p(MailboxBase+offAck)
 	head, ack := atomic.LoadUint64(headP), atomic.LoadUint64(ackP)
@@ -358,7 +324,7 @@ func (m *Mailbox) post(cmd Command) (uint64, error) {
 		head = ack
 	}
 	if head-ack >= Capacity {
-		return 0, errf(KindFull, "force-write mailbox full (%d commands pending): the runtime is not consuming fast enough", head-ack)
+		return 0, errf(KindFull, "write mailbox full (%d commands pending): the runtime is not consuming fast enough", head-ack)
 	}
 	seq := head + 1
 	e := MailboxBase + HeaderBytes + int(seq%Capacity)*EntryBytes
@@ -369,12 +335,8 @@ func (m *Mailbox) post(cmd Command) (uint64, error) {
 	atomic.StoreUint32(m.u32p(e+entStatus), stPending)
 	var v [8]byte
 	copy(v[:], cmd.Value)
-	has := byte(0)
-	if len(cmd.Value) > 0 {
-		has = 1
-	}
-	// op/size/has share one aligned word (+16..+19), stored atomically.
-	atomic.StoreUint32(m.u32p(e+entOp), uint32(cmd.Op)|uint32(len(cmd.Value))<<8|uint32(has)<<16)
+	// op/size/reserved share one aligned word (+16..+19), stored atomically.
+	atomic.StoreUint32(m.u32p(e+entOp), uint32(OpWrite)|uint32(len(cmd.Value))<<8)
 	atomic.StoreUint64(m.u64p(e+entValue), leU64(v[:]))
 	// ⚠️ seq is published LAST: Go atomics are sequentially consistent, so
 	// the consumer's acquire load of seq sees every field above.
@@ -409,13 +371,13 @@ func (m *Mailbox) wait(seq uint64, deadline time.Time, timeout time.Duration, al
 		}
 		if now.After(deadline) {
 			if m.cancel(e) {
-				return errf(KindTimeout, "runtime not consuming: the force-write was not acknowledged within %v (stalled runtime, or no task is scanning) — not applied", timeout)
+				return errf(KindTimeout, "runtime not consuming: the write was not acknowledged within %v (stalled runtime, or no task is scanning) — not applied", timeout)
 			}
 			// The runtime CLAIMED it just now: it is mid-apply, the ack follows.
 			grace := time.Now().Add(250 * time.Millisecond)
 			for atomic.LoadUint64(ackP) < seq {
 				if time.Now().After(grace) {
-					return errf(KindTimeout, "runtime claimed the force-write but did not acknowledge it within %v — outcome unknown", timeout+250*time.Millisecond)
+					return errf(KindTimeout, "runtime claimed the write but did not acknowledge it within %v — outcome unknown", timeout+250*time.Millisecond)
 				}
 				time.Sleep(200 * time.Microsecond)
 			}
@@ -453,48 +415,12 @@ func (m *Mailbox) result(e int, seq uint64) error {
 	case stBadOp:
 		return errf(KindRejected, "runtime rejected the write: unknown command")
 	case stCancelled:
-		return errf(KindTimeout, "force-write was cancelled")
+		return errf(KindTimeout, "write was cancelled")
 	case stPending, stClaimed:
-		// ack published before the status — impossible with a v2 runtime.
+		// ack published before the status — impossible with a v3 runtime.
 		return errf(KindMismatch, "runtime acknowledged without a status — runtime/server protocol mismatch, redeploy KronServer and Build & Send")
 	}
 	return errf(KindRejected, "runtime returned unknown status %d", st)
-}
-
-// ClearFlags zeroes every force-flag byte below the mailbox. ONLY valid while
-// no runtime runs (the runtime owns the flags) — KronServer's pre-start hook
-// and a ClearAllForces on a stopped runtime.
-func ClearFlags(mem []byte, keep func(off int) bool) int {
-	end := MailboxBase
-	if end > len(mem) {
-		end = len(mem)
-	}
-	n := 0
-	for i := ForceFlagsBase; i < end; i++ {
-		if keep != nil && keep(i) {
-			continue
-		}
-		if mem[i] != 0 {
-			mem[i] = 0
-			n++
-		}
-	}
-	return n
-}
-
-// FlagIsForced reports whether a force-flag byte marks a HELD value: the v2
-// runtime's FlagForced, or 1 — the FORCE value an outdated (v1) runtime still
-// stores. v1's PULSE (2) is a one-scan transient and not a force.
-func FlagIsForced(b byte) bool { return b == FlagForced || b == 1 }
-
-// IsForced reads the flag byte at off (a single byte load — never torn) and
-// reports whether that variable is forced. Out-of-range or non-flag offsets
-// (0 = the table carries no flag) report false.
-func IsForced(mem []byte, off int) bool {
-	if off < ForceFlagsBase || off >= MailboxBase || off >= len(mem) {
-		return false
-	}
-	return FlagIsForced(mem[off])
 }
 
 func leU64(b []byte) uint64 {
@@ -503,10 +429,10 @@ func leU64(b []byte) uint64 {
 }
 
 // LoadScalar copies an n-byte little-endian scalar out of a mapped segment with
-// ONE atomic access when n is 4 or 8 and off is n-aligned (SHM layout v2
+// ONE atomic access when n is 4 or 8 and off is n-aligned (SHM layout v2+
 // guarantees both for every slot). A 1- or 2-byte aligned load is a single
 // access on every supported CPU. An unaligned slot (a v1 table) falls back to a
-// byte copy — which is exactly as torn as v1 always was.
+// byte copy.
 func LoadScalar(mem []byte, off, n int, dst []byte) {
 	p := unsafe.Pointer(&mem[off])
 	switch {

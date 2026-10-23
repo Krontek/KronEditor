@@ -36,7 +36,9 @@ const displayValue = (val, isTime = false) => {
 };
 
 /**
- * ForceWriteModal — popup for writing a value to a live simulation variable.
+ * WriteValueModal — popup for writing a value ONCE to a live variable (local
+ * sim or remote PLC). One-shot: the PLC logic owns the variable again from the
+ * same scan.
  *
  * Props:
  *  isOpen        boolean
@@ -45,27 +47,13 @@ const displayValue = (val, isTime = false) => {
  *  varType       string  — PLC type ('BOOL', 'INT', 'REAL', …)
  *  currentValue  any     — current live value (null if unknown)
  *  liveKey       string  — key passed to onConfirm
- *  allowPulse    boolean — offer the Pulse/Force choice (local sim and, since the
- *                force-write mailbox, a remote PLC as well)
- *  onConfirm     (key, value, mode) => void  — mode: 'pulse' | 'force' | 'unforce'
- *                (unforce = Release: value is null, the force is dropped)
+ *  onConfirm     (key, value) => void
  */
-const ForceWriteModal = ({ isOpen, onClose, varName, varType, currentValue, liveKey, allowPulse, onConfirm }) => {
-  // Pulse (write once, logic resumes) works wherever a runtime is live. Callers
-  // that know their context pass `allowPulse`; the rest fall back to the flag App
-  // publishes on window (mirrors the existing window.stLiveCtx live-context
-  // pattern) so every force entry point behaves consistently without threading
-  // isSimulationMode through ReactFlow node data.
-  const pulseOK = allowPulse !== undefined
-    ? allowPulse
-    : (typeof window !== 'undefined' && !!window.__kronSimActive);
+const WriteValueModal = ({ isOpen, onClose, varName, varType, currentValue, liveKey, onConfirm }) => {
   const [inputValue, setInputValue] = useState('');
   const [boolSelect, setBoolSelect] = useState('TRUE');
   const [format, setFormat] = useState('dec'); // dec | hex | oct | bin
   const [error, setError] = useState('');
-  // 'pulse' = apply for one scan then release (default when offered); 'force' =
-  // hold the value every scan. When pulse isn't offered, always force.
-  const [mode, setMode] = useState('pulse');
 
   const type = (varType || '').toUpperCase();
   const isBool  = type === 'BOOL';
@@ -80,7 +68,6 @@ const ForceWriteModal = ({ isOpen, onClose, varName, varType, currentValue, live
     if (!isOpen) return;
     setError('');
     setFormat('dec');
-    setMode(pulseOK ? 'pulse' : 'force');
     if (isBool) {
       setBoolSelect(currentValue === true ? 'TRUE' : 'FALSE');
     } else if (isTime && currentValue !== null && currentValue !== undefined && typeof currentValue !== 'object') {
@@ -101,16 +88,7 @@ const ForceWriteModal = ({ isOpen, onClose, varName, varType, currentValue, live
   };
 
   const confirm = (value) => {
-    if (onConfirm) onConfirm(liveKey, value, pulseOK ? mode : 'force');
-    onClose();
-  };
-
-  // Release ONE variable: drop its force and hand it back to the program
-  // (mailbox UNFORCE with no value). Before this the only way out of a Force
-  // was Stop, which also restarts the program and drops every other force.
-  // Harmless on a variable that is not forced.
-  const release = () => {
-    if (onConfirm) onConfirm(liveKey, null, 'unforce');
+    if (onConfirm) onConfirm(liveKey, value);
     onClose();
   };
 
@@ -294,49 +272,12 @@ const ForceWriteModal = ({ isOpen, onClose, varName, varType, currentValue, live
           <div style={{ color: '#f44336', fontSize: 11, marginTop: 6 }}>{error}</div>
         )}
 
-        {/* Write mode: Pulse (one scan) vs Force (hold) — sim only */}
-        {pulseOK && (
-          <div style={{ marginTop: 12 }}>
-            <div style={{ display: 'flex', gap: 4 }}>
-              {[
-                ['pulse', 'Pulse', 'Apply for one scan, then the logic resumes'],
-                ['force', 'Force', 'Hold the value every scan (pinned)'],
-              ].map(([m, label, tip]) => (
-                <button
-                  key={m}
-                  onClick={() => setMode(m)}
-                  title={tip}
-                  style={{
-                    flex: 1, padding: '5px 0', fontSize: 11, cursor: 'pointer',
-                    fontWeight: mode === m ? 'bold' : 'normal',
-                    background: mode === m ? (m === 'force' ? '#7a4a12' : '#0e639c') : '#2d2d2d',
-                    border: `1px solid ${mode === m ? (m === 'force' ? '#a5641a' : '#007acc') : '#444'}`,
-                    color: mode === m ? 'white' : '#999',
-                    borderRadius: 3,
-                  }}
-                >{label}</button>
-              ))}
-            </div>
-            <div style={{ color: '#777', fontSize: 10, marginTop: 5, lineHeight: 1.4 }}>
-              {mode === 'pulse'
-                ? 'Writes the value for a single scan; the program keeps running from it.'
-                : 'Holds the value until you Release it or Stop the run (the program can’t change it).'}
-            </div>
-          </div>
-        )}
-
         {/* OK / Cancel — for all types */}
         <div style={{ display: 'flex', gap: 8, marginTop: 14 }}>
           <button onClick={onClose} style={{
             flex: 1, padding: '7px 0', background: 'transparent',
             border: '1px solid #444', color: '#999', borderRadius: 4, cursor: 'pointer', fontSize: 12
           }}>Cancel</button>
-          <button onClick={release}
-            title="Remove the force on this variable — the program controls it again. Other forces stay."
-            style={{
-              flex: 1, padding: '7px 0', background: 'transparent',
-              border: '1px solid #a5641a', color: '#e0a060', borderRadius: 4, cursor: 'pointer', fontSize: 12
-            }}>Release</button>
           <button onClick={handleSubmit} style={{
             flex: 2, padding: '7px 0', background: '#007acc', border: 'none',
             color: 'white', borderRadius: 4, cursor: 'pointer', fontSize: 12, fontWeight: 'bold'
@@ -348,4 +289,4 @@ const ForceWriteModal = ({ isOpen, onClose, varName, varType, currentValue, live
   );
 };
 
-export default ForceWriteModal;
+export default WriteValueModal;

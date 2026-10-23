@@ -90,7 +90,7 @@ export default function SlaveConfigPage({ slave, allSlaves = null, slaveIndex = 
 
   const addSdo = () => {
     const s = JSON.parse(JSON.stringify(slave));
-    const seed = { index: 0x6040, subindex: 0, value: 6, comment: '' };
+    const seed = { index: 0x6040, subindex: 0, value: 6, comment: '', onError: 'abort' };
     seed.byteSize = resolveSdoByteSize(s, seed.index, seed.subindex, 2).size;
     s.sdos = [...(s.sdos || []), seed];
     onChange?.(s);
@@ -384,6 +384,7 @@ export default function SlaveConfigPage({ slave, allSlaves = null, slaveIndex = 
                       <th style={S.th}>Sub</th>
                       <th style={S.th}>Value (hex)</th>
                       <th style={S.th}>Bytes</th>
+                      <th style={S.th} title="What a refused SDO does to the rest of the list. Abort: stop, the slave stays in PRE-OP and the bus does not start. Next line: log it and continue.">On error</th>
                       <th style={S.th}>Comment</th>
                       <th style={S.th}></th>
                     </tr>
@@ -428,6 +429,15 @@ export default function SlaveConfigPage({ slave, allSlaves = null, slaveIndex = 
                               </span>
                             );
                           })()}
+                        </td>
+                        <td style={S.td}>
+                          {/* Missing = abort: older projects and cached ESI devices
+                              stay on the safe side (the transpiler reads it the same way). */}
+                          <select style={{ ...S.input, maxWidth: 90 }} value={sdo.onError === 'next' ? 'next' : 'abort'}
+                            disabled={isRunning} onChange={e => updateSdo(si, 'onError', e.target.value)}>
+                            <option value="abort">Abort</option>
+                            <option value="next">Next line</option>
+                          </select>
                         </td>
                         <td style={S.td}>
                           <input style={{ ...S.input, maxWidth: '100%' }} value={sdo.comment || ''}

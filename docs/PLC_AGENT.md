@@ -224,7 +224,7 @@ This is the agent's most differentiated capability: it authors **real, editor-na
 | Communication | UART/I2C/SPI/USB blocks (from `GENERIC_FB_DEFS`) | ✅ |
 | Project (user) FBs | any `functionBlocks` POU | ✅ (pins from its Input/Output variables) |
 | Inline math/compare/move | ADD, SUB, GT, MOVE, SEL, conversions… (`FB_TRIGGER_PIN[type]==='EN'`) | ❌ rejected → "express it in an ST rung" (their OUT has no ladder sink in this DSL) |
-| Motion | MC_* (any pin typed `AXIS_REF`) | ❌ rejected → "author motion in ST" (Axis wiring is a special call parameter) |
+| Motion | MC_* (any pin typed `AXIS_REF`) | ✅ `fb.inputs.Axis` must name a declared `AXIS_REF` variable (validated, never auto-declared) → `data.values.Axis`, which the LD transpiler passes as `_Call`'s 2nd arg |
 
 The EN-rejection runs **before** library resolution, so it fires even if the library wasn't passed.
 
@@ -263,7 +263,7 @@ Transpiler mapping (verified by the gate): rung power reaches the FB via `inst.<
 The system prompt routes STRICTLY per rung, not per POU:
 
 - boolean interlocks + timers/counters/edges → **ladder** (`set_ladder`, with `fb`) — "timers and counters BELONG in ladder; do NOT switch to ST for them";
-- math/expressions, loops/CASE, motion (MC_*), multi-FB interactions, strings/arrays → **ST** (`set_st_code`);
+- math/expressions, loops/CASE, multi-FB interactions, strings/arrays → **ST** (`set_st_code`);
 - mixing both in one POU is normal — it's one rung list (the unified model, see src/CLAUDE.md).
 
 ---
@@ -323,5 +323,4 @@ Adding a tool:
 Known deliberate limits (do not "fix" casually):
 
 - One `fb` per rung; FB-to-FB wiring (cascades) and inline-math OUT sinks in ladder are out of scope — route to ST.
-- Motion in ladder is rejected (Axis is a call parameter, not a wire).
 - `set_ladder`/`set_st_code` replace the WHOLE rung list/body — there is no partial-rung edit tool; the model re-emits the full program (kept simple because `read_pou` gives it a faithful rendering to re-emit from).

@@ -66,9 +66,9 @@ func (m *shmMirror) ReadAt(b []byte, off int64) error {
 	return nil
 }
 
-// Bytes is the whole mapped segment (the force-write mailbox works on it).
+// Bytes is the whole mapped segment (the write mailbox works on it).
 // There is deliberately no WriteAt: writers post mailbox commands (SHM layout
-// v2) and never store into a slot or a flag byte.
+// v3) and never store into a slot.
 func (m *shmMirror) Bytes() []byte { return m.view() }
 
 func (m *shmMirror) Close() {

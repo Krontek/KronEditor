@@ -1,7 +1,7 @@
 /**
  * PLCClient.js — ConnectRPC client for PLCService.
  *
- * Unary calls  (start / stop / writeVar / clearAllForces):
+ * Unary calls  (start / stop / writeVar):
  *   POST /plc.v1.PLCService/<Method>
  *   Content-Type: application/json
  *   Connect-Protocol-Version: 1
@@ -46,29 +46,17 @@ export class PLCClient {
   }
 
   /**
-   * Write a variable through the target's force-write mailbox. Resolves only
+   * Write a variable ONCE through the target's write mailbox (one-shot: the
+   * PLC logic owns the value again from the same scan). Resolves only
    * after the runtime APPLIED it (KronServer waits for the runtime's ack), so
    * a rejection here is real: not running, stalled (deadline_exceeded),
    * mailbox full (resource_exhausted) or a runtime/server version mismatch.
    * @param {string} name  — IEC variable name
    * @param {boolean|number|string} value — runtime value; a 64-bit integer
    *   beyond ±2^53 MUST be a decimal string (a JSON number is a double)
-   * @param {'force'|'pulse'|'unforce'} [mode] — force (hold, default), pulse
-   *   (write once, the logic owns it from the same scan) or unforce (release;
-   *   a non-null value is also written once)
    */
-  async writeVar(name, value, mode = 'force') {
-    // `mode` is sent only when it is not the default: a KronServer older than
-    // the field rejects unknown JSON fields, and plain force must keep working
-    // against it (it will then fail loudly on the protocol check instead).
-    const body = { name, value };
-    if (mode && mode !== 'force') body.mode = mode;
-    return this._unary('WriteVar', body);
-  }
-
-  /** Clear all force flags so the PLC resumes normal variable sync. */
-  async clearAllForces() {
-    return this._unary('ClearAllForces', {});
+  async writeVar(name, value) {
+    return this._unary('WriteVar', { name, value });
   }
 
   // ---------------------------------------------------------------------------
@@ -79,8 +67,6 @@ export class PLCClient {
    * Stream live variable values. The server pushes a snapshot every 50 ms.
    *
    * @param {function(vars: Object): void} onUpdate — called on each snapshot.
-   *   The payload may carry the reserved key `__forced` (the forced set, NOT a
-   *   variable — see utils/forcedVars.splitForcedPayload); the caller splits it.
    * @param {function(err: Error): void}   onError  — called on fatal connection error
    * @param {{prefixes?: string[], names?: string[]}} [sub] — what to stream.
    *   `prefixes` are key prefixes (a POU's keys share `prog_<Name>_`, every

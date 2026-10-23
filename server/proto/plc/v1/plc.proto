@@ -14,11 +14,9 @@ service PLCService {
   // Stop gracefully terminates the PLC runtime.
   rpc Stop(StopRequest) returns (StopResponse);
 
-  // WriteVar force-writes a variable value into shared memory.
+  // WriteVar writes a variable value ONCE (the PLC logic owns it again from
+  // the same scan) and returns after the runtime applied it.
   rpc WriteVar(WriteVarRequest) returns (WriteVarResponse);
-
-  // ClearAllForces removes all force flags so the PLC resumes normal sync.
-  rpc ClearAllForces(ClearAllForcesRequest) returns (ClearAllForcesResponse);
 
   // StreamVars pushes all variable values every 50 ms (server streaming).
   rpc StreamVars(StreamVarsRequest) returns (stream VarsUpdate);
@@ -40,18 +38,14 @@ message WriteVarRequest {
   // Send 64-bit integers (LINT/ULINT/LWORD) as DECIMAL STRINGS: a protobuf
   // Value number is a double and loses every integer above 2^53.
   google.protobuf.Value value = 2;
-  // mode: "force" (default — write once and hold), "pulse" (write once, the
-  // logic owns the value from the same scan) or "unforce" (release the hold;
-  // a non-null value is also written once). The call returns only after the
-  // runtime has applied the command (force-write mailbox, SHM layout v2).
+  // mode must be empty or "write". Forcing was removed (SHM layout v3): any
+  // other value ("force", "pulse", "unforce") is refused with
+  // INVALID_ARGUMENT, never downgraded to a write. Every write is one-shot;
+  // the call returns only after the runtime has applied it (write mailbox).
   string mode = 3;
 }
 
 message WriteVarResponse {}
-
-message ClearAllForcesRequest {}
-
-message ClearAllForcesResponse {}
 
 message StreamVarsRequest {}
 

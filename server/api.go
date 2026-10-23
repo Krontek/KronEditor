@@ -11,7 +11,6 @@
 //   GET  /api/v1/variables/{name}  → read a single addressed variable
 //   POST /api/v1/variables/{name}  → write a single addressed variable
 //   GET  /api/v1/stream            → SSE stream of addressed variables (cadence configurable)
-//   POST /api/v1/forces/clear      → clear ALL force flags (every variable, not only addressed)
 //   GET  /api/v1/runtime           → runtime status (running, pid, auto_run, stream_interval_ms)
 //   POST /api/v1/runtime/start     → start PLC runtime
 //   POST /api/v1/runtime/stop      → stop PLC runtime
@@ -81,8 +80,6 @@ func RegisterAPIRoutes(mux *http.ServeMux, am *APIManager) {
 	mux.HandleFunc("GET /api/v1/stream/buffered", am.requireToken(am.handleBufferedStream))
 	mux.HandleFunc("GET /api/v1/stream/ring", am.requireToken(am.handleRingStream))
 	mux.HandleFunc("GET /api/v1/ring/info", am.requireToken(am.handleRingInfo))
-	mux.HandleFunc("GET /api/v1/forces", am.requireToken(am.handleListForces))
-	mux.HandleFunc("POST /api/v1/forces/clear", am.requireToken(am.handleClearForces))
 
 	mux.HandleFunc("GET /api/v1/runtime", am.requireToken(am.handleRuntimeStatus))
 	mux.HandleFunc("POST /api/v1/runtime/start", am.requireToken(am.handleRuntimeStart))
@@ -176,6 +173,8 @@ func (am *APIManager) handleReadOne(w http.ResponseWriter, r *http.Request) {
 //
 //	POST /api/v1/variables/{name}
 //	Body: {"value": 1200.0}
+//
+// A one-shot write: the PLC logic owns the value again from the same scan.
 func (am *APIManager) handleWriteOne(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
 	if name == "" {
@@ -190,23 +189,24 @@ func (am *APIManager) handleWriteOne(w http.ResponseWriter, r *http.Request) {
 
 	var body struct {
 		Value json.RawMessage `json:"value"`
-		// mode: "force" (default), "pulse" or "unforce" — see API.md.
+		// mode: optional, "" or "write" only. Forcing was removed; a
+		// "force"/"pulse"/"unforce" request is refused (400), never silently
+		// downgraded to a write.
 		Mode string `json:"mode"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		jsonError(w, http.StatusBadRequest, "invalid JSON")
 		return
 	}
-	op, err := shmcmd.ParseOp(body.Mode)
-	if err != nil {
+	if err := shmcmd.CheckWriteMode(body.Mode); err != nil {
 		jsonError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
-	// Returns only after the runtime APPLIED the command (force-write
-	// mailbox); 409 not running / version mismatch, 503 mailbox full, 504 the
-	// runtime did not acknowledge in time — see shmcmd.HTTPStatus.
-	if err := am.ipc.WriteVariableMode(name, body.Value, op); err != nil {
+	// Returns only after the runtime APPLIED the command (write mailbox);
+	// 409 not running / version mismatch, 503 mailbox full, 504 the runtime
+	// did not acknowledge in time — see shmcmd.HTTPStatus.
+	if err := am.ipc.WriteVariable(name, body.Value); err != nil {
 		jsonError(w, shmcmd.HTTPStatus(err), err.Error())
 		return
 	}
@@ -523,29 +523,6 @@ func (am *APIManager) handleBufferedStream(w http.ResponseWriter, r *http.Reques
 		}
 		flusher.Flush()
 	}
-}
-
-// handleListForces lists the FORCED addressed variables (REST scope: an
-// unaddressed variable is invisible here even when forced — the editor's
-// /stream/vars "__forced" key carries the full set).
-//
-//	GET /api/v1/forces
-//	Response: {"forced": ["prog__pump_on"], "count": 1}
-func (am *APIManager) handleListForces(w http.ResponseWriter, r *http.Request) {
-	forced := am.ipc.ForcedVariables(true)
-	jsonOK(w, map[string]any{"forced": forced, "count": len(forced)})
-}
-
-// handleClearForces clears ALL force flags — every variable in the table, not
-// just the addressed ones (same operation as the editor's ClearAllForces).
-//
-//	POST /api/v1/forces/clear
-func (am *APIManager) handleClearForces(w http.ResponseWriter, r *http.Request) {
-	if err := am.ipc.ClearAllForces(); err != nil {
-		jsonError(w, shmcmd.HTTPStatus(err), err.Error())
-		return
-	}
-	jsonOK(w, map[string]string{"status": "ok"})
 }
 
 // requireToken is an authentication middleware that checks for a valid

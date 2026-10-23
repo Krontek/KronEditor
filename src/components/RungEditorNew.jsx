@@ -4,9 +4,8 @@ import { Editor } from '@monaco-editor/react';
 import RungContainer, { blockConfig } from './RungContainer';
 import ErrorBoundary from './ErrorBoundary';
 import BlockSettingsModal from './BlockSettingsModal';
-import ForceWriteModal from './common/ForceWriteModal';
-import { useForcedSet } from './common/ForcedMarker';
-import { isKeyForced, stLiveKeyAt, ensureForcedDecorationStyle } from '../utils/forcedVars';
+import WriteValueModal from './common/WriteValueModal';
+import { stLiveKeyAt } from '../utils/stLiveKey';
 import DragDropManager from '../utils/DragDropManager';
 import { registerIECSTLanguage } from '../utils/iecSTLanguage';
 import { findStMarkers } from '../utils/stValidation';
@@ -120,12 +119,11 @@ function validateSCLCode(code, variables, globalVars, monaco, model, hwPortVars 
 // Auto-sizing Monaco editor for SCL ST rungs.
 // IMPORTANT: must stop mouse event propagation to prevent the outer
 // draggable rung div from intercepting clicks and blocking Monaco input.
-const SCLInlineEditor = ({ code, readOnly, onCodeChange, onBlur, variables = [], globalVars = [], liveVariables = null, parentName = '', hwPortVars = [], onForceRequest = null }) => {
+const SCLInlineEditor = ({ code, readOnly, onCodeChange, onBlur, variables = [], globalVars = [], liveVariables = null, parentName = '', hwPortVars = [], onWriteRequest = null }) => {
   const [height, setHeight] = useState(60);
-  const forcedSet = useForcedSet();
   // Read by the mount-registered mouse handler (outlives mount-time props).
-  const forceCtxRef = useRef(null);
-  forceCtxRef.current = { onForceRequest, liveVariables, parentName, variables, globalVars };
+  const writeCtxRef = useRef(null);
+  writeCtxRef.current = { onWriteRequest, liveVariables, parentName, variables, globalVars };
   const editorRef = useRef(null);
   const monacoRef = useRef(null);
   const liveDecsRef = useRef([]);
@@ -204,14 +202,11 @@ const SCLInlineEditor = ({ code, readOnly, onCodeChange, onBlur, variables = [],
         let val = liveGet(liveVariables, progKey);
         if (val === undefined) val = liveGet(liveVariables, globalKey);
         if (val === undefined) continue;
-        const liveKey = liveResolveKey(liveVariables, progKey) || liveResolveKey(liveVariables, globalKey);
 
         const isBool = typeof val === 'boolean';
         const displayStr = isBool ? (val ? 'TRUE' : 'FALSE') : String(val);
         const hlClass = isBool ? (val ? 'live-var-hl-true' : 'live-var-hl-false') : 'live-var-hl-num';
-        // A FORCED value's badge gets `live-var-forced` (red frame + "F").
-        const textClass = (isBool ? (val ? 'live-var-text-true' : 'live-var-text-false') : 'live-var-text-num')
-          + (isKeyForced(forcedSet, liveKey) ? ' live-var-forced' : '');
+        const textClass = isBool ? (val ? 'live-var-text-true' : 'live-var-text-false') : 'live-var-text-num';
         decs.push({
           range: new mc.Range(lineIdx + 1, match.index + 1, lineIdx + 1, match.index + 1 + word.length),
           options: { className: hlClass, after: { content: ` ${displayStr}`, inlineClassName: textClass } },
@@ -220,7 +215,7 @@ const SCLInlineEditor = ({ code, readOnly, onCodeChange, onBlur, variables = [],
     }
 
     liveDecsRef.current = ed.deltaDecorations(liveDecsRef.current, decs);
-  }, [liveVariables, variables, globalVars, parentName, forcedSet]);
+  }, [liveVariables, variables, globalVars, parentName]);
 
   return (
     <div
@@ -250,7 +245,6 @@ const SCLInlineEditor = ({ code, readOnly, onCodeChange, onBlur, variables = [],
         beforeMount={monaco => {
           registerIECSTLanguage(monaco);
           monacoRef.current = monaco;
-          ensureForcedDecorationStyle();
           if (!document.getElementById('inline-live-var-style')) {
             const style = document.createElement('style');
             style.id = 'inline-live-var-style';
@@ -299,23 +293,26 @@ const SCLInlineEditor = ({ code, readOnly, onCodeChange, onBlur, variables = [],
           updateHeight();
           // Read through refs — these listeners outlive the mount-time props.
           editor.onDidBlurEditorText(() => { onBlurRef.current && onBlurRef.current(); });
-          // Click on a forced value's red "F" badge → the force dialog.
+          // Double-click on an identifier while live → the write-value dialog
+          // (same entry point as the full ST editor in EditorPane).
           editor.onMouseDown((e) => {
-            const ctx = forceCtxRef.current;
-            const el = e.target.element;
-            if (!ctx?.onForceRequest || !ctx.liveVariables || !e.target.position) return;
-            if (!(el && el.classList && el.classList.contains('live-var-forced'))) return;
+            const ctx = writeCtxRef.current;
+            if (!ctx?.onWriteRequest || !ctx.liveVariables || !e.target.position) return;
+            if (!mc || e.target.type !== mc.editor.MouseTargetType.CONTENT_TEXT) return;
+            if (e.event.detail !== 2) return;
             const pos = e.target.position;
             const line = editor.getModel()?.getLineContent(pos.lineNumber) || '';
             const safeProg = (ctx.parentName || '').trim().replace(/\s+/g, '_');
             const hit = stLiveKeyAt(line, pos.column, ctx.liveVariables, safeProg);
             if (!hit || !hit.key) return;
+            const value = ctx.liveVariables[hit.key];
+            if (value !== null && typeof value === 'object') return; // composite: no single slot
             const v = findVarByName([...(ctx.variables || []), ...(ctx.globalVars || [])], hit.name);
-            ctx.onForceRequest({
+            ctx.onWriteRequest({
               varName: hit.name,
-              varType: v?.type || (typeof ctx.liveVariables[hit.key] === 'boolean' ? 'BOOL' : 'INT'),
+              varType: v?.type || (typeof value === 'boolean' ? 'BOOL' : 'INT'),
               liveKey: hit.key,
-              currentValue: ctx.liveVariables[hit.key],
+              currentValue: value,
             });
           });
           // Initial validation
@@ -384,7 +381,7 @@ const InsertZone = ({ onInsert, onPaste, canPaste, disabled }) => {
  * - When a rung moves, everything inside moves with it
  */
 
-const RungEditorNew = ({ variables, setVariables, rungs, setRungs, availableBlocks, globalVars = [], dataTypes = [], liveVariables = null, parentName = "", readOnly = false, onForceWrite = null, programType = 'LD', hwPortVars = [], errorCodeService = null }) => {
+const RungEditorNew = ({ variables, setVariables, rungs, setRungs, availableBlocks, globalVars = [], dataTypes = [], liveVariables = null, parentName = "", readOnly = false, onWriteVariable = null, programType = 'LD', hwPortVars = [], errorCodeService = null }) => {
   const { t } = useTranslation();
   // Undo/Redo history - each snapshot stores { rungs, variables } pair
   const historyRef = useRef([{
@@ -397,8 +394,8 @@ const RungEditorNew = ({ variables, setVariables, rungs, setRungs, availableBloc
 
   // Settings modal state
   const [editingBlock, setEditingBlock] = useState(null);
-  // Simulation force-write modal (double-click on node during simulation)
-  const [simForceModal, setSimForceModal] = useState(null); // { varName, varType, liveKey, currentValue }
+  // Live write-value dialog (double-click on a node / ST identifier while live)
+  const [simWriteModal, setSimWriteModal] = useState(null); // { varName, varType, liveKey, currentValue }
 
   // SCL: pending rung lang selection dialog
   const [pendingSCLInsert, setPendingSCLInsert] = useState(null); // { targetId, before }
@@ -781,11 +778,11 @@ const RungEditorNew = ({ variables, setVariables, rungs, setRungs, availableBloc
     }));
   }, [readOnly]);
 
-  // On block double-click: open settings (or force-write modal in simulation mode)
+  // On block double-click: open settings (or the write-value dialog while live)
   const handleNodeDoubleClick = useCallback((_event, node, rungId) => {
     if (readOnly) {
-      // Simulation mode: open force-write modal for this node's variable
-      if (!liveVariables || !onForceWrite) return;
+      // Live: open the write-value dialog for this node's variable
+      if (!liveVariables || !onWriteVariable) return;
       const instanceName = (
         node.data.instanceName ||
         node.data.values?.var ||
@@ -795,13 +792,13 @@ const RungEditorNew = ({ variables, setVariables, rungs, setRungs, availableBloc
       if (!instanceName) return;
       const safeProgName = (parentName || '').trim().replace(/\s+/g, '_');
       // Resolve to the key AS STORED (built from the declared spelling), not the
-      // spelling typed into the block — a force-write addresses the slot by name.
+      // spelling typed into the block — a write addresses the slot by name.
       const lookupKey = liveResolveKey(liveVariables, `prog_${safeProgName}_${instanceName}`)
         || liveResolveKey(liveVariables, `prog__${instanceName}`)
         || `prog_${safeProgName}_${instanceName}`;
       const instLower = instanceName.toLowerCase();
       const varDef = [...variables, ...globalVars].find(v => (v.name || '').toLowerCase() === instLower);
-      setSimForceModal({
+      setSimWriteModal({
         varName: instanceName,
         varType: varDef?.type || 'BOOL',
         liveKey: lookupKey,
@@ -815,7 +812,7 @@ const RungEditorNew = ({ variables, setVariables, rungs, setRungs, availableBloc
       type: node.data.type,
       ...node.data
     });
-  }, [readOnly, liveVariables, onForceWrite, parentName, variables, globalVars]);
+  }, [readOnly, liveVariables, onWriteVariable, parentName, variables, globalVars]);
 
   // Save block settings
   const handleSaveSettings = useCallback((blockId, newSettings) => {
@@ -1555,7 +1552,7 @@ const RungEditorNew = ({ variables, setVariables, rungs, setRungs, availableBloc
                               liveVariables={liveVariables}
                               parentName={parentName}
                               hwPortVars={hwPortVars}
-                              onForceRequest={onForceWrite ? setSimForceModal : null}
+                              onWriteRequest={onWriteVariable ? setSimWriteModal : null}
                             />
                           </div>
                         </div>
@@ -1610,7 +1607,7 @@ const RungEditorNew = ({ variables, setVariables, rungs, setRungs, availableBloc
                       liveVariables={liveVariables}
                       parentName={parentName}
                       readOnly={readOnly}
-                      onForceWrite={onForceWrite}
+                      onWriteVariable={onWriteVariable}
                       hwPortVars={hwPortVars}
                       errorCodeService={errorCodeService}
                       onFocusRung={() => {
@@ -1691,16 +1688,16 @@ const RungEditorNew = ({ variables, setVariables, rungs, setRungs, availableBloc
         globalVars={globalVars}
       />
 
-      {/* SIMULATION FORCE-WRITE MODAL (double-click on node during simulation) */}
-      {simForceModal && (
-        <ForceWriteModal
+      {/* LIVE WRITE-VALUE DIALOG (double-click on a node / ST identifier while live) */}
+      {simWriteModal && (
+        <WriteValueModal
           isOpen={true}
-          onClose={() => setSimForceModal(null)}
-          varName={simForceModal.varName}
-          varType={simForceModal.varType}
-          currentValue={simForceModal.currentValue}
-          liveKey={simForceModal.liveKey}
-          onConfirm={(key, val, mode) => { onForceWrite && onForceWrite(key, val, mode); setSimForceModal(null); }}
+          onClose={() => setSimWriteModal(null)}
+          varName={simWriteModal.varName}
+          varType={simWriteModal.varType}
+          currentValue={simWriteModal.currentValue}
+          liveKey={simWriteModal.liveKey}
+          onConfirm={(key, val) => { onWriteVariable && onWriteVariable(key, val); setSimWriteModal(null); }}
         />
       )}
     </div>

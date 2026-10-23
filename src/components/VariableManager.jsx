@@ -1,8 +1,6 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { DataTypeSelector, ModernSelect } from './common/Selectors';
-import ForceWriteModal from './common/ForceWriteModal';
-import ForcedMarker, { useForcedSet } from './common/ForcedMarker';
-import { isAnyMemberForced } from '../utils/forcedVars';
+import WriteValueModal from './common/WriteValueModal';
 import { useTranslation } from 'react-i18next';
 import { formatTimeUs, isTimeType, normalizeTimeLiteral } from '../utils/plcStandards';
 import { blockConfig } from './RungContainer';
@@ -196,17 +194,16 @@ const VariableManager = ({
   parentName = "",
   disabled = false,
   isSimulationMode = false,
-  onForceWrite = null,
+  onWriteVariable = null,
   onAddToWatchTable = null,
   projectStructure = null
 }) => {
   const { t } = useTranslation();
-  const forcedSet = useForcedSet();
   // Multi-select: set of selected variable ids. anchorId is the last clicked
   // row used as the pivot for Shift-range selection.
   const [selectedIds, setSelectedIds] = useState(() => new Set());
   const [anchorId, setAnchorId] = useState(null);
-  const [forceModal, setForceModal] = useState(null); // { varName, varType, liveKey, liveVal }
+  const [writeModal, setWriteModal] = useState(null); // { varName, varType, liveKey, liveVal }
   const [complexPopup, setComplexPopup] = useState(null); // { variable, anchorRect }
   const [ctxMenu, setCtxMenu] = useState(null); // { x, y, variable }
   const ctxMenuRef = useRef(null);
@@ -577,7 +574,7 @@ const VariableManager = ({
               <th style={hCell}>{t('tables.initialValue')}</th>
               {liveVariables && (
                 <th style={{ ...hCell, color: '#00e676' }}>
-                  Live {onForceWrite && <span style={{ color: '#888', fontSize: 9, fontWeight: 'normal' }}>(set)</span>}
+                  Live {onWriteVariable && <span style={{ color: '#888', fontSize: 9, fontWeight: 'normal' }}>(set)</span>}
                 </th>
               )}
               <th style={{ ...hCell, minWidth: '80px' }} title="IEC address — expose via REST API">Address</th>
@@ -590,11 +587,8 @@ const VariableManager = ({
               const liveVal = getLiveValue(v.name);
               const liveKey = getLiveKey(v.name);
               const hasValue = liveVal !== null && liveVal !== undefined;
-              const canForce = !!onForceWrite && liveVariables;
+              const canWrite = !!onWriteVariable && liveVariables;
               const isComplex = isComplexType(v.type);
-              // A composite (FB instance / struct / array) is forced when any
-              // of its flat member keys is.
-              const isForced = !!liveVariables && isAnyMemberForced(forcedSet, liveKey);
 
               return (
                 <React.Fragment key={v.id}>
@@ -694,16 +688,16 @@ const VariableManager = ({
                   </td>
                   {liveVariables && (
                     <td
-                      style={{ ...bCell, cursor: (canForce || isComplex) ? 'pointer' : 'default' }}
+                      style={{ ...bCell, cursor: (canWrite || isComplex) ? 'pointer' : 'default' }}
                       onClick={(e) => {
                         e.stopPropagation();
                         if (isComplex) {
                           setComplexPopup({ variable: v, anchorRect: e.currentTarget.getBoundingClientRect() });
-                        } else if (canForce) {
-                          setForceModal({ varName: v.name, varType: v.type, liveKey, liveVal });
+                        } else if (canWrite) {
+                          setWriteModal({ varName: v.name, varType: v.type, liveKey, liveVal });
                         }
                       }}
-                      title={isComplex ? 'Click to inspect elements' : canForce ? 'Click to force-write value' : ''}
+                      title={isComplex ? 'Click to inspect elements' : canWrite ? 'Click to write a value' : ''}
                     >
                       <span style={{
                         color: isComplex ? '#90caf9' : (hasValue || getFBOutputValues(v.name, v.type) ? '#00e676' : '#555'),
@@ -711,8 +705,8 @@ const VariableManager = ({
                         fontFamily: 'Consolas, monospace',
                         padding: '1px 6px',
                         borderRadius: 3,
-                        background: isComplex ? 'rgba(144,202,249,0.08)' : (canForce && hasValue ? 'rgba(0,230,118,0.08)' : 'transparent'),
-                        border: isComplex ? '1px solid rgba(144,202,249,0.25)' : (canForce ? `1px solid ${hasValue ? 'rgba(0,230,118,0.25)' : '#333'}` : 'none'),
+                        background: isComplex ? 'rgba(144,202,249,0.08)' : (canWrite && hasValue ? 'rgba(0,230,118,0.08)' : 'transparent'),
+                        border: isComplex ? '1px solid rgba(144,202,249,0.25)' : (canWrite ? `1px solid ${hasValue ? 'rgba(0,230,118,0.25)' : '#333'}` : 'none'),
                         display: 'inline-block'
                       }}>
                         {isComplex ? (() => {
@@ -724,14 +718,6 @@ const VariableManager = ({
                           return formatLiveDisplay(liveVal, v.type);
                         })()}
                       </span>
-                      {isForced && (
-                        <ForcedMarker
-                          onClick={(!isComplex && canForce && !getFBOutputValues(v.name, v.type))
-                            ? () => setForceModal({ varName: v.name, varType: v.type, liveKey, liveVal })
-                            : undefined}
-                          style={{ cursor: 'inherit' }}
-                        />
-                      )}
                     </td>
                   )}
                   <td style={bCell}>
@@ -794,17 +780,16 @@ const VariableManager = ({
         </table>
       </div>
 
-      {/* Force Write Modal */}
-      {forceModal && (
-        <ForceWriteModal
+      {/* Write-value dialog */}
+      {writeModal && (
+        <WriteValueModal
           isOpen={true}
-          onClose={() => setForceModal(null)}
-          varName={forceModal.varName}
-          varType={forceModal.varType}
-          currentValue={forceModal.liveVal}
-          liveKey={forceModal.liveKey}
-          allowPulse
-          onConfirm={(key, val, mode) => { onForceWrite && onForceWrite(key, val, mode); }}
+          onClose={() => setWriteModal(null)}
+          varName={writeModal.varName}
+          varType={writeModal.varType}
+          currentValue={writeModal.liveVal}
+          liveKey={writeModal.liveKey}
+          onConfirm={(key, val) => { onWriteVariable && onWriteVariable(key, val); }}
         />
       )}
 
@@ -857,12 +842,12 @@ const VariableManager = ({
               <span style={{ fontSize: 13 }}>👁</span> Add to Watchtable
             </div>
           )}
-          {onForceWrite && liveVariables && (
+          {onWriteVariable && liveVariables && (
             <div
               onClick={() => {
                 const liveKey = getLiveKey(ctxMenu.variable.name);
                 const liveVal = liveVariables[liveKey] ?? null;
-                setForceModal({ varName: ctxMenu.variable.name, varType: ctxMenu.variable.type, liveKey, liveVal });
+                setWriteModal({ varName: ctxMenu.variable.name, varType: ctxMenu.variable.type, liveKey, liveVal });
                 setCtxMenu(null);
               }}
               style={{ padding: '7px 14px', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 8 }}

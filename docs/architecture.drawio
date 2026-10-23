@@ -52,13 +52,13 @@
                 <mxCell id="ks" value="KRONSERVER — Go (server/) · runs ON the target SBC :7070" style="swimlane;rounded=1;fillColor=#ffe6cc;strokeColor=#d79b00;fontStyle=1;fontSize=13;startSize=32;verticalAlign=top;" parent="1" vertex="1">
                     <mxGeometry x="1140" y="70" width="420" height="500" as="geometry"/>
                 </mxCell>
-                <mxCell id="ks_rpc" value="ConnectRPC /plc.v1.PLCService/&#10;Start · Stop · WriteVar · ClearAllForces · StreamVars (50ms)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffedd8;strokeColor=#d79b00;align=left;spacingLeft=8;fontSize=11;" parent="ks" vertex="1">
+                <mxCell id="ks_rpc" value="ConnectRPC /plc.v1.PLCService/&#10;Start · Stop · WriteVar · StreamVars (50ms)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffedd8;strokeColor=#d79b00;align=left;spacingLeft=8;fontSize=11;" parent="ks" vertex="1">
                     <mxGeometry x="20" y="44" width="380" height="48" as="geometry"/>
                 </mxCell>
                 <mxCell id="ks_http" value="HTTP endpoints&#10;/deploy/{runtime,logic,variable-table,project-file,config}&#10;/status · /stream/vars (SSE)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffedd8;strokeColor=#d79b00;align=left;spacingLeft=8;fontSize=11;" parent="ks" vertex="1">
                     <mxGeometry x="20" y="100" width="380" height="60" as="geometry"/>
                 </mxCell>
-                <mxCell id="ks_ipc" value="ipc.go — /dev/shm mmap variable table&#10;name · offset · type · size · force_flag · offset-validated" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffedd8;strokeColor=#d79b00;align=left;spacingLeft=8;fontSize=11;" parent="ks" vertex="1">
+                <mxCell id="ks_ipc" value="ipc.go — /dev/shm mmap variable table&#10;name · offset · type · size · mb_index · offset-validated" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffedd8;strokeColor=#d79b00;align=left;spacingLeft=8;fontSize=11;" parent="ks" vertex="1">
                     <mxGeometry x="20" y="168" width="380" height="48" as="geometry"/>
                 </mxCell>
                 <mxCell id="ks_proc" value="process.go — runtime lifecycle · AutoRun · restart&#10;swapMu / preStartHook · WriteInitialValues" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffedd8;strokeColor=#d79b00;align=left;spacingLeft=8;fontSize=11;" parent="ks" vertex="1">
@@ -88,7 +88,7 @@
                 <mxCell id="e_plc" style="endArrow=classic;html=1;strokeColor=#cc6600;strokeWidth=2;exitX=1;exitY=0.2;entryX=0;entryY=0.2;" parent="1" source="fe" target="ks" edge="1">
                     <mxGeometry relative="1" as="geometry"/>
                 </mxCell>
-                <mxCell id="e_plc_lbl" value="PLCClient — HTTP/SSE to remote runtime&#10;(live vars · force · start/stop · REST)" style="text;html=1;fontSize=10;fontColor=#cc6600;labelBackgroundColor=#ffffff;align=center;" parent="1" vertex="1">
+                <mxCell id="e_plc_lbl" value="PLCClient — HTTP/SSE to remote runtime&#10;(live vars · write · start/stop · REST)" style="text;html=1;fontSize=10;fontColor=#cc6600;labelBackgroundColor=#ffffff;align=center;" parent="1" vertex="1">
                     <mxGeometry x="470" y="95" width="660" height="30" as="geometry"/>
                 </mxCell>
                 <mxCell id="e_deploy" style="endArrow=classic;html=1;strokeColor=#009900;strokeWidth=2;" parent="1" source="ha_deploy" target="ks_http" edge="1">

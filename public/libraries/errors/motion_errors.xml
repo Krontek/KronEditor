@@ -101,7 +101,8 @@
   </block>
 
   <block type="MC_Reset">
-    <error code="100" name="MC_ERR_AXIS" text="The error could not be cleared — it is still pending in the drive" />
+    <error code="2"   name="MC_ERR_STATE" text="The axis is moving; MC_Reset only leaves ErrorStop, Standstill or Disabled" />
+    <error code="100" name="MC_ERR_AXIS"  text="The drive kept its fault for KRON_FAULT_RESET_TIMEOUT_S after the CiA402 fault-reset edge — its cause is still present" />
   </block>
 
 </error_codes>

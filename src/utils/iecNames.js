@@ -60,7 +60,7 @@ export function liveGet(live, key) {
 
 // The key as it actually appears in `live`, resolved case-insensitively, or
 // undefined if there is none. Needed wherever a key is not just READ but handed
-// on — a force-write targets a key by name, so passing the user's spelling would
+// on — a write targets a key by name, so passing the user's spelling would
 // write to a slot that does not exist and silently do nothing.
 export function liveResolveKey(live, key) {
   if (!live || key == null) return undefined;

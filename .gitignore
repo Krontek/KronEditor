@@ -69,3 +69,6 @@ experiments/*
 /host-agent/kron-host-agent
 /host-agent/kron-host-agent.exe
 __pycache__/
+
+# shm_logger cross-compiled by ApiSamples/motion_control.py
+ApiSamples/build/

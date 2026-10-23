@@ -908,7 +908,18 @@ static inline void HAL_Init(void) {
 static inline void HAL_Cleanup(void) {
     int i;
     _bb_gpio_state_ensure();
-    for (i = 0; i < _BB_GPIO_MAX; i++) _bb_gpio_release_line(i);
+    /* ⚠️ STOP = SAFE STATE: drive every line we own as an OUTPUT low BEFORE
+     * releasing it. Closing a GPIO handle does not reset the pin — the line
+     * keeps its last level (driver-dependent), so a stopped PLC left a
+     * TRUE output energised. */
+    for (i = 0; i < _BB_GPIO_MAX; i++) {
+        if (_bb_line_fd[i] >= 0 && _bb_line_dir[i] == _BB_DIR_OUTPUT) {
+            struct gpiohandle_data data;
+            memset(&data, 0, sizeof(data));
+            (void)ioctl(_bb_line_fd[i], GPIOHANDLE_SET_LINE_VALUES_IOCTL, &data);
+        }
+        _bb_gpio_release_line(i);
+    }
     for (i = 0; i < _BB_GPIO_BANKS; i++) {
         if (_bb_chip_fd[i] >= 0) { close(_bb_chip_fd[i]); _bb_chip_fd[i] = -1; }
     }

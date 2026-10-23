@@ -11,14 +11,14 @@ import (
 )
 
 // shmMirror is the agent's handle on the loader-host's shared-memory mirror —
-// the single place live values are read from and force-write commands are
+// the single place live values are read from and write commands are
 // posted into. The three platforms create the segment very differently (POSIX
 // shm object vs Win32 named section vs a plain mmap'd file on macOS); only the
 // PATH differs between Linux and macOS (shmMirrorPath, per-OS files), and
 // everything above addresses the mirror purely by byte offset.
 //
-// ⚠️ MAPPED, not read with pread/pwrite. The force-write mailbox (SHM layout
-// v2) needs real atomic loads/stores and compare-and-swap on words the
+// ⚠️ MAPPED, not read with pread/pwrite. The write mailbox (SHM layout
+// v3) needs real atomic loads/stores and compare-and-swap on words the
 // runtime's task threads touch concurrently, and a file write is a memcpy in
 // the kernel with no such guarantee. Live-value reads use one atomic access
 // per naturally aligned slot for the same reason (no half-old/half-new LREAL).
@@ -84,7 +84,7 @@ func (m *shmMirror) ReadAt(b []byte, off int64) error {
 	return nil
 }
 
-// Bytes is the whole mapped segment (the force-write mailbox works on it).
+// Bytes is the whole mapped segment (the write mailbox works on it).
 func (m *shmMirror) Bytes() []byte { return m.mem }
 
 func (m *shmMirror) Close() {

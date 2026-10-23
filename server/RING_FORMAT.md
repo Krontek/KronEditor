@@ -244,7 +244,7 @@ the ring's resident memory tracks the *live backlog*:
 
 ---
 
-# Variable segment (`/dev/shm/<shm-name>`, SHM layout v2)
+# Variable segment (`/dev/shm/<shm-name>`, SHM layout v3)
 
 The 64 KiB segment the runtime mirrors its variables into (`PLC_SHM_SIZE`,
 KronServer `-shm-size`). Writers: KronServer on target, the host agent for the
@@ -255,9 +255,8 @@ the Go writer is `hotswaplib/shmcmd`, shared by both agents.
 
 | range | content | owner |
 |---|---|---|
-| `[0, 32768)` | data slots, offsets from `variable_table.json` | runtime writes (`plc_shm_sync`); readers read |
-| `[32768, 61440)` | one flag byte per variable, `force_flag_offset = 32768 + index` | **runtime only** |
-| `[61440, 65536)` | force-write mailbox | header fields per table below |
+| `[0, 61440)` | data slots, offsets from `variable_table.json` | runtime writes (`plc_shm_sync`); readers read |
+| `[61440, 65536)` | write mailbox | header fields per table below |
 
 - ⚠️ **Natural alignment.** An `n`-byte scalar sits at a multiple of
   `min(n, 8)`. The runtime copies every scalar slot with ONE
@@ -267,21 +266,21 @@ the Go writer is `hotswaplib/shmcmd`, shared by both agents.
   address; mmap bases are page-aligned, so the offset alignment suffices).
   STRING (64-byte, read-only) stays a `memcpy`: a torn display line is possible
   and tolerated.
-- **Flag byte**: `0` = the logic owns the value; `0x81` = FORCED (re-injected
-  every scan from `PlcState.__plc_fv`, the forced-value shadow at the slot's
-  offset — NOT from the slot, which another task's sync may have overwritten
-  with a stale value). Any other non-zero value was written by an outdated
-  (v1) writer: the runtime clears it, counts it in the mailbox header (+44) and
-  prints one warning. PULSE is no longer a stored flag value.
+- **One-way mirror.** The runtime writes every slot from PlcState after each
+  scan and never reads a slot back; nothing else ever stores into a slot while
+  a runtime runs. A write from outside is a mailbox command.
+- **No forcing.** v2 had a per-variable flag region `[32768, 61440)` and a
+  forced-value shadow in PlcState to HOLD a value against the logic; v3
+  removed both (that range is data space now). Every write is one-shot.
 
-## Force-write mailbox (at 61440)
+## Write mailbox (at 61440)
 
 Header (64 bytes):
 
 | off | type | name | written by |
 |---|---|---|---|
 | 0 | u32 | magic `0x424D524B` ("KRMB") | runtime, LAST at init (release); 0 = not ready |
-| 4 | u16 | layout version (2) | runtime |
+| 4 | u16 | layout version (3) | runtime |
 | 6 | u16 | header bytes (64) | runtime |
 | 8 | u32 | capacity (64) | runtime |
 | 12 | u32 | entry bytes (32) | runtime |
@@ -289,19 +288,18 @@ Header (64 bytes):
 | 20 | u32 | consumer try-lock | runtime task threads |
 | 24 | u64 | head — last posted seq | **writer** |
 | 32 | u64 | ack — last consumed seq (release) | runtime |
-| 40 | u32 | reserved | — |
-| 44 | u32 | foreign flag writes seen | runtime |
+| 40 | u64 | reserved | — |
 
 Entry `seq % capacity` at `61440 + 64 + slot × 32`:
 
 | off | type | name |
 |---|---|---|
 | 0 | u64 | seq — published LAST by the writer (release); valid ⇔ `== seq` |
-| 8 | u32 | variable index (`force_flag_offset - 32768`) |
+| 8 | u32 | variable index (the table's `mb_index`) |
 | 12 | u32 | status: 0 pending → runtime CASes 1 (claimed) → 2 applied / 3 bad index / 4 bad size / 5 read-only / 6 bad op; a timed-out writer CASes 0 → `0xFFFFFFFF` (cancelled) |
-| 16 | u8 | op: 1 FORCE, 2 PULSE, 3 UNFORCE, 4 CLEAR_ALL |
+| 16 | u8 | op: 2 WRITE (the only one; v2's 1 FORCE / 3 UNFORCE / 4 CLEAR_ALL → 6 bad op) |
 | 17 | u8 | value size (must equal the variable's size) |
-| 18 | u8 | has-value (UNFORCE only: also write the value once) |
+| 18 | u8 | reserved (0) |
 | 24 | u8[8] | value, little-endian |
 
 **Writer** (one process per segment; its threads serialised by a mutex):
@@ -315,28 +313,22 @@ wins the command is withdrawn and **never applied late** (504); if the
 runtime already claimed it, wait briefly for its ack. Success only after
 `status == applied`.
 
-**Consumer** (generated C, start of every `plc_shm_pull`, every task thread):
+**Consumer** (generated C, `plc_shm_pull` at the start of every task's scan):
 acquire-load magic; try-lock (+20) — a thread that finds it taken skips, never
 blocks (RT priority inversion); for `s = ack+1 …` (at most one lap per scan):
 acquire-load `entry.seq`, stop unless `== s`; CAS status 0 → claimed; apply
-(FORCE: forced value into `PlcState.__plc_fv`, then flag `0x81` with release;
-PULSE/UNFORCE: flag 0; then — if a value is carried — PlcState and the slot);
-store the final status (release); store `ack = s` (release). Unlock.
+(value into PlcState, then into the slot); store the final status (release);
+store `ack = s` (release). Unlock. The logic owns the value again from that
+same scan and may overwrite it.
 
 **Init** (`plc_mb_init`, once per runtime start before any task thread: in
 `plc_shm_init` for the single binary, in `plc_init_hs` on a hot-swap cold
-start — never on a swap): unpublish magic; reload every flag-`0x81` variable's
-forced value from its slot (a crash-restart with the same table keeps its
-forces — `plc_shm_sync` wrote the forced value there); `ack = head` (drop
-anything posted while nothing consumed); write header fields; publish magic.
+start — never on a swap): unpublish magic; `ack = head` (drop anything posted
+while nothing consumed); write header fields; publish magic.
 
-- ⚠️ **Hot-swap.** The mailbox lives in the HOST-owned mirror and the forced
-  values in host-owned PlcState, and no task thread is inside `plc_shm_pull`
-  while the swap barrier holds — so a command is neither lost nor applied twice
-  across a swap.
+- ⚠️ **Hot-swap.** The mailbox lives in the HOST-owned mirror and no task
+  thread is inside `plc_shm_pull` while the swap barrier holds — so a command
+  is neither lost nor applied twice across a swap.
 - ⚠️ **KronServer's pre-start hook** (old runtime gone, new one not spawned)
-  resets the mailbox (magic 0, `ack = head`) and, when the variable table
-  changed, zeroes the flag region directly. That direct write is legal ONLY
-  there: there is no consumer to race. `ClearAllForces` with the runtime
-  stopped clears the flags directly for the same reason; with it running it
-  is one CLEAR_ALL command.
+  resets the mailbox (magic 0, `ack = head`). That direct write is legal ONLY
+  there: there is no consumer to race.

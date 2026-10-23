@@ -267,14 +267,15 @@ const ButtonComp = ({ w, h, p, value, onWrite, liveKey, isPreview }) => {
     const bg = active ? (p.onColor || '#007acc') : (p.offColor || '#252525');
     const border = p.borderColor || '#3a3a3a';
 
-    // Momentary: press = FORCE TRUE (held while pressed), release = UNFORCE
-    // writing FALSE once, so the logic owns the bit again afterwards.
+    // Momentary: press = write TRUE once, release = write FALSE once. Both are
+    // one-shot writes — the PLC logic owns the bit in between, so a program
+    // that also writes it can overwrite the pressed state.
     // ⚠️ Pointer capture keeps the release on this element when the cursor or
     // finger slides off, and pointercancel / lostpointercapture count as a
-    // release — a missed release would leave the bit forced TRUE. downRef makes
-    // the release fire exactly once (pointerup is followed by
-    // lostpointercapture). Ordering of press vs release is guaranteed by the
-    // per-key chain in App.jsx handleForceWrite.
+    // release — a missed release would leave the bit TRUE. downRef makes the
+    // release fire exactly once (pointerup is followed by lostpointercapture).
+    // Ordering of press vs release is guaranteed by the per-key chain in
+    // App.jsx handleWriteVariable.
     const downRef = useRef(false);
     const handleDown = useCallback((e) => {
         if (!isPreview || !onWrite) return;
@@ -284,7 +285,7 @@ const ButtonComp = ({ w, h, p, value, onWrite, liveKey, isPreview }) => {
             downRef.current = true;
             try { e.currentTarget.setPointerCapture(e.pointerId); } catch { /* element gone */ }
             setPressed(true);
-            onWrite(liveKey, true, 'force');
+            onWrite(liveKey, true);
         } else {
             onWrite(liveKey, !on);
         }
@@ -294,7 +295,7 @@ const ButtonComp = ({ w, h, p, value, onWrite, liveKey, isPreview }) => {
         if (!downRef.current) return;
         downRef.current = false;
         setPressed(false);
-        if (isPreview && onWrite) onWrite(liveKey, false, 'unforce');
+        if (isPreview && onWrite) onWrite(liveKey, false);
     }, [isPreview, onWrite, liveKey]);
 
     // Unmounted mid-press (page switch, leaving preview): release too.

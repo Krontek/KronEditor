@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 01_read_write.py — the smallest useful KronServer session: log in, list the
-addressed variables, read one, force-write one, release the force.
+addressed variables, read one, write one.
 
 Works against ANY deployed project: it discovers the variables instead of
 assuming names or addresses. Only variables carrying an IEC address in the
@@ -9,8 +9,7 @@ editor's "Address" column are visible over REST.
 
 Usage:
     python3 01_read_write.py --host 192.168.1.104 --password krontek
-    python3 01_read_write.py --write myVar=42       # force-write, then read back
-    python3 01_read_write.py --clear-forces         # release every force
+    python3 01_read_write.py --write myVar=42       # write once, then read back
 """
 import argparse
 import sys
@@ -34,9 +33,7 @@ def coerce(text):
 def main():
     ap = add_common_args(argparse.ArgumentParser(description=__doc__))
     ap.add_argument("--write", metavar="NAME=VALUE", action="append", default=[],
-                    help="force-write a variable (repeatable)")
-    ap.add_argument("--clear-forces", action="store_true",
-                    help="release all forces and exit")
+                    help="write a variable once (repeatable)")
     args = ap.parse_args()
 
     client = connect(args)
@@ -45,11 +42,6 @@ def main():
     rt = client.runtime()
     print(f"runtime: {'RUNNING pid ' + str(rt['pid']) if rt['running'] else 'STOPPED'}"
           f"  auto_run={rt['auto_run']}  stream_interval={rt['stream_interval_ms']} ms")
-
-    if args.clear_forces:
-        client.clear_forces()
-        print("all forces cleared")
-        return 0
 
     variables = client.variables()
     if not variables:
@@ -69,12 +61,10 @@ def main():
         name, _, raw = spec.partition("=")
         value = coerce(raw)
         client.write(name, value)
-        # A write also sets the force flag, so the read-back is the forced value
-        # and the PLC will not overwrite it until clear_forces().
-        print(f"\nwrote {name} = {value!r} (forced) -> now {client.variable(name)['value']}")
-
-    if args.write:
-        print("run with --clear-forces to hand the variables back to the program")
+        # A one-shot write: the program owns the value again from the same
+        # scan, so a variable the logic assigns every scan reads back its own
+        # value, not the one written.
+        print(f"\nwrote {name} = {value!r} -> now {client.variable(name)['value']}")
     return 0
 
 

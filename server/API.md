@@ -63,7 +63,7 @@ KronServer is a Go-based PLC deployment and debug agent that runs on target hard
 
 The PLC runtime and KronServer communicate through a shared memory region (`/dev/shm/plc_runtime` by default, 64 KB). Variables are read/written at byte offsets defined in `variable_table.json`. All multi-byte values use **Little Endian** encoding.
 
-**SHM layout v2 — slots, flags, mailbox** (byte contract: [`RING_FORMAT.md` § Variable segment](RING_FORMAT.md)): data slots from offset 0 are **naturally aligned** (an `n`-byte scalar sits at a multiple of `min(n, 8)`), so every reader and the runtime copy a scalar with ONE atomic access. The force-flag bytes (`force_flag_offset` = 32768 + variable index) are **owned by the runtime**. Writers never store into a slot or a flag: every write — REST, HMI, ConnectRPC, the editor's local simulation — is a command posted into the **force-write mailbox** at offset 61440, which the runtime applies at the start of its next scan and acknowledges; the request returns only after that ack. A mismatch between the runtime and KronServer (one built before v2) is refused with an explicit message instead of writing memory the other side does not understand.
+**SHM layout v3 — slots, mailbox** (byte contract: [`RING_FORMAT.md` § Variable segment](RING_FORMAT.md)): data slots live in `[0, 61440)` and are **naturally aligned** (an `n`-byte scalar sits at a multiple of `min(n, 8)`), so every reader and the runtime copy a scalar with ONE atomic access. Writers never store into a slot: every write — REST, HMI, ConnectRPC, the editor's local simulation — is a command posted into the **write mailbox** at offset 61440 (addressed by the variable's `mb_index`), which the runtime applies **once** at the start of its next scan and acknowledges; the request returns only after that ack. A write is one-shot: the program owns the value again from that same scan, so logic that assigns the variable every scan overwrites it. **There is no forcing** (holding a value against the logic) — it was removed in v3. A mismatch between the runtime and KronServer (either one built before v3) is refused with an explicit message instead of writing memory the other side does not understand.
 
 ---
 
@@ -128,7 +128,7 @@ Uploaded via `POST /deploy/variable-table`. Defines the symbol table for SHM acc
       "offset": 0,
       "type": "float32",
       "size": 4,
-      "force_flag_offset": 32768,
+      "mb_index": 0,
       "address": "%MD0",
       "initial_value": 0.0
     },
@@ -137,7 +137,7 @@ Uploaded via `POST /deploy/variable-table`. Defines the symbol table for SHM acc
       "offset": 4,
       "type": "bool",
       "size": 1,
-      "force_flag_offset": 32769,
+      "mb_index": 1,
       "address": "%MX0.4",
       "initial_value": true
     },
@@ -146,7 +146,7 @@ Uploaded via `POST /deploy/variable-table`. Defines the symbol table for SHM acc
       "offset": 5,
       "type": "int32",
       "size": 4,
-      "force_flag_offset": 32770
+      "mb_index": 2
     }
   ],
   "api_password_hash": "a1b2c3d4e5f6...",
@@ -162,7 +162,7 @@ Uploaded via `POST /deploy/variable-table`. Defines the symbol table for SHM acc
 | `offset` | int | Yes | Byte offset in shared memory |
 | `type` | string | Yes | One of the supported VarType values |
 | `size` | int | Yes | Size in bytes (must match type) |
-| `force_flag_offset` | int | No | Byte offset of force flag in SHM |
+| `mb_index` | int | No | The variable's index in the write mailbox (`0 … shm_layout.nvars-1`). Without it the variable can be read but not written ("rebuild with the current editor") |
 | `address` | string | No | IEC address (e.g. `%MW0`). **Non-empty = exposed via REST API** |
 | `initial_value` | any | No | Value written to SHM before runtime starts |
 
@@ -293,13 +293,9 @@ Authorization: Bearer <token>
 
 ### `POST /api/v1/variables/{name}`
 
-Write a value to a single addressed variable. Returns **after the PLC runtime has applied it** (force-write mailbox): a `200` means the value is in the program, not merely in shared memory.
+Write a value to a single addressed variable **once**. Returns **after the PLC runtime has applied it** (write mailbox): a `200` means the value is in the program, not merely in shared memory. The program owns the value again from that same scan — a variable the logic assigns every scan is overwritten immediately, so write inputs/setpoints the logic only reads.
 
-| `mode` | Effect |
-|---|---|
-| `"force"` (default) | write once and **hold** — re-injected every scan until released |
-| `"pulse"` | write once; the program owns the value from the same scan (e.g. reseed a counter) |
-| `"unforce"` | release the hold; with a non-null `value`, also write it once (a momentary button's release) |
+`mode` is optional and, if present, must be `"write"`. **Forcing was removed:** `"force"`, `"pulse"` and `"unforce"` are refused with `400` (never silently downgraded to a write). A momentary signal is two writes — `true`, then `false`.
 
 **Request:**
 ```http
@@ -307,7 +303,7 @@ POST /api/v1/variables/prog__motor_speed
 Authorization: Bearer <token>
 Content-Type: application/json
 
-{"value": 1200.0, "mode": "force"}
+{"value": 1200.0}
 ```
 
 **Response (200):**
@@ -321,9 +317,9 @@ Content-Type: application/json
 | Status | Body | Condition |
 |--------|------|-----------|
 | 404 | `{"error": "variable not found or not addressed: xyz"}` | Variable does not exist or has no address |
-| 400 | `{"error": "..."}` | Malformed body, unknown `mode`, value does not fit the type, or the runtime rejected the command (read-only STRING, table/program mismatch) |
-| 409 | `{"error": "..."}` | Runtime not running; still starting and never initialised its mailbox (a runtime built before SHM layout v2 — Build & Send); or a **runtime/server protocol mismatch** (redeploy KronServer: `server/build.sh` + Deploy Server to Target) |
-| 503 | `{"error": "..."}` | Force-write mailbox full (64 commands pending) — the runtime is not consuming |
+| 400 | `{"error": "..."}` | Malformed body, missing `value`, a `mode` other than `"write"` (forcing was removed), value does not fit the type, a variable without `mb_index` (table from an older editor — Build & Send), or the runtime rejected the command (read-only STRING, table/program mismatch) |
+| 409 | `{"error": "..."}` | Runtime not running; still starting and never initialised its mailbox (a runtime built before SHM layout v3 — Build & Send); or a **runtime/server protocol mismatch** (redeploy KronServer: `server/build.sh` + Deploy Server to Target) |
+| 503 | `{"error": "..."}` | Write mailbox full (64 commands pending) — the runtime is not consuming |
 | 504 | `{"error": "..."}` | The runtime did not acknowledge within the timeout (2 × slowest task + 100 ms, 250 ms–2 s). The command was withdrawn and is **never applied late** |
 
 ---
@@ -589,267 +585,6 @@ Sample `i` was taken at ≈ `t_first_us + i·interval_us`; `missed > 0` means th
 
 ---
 
-### `GET /api/v1/forces`
-
-List the **addressed** variables that are currently FORCED (their force-flag byte holds `0x81`, see [RING_FORMAT.md](RING_FORMAT.md) § "Variable segment"), sorted by name. Like every REST endpoint it sees only addressed variables — a forced unaddressed variable is not listed (the editor's own `/stream/vars` carries the full set under the reserved key `"__forced"`). Works while the runtime is stopped too: the flags then show what the next start will re-apply.
-
-**Request:**
-```http
-GET /api/v1/forces
-Authorization: Bearer <token>
-```
-
-**Response (200):**
-```json
-{"forced": ["prog__pump_on", "prog__setpoint"], "count": 2}
-```
-
-Release one with `POST /api/v1/variables/{name}` (`"mode": "unforce"`), all with `POST /api/v1/forces/clear`.
-
----
-
-### `POST /api/v1/forces/clear`
-
-Clear **all** force flags — every variable in the deployed table, not only the addressed ones (it is the same operation as the editor's "clear all forces" and the ConnectRPC `ClearAllForces`, so it also releases forces set from the editor). It is one mailbox command (the runtime owns the flag bytes) and returns after the runtime applied it; with the runtime stopped the flags are cleared directly (`200`). Errors as for a variable write (`409`/`503`/`504`).
-
-**Request:**
-```http
-POST /api/v1/forces/clear
-Authorization: Bearer <token>
-```
-
-**Response (200):**
-```json
-{"status": "ok"}
-```
-
----
-
-### `GET /api/v1/runtime`
-
-Read the current PLC runtime status and persistent runtime config in a single call.
-
-**Request:**
-```http
-GET /api/v1/runtime
-Authorization: Bearer <token>
-```
-
-**Response (200):**
-```json
-{
-  "running": true,
-  "pid": 12345,
-  "auto_run": false,
-  "stream_interval_ms": 50
-}
-```
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `running` | bool | Whether the PLC runtime process is alive |
-| `pid` | int | PID of the runtime process (`0` if not running) |
-| `auto_run` | bool | Whether AutoRun-on-boot is enabled |
-| `stream_interval_ms` | int | Effective `/api/v1/stream` cadence in milliseconds |
-
----
-
-### `POST /api/v1/runtime/start`
-
-Launch the PLC runtime binary. Writes initial values from `variable_table.json` to shared memory before spawning the process. If a process is already running, it is stopped first.
-
-**Request:**
-```http
-POST /api/v1/runtime/start
-Authorization: Bearer <token>
-```
-
-**Response (200):**
-```json
-{"running": true, "pid": 12345}
-```
-
-**Errors:**
-| Status | Body | Condition |
-|--------|------|-----------|
-| 500 | `{"error": "runtime binary not found: ..."}` | `runtime.bin` not deployed |
-| 500 | `{"error": "..."}` | Spawn / SHM failure |
-
----
-
-### `POST /api/v1/runtime/stop`
-
-Gracefully terminate the PLC runtime: SIGTERM, wait up to 5 seconds, then SIGKILL. Returns immediately once the process has exited (or there was none to stop).
-
-**Request:**
-```http
-POST /api/v1/runtime/stop
-Authorization: Bearer <token>
-```
-
-**Response (200):**
-```json
-{"running": false}
-```
-
----
-
-### `POST /api/v1/runtime/config`
-
-Partial update of persistent runtime configuration. Only fields present in the body are changed; omitted fields keep their current value. Persisted to `{deploy-dir}/runtime_config.json` and applied immediately.
-
-**Request:**
-```http
-POST /api/v1/runtime/config
-Authorization: Bearer <token>
-Content-Type: application/json
-
-{"auto_run": true, "stream_interval_ms": 100}
-```
-
-| Field | Type | Optional | Effect |
-|-------|------|----------|--------|
-| `auto_run` | bool | yes | Whether the runtime is started automatically next time the agent boots |
-| `stream_interval_ms` | uint | yes | New `/api/v1/stream` cadence; clamped to **5–60000**. Applies to in-flight SSE clients on the next tick |
-| `ring_ram_percent` | number | yes | Capture-ring size as % of available RAM (0–50; 0 = default 50%). Applies on the next runtime (re)start |
-
-**Response (200):** the resulting (post-clamp) snapshot.
-```json
-{"auto_run": true, "stream_interval_ms": 100}
-```
-
-**Errors:**
-| Status | Body | Condition |
-|--------|------|-----------|
-| 400 | `{"error": "invalid JSON"}` | Malformed request body |
-
-> Note: this only affects the **`/api/v1/stream`** endpoint. The editor-facing streams (`/stream/vars` and ConnectRPC `StreamVars`) keep their fixed 50 ms cadence regardless of this setting.
-
----
-
-## Deploy Endpoints
-
-Used by KronEditor to upload the compiled PLC binary and configuration. No authentication required (same trust level as physical access to the device).
-
-### `POST /deploy/runtime`
-
-Upload the compiled PLC runtime binary. Saved atomically as `{deploy-dir}/runtime.bin` with executable permissions (0755). Max upload size: **128 MB**.
-
-**Request:**
-```http
-POST /deploy/runtime
-Content-Type: application/octet-stream
-
-<binary data>
-```
-
-**Response (200):**
-```json
-{"status": "ok", "path": "/opt/plc/runtime.bin"}
-```
-
----
-
-### `POST /deploy/variable-table`
-
-Upload the variable table JSON. The server parses and validates it immediately. Validation checks:
-- No empty variable names
-- No unsupported types
-- Size matches type
-- No out-of-bounds offsets
-- No duplicate variable names
-
-**Request:**
-```http
-POST /deploy/variable-table
-Content-Type: application/json
-
-<variable_table.json content>
-```
-
-**Response (200):**
-```json
-{"status": "ok", "path": "/opt/plc/variable_table.json", "variable_count": 42}
-```
-
-**Errors:**
-| Status | Body | Condition |
-|--------|------|-----------|
-| 422 | `"failed to parse table: ..."` | JSON parse error, validation failure |
-
----
-
-### `POST /deploy/config`
-
-Upload runtime configuration. Persisted as `{deploy-dir}/runtime_config.json`. Accepts a partial JSON body — fields that are omitted are left untouched, so the editor can push `{"auto_run": false}` without clobbering an API-tuned `stream_interval_ms` (and vice versa).
-
-**Request:**
-```http
-POST /deploy/config
-Content-Type: application/json
-
-{"auto_run": true, "stream_interval_ms": 100}
-```
-
-| Field | Type | Optional | Effect |
-|-------|------|----------|--------|
-| `auto_run` | bool | yes | Whether the runtime is started automatically when the agent boots |
-| `stream_interval_ms` | uint | yes | `/api/v1/stream` cadence in ms; clamped to **5–60000** |
-| `ring_ram_percent` | number | yes | Capture-ring size as % of available RAM (0–50; 0 = default 50%); applies on the next runtime (re)start |
-
-**Response (200):** the resulting (post-clamp) snapshot.
-```json
-{"auto_run": true, "stream_interval_ms": 100}
-```
-
-When `auto_run` is `true`, the server automatically starts the PLC runtime on startup (after writing initial values to SHM). The `stream_interval_ms` field is identical to the one accepted by `POST /api/v1/runtime/config` and affects only the `/api/v1/stream` endpoint.
-
----
-
-### `GET /status`
-
-Returns the current server and runtime status.
-
-**Request:**
-```http
-GET /status
-```
-
-**Response (200):**
-```json
-{
-  "running": true,
-  "pid": 12345,
-  "variable_count": 42,
-  "shm_name": "plc_runtime",
-  "deploy_dir": "/opt/plc",
-  "auto_run": false,
-  "stream_interval_ms": 50,
-  "mem_total_bytes": 7978577920,
-  "mem_available_bytes": 7593451520,
-  "ring_ram_percent": 50,
-  "ring_bytes": 2134614016
-}
-```
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `running` | bool | Whether the PLC runtime process is alive |
-| `pid` | int | PID of the runtime process (0 if not running) |
-| `variable_count` | int | Number of loaded variables |
-| `shm_name` | string | Shared memory region name |
-| `deploy_dir` | string | Deploy directory path |
-| `auto_run` | bool | Whether AutoRun is enabled |
-| `stream_interval_ms` | int | Effective `/api/v1/stream` cadence in ms |
-| `mem_total_bytes` | int | Device total RAM (from `/proc/meminfo`) |
-| `mem_available_bytes` | int | Device available RAM |
-| `ring_ram_percent` | number | Effective capture-ring size as % of available RAM (default 50) |
-| `ring_bytes` | int | Resolved capture-ring byte size the next runtime start will use |
-
-> `/status` is unauthenticated and primarily intended for liveness checks from the editor and load balancers. For authenticated programmatic access prefer `GET /api/v1/runtime`.
-
----
-
 ## ConnectRPC Service (`/plc.v1.PLCService/`)
 
 Used internally by KronEditor for runtime control and live variable streaming. Supports Connect, gRPC, and gRPC-Web protocols over HTTP/2 (h2c, no TLS).
@@ -861,7 +596,6 @@ service PLCService {
   rpc Start(StartRequest) returns (StartResponse);
   rpc Stop(StopRequest) returns (StopResponse);
   rpc WriteVar(WriteVarRequest) returns (WriteVarResponse);
-  rpc ClearAllForces(ClearAllForcesRequest) returns (ClearAllForcesResponse);
   rpc StreamVars(StreamVarsRequest) returns (stream VarsUpdate);
 }
 ```
@@ -878,15 +612,11 @@ Sends SIGTERM to the runtime. Waits up to **5 seconds** for graceful shutdown, t
 
 ### `WriteVar`
 
-Posts a write into the runtime's force-write mailbox and returns once the runtime applied it.
+Posts a one-shot write into the runtime's write mailbox and returns once the runtime applied it.
 
-**Request:** `{ name: string, value: google.protobuf.Value, mode?: "force" | "pulse" | "unforce" }` — `mode` defaults to `force` (only sent when different: a KronServer older than the field rejects unknown JSON fields). Send 64-bit integers beyond ±2^53 as **decimal strings** (a `Value` number is a double).
+**Request:** `{ name: string, value: google.protobuf.Value, mode?: string }` — `value` is required; `mode` must be empty or `"write"` (forcing was removed: `"force"`/`"pulse"`/`"unforce"` → `INVALID_ARGUMENT`). Send 64-bit integers beyond ±2^53 as **decimal strings** (a `Value` number is a double).
 
 **Errors:** `FAILED_PRECONDITION` (not running / not ready / protocol mismatch), `RESOURCE_EXHAUSTED` (mailbox full), `DEADLINE_EXCEEDED` (no ack — not applied), `INVALID_ARGUMENT`.
-
-### `ClearAllForces`
-
-Releases every force (one mailbox command; direct flag clear while the runtime is stopped).
 
 ### `StreamVars`
 
@@ -906,11 +636,7 @@ data: {"prog__motor_speed":1500.0,"prog__pump_on":true,"prog__internal_counter":
 
 `?p=<prefix,…>&v=<name,…>` narrows the values to what the editor has on screen (both absent = everything).
 
-**Reserved key `"__forced"`** — a sorted JSON array with the names of EVERY forced variable (flag byte `0x81`), regardless of `p`/`v`. It is not a variable: a client must take it out before treating the event as values. It is sent on a connection's first event, whenever the set changes (an empty array `[]` means "nothing is forced any more") and at least every 2 s; events in between omit it, meaning "unchanged".
-
-```
-data: {"prog__pump_on":true,"__forced":["prog__pump_on"]}
-```
+Every key is a variable (there is no reserved key any more — the `"__forced"` set was removed with forcing).
 
 ---
 
@@ -931,7 +657,7 @@ data: {"prog__pump_on":true,"__forced":["prog__pump_on"]}
 - Per-user accounts with 4-tier RBAC
 - Session stored in `kron_session` cookie
 - Same 8h TTL as API tokens
-- `POST <base>/login` takes a JSON body `{"username": "...", "password": "..."}` (`Content-Type: application/json`, else 415); the login page submits it with `fetch`. `POST <base>/api/write` also requires `application/json`. Its body is `{"key", "value", "mode"}` with the same `mode` values and status codes as `POST /api/v1/variables/{name}`; a momentary button sends `force`/`true` on press and `unforce`/`false` on release, serialised per variable in the page so the release can never overtake its press (pointer capture; `pointercancel` counts as a release).
+- `POST <base>/login` takes a JSON body `{"username": "...", "password": "..."}` (`Content-Type: application/json`, else 415); the login page submits it with `fetch`. `POST <base>/api/write` also requires `application/json`. Its body is `{"key", "value"}` (an optional `mode` follows the same rule) with the same status codes as `POST /api/v1/variables/{name}`; a momentary button writes `true` on press and `false` on release — two one-shot writes, so logic that assigns the variable every scan overrides the press — serialised per variable in the page so the release can never overtake its press (pointer capture; `pointercancel` counts as a release).
 - **Writes need a user.** With no HMI user defined the panel and `GET <base>/api/variables` stay open (read-only display), but `POST <base>/api/write` answers **403** ("HMI writes require at least one HMI user"). With no HMI deployed at all, both data endpoints answer **503**.
 - Sessions (and API bearer tokens) are revoked when a deploy changes the user set / the API password.
 - The dedicated HMI port refuses requests whose `Origin` is neither the panel's own origin nor a local/private one (403), like the agent port.
@@ -1002,7 +728,7 @@ Persisted across restarts. Written by `POST /deploy/config` and `POST /api/v1/ru
    GET /api/v1/ring/info        ← discover capture-ring layout (for high-rate capture)
    GET /api/v1/stream/ring      ← external clients: EVERY scan of addressed vars, lossless
 
-5. Force-write a variable:
+5. Write a variable (one-shot):
    ConnectRPC WriteVar()        ← from editor
    POST /api/v1/variables/{n}   ← from external client
 

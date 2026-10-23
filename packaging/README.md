@@ -82,7 +82,7 @@ On a non-dpkg distro the script stops with an explicit "install NSIS" message ra
 
 ## Windows notes
 
-**Local simulation works on Windows.** It runs the same hot-swap runtime as Linux: the loader-host creates a named section (`Local\plc_runtime`) instead of a `/dev/shm` object, loads the logic with `LoadLibrary` instead of `dlopen`, and takes its swap signal from a named Event instead of `SIGUSR1`. Everything above that — the scan barrier, the ping-pong slots, the force/pulse flag semantics — is the same code. host-agent/CLAUDE.md "Windows simulation" has the details and the traps found while porting.
+**Local simulation works on Windows.** It runs the same hot-swap runtime as Linux: the loader-host creates a named section (`Local\plc_runtime`) instead of a `/dev/shm` object, loads the logic with `LoadLibrary` instead of `dlopen`, and takes its swap signal from a named Event instead of `SIGUSR1`. Everything above that — the scan barrier, the ping-pong slots, the write mailbox — is the same code. host-agent/CLAUDE.md "Windows simulation" has the details and the traps found while porting.
 
 Only the LEGACY plain-sim path stays Linux-only (it reads `/proc/<pid>/mem` and needs ELF/DWARF); `handleRunSimulation` returns an explicit error on Windows. Users never pick that path — hot-swap is the default runtime.
 
@@ -92,7 +92,7 @@ Only the LEGACY plain-sim path stays Linux-only (it reads `/proc/<pid>/mem` and 
 
 ## macOS notes
 
-**Local simulation works on macOS too**, on the same hot-swap runtime. Four things differ and all four are in host-agent/CLAUDE.md "macOS simulation": the mirror is a plain mmap'd *file* (macOS has no `/dev/shm`, and a `shm_open`'d object is invisible to the agent), `plc_sleep_until` uses `mach_wait_until` (there is no `clock_nanosleep` at all), the scan barrier is a mutex+condvar shim (Apple never shipped `pthread_barrier_*`), and the logic module is a Mach-O **bundle** linked with `-bundle_loader` (the exact analogue of the Windows import library). Everything above that — the scan structure, the ping-pong slots, the swap protocol, force/pulse semantics — is the same code.
+**Local simulation works on macOS too**, on the same hot-swap runtime. Four things differ and all four are in host-agent/CLAUDE.md "macOS simulation": the mirror is a plain mmap'd *file* (macOS has no `/dev/shm`, and a `shm_open`'d object is invisible to the agent), `plc_sleep_until` uses `mach_wait_until` (there is no `clock_nanosleep` at all), the scan barrier is a mutex+condvar shim (Apple never shipped `pthread_barrier_*`), and the logic module is a Mach-O **bundle** linked with `-bundle_loader` (the exact analogue of the Windows import library). Everything above that — the scan structure, the ping-pong slots, the swap protocol, the write mailbox — is the same code.
 
 The LEGACY plain-sim path stays Linux-only here as well; `handleRunSimulation` returns an explicit error. Users never pick it — hot-swap is the default.
 
@@ -141,7 +141,7 @@ curl -s http://127.0.0.1:7799/api/host/health
 
 A green build is not proof. The checks that actually caught things here: the produced sim binary **runs**, and target compiles succeed for **both** aarch64 and armv7 (armv7 static linking has its own failure mode — see host-agent/CLAUDE.md on `LLVMGCCInstallDir`).
 
-On macOS the equivalent acceptance test is a hot-swap session, because that is where all four ported primitives meet: start a simulation, confirm live values move (proves the file-backed mirror and the `mach_wait_until` scan timing — a 10 ms task should tick ~100×/s, not thousands), force- and pulse-write a variable, then edit logic and Hot Reload (proves `-bundle_loader` binding and the barrier shim).
+On macOS the equivalent acceptance test is a hot-swap session, because that is where all four ported primitives meet: start a simulation, confirm live values move (proves the file-backed mirror and the `mach_wait_until` scan timing — a 10 ms task should tick ~100×/s, not thousands), write a variable (one-shot), then edit logic and Hot Reload (proves `-bundle_loader` binding and the barrier shim).
 
 ## Related docs
 

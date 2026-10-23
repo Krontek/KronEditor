@@ -1,8 +1,6 @@
 import React, { useState, useCallback, useRef, useEffect } from 'react';
 import { useTranslation } from 'react-i18next';
-import ForceWriteModal from './common/ForceWriteModal';
-import ForcedMarker, { useForcedSet } from './common/ForcedMarker';
-import { isKeyForced } from '../utils/forcedVars';
+import WriteValueModal from './common/WriteValueModal';
 import { formatTimeUs, normalizeTimeLiteral, isTimeType } from '../utils/plcStandards';
 import { liveGet, liveResolveKey, findVarByName } from '../utils/iecNames';
 import { ErrorCodeService } from '../services/ErrorCodeService';
@@ -18,6 +16,7 @@ import ReactFlow, {
 } from 'reactflow';
 import 'reactflow/dist/style.css';
 import DragDropManager from '../utils/DragDropManager';
+import { powerPins } from '../services/agentTools';
 
 
 /**
@@ -333,7 +332,7 @@ export const blockConfig = {
   // no `ByteSize` input, no `ErrorID` output), which is what VariableManager
   // uses to type an instance's live output pins.
   EC_GetMasterState: { label: 'EC_GetMasterState', inputs: [{ name: 'Enable', type: 'BOOL' }],                                                                                                                                                                                                                                  outputs: [{ name: 'Valid', type: 'BOOL' }, { name: 'Error', type: 'BOOL' }, { name: 'ErrorID', type: 'WORD' }, { name: 'State', type: 'BYTE' }, { name: 'Operational', type: 'BOOL' }, { name: 'SlaveCount', type: 'UINT' }] },
-  EC_GetSlaveState:  { label: 'EC_GetSlaveState',  inputs: [{ name: 'Enable', type: 'BOOL' }, { name: 'SlaveAddress', type: 'UINT' }],                                                                                                                                                                                          outputs: [{ name: 'Valid', type: 'BOOL' }, { name: 'Error', type: 'BOOL' }, { name: 'ErrorID', type: 'WORD' }, { name: 'State', type: 'BYTE' }, { name: 'LinkUp', type: 'BOOL' }] },
+  EC_GetSlaveState:  { label: 'EC_GetSlaveState',  inputs: [{ name: 'Enable', type: 'BOOL' }, { name: 'SlaveAddress', type: 'UINT' }],                                                                                                                                                                                          outputs: [{ name: 'Valid', type: 'BOOL' }, { name: 'Error', type: 'BOOL' }, { name: 'ErrorID', type: 'WORD' }, { name: 'State', type: 'BYTE' }, { name: 'LinkUp', type: 'BOOL' }, { name: 'SdoIndex', type: 'WORD' }, { name: 'SdoSubIndex', type: 'BYTE' }, { name: 'SdoAbortCode', type: 'DWORD' }] },
   EC_ResetBus:       { label: 'EC_ResetBus',       inputs: [{ name: 'Execute', type: 'BOOL' }],                                                                                                                                                                                                                                 outputs: [{ name: 'Done', type: 'BOOL' }, { name: 'Busy', type: 'BOOL' }, { name: 'Error', type: 'BOOL' }, { name: 'ErrorID', type: 'WORD' }] },
   EC_ReadSDO:        { label: 'EC_ReadSDO',        inputs: [{ name: 'Execute', type: 'BOOL' }, { name: 'SlaveAddress', type: 'UINT' }, { name: 'Index', type: 'WORD' }, { name: 'SubIndex', type: 'BYTE' }, { name: 'ByteSize', type: 'BYTE' }],                                                                                 outputs: [{ name: 'Done', type: 'BOOL' }, { name: 'Busy', type: 'BOOL' }, { name: 'Error', type: 'BOOL' }, { name: 'ErrorID', type: 'WORD' }, { name: 'Value', type: 'DWORD' }] },
   EC_WriteSDO:       { label: 'EC_WriteSDO',       inputs: [{ name: 'Execute', type: 'BOOL' }, { name: 'SlaveAddress', type: 'UINT' }, { name: 'Index', type: 'WORD' }, { name: 'SubIndex', type: 'BYTE' }, { name: 'ByteSize', type: 'BYTE' }, { name: 'Value', type: 'DWORD' }],                                               outputs: [{ name: 'Done', type: 'BOOL' }, { name: 'Busy', type: 'BOOL' }, { name: 'Error', type: 'BOOL' }, { name: 'ErrorID', type: 'WORD' }] },
@@ -456,9 +455,6 @@ const BlockNode = ({ id, data, selected }) => {
   const { setNodes } = useReactFlow();
   const edges = useEdges();
   const { variables = [], globalVars = [], dataTypes = [], hwPortVars = [], liveVariables = null, errorCodeService = null } = data; // Receive vars from data context
-  // Forced keys come through context, NOT node data: nothing live may enter
-  // mapBlocksToNodes' deps (src/CLAUDE.md), and the set changes rarely.
-  const forcedSet = useForcedSet();
 
   // Build map of array type names → their definitions for validation
   const arrayTypeMap = React.useMemo(() => {
@@ -511,7 +507,7 @@ const BlockNode = ({ id, data, selected }) => {
   }, [data.instanceName, data.type, data.values?.var, data.values?.coil]);
 
   const [localPinValues, setLocalPinValues] = useState(data.values || {});
-  const [forceModal, setForceModal] = useState(null);
+  const [writeModal, setWriteModal] = useState(null);
 
   React.useEffect(() => {
     setLocalPinValues(data.values || {});
@@ -557,8 +553,7 @@ const BlockNode = ({ id, data, selected }) => {
         || progKey;
     }
     const isLiveActive = liveVariables && lookupKey && liveVariables[lookupKey] !== undefined;
-    const canForce = !!data.onForceWrite && isLiveActive;
-    const contactForced = !!isLiveActive && isKeyForced(forcedSet, lookupKey);
+    const canWrite = !!data.onWriteVariable && isLiveActive;
     const allVars = [...variables, ...globalVars];
     const varDef = findVarByName(allVars, instanceName);
     const varType = varDef?.type || 'BOOL';
@@ -603,8 +598,8 @@ const BlockNode = ({ id, data, selected }) => {
         {isLiveActive && (
           <div
             className="nodrag"
-            onClick={(e) => { e.stopPropagation(); if (canForce) setForceModal({ liveKey: lookupKey, varName: instanceName, varType, currentValue: liveVariables?.[lookupKey] }); }}
-            title={canForce ? 'Click to force-write value' : ''}
+            onClick={(e) => { e.stopPropagation(); if (canWrite) setWriteModal({ liveKey: lookupKey, varName: instanceName, varType, currentValue: liveVariables?.[lookupKey] }); }}
+            title={canWrite ? 'Click to write a value' : ''}
             style={{
               position: 'absolute',
               top: -42,
@@ -612,22 +607,19 @@ const BlockNode = ({ id, data, selected }) => {
               transform: 'translateX(-50%)',
               background: liveVariables[lookupKey] ? '#00e676' : '#252526',
               color: liveVariables[lookupKey] ? '#000' : '#888',
-              border: `1px solid ${contactForced ? '#ff1744' : liveVariables[lookupKey] ? '#00e676' : '#888'}`,
+              border: `1px solid ${liveVariables[lookupKey] ? '#00e676' : '#888'}`,
               padding: '1px 4px',
               borderRadius: 4,
               fontSize: 8,
               fontWeight: 'bold',
               zIndex: 20,
-              cursor: canForce ? 'pointer' : 'default',
+              cursor: canWrite ? 'pointer' : 'default',
               whiteSpace: 'nowrap',
               display: 'inline-flex',
               alignItems: 'center',
             }}
           >
             {liveVariables[lookupKey] ? 'TRUE' : 'FALSE'}
-            {contactForced && (
-              <ForcedMarker compact onClick={canForce ? () => setForceModal({ liveKey: lookupKey, varName: instanceName, varType, currentValue: liveVariables?.[lookupKey] }) : undefined} />
-            )}
           </div>
         )}
         {/* Interactive Controls (Top) */}
@@ -753,15 +745,15 @@ const BlockNode = ({ id, data, selected }) => {
             zIndex: 5
           }}
         />
-        {forceModal && (
-          <ForceWriteModal
+        {writeModal && (
+          <WriteValueModal
             isOpen={true}
-            onClose={() => setForceModal(null)}
-            varName={forceModal.varName}
-            varType={forceModal.varType}
-            currentValue={forceModal.currentValue}
-            liveKey={forceModal.liveKey}
-            onConfirm={(key, val, mode) => { data.onForceWrite && data.onForceWrite(key, val, mode); }}
+            onClose={() => setWriteModal(null)}
+            varName={writeModal.varName}
+            varType={writeModal.varType}
+            currentValue={writeModal.currentValue}
+            liveKey={writeModal.liveKey}
+            onConfirm={(key, val) => { data.onWriteVariable && data.onWriteVariable(key, val); }}
           />
         )}
       </div>
@@ -865,15 +857,28 @@ const BlockNode = ({ id, data, selected }) => {
     };
   }
 
-  // Prepend EN pin to inputs if Execution Control is enabled
+  // Power-flow pins go on the FIRST row: EN/ENO when Execution Control is on,
+  // else the block's trigger/power output (powerPins — the same table the
+  // transpiler and agent wire through). Declaration order put e.g. MC_Stop's
+  // Execute BELOW Axis, ~95px under the block top — deeper than the fixed power
+  // line (MIDDLE_Y = 75), so no position could put it on the line and every
+  // such rung jogged. Board blocks are skipped: their trigger is EN, which is
+  // either already first or not drawn. Display order only — handles are by name.
+  const powerFirst = (pins, name) => {
+    const i = name ? pins.findIndex(p => p.name === name) : -1;
+    return i > 0 ? [pins[i], ...pins.slice(0, i), ...pins.slice(i + 1)] : pins;
+  };
+  const power = (data.executionControl || isBoardBlock)
+    ? { trigger: null, powerOutput: null }
+    : powerPins(data.type, cfg.inputs, cfg.outputs);
+
   const effectiveInputs = data.executionControl
     ? [{ name: 'EN', type: 'BOOL' }, ...cfg.inputs]
-    : cfg.inputs;
+    : powerFirst(cfg.inputs, power.trigger);
 
-  // Append ENO pin to outputs if Execution Control is enabled
   const effectiveOutputs = data.executionControl
     ? [{ name: 'ENO', type: 'BOOL' }, ...cfg.outputs]
-    : cfg.outputs;
+    : powerFirst(cfg.outputs, power.powerOutput);
 
   const getPinSuggestionList = (pin) => {
     // suggestType (set by the ANY_NUM polymorphic inference above) keeps the
@@ -996,14 +1001,6 @@ const BlockNode = ({ id, data, selected }) => {
             if (liveVariables && pinLiveVal === undefined) pinLiveVal = liveGet(liveVariables, `prog__${baseValName}`);
             if (liveVariables && pinLiveVal === undefined) pinLiveVal = liveVariables[shadowKey];
             const pinHasLive = pinLiveVal !== undefined;
-            // The key the badge's value came from (same resolution order), for
-            // the force marker.
-            const pinLiveKey = liveVariables
-              ? (liveResolveKey(liveVariables, `prog_${safeProgName}_${baseValName}`)
-                || liveResolveKey(liveVariables, `prog__${baseValName}`)
-                || (liveVariables[shadowKey] !== undefined ? shadowKey : null))
-              : null;
-            const pinForced = pinHasLive && isKeyForced(forcedSet, pinLiveKey);
             // ⚠️ A pin with no variable on it still HAS a value (its shadow field),
             // and hiding the badge until something is assigned is what made block
             // I/O invisible in a running simulation. In an EDITABLE live view
@@ -1039,47 +1036,46 @@ const BlockNode = ({ id, data, selected }) => {
                       const liveStr = hasLive
                         ? (typeof varLiveVal === 'boolean' ? (varLiveVal ? '1' : '0') : (isTimeType(pin.type) ? formatTimeUs(varLiveVal) : String(varLiveVal)))
                         : '---';
-                      // Open the force/pulse dialog for whatever this badge is showing:
+                      // Open the write-value dialog for whatever this badge is showing:
                       // the variable assigned to the pin, else the pin's own shadow field.
-                      const openForceModal = () => {
+                      const openWriteModal = () => {
                         const cleanedVal = (val || '').replace(/[🌍🏠⊞⊡⊟]/g, '').trim();
                         const isVarRefBadge = cleanedVal && /^[A-Za-z_]/.test(cleanedVal);
-                        let forceKey = shadowKey;
-                        let forceCurrent = liveVariables?.[shadowKey];
-                        let forceName = `${data.instanceName || data.type}.${pin.name}`;
+                        let writeKey = shadowKey;
+                        let writeCurrent = liveVariables?.[shadowKey];
+                        let writeName = `${data.instanceName || data.type}.${pin.name}`;
                         if (isVarRefBadge) {
                           const safeVar = cleanedVal.replace(/\s+/g, '_');
                           const pk = `prog_${safeProgName}_${safeVar}`;
-                          forceKey = liveResolveKey(liveVariables, pk)
+                          writeKey = liveResolveKey(liveVariables, pk)
                             || liveResolveKey(liveVariables, `prog__${safeVar}`) || pk;
-                          forceCurrent = liveVariables?.[forceKey];
-                          forceName = cleanedVal;
+                          writeCurrent = liveVariables?.[writeKey];
+                          writeName = cleanedVal;
                         }
                         const modalVarType = normalizedPinType === 'ANY' ? 'INT' : normalizedPinType;
-                        setForceModal({ liveKey: forceKey, varName: forceName, varType: modalVarType, currentValue: forceCurrent });
+                        setWriteModal({ liveKey: writeKey, varName: writeName, varType: modalVarType, currentValue: writeCurrent });
                       };
                       return (
                         <span
-                          title={hasLive && data.onForceWrite ? 'Double-click to write this value online (force / pulse)' : undefined}
                           // ⚠️ A green badge IS the live value, so double-clicking it writes that
-                          // value online. Gated on onForceWrite (non-null only while something
+                          // value online. Gated on onWriteVariable (non-null only while something
                           // is RUNNING) and on a value actually existing — deliberately NOT on
                           // data.readOnly, which is FALSE during a hot-swap sim and so made the
-                          // force path unreachable exactly where online editing is the point.
+                          // write path unreachable exactly where online editing is the point.
                           // ⚠️ Without stopPropagation the dblclick reaches the canvas's
                           // onNodeDoubleClick and opens Block Settings instead — the pin input
                           // below stops it for the same reason.
                           onDoubleClick={(e) => {
                             e.stopPropagation();
-                            if (hasLive && data.onForceWrite) { openForceModal(); return; }
-                            // Nothing to force: aim the gesture at the field this badge covers.
+                            if (hasLive && data.onWriteVariable) { openWriteModal(); return; }
+                            // Nothing to write: aim the gesture at the field this badge covers.
                             const inp = e.currentTarget.parentElement?.querySelector('input');
                             if (inp && !inp.readOnly) { inp.focus(); inp.select(); }
                           }}
                           onClick={(e) => {
                             e.stopPropagation();
-                            if (!data.readOnly || !data.onForceWrite) return;
-                            openForceModal();
+                            if (!data.readOnly || !data.onWriteVariable) return;
+                            openWriteModal();
                           }}
                           style={{
                           position: 'absolute',
@@ -1088,20 +1084,17 @@ const BlockNode = ({ id, data, selected }) => {
                           minWidth: 36,
                           fontSize: 9,
                           background: hasLive ? 'rgba(0,230,118,0.12)' : 'transparent',
-                          border: `1px solid ${pinForced ? '#ff1744' : hasLive ? 'rgba(0,230,118,0.4)' : '#444'}`,
+                          border: `1px solid ${hasLive ? 'rgba(0,230,118,0.4)' : '#444'}`,
                           color: hasLive ? '#00e676' : '#555',
                           padding: '0px 3px',
                           borderRadius: 2,
                           fontFamily: 'Consolas, monospace',
                           textAlign: 'center',
-                          cursor: hasLive && data.onForceWrite ? 'pointer' : 'default',
+                          cursor: hasLive && data.onWriteVariable ? 'pointer' : 'default',
                           zIndex: 10,
                           whiteSpace: 'nowrap'
                         }}>
                           {liveStr}
-                          {pinForced && (
-                            <ForcedMarker compact onClick={data.onForceWrite ? openForceModal : undefined} />
-                          )}
                         </span>
                       );
                     })()}
@@ -1117,22 +1110,22 @@ const BlockNode = ({ id, data, selected }) => {
                       onMouseDown={(e) => e.stopPropagation()}
                       onClick={(e) => {
                         e.stopPropagation();
-                        if (!data.readOnly || !data.onForceWrite) return;
+                        if (!data.readOnly || !data.onWriteVariable) return;
                         const cleanedVal = (val || '').replace(/[🌍🏠⊞⊡⊟]/g, '').trim();
                         const isVarRef = cleanedVal && /^[A-Za-z_]/.test(cleanedVal);
-                        let forceKey = shadowKey;
-                        let forceCurrent = liveVariables?.[shadowKey];
-                        let forceName = `${data.instanceName || data.type}.${pin.name}`;
+                        let writeKey = shadowKey;
+                        let writeCurrent = liveVariables?.[shadowKey];
+                        let writeName = `${data.instanceName || data.type}.${pin.name}`;
                         if (isVarRef) {
                           const safeVar = cleanedVal.replace(/\s+/g, '_');
                           const pk = `prog_${safeProgName}_${safeVar}`;
-                          forceKey = liveResolveKey(liveVariables, pk)
+                          writeKey = liveResolveKey(liveVariables, pk)
                             || liveResolveKey(liveVariables, `prog__${safeVar}`) || pk;
-                          forceCurrent = liveVariables?.[forceKey];
-                          forceName = cleanedVal;
+                          writeCurrent = liveVariables?.[writeKey];
+                          writeName = cleanedVal;
                         }
                         const modalVarType = normalizedPinType === 'ANY' ? 'INT' : normalizedPinType;
-                        setForceModal({ liveKey: forceKey, varName: forceName, varType: modalVarType, currentValue: forceCurrent });
+                        setWriteModal({ liveKey: writeKey, varName: writeName, varType: modalVarType, currentValue: writeCurrent });
                       }}
                       onChange={(e) => {
                         if (data.readOnly) return;
@@ -1224,11 +1217,11 @@ const BlockNode = ({ id, data, selected }) => {
             // Live value lookup for this output pin
             const lv = liveVariables;
             let outLiveVal;
-            // ⚠️ The KEY the value came from, kept so a force-write addresses the same
-            // slot the badge is displaying (CLAUDE.md: a force addresses its slot BY KEY, and
+            // ⚠️ The KEY the value came from, kept so a write addresses the same
+            // slot the badge is displaying (CLAUDE.md: a write addresses its slot BY KEY, and
             // IEC names are case-insensitive — hence liveResolveKey, never the raw name).
             let outLiveKey = null;
-            let outForceName = `${data.instanceName || data.type}.${pin.name}`;
+            let outWriteName = `${data.instanceName || data.type}.${pin.name}`;
             if (lv) {
               const safeProgName = (data.parentName || '').trim().replace(/\s+/g, '_');
               const safeInstName = (data.instanceName || '').trim().replace(/\s+/g, '_');
@@ -1237,7 +1230,7 @@ const BlockNode = ({ id, data, selected }) => {
                 const safeVar = assignedVar.replace(/\s+/g, '_');
                 const k = liveResolveKey(lv, `prog_${safeProgName}_${safeVar}`)
                   || liveResolveKey(lv, `prog__${safeVar}`);
-                if (k) { outLiveKey = k; outLiveVal = lv[k]; outForceName = assignedVar; }
+                if (k) { outLiveKey = k; outLiveVal = lv[k]; outWriteName = assignedVar; }
               }
               if (outLiveVal === undefined && safeInstName) {
                 const shadow = `prog_${safeProgName}_out_${safeInstName}_${pin.name}`;
@@ -1245,7 +1238,6 @@ const BlockNode = ({ id, data, selected }) => {
               }
             }
             const hasLive = outLiveVal !== undefined;
-            const outForced = hasLive && isKeyForced(forcedSet, outLiveKey);
             // Same policy as the input pins: a value that EXISTS is shown, whether
             // or not a variable was assigned to the pin — an unassigned OUT/Q still
             // produces one, which is exactly what its shadow field holds.
@@ -1302,21 +1294,21 @@ const BlockNode = ({ id, data, selected }) => {
                       const isErrorPin = ErrorCodeService.getErrorFieldName(pin.name) !== null;
                       const numericVal = hasLive ? Number(outLiveVal) : 0;
                       const errInfo = (isErrorPin && errorCodeService && numericVal !== 0)
-                        ? errorCodeService.lookup(data.type, numericVal)
+                        ? errorCodeService.lookup(data.type, numericVal, pin.name)
                         : null;
                       const isError = isErrorPin && numericVal !== 0;
                       return (
                         <span
-                          // Same contract as the input badge: a live value is force-writable
+                          // Same contract as the input badge: a live value is writable
                           // by double-click whenever something is running, and the dblclick
                           // must never reach onNodeDoubleClick (Block Settings).
                           onDoubleClick={(e) => {
                             e.stopPropagation();
-                            if (hasLive && outLiveKey && data.onForceWrite) {
+                            if (hasLive && outLiveKey && data.onWriteVariable) {
                               const t = normalizeEditorPinType(pin.type);
-                              setForceModal({
+                              setWriteModal({
                                 liveKey: outLiveKey,
-                                varName: outForceName,
+                                varName: outWriteName,
                                 varType: t === 'ANY' ? 'INT' : t,
                                 currentValue: outLiveVal,
                               });
@@ -1325,9 +1317,9 @@ const BlockNode = ({ id, data, selected }) => {
                             const inp = e.currentTarget.parentElement?.querySelector('input');
                             if (inp && !inp.readOnly) { inp.focus(); inp.select(); }
                           }}
-                          title={errInfo ? `[${errInfo.name}] ${errInfo.text}`
-                            : (hasLive && outLiveKey && data.onForceWrite
-                              ? 'Double-click to write this value online (force / pulse)' : undefined)}
+                          // Error pins explain their code; an unknown code says so instead of going silent.
+                          title={errInfo ? `${pin.name} ${numericVal} — ${errInfo.name}: ${errInfo.text}`
+                            : (isError ? `${pin.name} ${numericVal} — not in the error catalog for ${data.type}` : undefined)}
                           style={{
                             position: 'absolute',
                             top: outBadgeAbove ? -15 : 0,
@@ -1335,7 +1327,7 @@ const BlockNode = ({ id, data, selected }) => {
                             minWidth: 36,
                             fontSize: 9,
                             background: isError ? 'rgba(255,23,68,0.15)' : (hasLive ? 'rgba(0,230,118,0.12)' : 'transparent'),
-                            border: `1px solid ${outForced ? '#ff1744' : isError ? 'rgba(255,23,68,0.5)' : (hasLive ? 'rgba(0,230,118,0.4)' : '#444')}`,
+                            border: `1px solid ${isError ? 'rgba(255,23,68,0.5)' : (hasLive ? 'rgba(0,230,118,0.4)' : '#444')}`,
                             color: isError ? '#ff1744' : (hasLive ? '#00e676' : '#555'),
                             padding: '0px 3px',
                             borderRadius: 2,
@@ -1343,22 +1335,16 @@ const BlockNode = ({ id, data, selected }) => {
                             textAlign: 'center',
                             // ⚠️ Click-through by default so the badge never blocks the pin
                             // field underneath, but it MUST take events when it is actionable
-                            // — an error tooltip, or a live value that can be forced. While
+                            // — an error tooltip, or a live value that can be written. While
                             // this was unconditionally 'none' the double-click fell straight
                             // through to the canvas and opened Block Settings.
-                            pointerEvents: (errInfo || (hasLive && outLiveKey && data.onForceWrite)) ? 'auto' : 'none',
-                            cursor: hasLive && outLiveKey && data.onForceWrite ? 'pointer' : 'default',
+                            pointerEvents: (errInfo || isError || (hasLive && outLiveKey && data.onWriteVariable)) ? 'auto' : 'none',
+                            cursor: hasLive && outLiveKey && data.onWriteVariable ? 'pointer' : 'default',
                             zIndex: 10,
                             whiteSpace: 'nowrap',
                             cursor: errInfo ? 'help' : 'default'
                           }}>
                           {hasLive ? liveDisplay : '---'}
-                          {outForced && (
-                            <ForcedMarker compact onClick={data.onForceWrite ? () => {
-                              const t = normalizeEditorPinType(pin.type);
-                              setForceModal({ liveKey: outLiveKey, varName: outForceName, varType: t === 'ANY' ? 'INT' : t, currentValue: outLiveVal });
-                            } : undefined} />
-                          )}
                         </span>
                       );
                     })()}
@@ -1404,15 +1390,15 @@ const BlockNode = ({ id, data, selected }) => {
           })}
         </div>
       </div>
-      {forceModal && (
-        <ForceWriteModal
+      {writeModal && (
+        <WriteValueModal
           isOpen={true}
-          onClose={() => setForceModal(null)}
-          varName={forceModal.varName}
-          varType={forceModal.varType}
-          currentValue={forceModal.currentValue}
-          liveKey={forceModal.liveKey}
-          onConfirm={(key, val, mode) => { data.onForceWrite && data.onForceWrite(key, val, mode); }}
+          onClose={() => setWriteModal(null)}
+          varName={writeModal.varName}
+          varType={writeModal.varType}
+          currentValue={writeModal.currentValue}
+          liveKey={writeModal.liveKey}
+          onConfirm={(key, val) => { data.onWriteVariable && data.onWriteVariable(key, val); }}
         />
       )}
     </div >
@@ -1448,7 +1434,7 @@ const RungContainer = ({
   liveVariables = null,
   parentName = "",
   readOnly = false,
-  onForceWrite,
+  onWriteVariable,
   hwPortVars = [],
   isFocused = false,
   onFocusRung,
@@ -1650,10 +1636,7 @@ const RungContainer = ({
           type: block.data.label || block.type,
           values: block.data.values || {},
           onUpdate: (id, val) => onUpdateBlockRef.current(id, val),
-          // ⚠️ Pass `mode` through: the force-write mailbox has distinct ops
-          // (CLAUDE.md — FORCE, PULSE, UNFORCE) and ForceWriteModal lets the user pick. Dropping the third
-          // argument here silently collapsed every Pulse into a pinned Force.
-          onForceWrite: (key, val, mode) => onForceWriteRef.current?.(key, val, mode),
+          onWriteVariable: (key, val) => onWriteVariableRef.current?.(key, val),
           variables: variables,
           globalVars: globalVars,
           dataTypes: dataTypes,
@@ -1674,10 +1657,10 @@ const RungContainer = ({
     ...mapBlocksToNodes(rung.blocks)
   ]);
 
-  // Space key → toggle selected Contact variable in simulation mode
+  // Space key → toggle selected Contact variable while live (one-shot write)
   React.useEffect(() => {
     const handleKeyDown = (e) => {
-      if (e.code !== 'Space' || !onForceWrite || !liveVariables) return;
+      if (e.code !== 'Space' || !onWriteVariable || !liveVariables) return;
       // Focus guard: never hijack a space typed into an input/textarea,
       // contentEditable surface, or a Monaco editor.
       const ae = document.activeElement;
@@ -1699,12 +1682,12 @@ const RungContainer = ({
           || progKey;
         const currentVal = !!liveVariables[liveKey];
         e.preventDefault();
-        onForceWrite(liveKey, !currentVal);
+        onWriteVariable(liveKey, !currentVal);
       });
     };
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [nodes, liveVariables, parentName, onForceWrite]);
+  }, [nodes, liveVariables, parentName, onWriteVariable]);
 
   // Wrap onNodesChange to clamp block positions inside the rung
   const handleNodesChange = useCallback((changes) => {
@@ -1754,10 +1737,10 @@ const RungContainer = ({
     onUpdateBlockRef.current = onUpdateBlock;
   }, [onUpdateBlock]);
 
-  const onForceWriteRef = useRef(onForceWrite);
+  const onWriteVariableRef = useRef(onWriteVariable);
   React.useEffect(() => {
-    onForceWriteRef.current = onForceWrite;
-  }, [onForceWrite]);
+    onWriteVariableRef.current = onWriteVariable;
+  }, [onWriteVariable]);
 
   const handleEdgeClick = useCallback((event, edge) => {
     if (readOnly) return;
@@ -1956,7 +1939,10 @@ const RungContainer = ({
           const varVal = lookupVar(vals.var || block.data?.instanceName || '');
           blockOutPower[bid] = subType === 'NC' ? (inPower && !varVal) : (inPower && varVal);
         } else if (type === 'Coil') {
-          blockOutPower[bid] = false; // Coil is a sink — does not pass power forward
+          // A coil passes its input power through to the right (codegen: `bOut = inExpr`),
+          // whatever its subType writes to the variable — so series coils and the
+          // right-rail wire stay red while the rung is energized.
+          blockOutPower[bid] = inPower;
         } else {
           // Function Block — per-output-pin power from live simulation values
           const instName = (block.data?.instanceName || '').trim().replace(/\s+/g, '_');

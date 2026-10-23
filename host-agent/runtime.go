@@ -18,6 +18,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/krontek/hotswaplib/shmcmd"
 )
 
 type VarSpec struct {
@@ -237,9 +239,8 @@ func (s *Server) handleStopSimulation(w http.ResponseWriter, r *http.Request) {
 type writeVariableReq struct {
 	Name  string `json:"name"`
 	Value string `json:"value"`
-	// Mode (hot-swap sim): "force" (default) writes once and holds the value
-	// every scan; "pulse" writes it once and the logic owns it from the same
-	// scan; "unforce" releases the hold (a non-empty Value is written once).
+	// Mode must be empty (or "write"): every write is one-shot. The v2
+	// force/pulse/unforce modes are refused, not silently degraded.
 	Mode string `json:"mode"`
 }
 
@@ -250,6 +251,10 @@ func (s *Server) handleWriteVariable(w http.ResponseWriter, r *http.Request) {
 	}
 	var req writeVariableReq
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if err := shmcmd.CheckWriteMode(req.Mode); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -265,7 +270,7 @@ func (s *Server) handleWriteVariable(w http.ResponseWriter, r *http.Request) {
 	s.sim.mu.Unlock()
 	if pid == 0 {
 		// The DEFAULT simulation is the hot-swap loader-host, not the plain
-		// sim — force-write through its /dev/shm mirror instead.
+		// sim — write through its /dev/shm mirror's mailbox instead.
 		s.writeHotSwapVariable(w, req)
 		return
 	}

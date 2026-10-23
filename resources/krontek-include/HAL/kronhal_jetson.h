@@ -195,7 +195,16 @@ static inline void HAL_Init(void) {
 
 static inline void HAL_Cleanup(void) {
     int i;
+    /* ⚠️ STOP = SAFE STATE: drive every line we own as an OUTPUT low BEFORE
+     * releasing it. Closing a GPIO handle does not reset the pin — the line
+     * keeps its last level (driver-dependent), so a stopped PLC left a
+     * TRUE output energised. */
     for (i = 0; i < _JETSON_GPIO_MAX; i++) {
+        if (_line_fd[i] >= 0 && _gpio_dir[i] == _GPIO_DIR_OUTPUT) {
+            struct gpiohandle_data data;
+            memset(&data, 0, sizeof(data));
+            (void)ioctl(_line_fd[i], GPIOHANDLE_SET_LINE_VALUES_IOCTL, &data);
+        }
         if (_line_fd[i] >= 0) { close(_line_fd[i]); _line_fd[i] = -1; _gpio_dir[i] = _GPIO_DIR_NONE; }
     }
     if (_chip_fd >= 0) { close(_chip_fd); _chip_fd = -1; }

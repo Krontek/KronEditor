@@ -226,8 +226,8 @@ __attribute__((weak)) void __hs_axis_bind(void *(*getptr)(int));
 
 volatile uint64_t us_tick = 0;   /* owned + exported for the logic.so */
 volatile int plc_stop = 0;
-/* The /dev/shm mirror (monitored values + runtime-owned force flags + the
- * force-write command mailbox, SHM layout v2). Host-owned so it survives a
+/* The /dev/shm mirror (monitored values + the write command mailbox, SHM
+ * layout v3). Host-owned so it survives a
  * logic swap → the editor keeps reading live variables, and a command posted
  * around a swap is neither lost nor applied twice: the mailbox cursors live
  * HERE, not in the module, and no task thread is inside plc_shm_pull while
@@ -981,6 +981,15 @@ int main(int argc, char **argv) {
     for (int i = 0; i < g_ntask; i++) pthread_create(&th[i], NULL, task_thread, (void *)(intptr_t)i);
     for (int i = 0; i < g_ntask; i++) pthread_join(th[i], NULL);
     if (rt_started) pthread_join(rt, NULL);
+    /* ⚠️ STOP = SAFE STATE: PLC_Cleanup of the module running NOW (g_handle
+     * follows every swap) → HAL_Cleanup, which drives every GPIO output low
+     * and disables PWM before releasing them. It was never called here, so a
+     * stopped PLC left its outputs at their last level. Optional symbol: an
+     * older logic.so simply skips it. */
+    {
+        void (*pcleanup)(void) = (void(*)(void))plc_dlsym(g_handle, "plc_cleanup_hs");
+        if (pcleanup) pcleanup();
+    }
 #if defined(__linux__)
     /* After the task joins: plc_stop is set, so the bus loops are already
      * unwinding — this only joins them and closes the master. */
