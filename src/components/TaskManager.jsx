@@ -1,5 +1,6 @@
-import { useState, useRef, useEffect } from 'react';
+import React, { useState, useRef, useEffect } from 'react';
 import { useTranslation } from 'react-i18next';
+import { taskIecPriority, TASK_PRIORITY_MAX, RUNTIME_ERROR_TYPES } from '../services/CTranspilerService';
 
 const TASK_COLORS = [
     '#00bcd4', '#ff9800', '#9c27b0', '#4caf50',
@@ -32,11 +33,10 @@ const parseInterval = (str) => {
 
 const fmtInterval = (value, unit) => `T#${value}${unit}`;
 
-// SCHED_FIFO priority bounds (Linux). A task with no stored value predates the
-// field and gets the maximum, matching what the runtime hardcoded before.
-export const RT_PRIORITY_MIN = 1;
-export const RT_PRIORITY_MAX = 99;
-export const DEFAULT_RT_PRIORITY = 99;
+// IEC 61131-3 §6.8.2 c task PRIORITY: 0 is the HIGHEST, larger numbers are
+// lower. The runtime maps it to SCHED_FIFO 99 - PRIORITY (taskIecPriority in
+// the transpiler, which also reads the old SCHED_FIFO `rtPriority` field).
+export const DEFAULT_TASK_PRIORITY = 0;
 
 // ⚠️ Values here are MICROseconds. Both inputs this formats — the
 // `__exec_us_<prog>` field and the task interval parsed into `ivUs` — are µs
@@ -75,19 +75,26 @@ export default function TaskManager({
     tasks.forEach(t => (t.programs || []).forEach(p => assignedSet.set(p.program, t.id)));
     const unassigned = programs.filter(p => !assignedSet.has(p.name));
 
-    // SCHED_FIFO priority for this task's scan thread. 99 (the maximum) is the
-    // default because a PLC scan is the reason the machine exists; it is
-    // editable because that ALSO outranks every kernel RT thread, and a task
-    // that overruns its interval at 99 can starve the box. Distinct from
-    // `programs[].priority`, which is only the execution ORDER inside a task.
-    const setRtPriority = (id, v) => {
-        const n = Math.max(RT_PRIORITY_MIN, Math.min(RT_PRIORITY_MAX, Math.round(Number(v) || DEFAULT_RT_PRIORITY)));
-        update(tasks.map(t => t.id === id ? { ...t, rtPriority: n } : t));
+    // IEC task priority (0 = highest). 0 runs at SCHED_FIFO 99, which also
+    // outranks every kernel RT thread — a task that overruns its interval at 0
+    // can starve the box, hence editable. Distinct from `programs[].priority`,
+    // which is only the execution ORDER inside a task. Writing `priority`
+    // drops the legacy `rtPriority` it replaces.
+    const setPriority = (id, v) => {
+        const n = Math.max(0, Math.min(TASK_PRIORITY_MAX, Math.round(Number(v) || 0)));
+        update(tasks.map(t => {
+            if (t.id !== id) return t;
+            const { rtPriority: _legacy, ...rest } = t;
+            return { ...rest, priority: n };
+        }));
     };
+    // What the runtime does on each IEC run-time error (report / stop).
+    const rtePolicy = taskConfig?.runtimeErrorPolicy || {};
+    const setRtePolicy = (key, v) => onTaskConfigChange({ ...(taskConfig || {}), tasks, runtimeErrorPolicy: { ...rtePolicy, [key]: v } });
 
     const addTask = () => {
         const id = `task_${Date.now()}`;
-        update([...tasks, { id, name: `Task${tasks.length + 1}`, interval: 'T#10ms', rtPriority: DEFAULT_RT_PRIORITY, programs: [] }]);
+        update([...tasks, { id, name: `Task${tasks.length + 1}`, interval: 'T#10ms', priority: DEFAULT_TASK_PRIORITY, programs: [] }]);
     };
 
     const deleteTask = (id) => update(tasks.filter(t => t.id !== id));
@@ -244,17 +251,17 @@ export default function TaskManager({
                                     </select>
                                 </div>
 
-                                {/* Real-time priority of this task's scan thread */}
+                                {/* IEC task priority (0 = highest) */}
                                 <div style={{ display: 'flex', alignItems: 'center', gap: 5 }}>
                                     <span
                                         style={{ fontSize: 10, color: '#666', marginRight: 2, textTransform: 'uppercase', letterSpacing: '0.06em' }}
-                                        title={t('messages.rtPriorityHelp') || 'SCHED_FIFO priority of this task\'s scan thread (1-99, higher runs first). 99 also outranks kernel real-time threads.'}
-                                    >{t('messages.rtPriority') || 'RT prio'}</span>
+                                        title={t('messages.taskPriorityHelp') || `IEC 61131-3 task priority: 0 is the highest, ${TASK_PRIORITY_MAX} the lowest. Runs at SCHED_FIFO 99 - priority; 0 also outranks kernel real-time threads.`}
+                                    >{t('messages.taskPriority') || 'Priority'}</span>
                                     <input
-                                        type="number" min={RT_PRIORITY_MIN} max={RT_PRIORITY_MAX}
-                                        value={task.rtPriority ?? DEFAULT_RT_PRIORITY}
+                                        type="number" min={0} max={TASK_PRIORITY_MAX}
+                                        value={taskIecPriority(task)}
                                         disabled={isRunning}
-                                        onChange={e => setRtPriority(task.id, e.target.value)}
+                                        onChange={e => setPriority(task.id, e.target.value)}
                                         style={{ width: 46, background: '#1e1e1e', border: '1px solid #3a3a3a', borderRadius: 3, color: '#ccc', fontSize: 12, padding: '3px 6px', textAlign: 'right', outline: 'none', MozAppearance: 'textfield' }}
                                     />
                                 </div>
@@ -340,6 +347,11 @@ export default function TaskManager({
                             <span>{t('messages.unassignedPrograms')}</span>
                             {unassigned.length > 0 && <span style={{ background: '#f44336', color: '#fff', borderRadius: 9, padding: '0 5px', fontSize: 9, fontWeight: 700 }}>{unassigned.length}</span>}
                         </div>
+                        {unassigned.length > 0 && (
+                            <div style={{ fontSize: 11, color: '#888', marginBottom: 8 }}>
+                                {t('messages.backgroundPrograms') || 'These run in the BACKGROUND task: lowest priority, restarted as soon as they finish (IEC 61131-3 §6.8.2 d).'}
+                            </div>
+                        )}
                         <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
                             {unassigned.length === 0
                                 ? <span style={{ fontSize: 11, color: '#3a5a3a', fontStyle: 'italic' }}>{t('messages.allProgramsAssigned')}</span>
@@ -352,6 +364,29 @@ export default function TaskManager({
                         </div>
                     </div>
                 )}
+
+                {/* IEC run-time errors: report or stop, per type */}
+                <div style={{ background: '#1a1a2a', border: '1px solid #2a2a3a', borderRadius: 6, padding: '12px 16px' }}>
+                    <div style={{ fontSize: 10, color: '#555', textTransform: 'uppercase', letterSpacing: '0.1em', marginBottom: 10 }}>
+                        {t('messages.runtimeErrors') || 'Run-time errors'}
+                    </div>
+                    <div style={{ display: 'grid', gridTemplateColumns: 'minmax(0, 1fr) auto', gap: '6px 12px', alignItems: 'center' }}>
+                        {RUNTIME_ERROR_TYPES.map(rt => (
+                            <React.Fragment key={rt.key}>
+                                <span style={{ fontSize: 12, color: '#bbb' }} title={`Value on "report": ${rt.value}`}>{rt.label}</span>
+                                <select
+                                    value={rtePolicy[rt.key] || rt.def}
+                                    disabled={isRunning}
+                                    onChange={e => setRtePolicy(rt.key, e.target.value)}
+                                    style={{ background: '#1e1e1e', border: '1px solid #3a3a3a', borderRadius: 3, color: '#ccc', fontSize: 12, padding: '3px 4px', outline: 'none' }}
+                                >
+                                    <option value="report">{t('messages.rteReport') || 'Report, keep running'}</option>
+                                    <option value="stop">{t('messages.rteStop') || 'Stop PLC (safe state)'}</option>
+                                </select>
+                            </React.Fragment>
+                        ))}
+                    </div>
+                </div>
             </div>
         </div>
     );

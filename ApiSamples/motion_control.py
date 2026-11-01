@@ -47,7 +47,7 @@ ends the logger. The values only change as often as the logic task refreshes
 the shm mirror (see shm_logger.c).
 
 Usage:
-    python3 motion_control.py --host 192.168.1.103 --password krontek
+    python3 motion_control.py --host 192.168.1.102 --password krontek
     python3 motion_control.py --pos-min 0 --pos-max 360
 Keys: Esc = STOP, Space = Halt.
 
@@ -206,6 +206,18 @@ BLOCKS = {
                   ("Stop_CommandAborted", "Aborted"), ("Stop_Error", "Error")],
         "button": "STOP",
     },
+}
+
+# Form defaults for the "real" parameters. The form is authoritative for these:
+# load_fields does not replace them with the program's initial values (Apply
+# and every Execute write them to the PLC anyway).
+DEFAULTS = {
+    "Abs_Velocity": 10.0, "Abs_Acceleration": 50.0, "Abs_Deceleration": 50.0,
+    "Abs_Jerk": 1000.0,
+    "Vel_Velocity": 5.0, "Vel_Acceleration": 50.0, "Vel_Deceleration": 50.0,
+    "Vel_Jerk": 500.0,
+    "Halt_Deceleration": 500.0, "Halt_Jerk": 10000.0,
+    "Stop_Deceleration": 2000.0, "Stop_Jerk": 20000.0,
 }
 
 LAMP_ON = {"Error": "#dc2626", "Aborted": "#d97706"}   # default on-colour: green
@@ -588,7 +600,7 @@ class App:
             else:
                 ttk.Label(frame, text=label).grid(row=row, column=0, sticky="w", padx=6, pady=2)
                 if widget == "real":
-                    var = tk.StringVar(value="0.0")
+                    var = tk.StringVar(value=f"{DEFAULTS.get(key, 0.0):g}")
                     ent = ttk.Entry(frame, textvariable=var, width=12, justify="right")
                     ent.bind("<Return>", lambda e, b=block: self.apply(b))
                 else:
@@ -627,7 +639,7 @@ class App:
         top.grid(row=row, column=1, sticky="ew", padx=6, pady=2)
         ent = ttk.Entry(top, textvariable=var, width=12, justify="right")
         ent.pack(side="left")
-        self.move_on_change = tk.BooleanVar(value=False)
+        self.move_on_change = tk.BooleanVar(value=True)
         ttk.Checkbutton(top, text="Move on change",
                         variable=self.move_on_change).pack(side="left", padx=(8, 0))
 
@@ -890,12 +902,13 @@ class App:
 
     def load_fields(self, values):
         """Fill the form from the PLC so the first command doesn't overwrite
-        the program's initial values with this window's defaults."""
+        the program's initial values — except the DEFAULTS parameters, where
+        this window's values win."""
         dir_names = {v: k for k, v in DIRECTIONS.items()}
         buf_names = {v: k for k, v in BUFFER_MODES.items()}
         for key, (var, widget) in self.fields.items():
             v = values.get(key)
-            if v is None:
+            if v is None or key in DEFAULTS:
                 continue
             if widget == "real":
                 var.set(f"{float(v):g}")
@@ -986,10 +999,10 @@ class App:
 def main():
     ap = add_common_args(argparse.ArgumentParser(description=__doc__,
                                                  formatter_class=argparse.RawDescriptionHelpFormatter))
-    ap.set_defaults(host="192.168.1.103")   # plcAddress of motionrpi3bplus.xml
-    ap.add_argument("--pos-min", type=float, default=-1000.0,
+    ap.set_defaults(host="192.168.1.102")
+    ap.add_argument("--pos-min", type=float, default=-10.0,
                     help="position slider minimum (editable in the window)")
-    ap.add_argument("--pos-max", type=float, default=1000.0,
+    ap.add_argument("--pos-max", type=float, default=10.0,
                     help="position slider maximum (editable in the window)")
     ap.add_argument("--ssh-user", default="root", help="SSH user for the shm log (key auth)")
     ap.add_argument("--ssh-port", type=int, default=22)

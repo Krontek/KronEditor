@@ -87,6 +87,18 @@ export const parseCompilerLog = (raw) => {
     return { diagnostics, fallback: firstUsefulNoise || text.split('\n').find((l) => l.trim() && !isNoiseLine(l.trim()))?.trim() || '' };
 };
 
+// The transpiler wraps the C of every ST statement in `#line N "<KIND> <POU>,
+// rung R (ST)"` (and an LD rung in `… (LD)` at line 1 — CTranspilerService
+// applySrcLineMarkers), so clang names the editor location as its "file". That
+// diagnostic is shown as "<KIND> <POU>, rung R, line N: <message>"; null for an
+// ordinary C file.
+const SRC_FILE = /^(.+?) \((ST|LD)\)$/;
+const srcLocation = (d) => {
+    const m = SRC_FILE.exec(d.file || '');
+    if (!m) return null;
+    return m[2] === 'ST' ? `${m[1]}, line ${d.line}: ${d.message}` : `${m[1]}: ${d.message}`;
+};
+
 // Cap how many individual diagnostic lines we emit per failure — a project
 // with a systemic error (e.g. a missing header) can produce dozens of
 // downstream errors; past this point they stop being useful and just scroll
@@ -112,7 +124,7 @@ export const formatCompileFailure = (category, err) => {
     const shown = diagnostics.slice(0, MAX_DIAGNOSTIC_LINES);
     const entries = shown.map((d) => ({
         type: d.severity === 'warning' ? 'warning' : 'error',
-        msg: `${category} ${d.severity}: ${d.message} (${d.file}:${d.line})`,
+        msg: `${category} ${d.severity}: ${srcLocation(d) ?? `${d.message} (${d.file}:${d.line})`}`,
     }));
     const omitted = diagnostics.length - shown.length;
     if (omitted > 0) {

@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { createPortal } from 'react-dom';
-import { formatTimeUs, parseTimeUs, isTimeType } from '../../utils/plcStandards';
+import { formatDuration, parseDuration, isTimeType } from '../../utils/plcStandards';
 
 const INT_TYPES = new Set([
   'INT', 'DINT', 'UINT', 'UDINT', 'LINT', 'ULINT',
@@ -27,9 +27,9 @@ const formatInt = (n, fmt) => {
   }
 };
 
-const displayValue = (val, isTime = false) => {
+const displayValue = (val, isTime = false, type = 'TIME') => {
   if (val === null || val === undefined) return '---';
-  if (isTime && typeof val !== 'object') return formatTimeUs(val);
+  if (isTime && typeof val !== 'object') return formatDuration(val, type);
   if (typeof val === 'boolean') return val ? 'TRUE' : 'FALSE';
   if (typeof val === 'object') return JSON.stringify(val);
   return String(val);
@@ -59,8 +59,9 @@ const WriteValueModal = ({ isOpen, onClose, varName, varType, currentValue, live
   const isBool  = type === 'BOOL';
   const isInt   = INT_TYPES.has(type);
   const isFloat = FLOAT_TYPES.has(type);
-  // TIME/LTIME: signed 64-bit MICROseconds. Entered as an IEC duration
-  // (T#2h, -5s, 1m30s) or a bare integer µs count, sent as the exact µs count.
+  // TIME: signed 64-bit MICROseconds, LTIME: NANOseconds. Entered as an IEC
+  // duration (T#2h, -5s, 1m30s) or a bare integer count of the type's unit,
+  // sent as that exact count.
   const isTime  = isTimeType(type);
 
   // Reset state when modal opens
@@ -71,7 +72,7 @@ const WriteValueModal = ({ isOpen, onClose, varName, varType, currentValue, live
     if (isBool) {
       setBoolSelect(currentValue === true ? 'TRUE' : 'FALSE');
     } else if (isTime && currentValue !== null && currentValue !== undefined && typeof currentValue !== 'object') {
-      setInputValue(formatTimeUs(currentValue));
+      setInputValue(formatDuration(currentValue, type));
     } else if (currentValue !== null && currentValue !== undefined) {
       setInputValue(String(currentValue));
     } else {
@@ -100,8 +101,8 @@ const WriteValueModal = ({ isOpen, onClose, varName, varType, currentValue, live
     const s = inputValue.trim();
     if (!s) { setError('Please enter a value'); return; }
     if (isTime) {
-      const us = parseTimeUs(s);
-      if (us === null) { setError('Invalid duration — e.g. T#2h, T#-5s, 1m30s, or an integer µs count'); return; }
+      const us = parseDuration(s, type);
+      if (us === null) { setError(`Invalid duration — e.g. T#2h, T#-5s, 1m30s, or an integer ${String(type).toUpperCase() === 'LTIME' ? 'ns' : 'µs'} count`); return; }
       // Beyond ±2^53 a JS number would round: send the exact decimal string,
       // which both agents parse as int64.
       const asNum = Number(us);
@@ -170,7 +171,7 @@ const WriteValueModal = ({ isOpen, onClose, varName, varType, currentValue, live
             <span style={{ color: '#555', fontSize: 12 }}>:</span>
             <span style={{ color: '#4ec9b0', fontSize: 12 }}>{varType}</span>
             <span style={{ color: '#00e676', fontSize: 12, fontFamily: 'Consolas, monospace', marginLeft: 4 }}>
-              = {displayValue(currentValue, isTime)}
+              = {displayValue(currentValue, isTime, type)}
             </span>
           </div>
           <button

@@ -4,6 +4,7 @@ import { getPortOptions } from '../utils/devicePortMapping';
 import { validateIECAddress } from '../utils/iecAddress';
 import { buildEcVarNames, findEcIssues } from '../utils/ecNaming';
 import { createSTExprCompiler, STExprError } from './stExpr';
+import { iecIdentifierProblem } from '../utils/reservedNames';
 
 const getBoardFamilyDefine = (boardId) => {
     if (!boardId) return null;
@@ -125,6 +126,47 @@ const IEC_KRON_NAME = {
     USINT: 'UINT8', UINT: 'UINT16', UDINT: 'UINT32', ULINT: 'UINT64',
     REAL: 'REAL', LREAL: 'LREAL', STRING: 'STRING',
 };
+// ── Numeric / bit-string conversions <A>_TO_<B> (IEC T22–T25) ──────────────
+// ONE generator for ST (stExpr H.convC) and the LD conversion blocks, inline C
+// (no archive call: libkronconverter has no 64-bit forms):
+//   • REAL/LREAL → integer ROUNDS half to even (T22 fn. b — llrint in the
+//     default FE_TONEAREST mode) and SATURATES at the target's range: the
+//     out-of-range result is implementer-specific (T23) and a bare C cast is
+//     undefined behaviour; NaN → 0 (KRON_F2I in plc.h);
+//   • integer → integer reduces modulo 2^N (implementer-specific, T23);
+//   • bit string ↔ integer is a BINARY transfer (T25): the source's own bits,
+//     zero-filled on the left — never sign-extended (INT_TO_DWORD(-1) =
+//     16#0000_FFFF); REAL ↔ DWORD and LREAL ↔ LWORD copy the IEEE bits;
+//   • <bit string>_TO_BOOL is the rightmost bit (T24); a number → BOOL is a
+//     Kron extension (≠ 0).
+const CONV_BITS = { BYTE: 8, WORD: 16, DWORD: 32, LWORD: 64 };
+const CONV_INT = { SINT: [8, true], INT: [16, true], DINT: [32, true], LINT: [64, true], USINT: [8, false], UINT: [16, false], UDINT: [32, false], ULINT: [64, false] };
+const CONV_UC = { 8: 'uint8_t', 16: 'uint16_t', 32: 'uint32_t', 64: 'uint64_t' };
+export const convC = (src, dst, x) => {
+    const S = String(src).toUpperCase(), D = String(dst).toUpperCase();
+    const ct = mapType(D);
+    const widthOf = (t) => CONV_BITS[t] || CONV_INT[t]?.[0] || (t === 'BOOL' ? 1 : 0);
+    const isReal = (t) => t === 'REAL' || t === 'LREAL';
+    if (S === D) return `(${x})`;
+    if (D === 'BOOL') return CONV_BITS[S] ? `((bool)((${x}) & 1u))` : `((bool)((${x}) != 0))`;
+    if (S === 'BOOL') return `((${ct})((${x}) ? 1 : 0))`;
+    if (S === 'REAL' && D === 'DWORD') return `({ float __cf = (${x}); uint32_t __cu; memcpy(&__cu, &__cf, 4); __cu; })`;
+    if (S === 'DWORD' && D === 'REAL') return `({ uint32_t __cu = (${x}); float __cf; memcpy(&__cf, &__cu, 4); __cf; })`;
+    if (S === 'LREAL' && D === 'LWORD') return `({ double __cf = (${x}); uint64_t __cu; memcpy(&__cu, &__cf, 8); __cu; })`;
+    if (S === 'LWORD' && D === 'LREAL') return `({ uint64_t __cu = (${x}); double __cf; memcpy(&__cf, &__cu, 8); __cf; })`;
+    if (isReal(S) && (CONV_INT[D] || CONV_BITS[D])) {
+        const [w, signed] = CONV_INT[D] || [CONV_BITS[D], false];
+        const lo = signed ? (w === 64 ? '(-9223372036854775807.0 - 1.0)' : `${-(2 ** (w - 1))}.0`) : '0.0';
+        const hi = signed ? (w === 64 ? '9223372036854775807.0' : `${2 ** (w - 1) - 1}.0`) : (w === 64 ? '18446744073709551615.0' : `${2 ** w - 1}.0`);
+        return `((${ct})KRON_F2I${signed ? '' : 'U'}((double)(${x}), ${lo}, ${hi}))`;
+    }
+    // Into a bit string (or between bit strings): the source's bits, zero-filled.
+    if (CONV_BITS[D] && (CONV_INT[S] || CONV_BITS[S])) return `((${ct})(${CONV_UC[widthOf(S)]})(${x}))`;
+    // From a bit string into an integer: binary transfer of the rightmost bits.
+    if (CONV_BITS[S] && CONV_INT[D]) return `((${ct})(${CONV_UC[Math.min(widthOf(S), widthOf(D))]})(${x}))`;
+    return `((${ct})(${x}))`;
+};
+
 // Buffer symbol for one x_TO_STRING call site. A conversion to text has to
 // write SOMEWHERE, and every ownerless answer is wrong: a static races between
 // task threads, a thread-local pool goes stale, a compound literal dangles
@@ -411,6 +453,89 @@ const stripIecComments = (code, { keepLayout = false, blankStrings = false, strT
         i++;
     }
     return out;
+};
+
+// IEC task PRIORITY (§6.8.2 c: 0 = highest) of a TaskManager task, 0..98 so
+// that the SCHED_FIFO priority 99 - PRIORITY stays in 1..99. A project saved
+// before the field had only `rtPriority` (SCHED_FIFO, higher = more urgent).
+export const TASK_PRIORITY_MAX = 98;
+export const taskIecPriority = (task) => {
+    const raw = task?.priority !== undefined && task?.priority !== null && task?.priority !== ''
+        ? Number(task.priority)
+        : task?.rtPriority !== undefined ? 99 - Number(task.rtPriority) : 0;
+    return Math.max(0, Math.min(TASK_PRIORITY_MAX, Math.round(Number.isFinite(raw) ? raw : 0)));
+};
+
+// ── IEC run-time errors ─────────────────────────────────────────────────────
+// What the runtime does on each run-time ERROR the standard names (§14 of
+// Standards/iec61131-3.md): 'report' (count + log once per site, keep running
+// with the documented value) or 'stop' (plc_stop → safe state). Per type, set
+// in the project (projectStructure.taskConfig.runtimeErrorPolicy, TaskManager); the
+// order is the KRON_RTE_* codes of plc.h.
+export const RUNTIME_ERROR_TYPES = [
+    { key: 'div0', code: 1, label: 'Division by zero', value: 'result 0', def: 'report' },
+    { key: 'shift', code: 2, label: 'Negative shift count (SHL/SHR/ROL/ROR)', value: 'IN unchanged', def: 'report' },
+    { key: 'mux', code: 3, label: 'MUX selector out of range', value: 'IN0', def: 'report' },
+    { key: 'forStep', code: 4, label: 'FOR … BY 0', value: 'loop skipped', def: 'report' },
+    { key: 'index', code: 5, label: 'Array index out of range', value: 'lower bound', def: 'stop' },
+    { key: 'overrun', code: 6, label: 'Task overrun (missed deadline)', value: 'next cycle starts at once', def: 'report' },
+];
+const generateRteHandler = (policy = {}) => {
+    const stop = RUNTIME_ERROR_TYPES.map(t => ((policy?.[t.key] || t.def) === 'stop' ? 1 : 0));
+    const names = RUNTIME_ERROR_TYPES.map(t => `"${t.label.toLowerCase()}"`);
+    return `
+/* IEC run-time error (KRON_RTE_* in plc.h). Counted in PlcState, reported on
+ * stderr the FIRST time a site faults (one site = one statement; the string
+ * literal's address identifies it), stopped or not by the project policy.
+ * Exported so the hot-swap loader-host can report a task overrun too. */
+extern volatile int plc_stop;
+void plc_rte_report(int code, const char *where, long long value);
+static void __kron_rte(int code, const char *where, long long value) { plc_rte_report(code, where, value); }
+void plc_rte_report(int code, const char *where, long long value)
+{
+    static const char *const names[] = { "", ${names.join(', ')} };
+    static const unsigned char stop[] = { 0, ${stop.join(', ')} };
+    static const char *volatile seen[64];
+    static volatile int nseen;
+    if (code < 1 || code > ${RUNTIME_ERROR_TYPES.length}) return;
+    __atomic_add_fetch(&S->__rte_count, 1u, __ATOMIC_RELAXED);
+    S->__rte_code = (uint16_t)code;
+    int i, n = nseen;
+    for (i = 0; i < n && seen[i] != where; i++) ;
+    if (i == n) {
+        if (n < 64) { seen[n] = where; nseen = n + 1; }
+        fprintf(stderr, "[plc] RUNTIME ERROR: %s (value %lld) at %s - %s\\n", names[code], value, where ? where : "?",
+                stop[code] ? "PLC stopped, outputs set to safe state" : "reported, PLC keeps running");
+        fflush(stderr);
+    }
+    if (stop[code]) plc_stop = 1;
+}
+`;
+};
+
+// ── Source-line markers → `#line` ───────────────────────────────────────────
+// Code emitted for an ST statement is preceded by a marker naming its POU,
+// rung and ST line; applySrcLineMarkers turns each into `#line N "<POU>, rung
+// R (ST)"` and the region end back into the real file's numbering, so a clang
+// diagnostic in that code names the ST source (utils/errorFormat.js reads the
+// shape back). Every emitted line gets its own marker because `#line` numbers
+// the lines that FOLLOW it consecutively. An LD rung is one region at line 1
+// (only the rung is meaningful there).
+const SRC_LINE_END = '/*@KRON_LINE_END@*/';
+const srcLineMarker = (chunk, line, file) => chunk.split('\n')
+    .map(l => (l.trim() ? `/*@KRON_LINE ${line} "${file}"@*/\n${l}` : l)).join('\n');
+const srcLineRegion = (chunk, file) => `/*@KRON_LINE 1 "${file}"@*/\n${chunk}${chunk.endsWith('\n') ? '' : '\n'}${SRC_LINE_END}\n`;
+const applySrcLineMarkers = (text, realName) => {
+    const out = [];
+    for (const l of String(text).split('\n')) {
+        const m = /^\s*\/\*@KRON_LINE (\d+) "([^"]*)"@\*\/$/.exec(l);
+        if (m) { out.push(`#line ${m[1]} "${m[2]}"`); continue; }
+        // `#line N` numbers the NEXT physical line N: this directive is line
+        // out.length + 1, so the following one is out.length + 2.
+        if (l.trim() === SRC_LINE_END) { out.push(`#line ${out.length + 2} "${realName}"`); continue; }
+        out.push(l);
+    }
+    return out.join('\n');
 };
 
 // ── IEC numeric literals → C ────────────────────────────────────────────────
@@ -869,7 +994,31 @@ export const validateProjectST = (projectStructure, stdFunctionNames = [], hwPor
     return errors;
 };
 
+// §6.1.2/§6.1.3: every name the user gives — POU, variable, data type,
+// structure member, enumerated value, task — is an IEC identifier (no double
+// or trailing underscore, not a keyword). The UI checks as you type; this is
+// the gate for everything else (agent edits, imported/hand-edited projects).
+const checkProjectIdentifiers = (ps) => {
+    const bad = (name, what) => {
+        const p = iecIdentifierProblem(name);
+        if (p) throw new Error(`Invalid name "${String(name).trim()}" (${what}): ${p}.`);
+    };
+    const pous = [['PROGRAM', ps.programs], ['FUNCTION_BLOCK', ps.functionBlocks], ['FUNCTION', ps.functions]];
+    pous.forEach(([kind, list]) => (list || []).forEach(pou => {
+        bad(pou.name, kind);
+        (pou.content?.variables || []).forEach(v => bad(v.name, `variable of ${kind} ${pou.name}`));
+    }));
+    (ps.dataTypes || []).forEach(dt => {
+        bad(dt.name, 'data type');
+        (dt.content?.members || []).forEach(m => bad(m.name, `member of ${dt.name}`));
+        if (dt.type === 'Enumerated') (dt.content?.values || []).forEach(v => bad(v.name, `value of ${dt.name}`));
+    });
+    (ps.resources || []).forEach(r => (r.content?.globalVars || []).forEach(v => bad(v.name, 'global variable')));
+    (ps.taskConfig?.tasks || []).forEach(t => bad(t.name, 'task'));
+};
+
 export const transpileToC = (projectStructure, standardHeaders = [], boardId = null, simMode = true, buses = [], busConfigs = {}) => {
+    checkProjectIdentifiers(projectStructure);
     let stdFunctions = {};
     let customIncludes = ``;
 
@@ -995,7 +1144,7 @@ export const transpileToC = (projectStructure, standardHeaders = [], boardId = n
                 return b === 'true' || b === '1';
             }
             if (T === 'STRING' || T === 'WSTRING') return unquoteIecString(s) ?? iecStringDecode(s);
-            if (isTimeTypeName(T) && isTimeLiteral(s)) return mapIECtoTimeUs(s);
+            if (isTimeTypeName(T) && isTimeLiteral(s)) { const d = mapIECDuration(s, T); return Number.isSafeInteger(Number(d)) ? Number(d) : d; }
             const radix = s.match(/^(\d+)#([0-9A-Fa-f_]+)$/);
             if (radix) {
                 const n = parseInt(radix[2].replace(/_/g, ''), parseInt(radix[1], 10));
@@ -1128,6 +1277,7 @@ export const transpileToC = (projectStructure, standardHeaders = [], boardId = n
 #include <stdbool.h>
 #include <string.h>
 #include <stdlib.h>
+#include <stdio.h>
 #include <math.h>
 
 #ifndef ABS
@@ -1145,6 +1295,57 @@ export const transpileToC = (projectStructure, standardHeaders = [], boardId = n
     default: (__KRON_DIV_BAD(__kd) ? (__kd == 0 ? 0 : -(a)) : (a) / __kd)); })
 #define KRON_IMOD(a, b) ({ __typeof__(b) __kd = (b); __KRON_DIV_BAD(__kd) ? 0 : (a) % __kd; })
 #endif
+/* IEC run-time ERRORS (Standards/iec61131-3.md §14): each is counted (PlcState
+ * __rte_count / __rte_code, live keys prog____rte_*), reported once per site
+ * on stderr (the runtime log), and handled by the project's per-type policy:
+ * report = keep running with the documented value, stop = plc_stop (every
+ * output to the safe state). __kron_rte is defined in plc.c, after PlcState. */
+#ifndef KRON_RTE_DIV0
+#define KRON_RTE_DIV0     1   /* divide by zero (§7.3.2 a) -> 0 */
+#define KRON_RTE_SHIFT    2   /* SHL/SHR/ROL/ROR with N < 0 (T30 fn. a) -> IN */
+#define KRON_RTE_MUX      3   /* MUX K outside 0..n-1 (T32 fn. e) -> IN0 */
+#define KRON_RTE_FOR_STEP 4   /* FOR ... BY 0 (an endless loop) -> loop skipped */
+#define KRON_RTE_INDEX    5   /* array subscript out of range (§6.4.4.5) -> lower bound */
+#define KRON_RTE_OVERRUN  6   /* task missed its deadline (§6.8.2) */
+static void __kron_rte(int code, const char *where, long long value);
+#endif
+/* '/' with the run-time check: a divide by zero is reported through
+ * __kron_rte and yields 0; INT_MIN / -1 (a SIGFPE on x86_64) wraps. */
+#define KRON_DIV(a, b, where) ({ __typeof__(b) __kd = (b); \\
+    __kd == 0 ? (__kron_rte(KRON_RTE_DIV0, (where), 0), (__typeof__((a) / __kd))0) \\
+              : _Generic((a) / __kd, float: (a) / __kd, double: (a) / __kd, long double: (a) / __kd, \\
+                         default: (__KRON_DIV_BAD(__kd) ? -(a) : (a) / __kd)); })
+/* Checked array index (ST): an index outside the declared IEC bounds is the
+ * run-time error KRON_RTE_INDEX (policy default: STOP — plc_stop takes every
+ * task out of its loop and the cleanup drives the outputs to the safe state)
+ * instead of reading or writing a neighbouring PlcState field. The faulting
+ * access itself uses the lower bound so the rest of this scan stays inside
+ * the array. The index is evaluated once. */
+#ifndef KRON_IDX
+static inline __attribute__((cold, noinline)) int64_t __kron_idx_fault(int64_t i, int64_t lo, int64_t hi, const char *where)
+{
+    (void)hi;
+    __kron_rte(KRON_RTE_INDEX, where, (long long)i);
+    return lo;
+}
+#define KRON_IDX(i, lo, hi, where) ({ int64_t __ki = (int64_t)(i); \\
+    (__ki < (lo) || __ki > (hi)) ? __kron_idx_fault(__ki, (lo), (hi), (where)) : __ki; })
+#endif
+/* <REAL>_TO_<integer> (convC in the transpiler): round half to even (T22
+ * fn. b, llrint in FE_TONEAREST), saturate outside [lo, hi] (the T23 result is
+ * implementer-specific; a C cast would be undefined), NaN -> 0. */
+static inline int64_t KRON_F2I(double x, double lo, double hi) {
+    if (x != x) return 0;
+    if (x <= lo) return (int64_t)lo;
+    if (x >= hi) return x >= 9223372036854775807.0 ? INT64_MAX : (int64_t)hi;
+    return (int64_t)llrint(x);
+}
+static inline uint64_t KRON_F2IU(double x, double lo, double hi) {
+    (void)lo;
+    if (x != x || x <= 0.0) return 0;
+    if (x >= hi) return x >= 18446744073709551615.0 ? UINT64_MAX : (uint64_t)hi;
+    return x >= 9223372036854775807.0 ? (uint64_t)x : (uint64_t)llrint(x);
+}
 /* REAL -> integer conversion ROUNDS (IEC 61131-3), it does not truncate as a C
  * cast does; an integer argument passes through unchanged. */
 #ifndef KRON_RND
@@ -1192,7 +1393,7 @@ ${ecCfgEarly.motionIncludes ? ecCfgEarly.motionIncludes + '\n' : ''}${ecCfgEarly
 
 `;
 
-    let source = `// Autogenerated by KronEditor CTranspiler\n#include "plc.h"\n\n// ⚠️ <time.h> is needed on WINDOWS too: the exec-time instrumentation in\n// plc_task_body_* uses struct timespec + clock_gettime, which mingw/winpthreads\n// provide. Gating it on __linux__/__APPLE__ left struct timespec incomplete and\n// no Windows build could compile. <unistd.h> stays POSIX-only.\n#include <time.h>\n#if defined(__linux__) || defined(__APPLE__)\n#include <unistd.h>\n#endif\n#if defined(__linux__)\n#include <sched.h>\n#include <pthread.h>\n#elif defined(_WIN32)\nvoid Sleep(unsigned long ms);\nint SetPriorityClass(void *hProcess, unsigned long dwPriorityClass);\nvoid *GetCurrentProcess(void);\nint SetThreadPriority(void *hThread, int nPriority);\nvoid *GetCurrentThread(void);\n#define REALTIME_PRIORITY_CLASS 0x00000100\n#define THREAD_PRIORITY_TIME_CRITICAL 15\n#endif\n\n`;
+    let source = `// Autogenerated by KronEditor CTranspiler\n#include "plc.h"\n\n// ⚠️ <time.h> is needed on WINDOWS too: the exec-time instrumentation in\n// plc_task_body_* uses struct timespec + clock_gettime, which mingw/winpthreads\n// provide. Gating it on __linux__/__APPLE__ left struct timespec incomplete and\n// no Windows build could compile. <unistd.h> stays POSIX-only.\n#include <time.h>\n#if defined(__linux__) || defined(__APPLE__)\n#include <unistd.h>\n#endif\n#if defined(__linux__)\n#include <sched.h>\n#include <pthread.h>\n#ifndef SCHED_IDLE\n#define SCHED_IDLE 5 /* <sched.h> defines it only under _GNU_SOURCE */\n#endif\n#elif defined(_WIN32)\nvoid Sleep(unsigned long ms);\nint SetPriorityClass(void *hProcess, unsigned long dwPriorityClass);\nvoid *GetCurrentProcess(void);\nint SetThreadPriority(void *hThread, int nPriority);\nvoid *GetCurrentThread(void);\n#define REALTIME_PRIORITY_CLASS 0x00000100\n#define THREAD_PRIORITY_TIME_CRITICAL 15\n#endif\n\n`;
 
     // ── Phase 2 (hot-swap): all mutable state goes into ONE PlcState struct,
     // reached through a file-scope pointer S. Declarations are collected here
@@ -1291,7 +1492,7 @@ ${ecCfgEarly.motionIncludes ? ecCfgEarly.motionIncludes + '\n' : ''}${ecCfgEarly
     if (projectStructure.dataTypes && projectStructure.dataTypes.length > 0) {
         header += `// --- DATA TYPES ---\n`;
         projectStructure.dataTypes.forEach(dt => {
-            header += transpileDataType(dt);
+            header += transpileDataType(dt, enumDuplicateNames(projectStructure));
             // Record structured mapping
             variableTable.dataTypes[dt.name] = {
                 type: dt.type,
@@ -1423,9 +1624,8 @@ ${ecCfgEarly.motionIncludes ? ecCfgEarly.motionIncludes + '\n' : ''}${ecCfgEarly
             const gC = cIdent(v.name);
             const gIsFB = isFBType(v.type, projectStructure) || !!stdFunctions[v.type]?.isFB
                 || HAL_BLOCK_TYPES.has(v.type) || (v.type in FB_TRIGGER_PIN && !isInlineMathType(v.type));
-            const initLine = (isUserType || gIsFB) ? '' : initAssignStmt(`S->${gC}`, v.initialValue, v.type);
             stateFields.push(`${mapType(v.type)} ${gC};`);
-            if (initLine) stateInits.push(initLine);
+            if (!gIsFB) stateInits.push(...userTypeInitLines(v.type, `S->${gC}`, v.initialValue, projectStructure));
             if (gIsFB) stateInits.push(...fbInstanceInitLines(v.type, `S->${gC}`, v.initialValue, projectStructure));
             const gRetain = isRetainVar(v);
             // Globals are keyed by bare name — the same identity the ST/LD code
@@ -1604,10 +1804,9 @@ ${ecCfgEarly.motionIncludes ? ecCfgEarly.motionIncludes + '\n' : ''}${ecCfgEarly
                     // POU vars default to 0 even if Variable Manager shows e.g.
                     // `state := 90` or `pca_dev_addr := 16#40`, which silently
                     // breaks state machines that rely on a non-zero start state.
-                    const isUserType = !!dataTypeDefs[vType];
-                    const initLine = isUserType ? '' : initAssignStmt(`S->prog_${progName}_${vName}`, v.initialValue, vType);
+                    const initLines = userTypeInitLines(vType, `S->prog_${progName}_${vName}`, v.initialValue, projectStructure);
                     stateFields.push(`${mapType(vType)} prog_${progName}_${vName};`);
-                    if (initLine) stateInits.push(initLine);
+                    stateInits.push(...initLines);
                 }
 
                 const cSym = isFB ? `prog_${progName}_inst_${vName}` : `prog_${progName}_${vName}`;
@@ -1774,6 +1973,14 @@ ${ecCfgEarly.motionIncludes ? ecCfgEarly.motionIncludes + '\n' : ''}${ecCfgEarly
         variableTable.debugDefaults[liveKey] = { type: 'UDINT', c_symbol: cSym, defaultValue: 0, ...shmSlot };
         stateFields.push(`uint32_t ${cSym};`);
         return { progName: pName, cSym, liveKey };
+    });
+
+    // Run-time error counters (KRON_RTE_*, plc.h): live under prog____ like
+    // the exec times, so the editor's `prog__` subscription carries them.
+    [['__rte_count', 'UDINT', 'uint32_t'], ['__rte_code', 'UINT', 'uint16_t']].forEach(([cSym, iec, ct]) => {
+        const shmSlot = tryAssignShm(iec, cSym);
+        variableTable.debugDefaults[`prog____${cSym.slice(2)}`] = { type: iec, c_symbol: cSym, defaultValue: 0, ...shmSlot };
+        stateFields.push(`${ct} ${cSym};`);
     });
 
     // Fingerprint of the PlcState SHAPE (field decls, in order — not values),
@@ -2047,11 +2254,15 @@ ${ecCfgEarly.motionIncludes ? ecCfgEarly.motionIncludes + '\n' : ''}${ecCfgEarly
     header = header.replace('@@PLCSTATE_STRUCT@@', plcStateBlock);
 
     source += `\nvoid plc_bind(PlcState *s) { S = s; }\n`;
+    source += generateRteHandler(projectStructure.taskConfig?.runtimeErrorPolicy);
     source += `static void plc_state_init(void) {\n${stateInits.map(l => '    ' + l).join('\n')}\n}\n`;
     // Run the cold-init once at startup (sets non-zero initial values into S).
     source = source.replace('void PLC_Init(void) {\n', 'void PLC_Init(void) {\n    plc_state_init();\n');
 
-    return { header, source, variableTable, hal: ecCfg.halContent || '', hostGlue, plcStateLayoutHash };
+    return {
+        header: applySrcLineMarkers(header, 'plc.h'), source: applySrcLineMarkers(source, 'plc.c'),
+        variableTable, hal: ecCfg.halContent || '', hostGlue, plcStateLayoutHash,
+    };
 };
 
 const IEC_ELEMENTARY_TYPES = new Set([
@@ -2118,6 +2329,106 @@ const initAssignStmt = (cPath, raw, type) => {
         : `${cPath}${init};`;
 };
 
+// ── Initial values of user-data-type variables ──────────────────────────────
+// C enumerator of an enumerated value: its own name, unless another
+// enumeration uses the same name (§6.4.4.2 allows that) — then `Type__Value`,
+// which no IEC identifier can spell (a double underscore is invalid there).
+const enumDuplicateNames = (ps) => {
+    const seen = new Map(), dup = new Set();
+    (ps?.dataTypes || []).filter(dt => dt?.type === 'Enumerated').forEach(dt => {
+        (dt.content?.values || []).forEach(v => {
+            const l = String(v?.name || '').trim().toLowerCase();
+            if (!l) return;
+            if (seen.has(l) && seen.get(l) !== dt.name) dup.add(l);
+            seen.set(l, dt.name);
+        });
+    });
+    return dup;
+};
+const enumCName = (typeName, valueName, dup) =>
+    (dup.has(String(valueName).trim().toLowerCase()) ? `${String(typeName).trim()}__${String(valueName).trim()}` : String(valueName).trim());
+
+// Cold-init lines for a variable of a user data type at C path `cPath`:
+// §6.4.4.2.2 an enumerated variable starts at its FIRST value (C would give 0,
+// possibly no value of the enumeration at all) unless initialised; §6.4.4.6.2
+// a STRUCT applies its members' declared initial values, then the variable's
+// own `(a := 1, b := 2)`; §6.4.4.5.2 an ARRAY takes `[1, 2, 3(0)]` in element
+// order (fewer values: the rest keeps the element default; more: an error).
+// Recursive through nested user types. `raw` is the variable's initialValue.
+const userTypeInitLines = (type, cPath, raw, ps, depth = 0) => {
+    if (depth > 16) throw new Error(`Data type nesting too deep at "${cPath}" (recursive type "${type}"?).`);
+    const t = String(type || '').trim();
+    const dt = (ps?.dataTypes || []).find(d => String(d?.name || '').trim().toLowerCase() === t.toLowerCase());
+    const r = String(raw ?? '').trim();
+    const dup = enumDuplicateNames(ps);
+    const elemLines = (et, path, v) => {
+        if ((ps?.dataTypes || []).some(d => String(d?.name || '').trim().toLowerCase() === String(et || '').trim().toLowerCase())) {
+            return userTypeInitLines(et, path, v, ps, depth + 1);
+        }
+        const line = initAssignStmt(path, v, et);
+        return line ? [line] : [];
+    };
+    if (!dt) return elemLines(t, cPath, r);
+    if (dt.type === 'Enumerated') {
+        const values = dt.content?.values || [];
+        if (!values.length) return [];
+        let pick = values[0];
+        if (r) {
+            const name = r.replace(new RegExp(`^${dt.name}\\s*#`, 'i'), '').trim();
+            pick = values.find(v => String(v?.name || '').trim().toLowerCase() === name.toLowerCase());
+            if (!pick) throw new Error(`Initial value "${r}" of "${cPath.replace(/^S->/, '')}" is not a value of ${dt.name} (${values.map(v => v.name).join(', ')}).`);
+        }
+        return [`${cPath} = ${enumCName(dt.name, pick.name, dup)};`];
+    }
+    if (dt.type === 'Structure') {
+        const lines = [];
+        const members = dt.content?.members || [];
+        members.forEach(m => {
+            const mn = String(m?.name || '').trim();
+            if (mn) lines.push(...elemLines(m.type, `${cPath}.${cIdent(mn)}`, m.initialValue));
+        });
+        if (r) {
+            const mm = /^\(([\s\S]*)\)$/.exec(r);
+            if (!mm) throw new Error(`Initial value "${r}" of a ${dt.name} must be a parenthesised list, e.g. (${members[0]?.name || 'x'} := 1).`);
+            splitTopLevelArgs(mm[1]).forEach(a => {
+                const p = /^([A-Za-z_][A-Za-z0-9_]*)\s*:=\s*([\s\S]+)$/.exec(a);
+                if (!p) throw new Error(`Initial value "${r}" (${dt.name}): "${a}" is not a "member := value" pair.`);
+                const m = members.find(x => String(x?.name || '').trim().toLowerCase() === p[1].toLowerCase());
+                if (!m) throw new Error(`Initial value "${r}": ${dt.name} has no member "${p[1]}".`);
+                lines.push(...elemLines(m.type, `${cPath}.${cIdent(String(m.name).trim())}`, p[2].trim()));
+            });
+        }
+        return lines;
+    }
+    if (dt.type === 'Array') {
+        const base = dt.content?.baseType;
+        const dims = (dt.content?.dimensions || []).map(d => ({ min: parseInt(d.min, 10), max: parseInt(d.max, 10) }));
+        if (!dims.length || dims.some(d => !Number.isFinite(d.min) || !Number.isFinite(d.max))) return [];
+        // Element C paths in IEC order (row-major, the last index fastest).
+        const paths = [];
+        const rec = (k, suffix) => {
+            if (k === dims.length) { paths.push(`${cPath}${suffix}`); return; }
+            for (let i = dims[k].min; i <= dims[k].max; i++) rec(k + 1, `${suffix}[${i}]`);
+        };
+        rec(0, '');
+        let vals = [];
+        if (r) {
+            const mm = /^\[([\s\S]*)\]$/.exec(r);
+            if (!mm) throw new Error(`Initial value "${r}" of an ARRAY (${dt.name}) must be a bracketed list, e.g. [1, 2, 3(0)].`);
+            splitTopLevelArgs(mm[1]).forEach(a => {
+                const rep = /^(\d+)\s*\(([\s\S]*)\)$/.exec(a);
+                if (rep) for (let i = 0; i < parseInt(rep[1], 10); i++) vals.push(rep[2].trim());
+                else vals.push(a.trim());
+            });
+            if (vals.length > paths.length) throw new Error(`Initial value of an ARRAY (${dt.name}) has ${vals.length} values for ${paths.length} elements.`);
+        }
+        const lines = [];
+        paths.forEach((p, i) => lines.push(...elemLines(base, p, vals[i] ?? '')));
+        return lines;
+    }
+    return [];
+};
+
 // Cold-init lines for one FB instance at C path `cPath` (`S->prog_P_inst_t1`,
 // `S->g`, or a nested member). A user FB contributes its locals' declared
 // initial values — recursively, so an FB inside an FB is initialised too — and
@@ -2143,9 +2454,8 @@ const fbInstanceInitLines = (type, cPath, instInit, ps, depth = 0) => {
             const member = `${cPath}.${cIdent(vn)}`;
             if (isFbTypeName(v.type)) {
                 lines.push(...fbInstanceInitLines(v.type, member, v.initialValue, ps, depth + 1));
-            } else if (!(ps?.dataTypes || []).some(dt => dt.name === v.type)) {
-                const line = initAssignStmt(member, v.initialValue, v.type);
-                if (line) lines.push(line);
+            } else {
+                lines.push(...userTypeInitLines(v.type, member, v.initialValue, ps));
             }
         });
     }
@@ -2204,8 +2514,8 @@ const TIME_UNIT_US = {
     'D': 86400000000, 'H': 3600000000, 'M': 60000000,
     'S': 1000000, 'MS': 1000, 'US': 1, 'NS': 0.001,
 };
-// ⚠️ TIME (and LTIME, the same type) is a SIGNED 64-bit count of
-// MICROseconds end to end (kronstandard.h), so negative durations (T#-5s) are
+// ⚠️ TIME is a SIGNED 64-bit count of MICROseconds end to end (kronstandard.h;
+// LTIME is NANOseconds — mapIECtoTimeNs), so negative durations (T#-5s) are
 // legal. The bound enforced here is the tighter of the int64 range and JS's
 // exact-integer range: a literal is summed as a JS number, and beyond 2^53 µs
 // (~285 years) the sum would silently round, so the emitted C would not be
@@ -2267,6 +2577,46 @@ const mapIECtoTimeUs = (iecTimeStr) => {
     return checkTimeRange(sign * Math.round(total), raw);
 };
 
+// An IEC duration literal → LTIME NANOseconds (BigInt, exact over int64). LTIME
+// is int64 ns (T10 fn. m), TIME int64 µs — two units, kept apart end to end
+// (root CLAUDE.md); the literal's own prefix (`LT#`/`LTIME#` vs `T#`) decides
+// which one a literal in an expression is, a typed slot decides an initial
+// value. A bare number is ns.
+const TIME_UNIT_NS = { D: 86400000000000n, H: 3600000000000n, M: 60000000000n, S: 1000000000n, MS: 1000000n, US: 1000n, NS: 1n };
+const mapIECtoTimeNs = (iecTimeStr) => {
+    const raw = String(iecTimeStr ?? '').trim();
+    let str = raw.toUpperCase().replace(TIME_PREFIX_RE, '').replace(/_/g, '');
+    const bad = () => new Error(`Invalid LTIME literal "${raw}" — expected forms like LT#500ms, LT#-5s, LT#1h2m3s500ms250ns.`);
+    if (!str) throw bad();
+    let neg = false;
+    if (str[0] === '-' || str[0] === '+') { neg = str[0] === '-'; str = str.slice(1); }
+    let total = 0n;
+    if (/^\d+$/.test(str)) total = BigInt(str);
+    else {
+        const re = /(\d+)(?:\.(\d+))?(MS|US|NS|D|H|M|S)/y;
+        let idx = 0;
+        while (idx < str.length) {
+            re.lastIndex = idx;
+            const m = re.exec(str);
+            if (!m) throw bad();
+            const [, whole, frac = '', unit] = m;
+            total += BigInt(whole) * TIME_UNIT_NS[unit];
+            if (frac) total += (BigInt(frac) * TIME_UNIT_NS[unit] + 10n ** BigInt(frac.length) / 2n) / (10n ** BigInt(frac.length));
+            idx = re.lastIndex;
+        }
+    }
+    if (neg) total = -total;
+    if (total < -(2n ** 63n) || total > 2n ** 63n - 1n) throw new Error(`LTIME value "${raw}" is out of the signed 64-bit nanosecond range.`);
+    return total;
+};
+const isLtimeLiteral = (s) => /^(?:LTIME|LT)#/i.test(String(s ?? '').trim());
+// A duration literal for a slot of IEC type `type` (TIME µs / LTIME ns); an
+// untyped context takes the literal's own prefix.
+const mapIECDuration = (s, type = null) => {
+    const lt = type ? /^LTIME$/i.test(String(type).trim()) : isLtimeLiteral(s);
+    return lt ? mapIECtoTimeNs(s).toString() : String(mapIECtoTimeUs(s));
+};
+
 // formatVarInitial — turn a Variable Manager `initialValue` field into a C
 // initialiser fragment (`= ...`). Without this normalisation the raw IEC
 // text would land in plc.h verbatim and break the build:
@@ -2285,7 +2635,7 @@ const formatVarInitial = (raw, type) => {
     }
     if (isTimeTypeName(T)) {
         const s = String(raw).trim();
-        if (isTimeLiteral(s)) return ` = ${mapIECtoTimeUs(s)}`;
+        if (isTimeLiteral(s)) return ` = ${mapIECDuration(s, T)}LL`;
         const neg = /^-/.test(s);
         const n = iecNumberToC(s.replace(/^[-+]/, ''));
         if (n !== null && /^\d+$/.test(n)) return ` = ${checkTimeRange((neg ? -1 : 1) * Number(n), s)}`;
@@ -3426,31 +3776,20 @@ const generateMainLoop = (projectStructure, config, boardId = null, shmEnabled =
                     tName = `${tName}_${n}`;
                 }
                 usedTaskNames.add(tName);
-                // SCHED_FIFO priority for this task's scan thread (TaskManager
-                // field). Clamped here, not trusted: it reaches the runtime as a
-                // C literal, and sched_setscheduler rejects anything outside
-                // 1..99 — which would leave the thread at SCHED_OTHER with no
-                // indication why. A project saved before the field existed keeps
-                // the 99 the runtime used to hardcode.
-                const rtPriority = Math.max(1, Math.min(99, Math.round(Number(task.rtPriority) || 99)));
-                taskGroups.push({ taskName: tName, intervalUs, rtPriority, programs: progs });
+                // §6.8.2 c: the task PRIORITY is IEC's — 0 the highest, larger
+                // numbers lower (TaskManager `priority`). The scan thread runs
+                // at SCHED_FIFO 99 - PRIORITY, clamped to 1..99 (it reaches the
+                // runtime as a C literal and sched_setscheduler rejects anything
+                // else). taskIecPriority also reads a project saved with the old
+                // SCHED_FIFO `rtPriority` field.
+                const rtPriority = 99 - taskIecPriority(task);
+                taskGroups.push({ taskName: tName, label: task.name || task.id, intervalUs, rtPriority, programs: progs });
             }
             progs.forEach(pName => {
                 if (!programTasks.find(pt => pt.name === pName))
                     programTasks.push({ name: pName, intervalUs });
             });
         });
-        // STRICT (IEC 61131-3): a program runs ONLY if it is explicitly assigned
-        // to a task. Programs not in any task are NOT executed (no default task).
-        // Their POU code is still generated but never called by a task thread, so
-        // their variables stay at their initial values. Warn so an "I made a
-        // program but it doesn't run / no live data" situation is diagnosable.
-        const unassigned = (projectStructure.programs || [])
-            .map(p => (p.name || '').trim().replace(/\s+/g, '_'))
-            .filter(pName => !programTasks.find(pt => pt.name === pName));
-        if (unassigned.length > 0) {
-            console.warn(`[transpiler] Programs not assigned to any task (will NOT run): ${unassigned.join(', ')}. Assign them in Task Manager.`);
-        }
     } else if (config?.content?.instances?.length > 0) {
         // Legacy res_config tasks/instances — one flat group per task
         const legacyTaskMap = {};
@@ -3464,10 +3803,14 @@ const generateMainLoop = (projectStructure, config, boardId = null, shmEnabled =
             programTasks.push({ name: pName, intervalUs });
         });
         taskGroups = Object.values(legacyTaskMap);
-    } else {
-        // No tasks configured — programs are NOT executed. Build will succeed but nothing runs.
-        // (User must assign programs to tasks in Task Manager.)
     }
+    // §6.8.2 d: a program with NO task association has the LOWEST priority,
+    // starts with the resource and is re-scheduled as soon as it finishes —
+    // the free-running background cycle (added after every interval-based
+    // computation below, which must not see its interval 0).
+    const backgroundPrograms = (projectStructure.programs || [])
+        .map(p => (p.name || '').trim().replace(/\s+/g, '_'))
+        .filter(pName => pName && !programTasks.find(pt => pt.name === pName));
 
     // Rename task threads sequentially (Task0, Task1, ...) regardless of configured names.
     // This ensures clean, predictable thread identifiers in the generated C code.
@@ -3771,6 +4114,14 @@ const generateMainLoop = (projectStructure, config, boardId = null, shmEnabled =
         mainSrc += `#endif\n\n`;
     }
 
+    // The background task (§6.8.2 d) goes LAST, so no task index above moves:
+    // interval 0 = no period, rtPriority 0 = SCHED_IDLE (it runs only when no
+    // other thread wants the CPU, never ahead of a periodic task).
+    if (backgroundPrograms.length > 0) {
+        taskGroups.push({ taskName: 'Background', label: 'background (programs without a task)', intervalUs: 0, rtPriority: 0, programs: backgroundPrograms, background: true });
+        backgroundPrograms.forEach(name => programTasks.push({ name, intervalUs: 0 }));
+    }
+
     // Per-task scan BODY (SHM pull → programs → SHM sync). Extracted into its own
     // function so the SAME body is run by the in-binary thread loop (normal build)
     // AND by the hot-swap loader-host, which calls plc_task_body_<i> through dlsym
@@ -3832,6 +4183,17 @@ const generateMainLoop = (projectStructure, config, boardId = null, shmEnabled =
         const isIoTask = hasEc && (tg.intervalUs === fastestIntervalUs);
         mainSrc += `static void* plc_task_${tg.taskName}(void *arg) {\n`;
         mainSrc += `    (void)arg;\n`;
+        if (tg.background) {
+            // Lowest priority, re-run as soon as it ends (§6.8.2 d).
+            mainSrc += `    { struct sched_param __sp = { .sched_priority = 0 }; pthread_setschedparam(pthread_self(), SCHED_IDLE, &__sp); }\n`;
+            mainSrc += `    while (!plc_stop) {\n`;
+            mainSrc += `        { struct timespec __ts; clock_gettime(CLOCK_MONOTONIC, &__ts);\n`;
+            mainSrc += `          us_tick = (uint64_t)__ts.tv_sec * 1000000ULL + (uint64_t)__ts.tv_nsec / 1000ULL; }\n`;
+            mainSrc += `        plc_task_body_${ti}();\n`;
+            mainSrc += `        sched_yield();\n`;
+            mainSrc += `    }\n    return NULL;\n}\n\n`;
+            return;
+        }
         mainSrc += `    { struct sched_param __sp = { .sched_priority = ${tg.rtPriority || 99} };\n`;
         mainSrc += `      if (pthread_setschedparam(pthread_self(), SCHED_FIFO, &__sp) != 0)\n`;
         mainSrc += `          fprintf(stderr, "[plc] task ${tg.taskName}: real-time scheduling unavailable (need CAP_SYS_NICE or RLIMIT_RTPRIO) — timing will jitter\\n"); }\n`;
@@ -3849,6 +4211,12 @@ const generateMainLoop = (projectStructure, config, boardId = null, shmEnabled =
         mainSrc += `          us_tick = (uint64_t)__ts.tv_sec * 1000000ULL + (uint64_t)__ts.tv_nsec / 1000ULL; }\n`;
         mainSrc += `        plc_task_body_${ti}();\n`;
         if (!gpiMutexEnabled && isIoTask && ecPdoWriteCode) mainSrc += ecPdoWriteCode;
+        // §6.8.2: missing the deadline is an ERROR — counted and reported
+        // (KRON_RTE_OVERRUN); the schedule restarts from now instead of
+        // firing the missed periods back to back.
+        mainSrc += `        { struct timespec __now; clock_gettime(CLOCK_MONOTONIC, &__now);\n`;
+        mainSrc += `          long long __late = ((long long)__now.tv_sec - (long long)__next.tv_sec) * 1000000LL + ((long long)__now.tv_nsec - (long long)__next.tv_nsec) / 1000LL;\n`;
+        mainSrc += `          if (__late > 0) { __kron_rte(KRON_RTE_OVERRUN, "TASK ${cEscapeString(tg.label || tg.taskName)}", __late); __next = __now; } }\n`;
         mainSrc += `        plc_sleep_until(&__next);\n`;
         mainSrc += `    }\n`;
         mainSrc += `    return NULL;\n`;
@@ -3922,7 +4290,8 @@ const generateMainLoop = (projectStructure, config, boardId = null, shmEnabled =
     // pull/sync pair, so calling the programs directly left the mirror (and
     // therefore every live value and write) permanently empty.
     taskGroups.forEach((tg, ti) => {
-        mainSrc += `        if (us_tick / ${tg.intervalUs} != __prev_us / ${tg.intervalUs}) { plc_task_body_${ti}(); }\n`;
+        if (tg.background) mainSrc += `        plc_task_body_${ti}();\n`;
+        else mainSrc += `        if (us_tick / ${tg.intervalUs} != __prev_us / ${tg.intervalUs}) { plc_task_body_${ti}(); }\n`;
     });
     mainSrc += `        __prev_us = us_tick;\n`;
     if (retainEnabled) {
@@ -3946,7 +4315,8 @@ const generateMainLoop = (projectStructure, config, boardId = null, shmEnabled =
     mainSrc += `void PLC_Run(void) {\n`;
     if (ecPdoReadCode) mainSrc += ecPdoReadCode.replace(/^ {8}/gm, '    '); // 4-space indent for PLC_Run
     programTasks.forEach(pt => {
-        mainSrc += `    if (us_tick % ${pt.intervalUs}ULL == 0) { ${pt.name}(); }\n`;
+        if (!pt.intervalUs) mainSrc += `    ${pt.name}();\n`;
+        else mainSrc += `    if (us_tick % ${pt.intervalUs}ULL == 0) { ${pt.name}(); }\n`;
     });
     if (ecPdoWriteCode) mainSrc += ecPdoWriteCode.replace(/^ {8}/gm, '    ');
     mainSrc += `}\n\n`;
@@ -3983,9 +4353,14 @@ const generateMainLoop = (projectStructure, config, boardId = null, shmEnabled =
     mainSrc += `int plc_task_priority(int i) {\n`;
     mainSrc += `    switch (i) {\n`;
     taskGroups.forEach((tg, ti) => {
-        mainSrc += `        case ${ti}: return ${tg.rtPriority || 99};\n`;
+        mainSrc += `        case ${ti}: return ${tg.background ? 0 : (tg.rtPriority || 99)};\n`;
     });
     mainSrc += `        default: return 99;\n    }\n}\n`;
+    // OPTIONAL ABI symbol: the task's name, for the loader-host's overrun
+    // report (KRON_RTE_OVERRUN via plc_rte_report).
+    mainSrc += `const char *plc_task_name(int i) {\n    switch (i) {\n`;
+    taskGroups.forEach((tg, ti) => { mainSrc += `        case ${ti}: return "${cEscapeString(tg.label || tg.taskName)}";\n`; });
+    mainSrc += `        default: return "?";\n    }\n}\n`;
     // ⚠️ OPTIONAL ABI symbol, same contract as plc_task_priority: the axis
     // engine runs in the loader-host's bus thread, but AXIS_REF is a PlcState
     // field whose offset only this module knows. host.c resolves this after
@@ -4071,6 +4446,21 @@ const transpilePOUSource = (pou, category, stdFunctions = {}, parentName = '', g
 
     src += `${sig} {\n`;
 
+    // §6.5.2.1: VAR_TEMP is allocated and initialised on EVERY call. The
+    // member stays in the instance / PlcState (layout, live view) but is
+    // re-initialised at the top of the body, so nothing survives a call.
+    if (category !== 'function') {
+        (pou.content?.variables || []).filter(v => String(v.class || '').toLowerCase() === 'temp').forEach(v => {
+            const vName = (v.name || '').trim().replace(/\s+/g, '_');
+            if (!vName || isInlineMathType(v.type)) return;
+            const path = category === 'function_block' ? `instance->${cIdent(vName)}` : `S->prog_${safeName}_${vName}`;
+            src += `    memset(&(${path}), 0, sizeof(${path}));\n`;
+            const isFbT = isFBType(v.type, projectStructure) || (v.type in FB_TRIGGER_PIN && !isInlineMathType(v.type));
+            (isFbT ? fbInstanceInitLines(v.type, path, v.initialValue, projectStructure)
+                : userTypeInitLines(v.type, path, v.initialValue, projectStructure)).forEach(l => { src += `    ${l}\n`; });
+        });
+    }
+
     // FUNCTION POU: declare non-input variables as body locals (with initials)
     // and, for non-void functions, the implicit result variable. Assignments to
     // the function's own name (`FuncName := expr;`) target __ret via varMap, so
@@ -4099,6 +4489,12 @@ const transpilePOUSource = (pou, category, stdFunctions = {}, parentName = '', g
                 src += `    ${STRING_C_TYPE} ${cIdent(vName)} = {0};\n`;
                 const line = initAssignStmt(cIdent(vName), v.initialValue, v.type);
                 if (line) src += `    ${line}\n`;
+                return;
+            }
+            if ((projectStructure?.dataTypes || []).some(d => String(d?.name || '').trim() === String(v.type || '').trim())) {
+                // A user data type: zeroed, then its §6.4.4 initial values.
+                src += `    ${mapType((v.type || '').trim())} ${cIdent(vName)} = {0};\n`;
+                userTypeInitLines(v.type, cIdent(vName), v.initialValue, projectStructure).forEach(l => { src += `    ${l}\n`; });
                 return;
             }
             const init = formatVarInitial(v.initialValue, v.type) || ' = {0}';
@@ -4200,16 +4596,21 @@ const transpilePOUSource = (pou, category, stdFunctions = {}, parentName = '', g
     const buildStMaps = () => {
         const varMap = {};
         const varTypeMap = {};
+        // IEC name → lower-case variable class ('constant', 'input', …): the
+        // expression compiler refuses writes to a CONSTANT and to the POU's
+        // own VAR_INPUT (§6.5.2.2).
+        const varClassMap = {};
         // Globals first — so their TYPES are known (a global FB instance must get
         // FB-call treatment) — locals overwrite (shadowing).
         (globalVarsList || []).forEach(gv => {
             const gName = (gv.name || '').trim().replace(/\s+/g, '_');
-            if (gName) varTypeMap[gName] = gv.type;
+            if (gName) { varTypeMap[gName] = gv.type; varClassMap[gName] = String(gv.class || '').toLowerCase(); }
         });
         (pou.content.variables || []).forEach(v => {
             const vName = (v.name || '').trim().replace(/\s+/g, '_');
             if (!vName) return;
             varTypeMap[vName] = v.type;
+            varClassMap[vName] = String(v.class || '').toLowerCase();
             const g = globalLower.get(vName.toLowerCase());
             if (g) {
                 varMap[vName] = `S->${cIdent(g)}`; // global: PlcState field (hot-swap)
@@ -4242,7 +4643,7 @@ const transpilePOUSource = (pou, category, stdFunctions = {}, parentName = '', g
         if (category === 'function' && fnRetType !== 'void') {
             varMap[safeName] = '__ret';
         }
-        return { varMap, varTypeMap };
+        return { varMap, varTypeMap, varClassMap };
     };
 
     const stOpts = {
@@ -4282,25 +4683,39 @@ const transpilePOUSource = (pou, category, stdFunctions = {}, parentName = '', g
     const ldCtx = { memberCtx, nameTypes, fnPtrParams, declaredCanon };
 
     if (pou.type === 'ST') {
-        const { varMap, varTypeMap } = buildStMaps();
-        src += transpileSTLogics(pou.content.code, stdFunctions, parentName, category, varMap, varTypeMap, userFBTypes, stOpts);
+        const { varMap, varTypeMap, varClassMap } = buildStMaps();
+        src += transpileSTLogics(pou.content.code, stdFunctions, parentName, category, varMap, varTypeMap, userFBTypes, { ...stOpts, varClassMap });
     } else if (pou.type === 'LD') {
         src += transpileLDLogics(pou.content.rungs, stdFunctions, safeName, category, globalVarNames, inputShadowMap, 0, buildCSymTypeMap(), localVarNames, fbInstanceNames, ldCtx);
     } else if (pou.type === 'SCL') {
         // SCL: mixed LD/ST per rung. Each rung carries a `lang` field ('LD' or 'ST').
         let sclLdRungIdx = 0;
-        (pou.content.rungs || []).forEach(rung => {
+        const kindLabel = { program: 'PROGRAM', function_block: 'FUNCTION_BLOCK', function: 'FUNCTION' }[category] || 'POU';
+        (pou.content.rungs || []).forEach((rung, rungIdx) => {
             if (rung.lang === 'ST') {
-                const { varMap, varTypeMap } = buildStMaps();
+                const { varMap, varTypeMap, varClassMap } = buildStMaps();
                 src += `    // SCL rung [ST]\n`;
-                src += transpileSTLogics(rung.code || '', stdFunctions, parentName, category, varMap, varTypeMap, userFBTypes, stOpts);
+                src += transpileSTLogics(rung.code || '', stdFunctions, parentName, category, varMap, varTypeMap, userFBTypes, { ...stOpts, rungNo: rungIdx + 1, varClassMap });
             } else {
                 // Default: treat as LD rung
                 src += `    // SCL rung [LD]\n`;
-                src += transpileLDLogics([rung], stdFunctions, safeName, category, globalVarNames, inputShadowMap, sclLdRungIdx, buildCSymTypeMap(), localVarNames, fbInstanceNames, ldCtx);
+                const ld = transpileLDLogics([rung], stdFunctions, safeName, category, globalVarNames, inputShadowMap, sclLdRungIdx, buildCSymTypeMap(), localVarNames, fbInstanceNames, { ...ldCtx, rungNo: rungIdx + 1 });
+                src += srcLineRegion(ld, `${kindLabel} ${parentName}, rung ${rungIdx + 1} (LD)`);
                 sclLdRungIdx++;
             }
         });
+    }
+
+    // §7.3.3.2.3: "If a result is defined for this POU at least one
+    // assignment to the name of this POU shall be made" — a function that
+    // never does would silently return 0. An LD rung counts when one of its
+    // blocks names the function (a coil / output on the result).
+    if (stOpts.fnResult && !stOpts.fnResult.assigned) {
+        const nameRe = new RegExp(`"${safeName}"`, 'i');
+        const ldAssigns = (pou.content?.rungs || []).some(r => r.lang !== 'ST' && nameRe.test(JSON.stringify(r.blocks || [])));
+        if (!ldAssigns && pou.type !== 'LD') {
+            throw new Error(`FUNCTION ${safeName}: its result is never assigned — write "${safeName} := …;" in the body (IEC 61131-3 §7.3.3.2.3).`);
+        }
     }
 
     src += fnEpilogue;
@@ -4693,9 +5108,9 @@ const collectInputShadowVars = (rungs, progName) => {
                 let initVal = 0;
                 if (cleanVal) {
                     if (isTimeTypeName(iecType)) {
-                        const us = mapIECtoTimeUs(cleanVal);
-                        initStr = String(us);
-                        initVal = us;
+                        const d = mapIECDuration(cleanVal, iecType);
+                        initStr = `${d}LL`;
+                        initVal = Number.isSafeInteger(Number(d)) ? Number(d) : d;
                     } else if (/^16#([0-9A-Fa-f]+)$/i.test(cleanVal)) {
                         const hexDigits = cleanVal.slice(3);
                         const hexVal = parseInt(hexDigits, 16);
@@ -4946,41 +5361,61 @@ const ecPdoCanon = (name) => {
 // see canonMemberPath.
 const buildMemberCtx = (ps) => {
     const types = new Map();
-    const add = (typeName, vars) => {
+    const add = (typeName, vars, isFb) => {
         const n = String(typeName || '').trim().replace(/\s+/g, '_');
         if (!n) return;
         const members = new Map();
         (vars || []).forEach(v => {
             const vn = String(v?.name || '').trim().replace(/\s+/g, '_');
-            if (vn) members.set(vn.toLowerCase(), { name: vn, type: v.type, inout: isInOutClass(v) });
+            const cls = String(v?.class || '').toLowerCase();
+            // dir: an FB member's access class from outside (F13).
+            const dir = cls === 'input' ? 'input' : cls === 'output' ? 'output' : cls === 'inout' ? 'inout' : 'internal';
+            if (vn) members.set(vn.toLowerCase(), { name: vn, type: v.type, inout: isInOutClass(v), dir, initialValue: v?.initialValue });
         });
-        types.set(n.toLowerCase(), { name: n, members });
+        types.set(n.toLowerCase(), { name: n, members, isFb });
     };
-    (ps?.functionBlocks || []).forEach(fb => add(fb.name, fb.content?.variables));
-    (ps?.dataTypes || []).forEach(dt => { if (dt?.type === 'Structure') add(dt.name, dt.content?.members); });
+    (ps?.functionBlocks || []).forEach(fb => add(fb.name, fb.content?.variables, true));
+    (ps?.dataTypes || []).forEach(dt => { if (dt?.type === 'Structure') add(dt.name, dt.content?.members, false); });
     // ARRAY data types: element type + dimension count, so an assignment to
-    // `arr[i]` / `arr[i].member` can tell whether its target is STRING storage.
+    // `arr[i]` / `arr[i].member` can tell whether its target is STRING storage,
+    // and the IEC bounds of each dimension for the index check (KRON_IDX).
     const arrays = new Map();
     (ps?.dataTypes || []).forEach(dt => {
         if (dt?.type !== 'Array') return;
         const n = String(dt.name || '').trim().replace(/\s+/g, '_');
-        if (n) arrays.set(n.toLowerCase(), { baseType: dt.content?.baseType, dims: (dt.content?.dimensions || []).length || 1 });
+        const dimDefs = dt.content?.dimensions || [];
+        const bounds = dimDefs.map(d => ({ min: parseInt(d.min, 10), max: parseInt(d.max, 10) }));
+        if (n) arrays.set(n.toLowerCase(), {
+            baseType: dt.content?.baseType,
+            dims: dimDefs.length || 1,
+            bounds: bounds.every(b => Number.isFinite(b.min) && Number.isFinite(b.max)) ? bounds : null,
+        });
     });
     // ENUMERATED data types: type lower → declared name, value lower →
     // { name, type } (C enum constants are bare, file-scope identifiers).
+    // A value name used by several enumerations (allowed, §6.4.4.2) is
+    // AMBIGUOUS unqualified — `Type#Value` (enumValueOf) still names it.
     const enumTypes = new Map();
     const enumValues = new Map();
+    const enumValueOf = new Map();
+    const dup = enumDuplicateNames(ps);
     (ps?.dataTypes || []).forEach(dt => {
         if (dt?.type !== 'Enumerated') return;
         const n = String(dt.name || '').trim();
         if (!n) return;
         enumTypes.set(n.toLowerCase(), n);
+        const own = new Map();
+        enumValueOf.set(n.toLowerCase(), own);
         (dt.content?.values || []).forEach(v => {
             const vn = String(v?.name || '').trim();
-            if (vn) enumValues.set(vn.toLowerCase(), { name: vn, type: n });
+            if (!vn) return;
+            const e = { name: enumCName(n, vn, dup), type: n };
+            own.set(vn.toLowerCase(), e);
+            const prev = enumValues.get(vn.toLowerCase());
+            enumValues.set(vn.toLowerCase(), prev && prev.type !== n ? { ...e, ambiguous: [...(prev.ambiguous || [prev.type]), n] } : e);
         });
     });
-    return { types, arrays, enumTypes, enumValues };
+    return { types, arrays, enumTypes, enumValues, enumValueOf };
 };
 
 
@@ -5330,8 +5765,9 @@ const transpileSTLogics = (code, stdFunctions = {}, parentName = '', category = 
         fnReturnVar = null, userFBInputs = {},
         strConv = null, memberCtx = null, labelSeq = { next: 0 }, fnResult = null,
         userFunctionDefs = new Map(), exprSeq = { next: 0 },
-        stringFnReturn = null,
+        stringFnReturn = null, rungNo = null, varClassMap = {},
     } = opts;
+    const varClassLower = new Map(Object.entries(varClassMap).map(([k, v]) => [k.toLowerCase(), v]));
     // Case-insensitive type lookup (IEC identifiers are case-insensitive).
     const varTypeLower = new Map(Object.entries(varTypeMap).map(([k, v]) => [k.toLowerCase(), v]));
     const typeOfName = (n) => varTypeLower.get(String(n || '').toLowerCase());
@@ -5453,7 +5889,7 @@ const transpileSTLogics = (code, stdFunctions = {}, parentName = '', category = 
         // Label atoms: numbers (incl. negative), identifiers (enum members),
         // TypeName#EnumValue — same shapes the case-label handler accepts.
         // `:(?!=)` keeps assignments (`x := 1`) from being split as labels.
-        const SPLIT_ATOM = '(?:[A-Za-z_][A-Za-z0-9_]*(?:#[A-Za-z_][A-Za-z0-9_]*)?|-?\\d+)';
+        const SPLIT_ATOM = '(?:\\x0e\\d+\\x0f|[A-Za-z_][A-Za-z0-9_]*#[-+]?[A-Za-z0-9_.]+|[A-Za-z_][A-Za-z0-9_]*|[-+]?\\d[\\d_]*(?:#[0-9A-Fa-f_]+|(?:\\.\\d[\\d_]*)?(?:[eE][-+]?\\d+)?))';
         const SPLIT_LABEL_RE = new RegExp(`^(${SPLIT_ATOM}(?:\\s*(?:\\.\\.|,)\\s*${SPLIT_ATOM})*)\\s*:(?!=)\\s*(.+)$`);
         for (const ln of lines) {
             const t = ln.trim();
@@ -5545,29 +5981,34 @@ const transpileSTLogics = (code, stdFunctions = {}, parentName = '', category = 
         .filter(k => !isInlineMathType(k)).map(k => [k.toLowerCase(), k]));
     const exprEnv = {
         H: {
-            iecNumberToC, mapIECtoTimeUs, iecStringDecode, cEscapeString, cIdent, mapType, rotateExpr,
+            iecNumberToC, mapIECtoTimeUs, mapIECtoTimeNs, iecStringDecode, convC, cEscapeString, cIdent, mapType, rotateExpr,
             IEC_KRON_NAME, strConvSymbol, STRING_SHM_BYTES,
         },
         strTable,
         lookupVar: (name) => {
             const l = String(name).toLowerCase();
             if (fnResult && l === String(fnResult.name).toLowerCase() && varMapLower[l] !== undefined) {
-                return { c: varMapLower[l], t: fnResult.type || null };
+                return { c: varMapLower[l], t: fnResult.type || null, name: fnResult.name };
             }
             const c = varMapLower[l];
             if (c === undefined) return null;
-            return { c, t: typeOfName(name) ?? null };
+            return { c, t: typeOfName(name) ?? null, name, cls: varClassLower.get(l) || '' };
         },
         enumMember: (name) => memberCtx?.enumValues?.get(String(name).toLowerCase()) || null,
+        enumMemberOf: (type, name) => memberCtx?.enumValueOf?.get(String(type).toLowerCase())?.get(String(name).toLowerCase()) || null,
         enumTypes: memberCtx?.enumTypes || new Map(),
         memberCtx,
         stdMember: (t, m) => {
             if (!(FB_OUTPUTS[t] || FB_INPUTS[t] || FB_TRIGGER_PIN[t] || FB_INPUT_TYPES[t] || stdFunctions[t]?.isFB)) return null;
             const pin = canonicalPinName(t, m);
             const pt = stdPinTypeForExpr(t, pin);
+            // F13 direction, only where the tables are unambiguous.
+            const isIn = (FB_INPUTS[t] || stdFunctions[t]?.inputs || []).includes(pin) || FB_INPUT_TYPES[t]?.[pin] !== undefined;
+            const isOut = (FB_OUTPUTS[t] || stdFunctions[t]?.outputs || []).includes(pin);
+            const dir = isIn && !isOut ? 'input' : isOut && !isIn ? 'output' : null;
             // A standard block's STRING INPUT is a `const char *` re-pointed
             // every scan — assigned with `=`, never copied into.
-            return { c: cStructPin(t, pin), t: pt, ptrStr: isStringInputType(pt) && FB_INPUT_TYPES[t]?.[pin] !== undefined };
+            return { c: cStructPin(t, pin), t: pt, ptrStr: isStringInputType(pt) && FB_INPUT_TYPES[t]?.[pin] !== undefined, dir };
         },
         isFbTypeName: (n) => userFbLower.has(String(n).toLowerCase()) || stdFbLower.has(String(n).toLowerCase()),
         isFbInstance: (n) => fbTypeOf(typeOfName(n)),
@@ -5626,39 +6067,98 @@ const transpileSTLogics = (code, stdFunctions = {}, parentName = '', category = 
         })
         .join('; ');
 
-    // Errors name the POU, an approximate source line and the statement.
-    const locate = (stmt) => {
-        const probe = restoreStr(stmt).trim().slice(0, 24);
-        const at = probe ? String(code).indexOf(probe) : -1;
-        return at < 0 ? '' : `, line ${String(code).slice(0, at).split('\n').length}`;
-    };
+    // Every statement is mapped back to its SOURCE line: the statements reach
+    // here reflowed (joined continuation lines, split `a; b;`, CASE labels cut
+    // off their bodies), so the line is found by matching the statement's
+    // whitespace-free text against the whitespace-free source, moving forward
+    // from the previous statement — two identical statements get their own
+    // lines. The line feeds the error messages AND the `#line` markers that
+    // make clang's own diagnostics name the ST line (srcLineMarker).
+    const locator = (() => {
+        const src = stripIecComments(code, { keepLayout: true })
+            .replace(/(?<![\w.])(?:global|gvl)\s*\.\s*/gi, (m) => m.replace(/[^\n]/g, ' '));
+        let flat = '';
+        const lineOf = [];
+        let ln = 1;
+        for (const ch of src) {
+            if (ch === '\n') { ln++; continue; }
+            if (/\s/.test(ch)) continue;
+            flat += ch; lineOf.push(ln);
+        }
+        let cursor = 0;
+        return (stmt) => {
+            const key = restoreStr(stmt).replace(/\s+/g, '');
+            if (!key) return null;
+            for (const k of [key, key.slice(0, 16)]) {
+                const at = flat.indexOf(k, cursor);
+                if (at >= 0) { cursor = at + k.length; return lineOf[at]; }
+            }
+            const any = flat.indexOf(key);
+            return any >= 0 ? lineOf[any] : null;
+        };
+    })();
     const kindLabel = { program: 'PROGRAM', function_block: 'FUNCTION_BLOCK', function: 'FUNCTION' }[category] || 'POU';
+    const where = `${kindLabel} ${parentName}${rungNo ? `, rung ${rungNo}` : ''}`;
+    // Where a run-time check (KRON_IDX, KRON_RTE) reports its fault from.
+    let curLine = null;
+    exprEnv.indexSite = () => `${where}${curLine ? `, line ${curLine}` : ''}: `;
+    exprEnv.rteSite = () => `${where}${curLine ? `, line ${curLine}` : ''}`;
+    // The control variables of the FOR loops enclosing the current statement.
+    exprEnv.isForControl = (n) => blockStack.some(f => f.kind === 'FOR' && f.ctrl === String(n).toLowerCase());
 
     lines.forEach(line => {
         const trimmed = line.trim();
         if (!trimmed) return;
+        curLine = locator(trimmed);
+        const before = out.length;
         try {
             emitLine(trimmed);
         } catch (e) {
             if (e?.stLocated) throw e;
             const msg = String(e?.message || e).replace(/^ST:\s*/, '');
-            const err = new Error(`ST ${kindLabel} ${parentName}${locate(trimmed)}: ${msg} — in "${restoreStr(trimmed)}"`);
+            const err = new Error(`ST ${where}${curLine ? `, line ${curLine}` : ''}: ${msg} — in "${restoreStr(trimmed)}"`);
             err.stLocated = true;
+            err.stSite = { pou: parentName, kind: kindLabel, rung: rungNo, line: curLine };
             throw err;
         }
+        if (curLine && out.length > before) out = out.slice(0, before) + srcLineMarker(out.slice(before), curLine, `${where} (ST)`);
     });
+    // Open blocks are a syntax error, not a C compile error two rungs later.
+    if (blockStack.length) {
+        const open = blockStack[blockStack.length - 1].kind;
+        const end = { IF: 'END_IF', CASE: 'END_CASE', FOR: 'END_FOR', WHILE: 'END_WHILE', REPEAT: 'UNTIL … END_REPEAT' }[open] || 'END';
+        const err = new Error(`ST ${where}: ${open} without ${end}`);
+        err.stLocated = true;
+        throw err;
+    }
     if (exprEnv.decls.length) out = exprEnv.decls.map(d => `    ${d}\n`).join('') + out;
 
-    return out || `    // ST parsing placeholder\n`;
+    return out ? `${out}${SRC_LINE_END}\n` : `    // ST parsing placeholder\n`;
 
     function emitLine(trimmed) {
 
         // ── CASE x OF ────────────────────────────────────────────────────
+        // §7.3.3.3.3: the selector is any ELEMENTARY value (REAL, TIME and
+        // STRING included), labels are constants (literals, enumerated
+        // values, CONSTANTs, subranges) and the FIRST group whose labels hold
+        // the value runs — so overlapping labels are legal and the earlier
+        // one wins. A C switch can do none of that (integers only, constant
+        // labels only, a duplicate value is an error), so a CASE is an
+        // if / else-if chain over the selector evaluated ONCE; clang turns a
+        // dense integer chain back into a jump table.
         const caseOfMatch = trimmed.match(/^CASE\s+(.+?)\s+OF\s*;?\s*$/i);
         if (caseOfMatch) {
-            out += `${indent()}switch (${stripOuter(exprC(caseOfMatch[1]))}) {\n`;
+            const selR = X.expr(caseOfMatch[1]);
+            const st = selR.t === null ? null : String(selR.t);
+            const ELEM = /^(?:BOOL|S?INT|D?INT|L?INT|U?S?INT|UD?INT|UL?INT|BYTE|D?WORD|LWORD|L?REAL|L?TIME|W?STRING|#INT|#REAL)$/i;
+            if (st !== null && !ELEM.test(st) && !memberCtx?.enumTypes?.has(st.toLowerCase())) {
+                throw new STExprError(`CASE selector must be of an elementary type (or an enumerated type), got ${st} (IEC §7.3.3.3.3)`);
+            }
+            const sel = `__case${labelSeq.next++}`;
+            out += `${indent()}{\n`;
             indentLevel++;
-            blockStack.push({ kind: 'CASE', caseBodyOpen: false, hasDefault: false });
+            out += `${indent()}__auto_type ${sel} = ${selR.c};\n`;
+            blockStack.push({ kind: 'CASE', sel: { c: sel, t: selR.t, pure: true }, caseBodyOpen: false, hasDefault: false });
             return;
         }
 
@@ -5667,12 +6167,8 @@ const transpileSTLogics = (code, stdFunctions = {}, parentName = '', category = 
             const frame = topFrame();
             if (frame && frame.kind === 'CASE') {
                 if (frame.caseBodyOpen) {
-                    out += `${indent()}break;\n`;
                     indentLevel = Math.max(1, indentLevel - 1);
-                }
-                // Only emit fallback default if user did not already write ELSE
-                if (!frame.hasDefault) {
-                    out += `${indent()}default: break;\n`;
+                    out += `${indent()}}\n`;
                 }
                 indentLevel = Math.max(1, indentLevel - 1);
                 out += `${indent()}}\n`;
@@ -5687,17 +6183,22 @@ const transpileSTLogics = (code, stdFunctions = {}, parentName = '', category = 
         // and we should not treat it as one here.
         if (topKind() === 'CASE') {
             const frame = topFrame();
-            // ELSE inside CASE (at the case's direct level) → default:
+            const openBranch = (cond) => {
+                if (frame.hasDefault) throw new STExprError('CASE: a label after ELSE (ELSE must be the last branch)');
+                if (frame.caseBodyOpen) {
+                    indentLevel = Math.max(1, indentLevel - 1);
+                    out += `${indent()}} ${cond === null ? 'else' : `else if (${cond})`} {\n`;
+                } else {
+                    out += `${indent()}${cond === null ? '' : `if (${cond}) `}{\n`;
+                }
+                indentLevel++;
+                frame.caseBodyOpen = true;
+            };
+            // ELSE inside CASE (at the case's direct level) → the last branch.
             // Checked BEFORE label matching — `ELSE` would otherwise parse as
             // an identifier label now that identifier labels are supported.
             if (/^ELSE\b\s*:?/i.test(trimmed)) {
-                if (frame.caseBodyOpen) {
-                    out += `${indent()}break;\n`;
-                    indentLevel = Math.max(1, indentLevel - 1);
-                }
-                out += `${indent()}default:\n`;
-                indentLevel++;
-                frame.caseBodyOpen = true;
+                openBranch(null);
                 frame.hasDefault = true;
                 const elseBody = trimmed.replace(/^ELSE\b\s*:?\s*/i, '').trim();
                 if (elseBody && elseBody !== ';') {
@@ -5707,40 +6208,22 @@ const transpileSTLogics = (code, stdFunctions = {}, parentName = '', category = 
                 }
                 return;
             }
-            // Label atoms: integers (incl. negative), identifiers (enum members —
-            // transpiled enums are plain C enum constants, so a bare identifier
-            // label works), or TypeName#EnumValue. `:(?!=)` keeps assignments
-            // (`x := 1`) from matching as a label `x`.
-            const CASE_ATOM = '(?:[A-Za-z_][A-Za-z0-9_]*(?:#[A-Za-z_][A-Za-z0-9_]*)?|-?\\d+)';
+            // Label atoms: integers (incl. negative, radix), reals, typed
+            // literals and Type#Value, identifiers (enum values, CONSTANTs).
+            // `:(?!=)` keeps assignments (`x := 1`) from matching as a label.
+            const CASE_ATOM = '(?:\\x0e\\d+\\x0f|[A-Za-z_][A-Za-z0-9_]*#[-+]?[A-Za-z0-9_.]+|[A-Za-z_][A-Za-z0-9_]*|[-+]?\\d[\\d_]*(?:#[0-9A-Fa-f_]+|(?:\\.\\d[\\d_]*)?(?:[eE][-+]?\\d+)?))';
             const caseLabelMatch = trimmed.match(new RegExp(`^(${CASE_ATOM}(?:\\s*(?:\\.\\.|,)\\s*${CASE_ATOM})*)\\s*:(?!=)\\s*(.*)$`));
             if (caseLabelMatch) {
                 const labelPart = caseLabelMatch[1].trim();
                 const bodyPart  = caseLabelMatch[2].trim();
-                if (frame.caseBodyOpen) {
-                    out += `${indent()}break;\n`;
-                    indentLevel = Math.max(1, indentLevel - 1);
-                }
-                // TypeName#EnumValue → EnumValue (enum members are bare C constants)
-                const stripEnumPrefix = (p) => p.replace(/^[A-Za-z_][A-Za-z0-9_]*#/, '');
-                // Multiple values: "1, 2" or ranges "1..3"
-                const parts = labelPart.split(',').map(p => p.trim());
-                parts.forEach(p => {
+                const conds = labelPart.split(',').map(p => p.trim()).map(p => {
                     if (p.includes('..')) {
-                        const [fromS, toS] = p.split('..').map(n => n.trim());
-                        const from = parseInt(fromS, 10);
-                        const to = parseInt(toS, 10);
-                        if (Number.isFinite(from) && Number.isFinite(to)) {
-                            for (let v = from; v <= to; v++) out += `${indent()}case ${v}:\n`;
-                        } else {
-                            // Non-numeric range bounds: GCC/Clang case-range extension
-                            out += `${indent()}case ${stripEnumPrefix(fromS)} ... ${stripEnumPrefix(toS)}:\n`;
-                        }
-                    } else {
-                        out += `${indent()}case ${stripEnumPrefix(p)}:\n`;
+                        const [lo, hi] = p.split('..').map(n => n.trim());
+                        return `(${X.caseCompare(frame.sel, '>=', lo)} && ${X.caseCompare(frame.sel, '<=', hi)})`;
                     }
+                    return X.caseCompare(frame.sel, '=', p);
                 });
-                indentLevel++;
-                frame.caseBodyOpen = true;
+                openBranch(conds.join(' || '));
                 if (bodyPart && bodyPart !== ';') {
                     let cl = stmtC(bodyPart);
                     if (!cl.endsWith(';')) cl += ';';
@@ -5817,23 +6300,43 @@ const transpileSTLogics = (code, stdFunctions = {}, parentName = '', category = 
         // are evaluated once, before the first iteration (IEC forbids the
         // body from changing them). After the loop the control variable holds
         // the last value it was given (IEC leaves it implementation-defined).
+        // §7.3.3.4.2: the control variable, the initial value and the final
+        // value are expressions of the SAME integer type (ANY_INT — no REAL,
+        // no bit string); the control variable is not written in the body
+        // (checked via exprEnv.isForControl); BY 0 is an endless loop — a
+        // compile error as a literal, a run-time error (KRON_RTE_FOR_STEP,
+        // the loop is skipped) otherwise.
         const forHeader = (vn, start, end, step) => {
-            const cv = X.lvalue(vn).c;
+            const L = X.lvalue(vn);
+            X.checkWritable(vn, `FOR control variable ${vn}`);
+            const ct = L.t;
+            const INT_TYPES = ['SINT', 'INT', 'DINT', 'LINT', 'USINT', 'UINT', 'UDINT', 'ULINT'];
+            if (ct !== null && !INT_TYPES.includes(String(ct).toUpperCase())) {
+                throw new STExprError(`FOR control variable ${vn} must be an integer (ANY_INT), got ${ct} (IEC §7.3.3.4.2)`);
+            }
+            // Each bound converts to the control variable's type like an
+            // assignment (a literal that fits, or an implicit F12 widening of
+            // a smaller integer) — never a narrowing or a REAL.
+            const bound = (text, what) => X.value(text, ct, `FOR ${what}`);
+            const cv = L.c;
             const n = labelSeq.next++;
             const i = `__for_i${n}`, e = `__for_e${n}`, st = `__for_s${n}`;
-            const stepExpr = step === null ? '1' : exprC(step).trim();
+            const stepExpr = step === null ? '1' : bound(step, 'BY value').trim();
+            if (/^\(?\s*[-+]?\s*0+\s*\)?$/.test(stepExpr)) throw new STExprError('FOR … BY 0 never ends (IEC §7.3.3.4.2)');
+            const literalStep = /^\+?\s*\d+$/.test(stepExpr) ? 1 : /^\(?-\s*\d+\)?$/.test(stepExpr) ? -1 : 0;
             let cond;
-            if (/^\+?\s*\d+(?:\.\d+)?$/.test(stepExpr)) cond = `${i} <= ${e}`;
-            else if (/^-\s*\d+(?:\.\d+)?$/.test(stepExpr)) cond = `${i} >= ${e}`;
+            if (literalStep > 0) cond = `${i} <= ${e}`;
+            else if (literalStep < 0) cond = `${i} >= ${e}`;
             else cond = `(${st} >= 0 ? ${i} <= ${e} : ${i} >= ${e})`;
             out += `${indent()}{\n`;
             indentLevel++;
-            out += `${indent()}const int64_t ${e} = (int64_t)(${exprC(end)});\n`;
+            out += `${indent()}const int64_t ${e} = (int64_t)(${bound(end, 'TO value')});\n`;
             out += `${indent()}const int64_t ${st} = (int64_t)(${stepExpr});\n`;
-            out += `${indent()}for (int64_t ${i} = (int64_t)(${exprC(start)}); ${cond}; ${i} += ${st}) {\n`;
+            if (!literalStep) out += `${indent()}if (${st} == 0) __kron_rte(KRON_RTE_FOR_STEP, "${cEscapeString(exprEnv.rteSite())}", 0); else\n`;
+            out += `${indent()}for (int64_t ${i} = (int64_t)(${bound(start, 'start value')}); ${cond}; ${i} += ${st}) {\n`;
             indentLevel++;
             out += `${indent()}${cv} = (__typeof__(${cv}))${i};\n`;
-            blockStack.push({ kind: 'FOR', wrapped: true });
+            blockStack.push({ kind: 'FOR', wrapped: true, ctrl: String(vn).toLowerCase() });
         };
         const forByMatch = trimmed.match(/^FOR\s+(\w+)\s*:=\s*(.+?)\s+TO\s+(.+?)\s+BY\s+(.+?)\s+DO\s*;?\s*$/i);
         if (forByMatch) {
@@ -5912,6 +6415,7 @@ const transpileSTLogics = (code, stdFunctions = {}, parentName = '', category = 
         // ── RETURN ────────────────────────────────────────────────────────
         if (/^RETURN\b/i.test(trimmed)) {
             const retVal = trimmed.replace(/^RETURN\s*/i, '').replace(/;$/, '').trim();
+            if (retVal && fnResult) fnResult.assigned = true;
             if (retVal && fnResult?.isString) {
                 // Copied into the result buffer: `RETURN local;` would
                 // otherwise hand back a pointer into this call's stack frame.
@@ -6072,6 +6576,7 @@ const transpileSTLogics = (code, stdFunctions = {}, parentName = '', category = 
                         if (!IDENTIFIER_REF_REGEX.test(rawValue)) {
                             throw new Error(`ST: ${fbType}.${userPin} is VAR_IN_OUT and must be given a variable, got "${rawValue}".`);
                         }
+                        X.checkInOutActual(rawValue, userMem.type, `${instName}.${userPin} (VAR_IN_OUT)`);
                         inOutCopyBack.push(X.assignC(rawValue, `${cInst}.${member}`, userMem.type ?? null));
                     }
                 });
@@ -6133,6 +6638,45 @@ const transpileLDLogics = (rungs, stdFunctions = {}, parentName = '', category =
     };
     const isRealExpr = (val) => ['REAL', 'LREAL'].includes(operandType(val));
 
+    // `[…]` in an LD operand: every index is an operand of its own, resolved
+    // like any other — it used to be copied verbatim, so `arr[i]` only compiled
+    // inside a FUNCTION, where `i` happens to be the C name too — and checked
+    // against the array's IEC bounds the way ST's are (stExpr.js checkedIndex):
+    // a literal here, anything else at run time through KRON_IDX (plc.h).
+    let ldRungNo = null;
+    const ldKind = { program: 'PROGRAM', function_block: 'FUNCTION_BLOCK', function: 'FUNCTION' }[category] || 'POU';
+    const resolveIndexSuffix = (baseName, suffix) => {
+        if (!suffix.includes('[')) return suffix;
+        const where = `LD ${ldKind} ${parentName}${ldRungNo !== null ? `, rung ${ldRungNo}` : ''}`;
+        let t = nameTypes.get(baseName.toLowerCase()) || null;
+        let arr = null, dim = 0;
+        return suffix.replace(/\.([A-Za-z_][A-Za-z0-9_]*)|\[([^\]]*)\]/g, (seg, member, idxText) => {
+            if (member !== undefined) {
+                const info = t ? memberCtx?.types?.get(String(t).toLowerCase()) : null;
+                t = info?.members.get(member.toLowerCase())?.type || null;
+                arr = null; dim = 0;
+                return seg;
+            }
+            if (!arr) { arr = t ? memberCtx?.arrays?.get(String(t).trim().toLowerCase()) || null : null; dim = 0; }
+            const idx = idxText.split(',').map(raw => {
+                const c = resolveVal(raw.trim());
+                if (c === null) throw new Error(`${where}: cannot resolve the index "${raw.trim()}" of "${baseName}${suffix}"`);
+                const b = arr?.bounds?.[dim];
+                const what = arr?.bounds?.length > 1 ? `${baseName} (dimension ${dim + 1})` : baseName;
+                dim++;
+                if (!b) return c;
+                if (/^-?\d+$/.test(c)) {
+                    const n = Number(c);
+                    if (n < b.min || n > b.max) throw new Error(`${where}: index ${n} of ${what} is out of range [${b.min}..${b.max}]`);
+                    return c;
+                }
+                return `KRON_IDX(${c}, ${b.min}, ${b.max}, "${cEscapeString(`${where}: ${what}`)}")`;
+            });
+            if (arr && dim >= (arr.dims || 1)) { t = arr.baseType || null; arr = null; dim = 0; }
+            return `[${idx.join('][')}]`;
+        });
+    };
+
     // Resolve a variable/signal name to its C symbol, respecting scope.
     // Handles simple names, array elements (var[idx]), struct members (var.member),
     // FB-instance output access (blink.Q → …_inst_blink.Q).
@@ -6153,6 +6697,7 @@ const transpileLDLogics = (rungs, stdFunctions = {}, parentName = '', category =
                 suffix = canonMemberPath(t, m[1].split('.').filter(Boolean), memberCtx).map(x => '.' + x).join('') + m[2];
             }
         }
+        suffix = resolveIndexSuffix(baseName, suffix);
         // EtherCAT PDO variables have no PlcState field — leave the name BARE
         // so the GPI access macro (#define ec_X (__gpi_snap->…)) applies.
         const ecName = ecPdoCanon(baseName);
@@ -6200,7 +6745,7 @@ const transpileLDLogics = (rungs, stdFunctions = {}, parentName = '', category =
             return null;
         }
         if (isTimeLiteral(s)) {
-            return mapIECtoTimeUs(s).toString();
+            return `${mapIECDuration(s)}LL`;
         }
         // Quoted STRING literal ('…' IEC, "…" also accepted) → C string
         const strLit = quotedStringToC(s);
@@ -6325,6 +6870,15 @@ const transpileLDLogics = (rungs, stdFunctions = {}, parentName = '', category =
 
     rungs.forEach((rung, ri) => {
         const rungIdx = rungIdxOffset + ri;
+        // The rung number the EDITOR shows (an SCL POU counts its ST rungs
+        // too, rungIdx only the LD ones).
+        ldRungNo = ldCtx?.rungNo ?? rungIdx + 1;
+        const ldFail = (msg) => { throw new Error(`LD ${ldKind} ${parentName}, rung ${ldRungNo}: ${msg}`); };
+        const blockLabel = (b) => {
+            const d = b.data || {};
+            const v = String(d.values?.var || d.values?.coil || d.instanceName || '').replace(/[🌍🏠⊞⊡⊟]/g, '').trim();
+            return `${b.type}${v ? ` "${v}"` : ''}`;
+        };
         out += `    // Rung ${rungIdx}\n`;
 
         if (!rung.blocks || rung.blocks.length === 0) {
@@ -6372,10 +6926,13 @@ const transpileLDLogics = (rungs, stdFunctions = {}, parentName = '', category =
                 if (incoming[child] === 0) queue.push(child);
             });
         }
-        // Append any blocks not reached (disconnected sub-graphs / cycles)
-        rung.blocks.forEach(b => {
-            if (!sorted.includes(b.id)) sorted.push(b.id);
-        });
+        // §8.1.5.2 a: an explicit feedback loop exists only in FBD — in LD
+        // feedback goes through a variable (a self-holding contact). A block
+        // Kahn's sort could not place is on a CYCLE of wires.
+        const cyclic = rung.blocks.filter(b => !sorted.includes(b.id));
+        if (cyclic.length) {
+            ldFail(`the wiring forms a loop through ${cyclic.map(blockLabel).join(', ')} — LD has no explicit feedback (IEC §8.1.5.2 a); use a variable (a self-holding contact) instead`);
+        }
 
         // Index map: blockId → position in sorted array
         const sortedIndex = {};
@@ -6451,7 +7008,8 @@ const transpileLDLogics = (rungs, stdFunctions = {}, parentName = '', category =
                     conds.push(`out_r${rungIdx}_b${sortedIndex[c.source]}`);
                 }
             });
-            return conds.length > 0 ? `(${conds.join(' || ')})` : 'true';
+            // null: no power wire reaches this element at all.
+            return conds.length > 0 ? `(${conds.join(' || ')})` : null;
         };
 
         // 3. Emit C code in topological order
@@ -6461,7 +7019,22 @@ const transpileLDLogics = (rungs, stdFunctions = {}, parentName = '', category =
             const data = b.data || {};
             const subType = data.subType || (type === 'Contact' ? 'NO' : 'Normal');
             const bOut = `out_r${rungIdx}_b${idx}`;
-            const inExpr = getInExpr(blockId, type);
+            // §8.2.3: power reaches an element only from the left rail through
+            // links. A contact or coil with no incoming link is an incomplete
+            // network — it used to behave as if wired to the rail. A block's
+            // trigger input (TON.IN, CTU.CU …) needs a link or a value; an
+            // unconnected EN is TRUE by definition (§6.6.1.5: EN := 1).
+            const rawIn = getInExpr(blockId, type);
+            if (rawIn === null && (type === 'Contact' || type === 'Coil')) {
+                ldFail(`${blockLabel(b)} is not connected to the left power rail (IEC §8.2.3)`);
+            }
+            if (rawIn === null && FB_TRIGGER_PIN[type] && FB_TRIGGER_PIN[type] !== 'EN' && !isInlineMathType(type)) {
+                const tv = data.values?.[FB_TRIGGER_PIN[type]];
+                if (tv === undefined || tv === null || String(tv).trim() === '') {
+                    ldFail(`${blockLabel(b)}: its ${FB_TRIGGER_PIN[type]} input is neither wired nor given a value`);
+                }
+            }
+            const inExpr = rawIn ?? 'true';
 
             out += `    bool ${bOut} = false;\n`;
 
@@ -6489,8 +7062,9 @@ const transpileLDLogics = (rungs, stdFunctions = {}, parentName = '', category =
                             out += `    ${mem} = ${v};\n`;
                             out += `    ${bOut} = ${inExpr} && ${edgeLocal};\n`;
                         } else {
-                            // No persistent state (function): level semantics fallback
-                            out += `    ${bOut} = ${inExpr} && ${subType === 'Falling' ? `!${v}` : v}; /* edge contact: no state in FUNCTION, level fallback */\n`;
+                            // T75: a P/N contact is a one-evaluation pulse, which
+                            // needs memory a FUNCTION does not have (§6.6.2.1).
+                            ldFail(`${subType === 'Rising' ? 'P' : 'N'} (edge) contact "${varName}" needs state, and a FUNCTION has none — use it in a FUNCTION_BLOCK or PROGRAM`);
                         }
                     } else if (subType === 'NC') {
                         out += `    ${bOut} = ${inExpr} && !${v};\n`;
@@ -6520,7 +7094,7 @@ const transpileLDLogics = (rungs, stdFunctions = {}, parentName = '', category =
                             out += `    ${v} = ${subType === 'Rising' ? `(${bOut} && !${mem})` : `(!${bOut} && ${mem})`};\n`;
                             out += `    ${mem} = ${bOut};\n`;
                         } else {
-                            out += `    ${v} = ${bOut}; /* edge coil: no state in FUNCTION, level fallback */\n`;
+                            ldFail(`${subType === 'Rising' ? 'P' : 'N'} (edge) coil "${varName}" needs state, and a FUNCTION has none — use it in a FUNCTION_BLOCK or PROGRAM`);
                         }
                     } else {
                         out += `    ${v} = ${bOut};\n`;
@@ -6656,7 +7230,8 @@ const transpileLDLogics = (rungs, stdFunctions = {}, parentName = '', category =
                             const a = cv(inputVals[0] || '0');
                             const b = cv(inputVals[1] || '0');
                             if (type === 'SUB') expr = `${a} - ${b}`;
-                            else if (type === 'DIV') expr = isF ? `(${b} != ${zero}) ? (${a} / ${b}) : ${zero}` : `KRON_IDIV(${a}, ${b})`;
+                            // §7.3.2 a: a divide by zero is a run-time error (KRON_RTE).
+                            else if (type === 'DIV') expr = `KRON_DIV(${a}, ${b}, "${cEscapeString(`LD ${ldKind} ${parentName}, rung ${ldRungNo}: ${data.instanceName || 'DIV'}`)}")`;
                             else if (type === 'MOD') expr = isF ? `(${b} != ${zero}) ? fmod${fsuf}(${a}, ${b}) : ${zero}` : `KRON_IMOD(${a}, ${b})`;
                             else if (type === 'MOVE') expr = a;
                             else if (type === 'NEG') expr = `-${a}`;
@@ -6801,14 +7376,9 @@ const transpileLDLogics = (rungs, stdFunctions = {}, parentName = '', category =
                             } else {
                                 resultExpr = `KRON_STRING_TO_${kd}(${args[0]})`;
                             }
-                        } else if ((srcType === 'REAL' || srcType === 'LREAL') && IEC_INT_TYPES.has(dstType)) {
-                            // ⚠️ IEC REAL_TO_INT ROUNDS; a C cast truncates (2.7 → 2).
-                            resultExpr = srcType === 'REAL'
-                                ? `((${mapType(dstType)})llrintf((float)(${args[0]})))`
-                                : `((${mapType(dstType)})llrint((double)(${args[0]})))`;
                         } else {
-                            // Other numeric conversions — a C cast is exact and free
-                            resultExpr = `(${mapType(dstType)})(${args[0]})`;
+                            // T22–T25 (rounding, saturation, binary transfer) — convC.
+                            resultExpr = convC(srcType, dstType, args[0]);
                         }
                     } else {
                         // ⚠️ Never emit a placeholder: `/* unknown */ 0` compiled
@@ -7157,12 +7727,12 @@ const mapType = (iecType) => {
     return typeMap[String(iecType || '').trim().toUpperCase()] || String(iecType || '').trim().replace(/\s+/g, '_');
 };
 
-const transpileDataType = (dt) => {
+const transpileDataType = (dt, enumDup = new Set()) => {
     let code = '';
     if (dt.type === 'Enumerated') {
         code += `typedef enum {\n`;
         dt.content.values.forEach((val, i) => {
-            code += `    ${val.name}${val.value !== undefined && val.value !== '' ? ` = ${val.value}` : ''}${i < dt.content.values.length - 1 ? ',' : ''}\n`;
+            code += `    ${enumCName(dt.name, val.name, enumDup)}${val.value !== undefined && val.value !== '' ? ` = ${val.value}` : ''}${i < dt.content.values.length - 1 ? ',' : ''}\n`;
         });
         code += `} ${dt.name};\n\n`;
     } else if (dt.type === 'Structure') {

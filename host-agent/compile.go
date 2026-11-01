@@ -22,6 +22,14 @@ import (
 // handleRunSimulation; targets/deploy/hotswap keep the literal "runtime.bin".
 const simBin = "sim_runtime.bin"
 
+// plcSemanticsFlags go on EVERY compile of the generated plc.c (plain sim,
+// hot-swap logic.so, target binary, target logic.so) — they define what the
+// program MEANS, not how it is optimised. -fwrapv: IEC integer arithmetic
+// wraps in two's complement; without it a DINT/LINT overflow is undefined in
+// C, and -O2/-O3 may fold `x + 1 > x` to TRUE, so the sim (-O0) and the
+// target (-O3) could disagree about the same program.
+var plcSemanticsFlags = []string{"-fwrapv"}
+
 // ── compile_simulation ───────────────────────────────────────────────────────
 
 func (s *Server) handleCompileSimulation(w http.ResponseWriter, r *http.Request) {
@@ -90,6 +98,7 @@ func (s *Server) compileSimulation() (string, string, error) {
 		"-ffunction-sections",
 		"-fdata-sections",
 	)
+	args = append(args, plcSemanticsFlags...)
 	args = append(args, hostUseLLD()...)
 	args = append(args,
 		// -O0 for the SIMULATION build: it is a correctness/logic test, not a
@@ -136,10 +145,12 @@ func (s *Server) compileSimulation() (string, string, error) {
 }
 
 // simInputsHash returns a SHA-256 over the transpiled inputs (plc.c + plc.h)
-// that fully determine the simulation binary. Empty string on any read error
-// (caller then just rebuilds — never a false cache hit).
+// and the flags that change what they mean (plcSemanticsFlags), which together
+// determine the simulation binary. Empty string on any read error (caller then
+// just rebuilds — never a false cache hit).
 func simInputsHash(buildDir string) string {
 	h := sha256.New()
+	h.Write([]byte(strings.Join(plcSemanticsFlags, " ")))
 	for _, name := range []string{"plc.c", "plc.h"} {
 		b, err := os.ReadFile(filepath.Join(buildDir, name))
 		if err != nil {
@@ -231,6 +242,7 @@ func (s *Server) compileForTarget(req *compileForTargetReq) (string, string, err
 
 	args := append([]string{}, baseArgs...)
 	args = append(args, "-O3", "-ffunction-sections", "-fdata-sections", "-fuse-ld=lld", "-static", "-Wl,--gc-sections")
+	args = append(args, plcSemanticsFlags...)
 	args = append(args, bt.flags...)
 
 	needsEC := strings.Contains(req.Source, "kron_ec_init(") ||

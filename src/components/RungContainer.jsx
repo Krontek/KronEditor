@@ -1,7 +1,7 @@
 import React, { useState, useCallback, useRef, useEffect } from 'react';
 import { useTranslation } from 'react-i18next';
 import WriteValueModal from './common/WriteValueModal';
-import { formatTimeUs, normalizeTimeLiteral, isTimeType } from '../utils/plcStandards';
+import { formatDuration, normalizeTimeLiteral, isTimeType } from '../utils/plcStandards';
 import { liveGet, liveResolveKey, findVarByName } from '../utils/iecNames';
 import { ErrorCodeService } from '../services/ErrorCodeService';
 import ReactFlow, {
@@ -1034,7 +1034,7 @@ const BlockNode = ({ id, data, selected }) => {
                       const varLiveVal = pinLiveVal;
                       const hasLive = pinHasLive;
                       const liveStr = hasLive
-                        ? (typeof varLiveVal === 'boolean' ? (varLiveVal ? '1' : '0') : (isTimeType(pin.type) ? formatTimeUs(varLiveVal) : String(varLiveVal)))
+                        ? (typeof varLiveVal === 'boolean' ? (varLiveVal ? '1' : '0') : (isTimeType(pin.type) ? formatDuration(varLiveVal, pin.type) : String(varLiveVal)))
                         : '---';
                       // Open the write-value dialog for whatever this badge is showing:
                       // the variable assigned to the pin, else the pin's own shadow field.
@@ -1247,7 +1247,7 @@ const BlockNode = ({ id, data, selected }) => {
             const liveDisplay = hasLive
               ? (typeof outLiveVal === 'boolean'
                 ? (outLiveVal ? '1' : '0')
-                : isTimeType(pin.type) ? formatTimeUs(outLiveVal) : String(outLiveVal))
+                : isTimeType(pin.type) ? formatDuration(outLiveVal, pin.type) : String(outLiveVal))
               : null;
 
             return (

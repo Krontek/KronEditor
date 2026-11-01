@@ -1226,14 +1226,17 @@ static inline void Read_Hwmon_Call(Read_Hwmon *inst)
  * archive, and TIME has no entry there. These blocks fill the gap instead, so
  * their names deliberately avoid the _TO_ spelling.
  *
- * IEC TIME (and LTIME, the same type) is a SIGNED 64-bit count of
- * MICROseconds end to end (kronstandard.h), so a duration may be negative
- * (T#-5s) and spans about +/- 292 000 years. Every block below SATURATES at
- * the int64 limits rather than wrapping (signed overflow is undefined
- * behaviour in C). T_To_Ms additionally saturates to its DINT output.
+ * IEC TIME is a SIGNED 64-bit count of MICROseconds end to end
+ * (kronstandard.h), so a duration may be negative (T#-5s) and spans about
+ * +/- 292 000 years. LTIME is a signed 64-bit count of NANOseconds (IEC
+ * 61131-3:2013 Table 10 footnote m) — the same C type, a different unit — and
+ * none of the blocks below accepts it: convert with LTIME_TO_TIME first.
+ * Every block below SATURATES at the int64 limits rather than wrapping
+ * (signed overflow is undefined behaviour in C). T_To_Ms additionally
+ * saturates to its DINT output.
  *
  * The fields are declared int64_t, not TIME: this header must not depend on
- * kronstandard.h being included first, and the two are the same type.
+ * kronstandard.h being included first, and TIME is int64_t there.
  *===========================================================================*/
 
 #define KRON_T_MAX INT64_MAX

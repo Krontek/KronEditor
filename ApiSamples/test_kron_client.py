@@ -147,7 +147,7 @@ class BufferedV2Test(unittest.TestCase):
 
 
 class TimeTypeTest(unittest.TestCase):
-    """IEC TIME/LTIME = int64 microseconds (signed), published as "int64"."""
+    """IEC TIME = int64 microseconds (LTIME: nanoseconds), signed, published as "int64"."""
 
     def test_ring_decodes_time_as_signed_64bit(self):
         layout = {"tasks": [{"task_id": 0, "vars": [

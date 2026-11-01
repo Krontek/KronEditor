@@ -34,16 +34,10 @@ const SettingsPage = ({ theme, setTheme, editorSettings, setEditorSettings, sele
     const unlistenRef = useRef(null);
 
     // Connection state
-    const [connIp, setConnIp] = useState(() => {
-        const saved = localStorage.getItem('plcAddress') || '';
-        const parts = saved.split(':');
-        return parts[0] || '';
-    });
-    const [connPort, setConnPort] = useState(() => {
-        const saved = localStorage.getItem('plcAddress') || '';
-        const parts = saved.split(':');
-        return parts[1] || '7070';
-    });
+    // Seeded from the PROJECT's address, never from localStorage (a new
+    // project must not show the previous project's target).
+    const [connIp, setConnIp] = useState(() => (plcAddress || '').split(':')[0] || '');
+    const [connPort, setConnPort] = useState(() => (plcAddress || '').split(':')[1] || '7070');
     const [connStatus, setConnStatus] = useState(null); // null | 'checking' | 'connected' | 'failed' | 'disconnected'
 
     // ── Network device search (pick an interface, scan its subnet) ──────────
@@ -237,13 +231,11 @@ const SettingsPage = ({ theme, setTheme, editorSettings, setEditorSettings, sele
     const [sshPort, setSshPort] = useState(() => sshPortProp || localStorage.getItem('sshPort') || '22');
     const [isDeploying, setIsDeploying] = useState(false);
 
-    // Sync connection fields when project is loaded (props change)
+    // Sync connection fields when project is loaded/closed (props change)
     useEffect(() => {
-        if (plcAddress) {
-            const parts = plcAddress.split(':');
-            setConnIp(parts[0] || '');
-            setConnPort(parts[1] || '7070');
-        }
+        const parts = (plcAddress || '').split(':');
+        setConnIp(parts[0] || '');
+        setConnPort(parts[1] || '7070');
     }, [plcAddress]);
 
     useEffect(() => {
@@ -384,7 +376,6 @@ const SettingsPage = ({ theme, setTheme, editorSettings, setEditorSettings, sele
         try {
             await host.checkServerStatus(addr);
             setConnStatus('connected');
-            localStorage.setItem('plcAddress', addr);
             if (setPlcAddress) setPlcAddress(addr);
             if (setConnectionEnabled) setConnectionEnabled(true);
         } catch {
@@ -399,7 +390,6 @@ const SettingsPage = ({ theme, setTheme, editorSettings, setEditorSettings, sele
 
     const handleSaveConnection = () => {
         const addr = connIp ? `${connIp}:${connPort}` : '';
-        localStorage.setItem('plcAddress', addr);
         localStorage.setItem('sshUser', sshUser);
         localStorage.setItem('sshPort', sshPort);
         if (setPlcAddress) setPlcAddress(addr);
@@ -429,7 +419,6 @@ const SettingsPage = ({ theme, setTheme, editorSettings, setEditorSettings, sele
             setProgressLog(prev => prev + '✓ Server deployed successfully!\n');
             setConnStatus('connected');
             const addr = `${connIp}:${connPort}`;
-            localStorage.setItem('plcAddress', addr);
             if (setPlcAddress) setPlcAddress(addr);
         } catch (err) {
             setProgressLog(prev => prev + '✗ Deploy failed: ' + (err.message || err) + '\n');

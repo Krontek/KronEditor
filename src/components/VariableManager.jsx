@@ -2,11 +2,11 @@ import React, { useState, useEffect, useRef } from 'react';
 import { DataTypeSelector, ModernSelect } from './common/Selectors';
 import WriteValueModal from './common/WriteValueModal';
 import { useTranslation } from 'react-i18next';
-import { formatTimeUs, isTimeType, normalizeTimeLiteral } from '../utils/plcStandards';
+import { formatTimeUs, formatDuration, isTimeType, normalizeTimeLiteral } from '../utils/plcStandards';
 import { blockConfig } from './RungContainer';
 import { writeClipboard, readClipboard, useKronClipboard, CLIP_KIND } from '../utils/kronClipboard';
 import { setEditorScope, getEditorScope, EDITOR_SCOPE, hasTextSelection } from '../utils/editorScope';
-import { isReservedTranspilerName, isValidIecIdentifier } from '../utils/reservedNames';
+import { isReservedTranspilerName, isValidIecIdentifier, iecIdentifierProblem } from '../utils/reservedNames';
 import { formatIECAddress, retargetIECAddress } from '../utils/iecAddress';
 
 const ALL_CLASSES = ['Local', 'Global', 'Input', 'Output', 'InOut', 'Temp'];
@@ -372,7 +372,7 @@ const VariableManager = ({
     // Must be a valid IEC identifier — no spaces (incl. internal), no
     // punctuation, no leading digit — else the generated C symbol is broken.
     if (!isValidIecIdentifier(trimmed)) {
-      alert(t('errors.invalidVarName', { name: trimmed }));
+      alert(`${t('errors.invalidVarName', { name: trimmed })}\n${iecIdentifierProblem(trimmed)}`);
       return;
     }
     // Block names the transpiler/runtime reserve at C file scope (e.g. "S" is
@@ -467,7 +467,7 @@ const VariableManager = ({
       let display;
       if (typeof v === 'boolean') display = v ? 'T' : 'F';
       else if (e.type === 'BOOL' && (v === 0 || v === 1)) display = v ? 'T' : 'F';
-      else if (isTimeType(e.type)) display = formatTimeUs(v);
+      else if (isTimeType(e.type)) display = formatDuration(v, e.type);
       else display = String(v ?? '---');
       return `${e.pin}=${display}`;
     }).join(' ');
@@ -481,7 +481,7 @@ const VariableManager = ({
       if ('Q' in val && 'CV' in val) return `Q=${val.Q ? 'T' : 'F'} CV=${val.CV}`;
       return JSON.stringify(val);
     }
-    if (isTimeType(type)) return formatTimeUs(val);
+    if (isTimeType(type)) return formatDuration(val, type);
     return String(val);
   };
 

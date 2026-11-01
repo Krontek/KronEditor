@@ -4,7 +4,7 @@ import WriteValueModal from './common/WriteValueModal';
 import { ErrorCodeService } from '../services/ErrorCodeService';
 import { findVarByName } from '../utils/iecNames';
 import { ERROR_CATEGORY } from '../utils/errorFormat';
-import { formatTimeUs, isTimeType } from '../utils/plcStandards';
+import { formatDuration, isTimeType } from '../utils/plcStandards';
 
 const LOG_COLORS = {
     info:    '#c8c8c8',
@@ -506,7 +506,7 @@ const OutputPanel = ({
         if (typeof val === 'boolean') return val ? 'TRUE' : 'FALSE';
         // TIME/LTIME: signed 64-bit µs; a value beyond ±2^53 arrives as a
         // decimal string, which formatTimeUs keeps exact.
-        if (isTimeType(type)) return formatTimeUs(val);
+        if (isTimeType(type)) return formatDuration(val, type);
         return String(val);
     };
 

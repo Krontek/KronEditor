@@ -18,7 +18,7 @@
  * context but cannot change hardware.
  */
 
-import { isReservedTranspilerName } from '../utils/reservedNames';
+import { isReservedTranspilerName, isValidIecIdentifier, iecIdentifierProblem } from '../utils/reservedNames';
 import { validateIECAddress, retargetIECAddress } from '../utils/iecAddress';
 import { findVarByName } from '../utils/iecNames';
 // Single source of truth for FB power-flow wiring: the transpiler reads the
@@ -32,10 +32,9 @@ const RESOURCE_TYPE = 'RESOURCE_EDITOR';
 
 // ── small immutable helpers ──────────────────────────────────────────────────
 
-// IEC 61131-3 identifier: starts with a letter or underscore, then letters /
-// digits / underscores. No spaces or punctuation. Used for POU + variable names.
-const IEC_NAME_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
-const isValidIecName = (n) => IEC_NAME_RE.test(String(n || '').trim());
+// IEC 61131-3 identifier (§6.1.2/§6.1.3 — the one rule, utils/reservedNames.js):
+// no double or trailing underscore, not a keyword. Used for POU + variable names.
+const isValidIecName = (n) => isValidIecIdentifier(n);
 
 // Scalar IEC 61131-3 types the transpiler's mapType() resolves directly
 // (CTranspilerService.js's typeMap). Anything NOT in this set must be either
@@ -828,7 +827,7 @@ export function applyToolCall(struct, name, args = {}) {
           : (catRaw === 'function' || catRaw === 'functions') ? 'functions'
           : 'programs';
         if (!args.name || !args.name.trim()) return { ok: false, error: 'name is required' };
-        if (!isValidIecName(args.name)) return { ok: false, error: `invalid name "${args.name}" — POU names must be IEC identifiers (letters, digits, underscore; no spaces; can't start with a digit)` };
+        if (!isValidIecName(args.name)) return { ok: false, error: `invalid name "${args.name}" — ${iecIdentifierProblem(args.name)}` };
         if (isReservedTranspilerName(args.name)) return { ok: false, error: `"${args.name}" is reserved by the transpiler/runtime — pick a different POU name` };
         if (findPOU(struct, args.name)) return { ok: false, error: `a POU named "${args.name}" already exists — edit it directly with set_ladder / set_st_code (read_pou first to see what it contains), or choose a different name.` };
         // Unified rung model: every POU is 'SCL' (a list of rungs, each LD or
@@ -857,7 +856,7 @@ export function applyToolCall(struct, name, args = {}) {
         const hit = findPOU(struct, args.name);
         if (!hit) return { ok: false, error: pouTargetError(struct, args.name) };
         if (!args.newName || !args.newName.trim()) return { ok: false, error: 'newName is required' };
-        if (!isValidIecName(args.newName)) return { ok: false, error: `invalid name "${args.newName}" — must be an IEC identifier (no spaces; can't start with a digit)` };
+        if (!isValidIecName(args.newName)) return { ok: false, error: `invalid name "${args.newName}" — ${iecIdentifierProblem(args.newName)}` };
         if (isReservedTranspilerName(args.newName)) return { ok: false, error: `"${args.newName}" is reserved by the transpiler/runtime — pick a different name` };
         if (findPOU(struct, args.newName)) return { ok: false, error: `name "${args.newName}" is already taken` };
         const list = struct[hit.category].map((p, i) => (i === hit.index ? { ...p, name: args.newName.trim() } : p));
@@ -1040,7 +1039,7 @@ export function applyToolCall(struct, name, args = {}) {
       case 'add_variable': {
         const scope = args.scope === 'global' ? 'global' : 'local';
         if (!args.name || !args.name.trim()) return { ok: false, error: 'name is required' };
-        if (!isValidIecName(args.name)) return { ok: false, error: `invalid variable name "${args.name}" — must be an IEC identifier (no spaces; can't start with a digit)` };
+        if (!isValidIecName(args.name)) return { ok: false, error: `invalid variable name "${args.name}" — ${iecIdentifierProblem(args.name)}` };
         if (isReservedTranspilerName(args.name)) return { ok: false, error: `"${args.name}" is reserved by the transpiler/runtime (e.g. "S" is the internal PlcState pointer) — pick a different name` };
         const resolved = resolveVarType(struct, args.type, args.__hardware);
         if (!resolved.ok) return { ok: false, error: resolved.error };

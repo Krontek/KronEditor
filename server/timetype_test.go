@@ -6,7 +6,7 @@ import (
 )
 
 // IEC TIME/LTIME reach KronServer as the variable-table type "int64" (signed
-// microseconds, CTranspilerService.js IEC_TO_SERVER_TYPE). They used to be
+// microseconds for TIME, nanoseconds for LTIME, CTranspilerService.js IEC_TO_SERVER_TYPE). They used to be
 // "uint32", so T#2h wrapped and a negative duration could not be written.
 // Every path here is the generic int64 one; this pins the TIME values that
 // matter: beyond 2^32, negative, and beyond 2^53 (must stay exact).

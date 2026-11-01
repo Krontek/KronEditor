@@ -35,8 +35,9 @@ Notes that bite:
 
 - Only variables with an IEC **address** in the editor's Address column are
   visible over REST. Everything else is editor-only.
-- An IEC `TIME`/`LTIME` variable is type **`int64`**: signed **microseconds**
-  (`T#2h` = `7200000000`, `T#-5s` = `-5000000`), addressed as `%ML`. Beyond
+- An IEC `TIME`/`LTIME` variable is type **`int64`**: signed **microseconds** for
+  `TIME` (`T#2h` = `7200000000`, `T#-5s` = `-5000000`), **nanoseconds** for `LTIME`
+  (`LT#1s` = `1000000000`), addressed as `%ML`. Beyond
   ±2^53 a REST/SSE value is a decimal string; `kron_client.time_us()` /
   `format_iec_time()` handle both.
 - A REST write is **one-shot**: the value is written once and the program owns

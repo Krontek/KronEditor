@@ -1,7 +1,7 @@
 // src/utils/plcStandards.js
 
-// Coerce a live TIME value to a BigInt. TIME/LTIME are signed 64-bit
-// MICROseconds; a value beyond ±2^53 arrives as a decimal STRING (jsonSafe64
+// Coerce a live TIME/LTIME value to a BigInt. TIME is signed 64-bit
+// MICROseconds, LTIME NANOseconds; a value beyond ±2^53 arrives as a decimal STRING (jsonSafe64
 // on both agents), which Number() would round. Returns null when the value
 // is not an integer count.
 const toBigIntUs = (us) => {
@@ -15,7 +15,8 @@ const toBigIntUs = (us) => {
 };
 
 /**
- * Format a TIME/LTIME value (signed 64-bit microseconds) into IEC T# notation.
+ * Format a TIME value (signed 64-bit microseconds) into IEC T# notation
+ * (an LTIME is nanoseconds — formatDuration / formatTimeNs).
  * e.g. 1100000 → "T#1s100ms", 7200000000 → "T#2h", -5000000 → "T#-5s",
  * 90061000001 → "T#1d1h1m1s1us". A non-numeric value is returned as text.
  */
@@ -80,6 +81,57 @@ export const parseTimeUs = (raw) => {
     if (neg) total = -total;
     return (total < INT64_MIN || total > INT64_MAX) ? null : total;
 };
+
+// ── LTIME: signed 64-bit NANOseconds (IEC 61131-3 T10 fn. m) ──
+// TIME stays microseconds; the two are distinct units end to end (transpiler
+// mapIECtoTimeNs, root CLAUDE.md). Every display / write of a duration must go
+// through formatDuration / parseDuration with the variable's TYPE.
+export const formatTimeNs = (ns) => {
+    const big = toBigIntUs(ns);
+    if (big === null) return String(ns);
+    if (big === 0n) return 'LT#0s';
+    const neg = big < 0n;
+    let rem = neg ? -big : big;
+    const parts = [[86_400_000_000_000n, 'd'], [3_600_000_000_000n, 'h'], [60_000_000_000n, 'm'],
+        [1_000_000_000n, 's'], [1_000_000n, 'ms'], [1_000n, 'us'], [1n, 'ns']];
+    let result = neg ? 'LT#-' : 'LT#';
+    for (const [unit, suffix] of parts) {
+        const q = rem / unit;
+        rem %= unit;
+        if (q) result += `${q}${suffix}`;
+    }
+    return result;
+};
+// A user-typed LTIME → nanoseconds (BigInt); a bare integer is NANOseconds.
+export const parseTimeNs = (raw) => {
+    let s = String(raw ?? '').trim().toUpperCase().replace(/^(?:LTIME|TIME|LT|T)#/, '').replace(/_/g, '');
+    if (!s) return null;
+    let neg = false;
+    if (s[0] === '-' || s[0] === '+') { neg = s[0] === '-'; s = s.slice(1); }
+    if (!s) return null;
+    const UNIT = { D: 86_400_000_000_000n, H: 3_600_000_000_000n, M: 60_000_000_000n, S: 1_000_000_000n, MS: 1_000_000n, US: 1_000n, NS: 1n };
+    let total = 0n;
+    if (/^\d+$/.test(s)) {
+        total = BigInt(s);
+    } else {
+        const re = /(\d+)(?:\.(\d+))?(MS|US|NS|D|H|M|S)/y;
+        let idx = 0;
+        while (idx < s.length) {
+            re.lastIndex = idx;
+            const m = re.exec(s);
+            if (!m) return null;
+            const [, whole, frac = '', unit] = m;
+            total += BigInt(whole) * UNIT[unit];
+            if (frac) total += (BigInt(frac) * UNIT[unit]) / (10n ** BigInt(frac.length));
+            idx = re.lastIndex;
+        }
+    }
+    if (neg) total = -total;
+    return (total < INT64_MIN || total > INT64_MAX) ? null : total;
+};
+const isLtime = (type) => String(type || '').trim().toUpperCase() === 'LTIME';
+export const formatDuration = (val, type) => (isLtime(type) ? formatTimeNs(val) : formatTimeUs(val));
+export const parseDuration = (raw, type) => (isLtime(type) ? parseTimeNs(raw) : parseTimeUs(raw));
 
 // True for the IEC duration types the T#-prefix normalisation applies to.
 export const isTimeType = (type) => {

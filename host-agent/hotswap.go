@@ -555,6 +555,7 @@ func (s *Server) compileLogic(buildDir string, ver int) (string, string, error) 
 	args = append(args, ecSimFlag(libDir, resInclude)...)
 	args = append(args, soemIncludeArgs(resInclude)...)
 	args = append(args, hostUseLLD()...)
+	args = append(args, plcSemanticsFlags...)
 	args = append(args, "-O2", "-o", tmpSO, plcC)
 	args = append(args, staticArchiveLinkArgs(libDir, runtime.GOOS == "darwin")...)
 	args = append(args, "-lm")
@@ -868,6 +869,7 @@ func (s *Server) compileLogicForTarget(buildDir, boardID string, ver int) (strin
 	tmpSO := hotswaplib.TempGenerationPath(buildDir, ver) // atomic install — see compileLogic
 	args := append([]string{}, baseArgs...)
 	args = append(args, "-shared", "-fPIC", "-DPLC_HOTSWAP", "-O2", "-ffunction-sections", "-fdata-sections", "-fuse-ld=lld")
+	args = append(args, plcSemanticsFlags...)
 	args = append(args, bt.flags...)
 	for _, inc := range sysIncs {
 		args = append(args, "-isystem", inc)

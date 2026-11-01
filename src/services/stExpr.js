@@ -55,6 +55,36 @@ const isTimeT = (t) => t === 'TIME' || t === 'LTIME';
 const isStrT = (t) => t === 'STRING' || t === 'WSTRING';
 const isBoolT = (t) => t === 'BOOL';
 const isNumT = (t) => isIntT(t) || isRealT(t) || isTimeT(t);
+// IEC keeps the bit strings apart from the integers: no arithmetic on a WORD,
+// no AND on an INT (T29 ADD/SUB/MUL/DIV take ANY_MAGNITUDE/ANY_NUM, T31
+// AND/OR/XOR/NOT take ANY_BIT). isIntT above is the C REPRESENTATION question
+// (an integer of some width); these are the IEC categories.
+const BIT_STR = new Set(['BYTE', 'WORD', 'DWORD', 'LWORD']);
+const isBitStrT = (t) => BIT_STR.has(t);
+const isAnyIntT = (t) => t === '#INT' || (!!INT_INFO[t] && !BIT_STR.has(t));
+const isAnyNumT = (t) => isAnyIntT(t) || isRealT(t);
+const isLitT = (t) => t === '#INT' || t === '#REAL';
+// IEC 61131-3 F11/F12 — the ONLY implicit conversions (value- and
+// accuracy-preserving). Everything else needs an explicit <A>_TO_<B>: no
+// narrowing (DINT→INT, LREAL→REAL), no signed→unsigned, never integer ↔ bit
+// string, DINT→REAL only explicitly (precision). Standards/iec61131-3.md §6.6.
+const IMPLICIT = {
+    BOOL: ['BYTE', 'WORD', 'DWORD', 'LWORD'],
+    BYTE: ['WORD', 'DWORD', 'LWORD'], WORD: ['DWORD', 'LWORD'], DWORD: ['LWORD'],
+    SINT: ['INT', 'DINT', 'LINT', 'REAL', 'LREAL'],
+    INT: ['DINT', 'LINT', 'REAL', 'LREAL'],
+    DINT: ['LINT', 'LREAL'],
+    USINT: ['UINT', 'UDINT', 'ULINT', 'INT', 'DINT', 'LINT', 'REAL', 'LREAL'],
+    UINT: ['UDINT', 'ULINT', 'DINT', 'LINT', 'REAL', 'LREAL'],
+    UDINT: ['ULINT', 'LINT', 'LREAL'],
+    REAL: ['LREAL'],
+    TIME: ['LTIME'],
+};
+const canImplicit = (from, to) => from === to || (IMPLICIT[from] || []).includes(to);
+// Two operands of different types meet in the SMALLEST type both convert to
+// implicitly (INT + UINT → DINT, DINT + REAL → LREAL), none → a type error.
+const UNIFY_ORDER = ['SINT', 'USINT', 'INT', 'UINT', 'DINT', 'UDINT', 'LINT', 'ULINT', 'REAL', 'LREAL',
+    'BYTE', 'WORD', 'DWORD', 'LWORD', 'TIME', 'LTIME'];
 const widthOf = (t) => (INT_INFO[t] ? INT_INFO[t][0] : isTimeT(t) ? 64 : 0);
 const signedT = (t) => (INT_INFO[t] ? INT_INFO[t][1] : isTimeT(t));
 const showT = (t) => (t === '#INT' ? 'integer literal' : t === '#REAL' ? 'real literal' : t === null ? 'unknown type' : t);
@@ -150,7 +180,9 @@ export const tokenizeST = (text, env) => {
                     const mm = tm.exec(s);
                     if (!mm) fail(`malformed time literal "${s.slice(pos, pos + 24).split(/[\s,;)]/)[0]}"`);
                     const lit = s.slice(pos, i + 1 + mm[0].length);
-                    toks.push({ k: 'time', us: BigInt(H.mapIECtoTimeUs(lit)), type: up.startsWith('L') ? 'LTIME' : 'TIME', raw: lit, pos });
+                    // LT#/LTIME# is an LTIME literal in NANOseconds, T#/TIME# a TIME in µs.
+                    const isL = up.startsWith('L');
+                    toks.push({ k: 'time', us: isL ? BigInt(H.mapIECtoTimeNs(lit)) : BigInt(H.mapIECtoTimeUs(lit)), type: isL ? 'LTIME' : 'TIME', raw: lit, pos });
                     i += 1 + mm[0].length;
                     continue;
                 }
@@ -219,24 +251,26 @@ export const tokenizeST = (text, env) => {
 };
 
 // ── Pratt parser ────────────────────────────────────────────────────────────
-// IEC 61131-3 (3rd ed., table "Operators of the ST language"), highest first:
-//   ( ) and function calls · ** · unary - + NOT · * / MOD · + - ·
+// IEC 61131-3 Table 71 / Annex A, highest first:
+//   ( ) and function calls · unary - + NOT · ** · * / MOD · + - ·
 //   < > <= >= · = <> · AND & · XOR · OR
-// ⚠️ `**` is LEFT-associative here (`2**3**2` = 64): the standard gives no
-// right-associativity rule and says operators of equal precedence apply left
-// to right; CODESYS does the same, and so did the regex path this replaces.
-// `**` binds tighter than unary minus, so `-2**2` is -(2**2) = -4. A unary
-// operand is accepted on the RIGHT of `**` (`2 ** -1`) for convenience.
-// Comparisons are NON-associative: `a < b < c` is an error, not (a<b)<c.
+// ⚠️ Unary minus binds TIGHTER than `**` (T71: negation 8, exponentiation 7;
+// Annex A `power_expr : unary_expr ('**' unary_expr)*`), so `-2.0**2.0` is
+// (-2.0)**2.0 = 4.0 — it used to be -(2**2) = -4. `**` is left-associative
+// (`2**3**2` = 64): operators of equal precedence apply left to right (§7.3.2
+// rule 2). A unary operand on the RIGHT of `**` (`2.0 ** -1`) is the grammar's
+// own `unary_expr`.
+// Comparisons are NON-associative: `a < b < c` is a compile error, not
+// (a<b)<c — a deliberate Kron restriction (Standards/iec61131-3.md §16).
 // The vendor operators BAND/BOR/BXOR/BNOT sit at the AND/OR/XOR/NOT levels
 // and are always bitwise.
 const BINARY_BP = {
     OR: 10, BOR: 10, XOR: 20, BXOR: 20, AND: 30, '&': 30, BAND: 30,
     '=': 40, '<>': 40, '<': 50, '>': 50, '<=': 50, '>=': 50,
-    '+': 60, '-': 60, '*': 70, '/': 70, MOD: 70, '**': 90,
+    '+': 60, '-': 60, '*': 70, '/': 70, MOD: 70, '**': 80,
 };
 const NON_ASSOC = new Set([40, 50]);
-const UNARY_BP = 80;
+const UNARY_BP = 90;
 
 export const parseST = (toks) => {
     let p = 0;
@@ -333,11 +367,7 @@ export const parseST = (toks) => {
                 fail(`comparison operators do not chain ("… ${t.v} …"); combine them with AND`);
             }
             next();
-            // `**` is left-associative: its right operand binds at its own
-            // level, but a unary sign is accepted there (`2 ** -1`).
-            const right = t.v === '**' && peek().k === 'op' && (peek().v === '-' || peek().v === '+')
-                ? parsePrimary()
-                : parseExpr(bp);
+            const right = parseExpr(bp);
             left = { k: 'bin', op: t.v, l: left, r: right, pos: t.pos };
             lastNonAssoc = NON_ASSOC.has(bp) ? bp : -1;
         }
@@ -402,9 +432,90 @@ export const createSTExprCompiler = (env) => {
     const castTo = (r, t) => {
         if (t === null || r.t === null || r.t === t) return r.c;
         if (r.t === '#INT' && (litFits(r.lit, t) || isRealT(t))) return r.c;
+        // A real literal next to a REAL is a REAL (float) constant: compared
+        // as a double, `r = 0.1` would never hold for a REAL r.
+        if (r.t === '#REAL' && t === 'REAL') return r.numLit ? `${r.c}f`.replace(/^(-?)(\d+)f$/, '$1$2.0f') : `((float)${r.c})`;
         if (r.t === '#REAL' && isRealT(t)) return r.c;
+        // TIME is µs, LTIME ns (both int64): the implicit TIME → LTIME
+        // conversion (F12) is a change of UNIT, not of width.
+        if (r.t === 'TIME' && t === 'LTIME') return `((int64_t)(${r.c}) * 1000LL)`;
         const ct = cTypeOf(t);
         return ct ? `((${ct})${r.c})` : r.c;
+    };
+    // Type an untyped literal takes next to an operand of type `other`
+    // (rule 8 of §6.6.1.6 leaves this to the implementer): an integer literal
+    // becomes that integer / bit-string type when its value fits, and that
+    // REAL type next to a REAL; otherwise the smallest type holding it, and
+    // the normal implicit rules decide. A real literal is REAL/LREAL.
+    const litType = (r, other) => {
+        if (r.t === '#INT') {
+            if (other && INT_INFO[other] && litFits(r.lit, other)) return other;
+            if (other === 'REAL' || other === 'LREAL') return other;
+            return literalNaturalType(r.lit);
+        }
+        if (r.t === '#REAL') return other === 'REAL' || other === 'LREAL' ? other : 'LREAL';
+        return r.t;
+    };
+    const convName = (from, to) => `${from}_TO_${to}`;
+    // The common type of two operands of an operation (§6.6.1.6 rule 7,
+    // F12): the same type, or the smallest type BOTH convert to implicitly.
+    // null when either side is UNKNOWN (C semantics then). `what` names the
+    // operation in the error.
+    const unify = (a, b, what) => {
+        if (a.t === null || b.t === null) return null;
+        if (a.t === '#INT' && b.t === '#INT') return '#INT';
+        if (isLitT(a.t) && isLitT(b.t)) return '#REAL';
+        const ta = isLitT(a.t) ? litType(a, b.t) : a.t;
+        const tb = isLitT(b.t) ? litType(b, a.t) : b.t;
+        if (ta === tb) return ta;
+        if (canImplicit(ta, tb)) return tb;
+        if (canImplicit(tb, ta)) return ta;
+        const x = UNIFY_ORDER.find(X => canImplicit(ta, X) && canImplicit(tb, X));
+        if (x) return x;
+        fail(`${what}: ${ta} and ${tb} have no common type — IEC 61131-3 allows no implicit conversion between them (F11/F12); ` +
+            `convert one side explicitly, e.g. ${convName(ta, tb)}(…) or ${convName(tb, ta)}(…)`);
+        return null;
+    };
+    // `r` converted to the slot type `target` of an assignment / argument /
+    // FB pin, or a type error: only the F12 implicit conversions are
+    // accepted (an untyped literal that fits is typed by its slot). `exact`:
+    // a VAR_IN_OUT takes exactly its own type (§6.6.1.6 rule 6) — the callee
+    // works through a pointer to it. Returns the C text.
+    const coerce = (target, r, what, { exact = false } = {}) => {
+        if (r.t === 'VOID') fail(`${what}: the called FUNCTION returns no value`);
+        const tt = canonT(target);
+        if (!tt || r.t === null || r.t === 'POINTER' || tt === 'POINTER') return r.c;
+        const T = String(tt).toUpperCase();
+        if (isStrT(T) || isStrT(r.t)) {
+            if (isStrT(T) && !isStrT(r.t)) fail(`${what} is ${T}, cannot take ${showT(r.t)} (convert with ${r.t === '#INT' ? 'DINT' : r.t}_TO_STRING)`);
+            if (!isStrT(T) && isStrT(r.t)) fail(`${what} is ${tt}, cannot take a STRING (convert with STRING_TO_${INT_INFO[T] || isRealT(T) ? T : 'DINT'})`);
+            return r.c;
+        }
+        const elemT = !!ELEMENTARY_C[T];
+        if (!elemT) {
+            // A user type (enum, structure, array) or an FB: only the same type.
+            if (String(r.t).toLowerCase() !== String(tt).toLowerCase()) {
+                fail(`${what} is ${tt}, cannot take ${showT(r.t)}${env.enumTypes.has(String(tt).toLowerCase()) && isIntT(r.t) ? ' (an enumerated variable takes only its own values)' : ''}`);
+            }
+            return r.c;
+        }
+        if (r.t === '#INT') {
+            if (exact) fail(`${what} is VAR_IN_OUT ${T}: it needs a variable of exactly that type`);
+            if (isBoolT(T) && (r.lit === 0n || r.lit === 1n)) return r.lit ? 'true' : 'false';
+            if ((INT_INFO[T] && litFits(r.lit, T)) || isRealT(T)) return r.c;
+            fail(`${what} is ${T}: the literal ${r.lit} ${INT_INFO[T] ? 'does not fit' : 'is an integer'}${isTimeT(T) ? ' (a TIME takes a duration literal such as T#5s)' : ''}`);
+        }
+        if (r.t === '#REAL') {
+            if (exact) fail(`${what} is VAR_IN_OUT ${T}: it needs a variable of exactly that type`);
+            if (isRealT(T)) return r.c;
+            fail(`${what} is ${T}: cannot take a REAL literal${INT_INFO[T] ? ` (convert with LREAL_TO_${T})` : ''}`);
+        }
+        if (r.t === T) return r.c;
+        if (exact) fail(`${what} is VAR_IN_OUT ${T}: it needs a variable of exactly that type, got ${showT(r.t)} (§6.6.1.6 rule 6 — no conversion on an in-out)`);
+        if (!ELEMENTARY_C[r.t]) fail(`${what} is ${T}, cannot take ${showT(r.t)}`);
+        if (canImplicit(r.t, T)) return castTo(r, T);
+        fail(`${what} is ${T}, cannot take ${r.t} implicitly — IEC 61131-3 F11 requires an explicit conversion: ${convName(r.t, T)}(…)`);
+        return null;
     };
     // A literal compared / combined with a typed operand takes that type when
     // its value fits (IEC: an untyped literal is typed by its context).
@@ -453,9 +564,12 @@ export const createSTExprCompiler = (env) => {
     const resolveId = (node) => {
         const name = node.v;
         const v = env.lookupVar(name);
-        if (v) return { c: v.c, t: canonT(v.t), lval: true, pure: true, ptrStr: false };
+        if (v) return { c: v.c, t: canonT(v.t), lval: true, pure: true, ptrStr: false, root: { name: v.name || name, cls: v.cls || '' } };
         const em = env.enumMember(name);
-        if (em) return { c: em.name, t: canonT(em.type), pure: true };
+        if (em) {
+            if (em.ambiguous) fail(`"${name}" is a value of several enumerated types (${em.ambiguous.join(', ')}) — qualify it, e.g. ${em.ambiguous[0]}#${name} (IEC §6.4.4.2)`);
+            return { c: em.name, t: canonT(em.type), pure: true };
+        }
         if (/^NULL$/i.test(name)) return { c: 'NULL', t: 'POINTER', pure: true };
         if (env.userFunctions.has(name.toLowerCase())) fail(`FUNCTION ${name} must be called with parentheses`);
         fail(`unknown identifier "${name}"`);
@@ -465,10 +579,31 @@ export const createSTExprCompiler = (env) => {
     const arrayInfo = (t) => {
         if (!t) return null;
         const a = env.memberCtx?.arrays?.get(String(t).trim().toLowerCase());
-        if (a) return { base: a.baseType, dims: a.dims };
+        if (a) return { base: a.baseType, dims: a.dims, bounds: a.bounds || null };
         const m = /^ARRAY\s*\[([^\]]*)\]\s*OF\s+(.+)$/i.exec(String(t).trim());
-        if (m) return { base: m[2].trim(), dims: m[1].split(',').length };
+        if (m) {
+            const bounds = m[1].split(',').map(d => {
+                const r = /^\s*(-?\d+)\s*\.\.\s*(-?\d+)\s*$/.exec(d);
+                return r ? { min: parseInt(r[1], 10), max: parseInt(r[2], 10) } : null;
+            });
+            return { base: m[2].trim(), dims: bounds.length, bounds: bounds.every(Boolean) ? bounds : null };
+        }
         return null;
+    };
+
+    // An index into a dimension whose IEC bounds are known is CHECKED: a
+    // literal at transpile time, anything else at run time through KRON_IDX
+    // (plc.h), which stops the PLC instead of letting the store land in a
+    // neighbouring PlcState field — C arrays are sized [max+1], so even an
+    // index below `min` is a valid C access and nothing else would notice.
+    const checkedIndex = (r, b, what) => {
+        if (!b) return r;
+        if (r.lit !== undefined) {
+            if (r.lit < b.min || r.lit > b.max) fail(`index ${r.lit} of ${what} is out of range [${b.min}..${b.max}]`);
+            return r;
+        }
+        const site = H.cEscapeString(`${env.indexSite ? env.indexSite() : ''}${what}`);
+        return { ...r, c: `KRON_IDX(${r.c}, ${b.min}, ${b.max}, "${site}")` };
     };
 
     const memberAccess = (node) => {
@@ -480,47 +615,61 @@ export const createSTExprCompiler = (env) => {
         if (info) {
             const mem = info.members.get(String(node.name).toLowerCase());
             if (!mem) fail(`${info.name} has no member "${node.name}"`);
-            return { c: `${base.c}.${H.cIdent(mem.name)}`, t: canonT(mem.type), lval: base.lval, pure: base.pure };
+            // F13: from outside an FB instance its inputs are write-only,
+            // its outputs read-only and its in-outs not accessible at all.
+            const fbAccess = info.isFb ? { fb: info.name, pin: mem.name, dir: mem.dir } : null;
+            if (fbAccess && fbAccess.dir === 'inout') fail(`${info.name}.${mem.name} is VAR_IN_OUT: it can only be given in the call (IEC F13)`);
+            if (fbAccess && !['input', 'output'].includes(fbAccess.dir)) fail(`${info.name}.${mem.name} is internal to the FUNCTION_BLOCK and cannot be accessed from outside (IEC §6.6.3.2)`);
+            return { c: `${base.c}.${H.cIdent(mem.name)}`, t: canonT(mem.type), lval: base.lval, pure: base.pure, root: base.root, fbAccess };
         }
         const sm = env.stdMember(t, node.name);
-        if (sm) return { c: `${base.c}.${sm.c}`, t: canonT(sm.t), ptrStr: !!sm.ptrStr, lval: base.lval, pure: base.pure };
+        if (sm) {
+            return { c: `${base.c}.${sm.c}`, t: canonT(sm.t), ptrStr: !!sm.ptrStr, lval: base.lval, pure: base.pure, root: base.root,
+                fbAccess: sm.dir ? { fb: t, pin: node.name, dir: sm.dir } : null };
+        }
         if (ELEMENTARY_C[t] || isStrT(t)) fail(`"${node.name}" is not a member: ${t} has no members`);
         // A type no table describes (AXIS_REF, a header struct): C names it.
-        return { c: `${base.c}.${node.name}`, t: null, lval: base.lval, pure: base.pure };
+        return { c: `${base.c}.${node.name}`, t: null, lval: base.lval, pure: base.pure, root: base.root };
     };
 
     const bitAccess = (node) => {
         const base = emitNode(node.obj);
         const w = widthOf(base.t);
-        if (base.t !== null && !INT_INFO[base.t]) fail(`bit access ".${node.bit}" needs an integer/bit-string operand, got ${showT(base.t)}`);
+        // T17: partial (bit) access is defined on ANY_BIT only.
+        if (base.t !== null && !isBitStrT(base.t)) fail(`bit access ".${node.bit}" needs a bit string (BYTE/WORD/DWORD/LWORD), got ${showT(base.t)}${isAnyIntT(base.t) ? ` — convert with ${convName(base.t, 'WORD')}(…)` : ''} (IEC T17)`);
         if (w && node.bit >= w) fail(`bit ${node.bit} is out of range for ${base.t} (${w} bits)`);
         const one = (w === 64) ? '1ULL' : '1u';
-        return { c: `((bool)((${base.c} >> ${node.bit}) & ${one}))`, t: 'BOOL', pure: base.pure, bitOf: base, bit: node.bit };
+        return { c: `((bool)((${base.c} >> ${node.bit}) & ${one}))`, t: 'BOOL', pure: base.pure, bitOf: base, bit: node.bit, root: base.root };
     };
 
     const indexAccess = (node) => {
         const base = emitNode(node.obj);
-        let dims = base.pendingDims || 0, elem = base.pendingElem;
+        let dims = base.pendingDims || 0, elem = base.pendingElem, bounds = base.pendingBounds || null;
+        const name = base.arrName || (node.obj.k === 'id' ? node.obj.v : node.obj.k === 'member' ? node.obj.name : 'array');
         if (!dims) {
             if (base.t === null) {
                 const idx = node.idx.map(e => emitNode(e).c);
-                return { c: `${base.c}${idx.map(i => `[${i}]`).join('')}`, t: null, lval: base.lval, pure: base.pure };
+                return { c: `${base.c}${idx.map(i => `[${i}]`).join('')}`, t: null, lval: base.lval, pure: base.pure, root: base.root };
             }
             const ai = arrayInfo(base.t);
             if (!ai) fail(`${showT(base.t)} is not an ARRAY, it cannot be indexed`);
-            dims = ai.dims; elem = ai.base;
+            dims = ai.dims; elem = ai.base; bounds = ai.bounds;
         }
         if (node.idx.length > dims) fail(`too many indexes: ${node.idx.length} given, ${dims} left`);
-        const parts = node.idx.map(e => {
+        // Dimension numbers count from the array's first one, also when its
+        // indexes arrive in several brackets (`a[i][j]` on ARRAY[..,..]).
+        const firstDim = (bounds ? bounds.length : dims) - dims;
+        const parts = node.idx.map((e, k) => {
             const r = emitNode(e);
-            if (r.t !== null && !isIntT(r.t) && !env.enumTypes.has(String(r.t).toLowerCase())) fail(`array index must be an integer, got ${showT(r.t)}`);
-            return r;
+            if (r.t !== null && !isAnyIntT(r.t)) fail(`array index must be an integer (ANY_INT), got ${showT(r.t)}`);
+            const d = firstDim + k;
+            return checkedIndex(r, bounds?.[d], bounds && bounds.length > 1 ? `${name} (dimension ${d + 1})` : name);
         });
         const left = dims - node.idx.length;
         const pure = base.pure && parts.every(isPureR);
         const c = `${base.c}${parts.map(r => `[${r.c}]`).join('')}`;
-        if (left) return { c, t: '#ARRAYPART', pendingDims: left, pendingElem: elem, lval: base.lval, pure };
-        return { c, t: canonT(elem), lval: base.lval, pure };
+        if (left) return { c, t: '#ARRAYPART', pendingDims: left, pendingElem: elem, pendingBounds: bounds, arrName: name, lval: base.lval, pure, root: base.root };
+        return { c, t: canonT(elem), lval: base.lval, pure, root: base.root };
     };
 
     // ── literals ──
@@ -533,7 +682,7 @@ export const createSTExprCompiler = (env) => {
         return c;
     };
     const emitNum = (n) => {
-        if (n.real) return { c: n.neg ? `-${n.c}` : n.c, t: '#REAL', pure: true };
+        if (n.real) return { c: n.neg ? `-${n.c}` : n.c, t: '#REAL', pure: true, numLit: true };
         return intLit(n.v, intLitC(n.v, n.c, !!n.neg));
     };
     const emitTyped = (tok) => {
@@ -571,7 +720,9 @@ export const createSTExprCompiler = (env) => {
     const emitUnary = (node) => {
         const r = emitNode(node.e);
         if (node.op === '-') {
-            if (r.t !== null && !isNumT(r.t)) fail(`unary "-" needs a number, got ${showT(r.t)}`);
+            if (r.t !== null && !isAnyNumT(r.t) && !isTimeT(r.t)) {
+                fail(`unary "-" needs a number or a TIME, got ${showT(r.t)}${isBitStrT(r.t) ? ' (a bit string has no sign: convert with ' + convName(r.t, 'DINT') + ')' : ''}`);
+            }
             const res = { c: r.c.startsWith('-') ? `(- ${r.c})` : `(-${r.c})`, t: r.t, pure: r.pure };
             if (r.t === '#INT') res.lit = -r.lit;
             return res;
@@ -579,6 +730,11 @@ export const createSTExprCompiler = (env) => {
         // NOT / BNOT
         if (r.t === null) return { c: `KRON_NOT_U(${r.c})`, t: null, pure: r.pure };
         if (isBoolT(r.t)) return { c: `(!${r.c})`, t: 'BOOL', pure: r.pure };
+        // T31: NOT works on ANY_BIT — BOOL and the bit strings. On an integer
+        // only the vendor BNOT is bitwise.
+        if (node.op === 'NOT' && isAnyIntT(r.t) && r.t !== '#INT') {
+            fail(`NOT needs BOOL or a bit string (BYTE/WORD/DWORD/LWORD), got ${r.t} — convert with ${convName(r.t, 'WORD')}(…) or use the vendor operator BNOT`);
+        }
         if (isIntT(r.t)) {
             // ⚠️ Masked to the operand's width: C's `~` works on the PROMOTED
             // int, so `NOT BYTE#1` would be -2 (0xFFFFFFFE), not 254.
@@ -597,7 +753,19 @@ export const createSTExprCompiler = (env) => {
         const a = emitNode(node.l), b = emitNode(node.r);
         const pure = a.pure !== false && b.pure !== false;
         [a, b].forEach(r => { if (r.pendingDims) fail('an array needs all its indexes before it can be used as a value'); });
+        // §7.3.2 rule 3: the LEFT operand is evaluated first. C leaves the
+        // order of two operands unspecified, so when both sides call
+        // something the left one is evaluated into a temp in a statement
+        // expression first (`F1(x) * F2(y)` with side effects).
+        if (a.pure === false && b.pure === false) {
+            const n = tmp();
+            const r = emitBinaryTyped(op, { ...a, c: n, pure: true }, b, pure);
+            return { ...r, c: `({ ${cTypeOf(a.t) || '__auto_type'} ${n} = ${a.c}; ${r.c}; })`, pure: false };
+        }
+        return emitBinaryTyped(op, a, b, pure);
+    };
 
+    const emitBinaryTyped = (op, a, b, pure) => {
         if (LOGIC[op] || BITWISE[op]) {
             const opName = op === '&' ? 'AND' : op;
             const boolA = isBoolT(a.t), boolB = isBoolT(b.t);
@@ -609,10 +777,21 @@ export const createSTExprCompiler = (env) => {
                 if (op === 'XOR') return { c: `((bool)${lc} != (bool)${rc})`, t: 'BOOL', pure };
                 return { c: `(${lc} ${LOGIC[op][0]} ${rc})`, t: 'BOOL', pure };
             }
+            // T31: AND/OR/XOR are ANY_BIT operations — on an INT they are a
+            // type error (§7.3.2 b); the vendor BAND/BOR/BXOR stay bitwise
+            // on any integer.
+            if (!BITWISE[op]) {
+                const bad = [a, b].find(r => isAnyIntT(r.t) && r.t !== '#INT');
+                if (bad) {
+                    fail(`${opName} needs BOOL or bit-string operands (BYTE/WORD/DWORD/LWORD), got ${bad.t} — ` +
+                        `convert with ${convName(bad.t, 'WORD')}(…)/${convName(bad.t, 'DWORD')}(…), or use the vendor operator B${opName}`);
+                }
+            }
             if ((intA || a.t === null) && (intB || b.t === null) && (intA || intB)) {
-                // Bitwise on integers / bit strings: the result has the common
-                // width, and AND/OR/XOR of two in-range values stays in range.
-                const ct = commonNum(a, b);
+                // Bitwise on bit strings (and, for BAND/BOR/BXOR, integers):
+                // the result has the common width, and AND/OR/XOR of two
+                // in-range values stays in range.
+                const ct = BITWISE[op] ? commonNum(a, b) : unify(a, b, opName);
                 const cop = BITWISE[op] || LOGIC[op][1];
                 const t = ct === '#INT' ? '#INT' : ct;
                 const res = { c: `(${a.c} ${cop} ${b.c})`, t, pure };
@@ -654,63 +833,109 @@ export const createSTExprCompiler = (env) => {
             }
             const enumA = env.enumTypes.has(String(a.t).toLowerCase()), enumB = env.enumTypes.has(String(b.t).toLowerCase());
             if (enumA || enumB) {
-                if (enumA && enumB && a.t !== b.t) fail(`cannot compare ${a.t} with ${b.t}`);
-                const other = enumA ? b : a;
-                if (!enumA || !enumB) { if (!isIntT(other.t)) fail(`cannot compare ${showT(a.t)} with ${showT(b.t)}`); }
+                // T38: an enumerated value takes part in = and <> only, and
+                // only against a value of its own type.
+                if (!enumA || !enumB || a.t !== b.t) fail(`cannot compare ${showT(a.t)} with ${showT(b.t)} (an enumerated value compares only with its own type)`);
+                if (op !== '=' && op !== '<>') fail(`"${op}" does not order enumerated values (IEC T38: only = and <>)`);
                 return { c: `(${a.c} ${cop} ${b.c})`, t: 'BOOL', pure };
             }
-            if (!isNumT(a.t) || !isNumT(b.t)) fail(`cannot compare ${showT(a.t)} with ${showT(b.t)}`);
-            if (isTimeT(a.t) !== isTimeT(b.t) && a.t !== '#INT' && b.t !== '#INT') {
-                fail(`cannot compare ${showT(a.t)} with ${showT(b.t)} (a TIME compares with a TIME)`);
+            const comparable = (t) => isAnyNumT(t) || isBitStrT(t) || isTimeT(t);
+            if (!comparable(a.t) || !comparable(b.t)) fail(`cannot compare ${showT(a.t)} with ${showT(b.t)}`);
+            if (isTimeT(a.t) !== isTimeT(b.t)) {
+                fail(`cannot compare ${showT(a.t)} with ${showT(b.t)} (a TIME compares with a TIME: write the other side as a duration, e.g. T#0s)`);
             }
-            // Numeric: both sides in ONE explicit common type whenever C's own
-            // conversion would differ (signed vs unsigned, int vs real).
-            const ct = commonNum(a, b);
-            const ta = effType(a, b), tb = effType(b, a);
-            const mixedClass = (isRealT(ta) !== isRealT(tb)) || needsSignCast(a, b, ct);
-            const [lc, rc] = mixedClass && ct && ct !== '#INT' && ct !== '#REAL'
-                ? [castTo(a, ct), castTo(b, ct)] : [a.c, b.c];
+            // Both sides in ONE common type (F12), cast explicitly wherever
+            // it differs from the operand's own: C's usual conversions get
+            // signed vs unsigned and DINT vs REAL wrong.
+            const ct = unify(a, b, `"${op}"`);
+            const [lc, rc] = isLitT(ct) ? [a.c, b.c] : [castTo(a, ct), castTo(b, ct)];
             return { c: `(${lc} ${cop} ${rc})`, t: 'BOOL', pure };
         }
 
-        if (op === '**') {
-            if ((a.t !== null && !isNumT(a.t)) || (b.t !== null && !isNumT(b.t))) fail(`** needs numbers, got ${showT(a.t)} and ${showT(b.t)}`);
-            return { c: `pow((double)${a.c}, (double)${b.c})`, t: 'LREAL', pure };
-        }
+        if (op === '**') return emitExpt(a, b, '**', pure);
 
         // + - * / MOD
-        if ((a.t !== null && !isNumT(a.t)) || (b.t !== null && !isNumT(b.t))) {
-            const what = isStrT(a.t) || isStrT(b.t) ? ' (STRING has no arithmetic operators; convert with STRING_TO_DINT / STRING_TO_REAL)' : '';
-            fail(`"${op}" needs numbers, got ${showT(a.t)} and ${showT(b.t)}${what}`);
+        const isEnumT = (t) => t !== null && env.enumTypes.has(String(t).toLowerCase());
+        [a, b].forEach(r => {
+            if (r.t === null || isAnyNumT(r.t) || isTimeT(r.t)) return;
+            if (isStrT(r.t)) fail(`"${op}" needs numbers, got ${showT(a.t)} and ${showT(b.t)} (STRING has no arithmetic operators; convert with STRING_TO_DINT / STRING_TO_REAL)`);
+            if (isBitStrT(r.t)) {
+                fail(`"${op}" needs numbers, got ${r.t} — a bit string has no arithmetic (IEC T29: ANY_NUM / ANY_MAGNITUDE); ` +
+                    `convert with ${convName(r.t, { BYTE: 'USINT', WORD: 'UINT', DWORD: 'UDINT', LWORD: 'ULINT' }[r.t])}(…)`);
+            }
+            fail(`"${op}" needs numbers, got ${showT(a.t)} and ${showT(b.t)}${isEnumT(r.t) ? ' (an enumerated value has no arithmetic)' : ''}`);
+        });
+        const zeroLit = (r) => (r.lit !== undefined && r.lit === 0n) || (r.numLit && parseFloat(r.c) === 0);
+        // A literal divisor other than 0 (and -1, whose INT_MIN / -1 traps)
+        // needs no run-time check.
+        const safeDivisor = (r) => (r.lit !== undefined && r.lit !== 0n && r.lit !== -1n) || (r.numLit && parseFloat(r.c) !== 0);
+        const divide = (lc, rc, t, extra = {}) => {
+            if (zeroLit(b)) fail('division by zero (IEC 61131-3 §7.3.2 a)');
+            if (safeDivisor(b)) return { c: `(${lc} / ${rc})`, t, pure, ...extra };
+            // §7.3.2 a: a divide by zero is a run-time ERROR — reported (or
+            // the PLC stopped) through KRON_RTE, the value is then 0.
+            return { c: `KRON_DIV(${lc}, ${rc}, ${rteSite()})`, t, pure, ...extra };
+        };
+
+        // T35: TIME ± TIME, TIME * ANY_NUM, TIME / ANY_NUM — nothing else, and
+        // TIME and LTIME do not mix (T35 note: overloading only within each set).
+        if (isTimeT(a.t) || isTimeT(b.t)) {
+            if (op === '+' || op === '-') {
+                if (!isTimeT(a.t) || !isTimeT(b.t)) {
+                    if (a.t !== null && b.t !== null) fail(`"${op}" cannot combine ${showT(a.t)} and ${showT(b.t)} (IEC T35: TIME ${op} TIME only — write a duration literal such as T#5s, or scale a TIME with * or /)`);
+                    return { c: `(${a.c} ${op} ${b.c})`, t: isTimeT(a.t) ? a.t : b.t, pure };
+                }
+                if (a.t !== b.t) fail(`"${op}" cannot combine ${a.t} and ${b.t} (IEC T35: TIME with TIME, LTIME with LTIME — convert with TIME_TO_LTIME / LTIME_TO_TIME)`);
+                return { c: `(${a.c} ${op} ${b.c})`, t: a.t, pure };
+            }
+            if (op === '*' || op === '/') {
+                if (!isTimeT(a.t)) fail(`"${op}": IEC T35 defines only TIME ${op} ANY_NUM — write the duration first${op === '/' ? ' (a number cannot be divided by a TIME)' : ''}`);
+                if (isTimeT(b.t)) fail(`"${op}" of two durations is not defined (IEC T35: TIME ${op} ANY_NUM)`);
+                if (b.t !== null && !isAnyNumT(b.t)) fail(`"${op}": a TIME is scaled by a number, got ${showT(b.t)}`);
+                if (isRealT(b.t)) {
+                    // Scaled in double (a float would lose the µs of a long
+                    // TIME), truncated back to the duration's integer count.
+                    if (op === '*') return { c: `((int64_t)((double)${a.c} * (double)${b.c}))`, t: a.t, pure };
+                    const d = divide(`(double)${a.c}`, `(double)${b.c}`, a.t);
+                    return { ...d, c: `((int64_t)${d.c})` };
+                }
+                if (op === '*') return { c: `(${a.c} * (int64_t)${b.c})`, t: a.t, pure };
+                return divide(a.c, `(int64_t)${b.c}`, a.t);
+            }
+            fail(`${op} is not defined on a TIME`);
         }
-        let ct = commonNum(a, b);
-        if ((op === '+' || op === '-') && (isTimeT(a.t) !== isTimeT(b.t)) && a.t !== '#INT' && b.t !== '#INT' && a.t !== null && b.t !== null) {
-            fail(`"${op}" cannot combine ${showT(a.t)} and ${showT(b.t)} (TIME ± TIME only; scale a TIME with * or /)`);
-        }
-        const signCast = needsSignCast(a, b, ct);
-        const [lc, rc] = signCast ? [castTo(a, ct), castTo(b, ct)] : [a.c, b.c];
-        const intDiv = (ct === null) || (!isRealT(effType(a, b)) && !isRealT(effType(b, a)));
+
+        const ct = unify(a, b, `"${op}"`);
+        const [lc, rc] = isLitT(ct) || ct === null ? [a.c, b.c] : [castTo(a, ct), castTo(b, ct)];
         // Literal folding of the TYPE only (the C text stays as written).
         const litOf = (f) => (ct === '#INT' ? { lit: f() } : {});
         if (op === 'MOD') {
-            if (ct !== null && !intDiv) fail(`MOD needs integers, got ${showT(a.t)} and ${showT(b.t)}`);
+            // T29: MOD is ANY_INT only; IN2 = 0 gives 0 BY DEFINITION (fn. e),
+            // which is not an error.
+            if (ct !== null && !isAnyIntT(ct)) fail(`MOD needs integers, got ${showT(a.t)} and ${showT(b.t)}`);
             return { c: `KRON_IMOD(${lc}, ${rc})`, t: ct, pure, ...litOf(() => (b.lit === 0n ? 0n : a.lit % b.lit)) };
         }
-        if (op === '/') {
-            // ⚠️ An integer divide by zero (and INT_MIN / -1) is SIGFPE on
-            // x86_64: KRON_IDIV yields 0 instead. Unknown operand types also
-            // take KRON_IDIV, whose _Generic still divides floats normally.
-            if (intDiv) return { c: `KRON_IDIV(${lc}, ${rc})`, t: ct, pure, ...litOf(() => (b.lit === 0n ? 0n : a.lit / b.lit)) };
-            if (isTimeT(ct)) return { c: `((int64_t)(${lc} / ${rc}))`, t: ct, pure };
-            return { c: `(${lc} / ${rc})`, t: ct, pure };
-        }
-        const c = `(${lc} ${op} ${rc})`;
-        // TIME scaled by a REAL is computed in double; keep it a TIME (int64).
-        if (isTimeT(ct) && (isRealT(a.t) || isRealT(b.t))) return { c: `((int64_t)${c})`, t: ct, pure };
-        const res = { c, t: ct, pure };
+        if (op === '/') return divide(lc, rc, ct, litOf(() => (b.lit === 0n ? 0n : a.lit / b.lit)));
+        const res = { c: `(${lc} ${op} ${rc})`, t: ct, pure };
         if (ct === '#INT') res.lit = op === '+' ? a.lit + b.lit : op === '-' ? a.lit - b.lit : a.lit * b.lit;
         return res;
     };
+
+    // T29 EXPT / `**` (T71 fn. b: the same thing): IN1 ANY_REAL, IN2 ANY_NUM,
+    // the result has the type of IN1 (fn. f) — an integer base is a type error.
+    const emitExpt = (a, b, what, pure) => {
+        if (a.t !== null && !isRealT(a.t)) {
+            fail(`${what}: the base must be REAL or LREAL (IEC T29 EXPT: IN1 is ANY_REAL), got ${showT(a.t)}` +
+                (a.t === '#INT' ? ` — write ${a.lit}.0` : isAnyIntT(a.t) ? ` — convert with ${convName(a.t, 'REAL')}(…)` : ''));
+        }
+        if (b.t !== null && !isAnyNumT(b.t)) fail(`${what}: the exponent must be a number (ANY_NUM), got ${showT(b.t)}`);
+        if (a.t === 'REAL') return { c: `((float)pow((double)${a.c}, (double)${b.c}))`, t: 'REAL', pure };
+        // An untyped real base (`-2.0 ** 2.0`) leaves the result untyped too:
+        // its context types it like the literal itself.
+        return { c: `pow((double)${a.c}, (double)${b.c})`, t: a.t === '#REAL' ? '#REAL' : 'LREAL', pure };
+    };
+    // C string literal naming the statement a run-time error comes from.
+    const rteSite = () => `"${H.cEscapeString(env.rteSite ? env.rteSite() : '')}"`;
 
     // ── calls ──
     const positional = (fname, args, order, { min = order.length, max = order.length, variadicPrefix = null } = {}) => {
@@ -760,20 +985,36 @@ export const createSTExprCompiler = (env) => {
 
     const numericArgs = (fname, rs) => {
         rs.forEach(r => {
-            if (r.t !== null && !isNumT(r.t) && !env.enumTypes.has(String(r.t).toLowerCase())) fail(`${fname} needs numeric arguments, got ${showT(r.t)}`);
+            if (r.t !== null && !isNumT(r.t)) fail(`${fname} needs numeric, bit-string or TIME arguments, got ${showT(r.t)}`);
         });
-        // Fold the common type over the arguments; all-literal → the type
-        // the largest literal needs.
+        // Fold the common type over the arguments (F12, as for an operator);
+        // all-literal → the type the largest literal needs.
         let acc = rs[0];
         for (const r of rs.slice(1)) {
             if (acc.t === null || r.t === null) return null;
-            const t = commonNum(acc, r);
-            if (t === null) return null;
-            acc = t === '#INT' ? { t, lit: (acc.lit < 0n ? -acc.lit : acc.lit) > (r.lit < 0n ? -r.lit : r.lit) ? acc.lit : r.lit } : { t };
+            const t = unify(acc, r, fname);
+            if (isTimeT(acc.t) !== isTimeT(r.t)) fail(`${fname}: cannot mix ${showT(acc.t)} and ${showT(r.t)}`);
+            acc = t === '#INT' ? { t, lit: (acc.lit < 0n ? -acc.lit : acc.lit) > (r.lit < 0n ? -r.lit : r.lit) ? acc.lit : r.lit } : { t, c: '', lit: undefined };
         }
-        if (acc.t === '#INT') return literalNaturalType(acc.lit);
+        // All untyped integer literals: the smallest signed type holding
+        // every one of them (`MUX(k, 10, 20, 30)` is a SINT, which widens
+        // implicitly to whatever INT/DINT slot receives it).
+        if (acc.t === '#INT') {
+            const vals = rs.map(r => r.lit);
+            return ['SINT', 'INT', 'DINT', 'LINT', 'ULINT'].find(T => vals.every(v => litFits(v, T))) || 'ULINT';
+        }
         if (acc.t === '#REAL') return 'LREAL';
         return acc.t;
+    };
+    // Inputs of a selection (SEL/MUX: ANY, T32/T38) → their common type, an
+    // enumerated type only with itself.
+    const selectionArgs = (fname, rs) => {
+        const en = rs.find(r => r.t !== null && env.enumTypes.has(String(r.t).toLowerCase()));
+        if (en) {
+            if (rs.some(r => r.t !== null && r.t !== en.t)) fail(`${fname}: all inputs must be ${en.t}`);
+            return en.t;
+        }
+        return numericArgs(fname, rs);
     };
 
     const emitSelection = (U, args) => {
@@ -814,22 +1055,26 @@ export const createSTExprCompiler = (env) => {
             if (strs[0] !== strs[1] && in0.t !== null && in1.t !== null) fail(`SEL: IN0 and IN1 must have the same type (${showT(in0.t)} vs ${showT(in1.t)})`);
             if (strs[0] || strs[1]) return { c: `(${g.c} ? ${in1.c} : ${in0.c})`, t: 'STRING', pure: [g, in0, in1].every(isPureR) };
             if (isBoolT(in0.t) && isBoolT(in1.t)) return { c: `(${g.c} ? ${in1.c} : ${in0.c})`, t: 'BOOL', pure: [g, in0, in1].every(isPureR) };
-            const t = numericArgs(U, [in0, in1]);
+            const t = selectionArgs(U, [in0, in1]);
             return { c: `(${g.c} ? ${t ? castTo(in1, t) : in1.c} : ${t ? castTo(in0, t) : in0.c})`, t, pure: [g, in0, in1].every(isPureR) };
         }
         if (U === 'MUX') {
             const list = positional(U, args, ['K'], { min: 2, max: Infinity, variadicPrefix: 'IN' });
             const [k, ...ins] = list.map(emitNode);
-            if (k.t !== null && !isIntT(k.t)) fail(`MUX: K must be an integer, got ${showT(k.t)}`);
+            if (k.t !== null && !isAnyIntT(k.t)) fail(`MUX: K must be an integer (ANY_INT), got ${showT(k.t)}`);
             const anyStr = ins.some(r => isStrT(r.t));
             const anyBool = ins.every(r => isBoolT(r.t));
-            const t = anyStr ? 'STRING' : anyBool ? 'BOOL' : numericArgs(U, ins);
+            const t = anyStr ? 'STRING' : anyBool ? 'BOOL' : selectionArgs(U, ins);
             if (anyStr && ins.some(r => r.t !== null && !isStrT(r.t))) fail('MUX: all inputs must have the same type');
+            const n = ins.length;
+            if (k.lit !== undefined && (k.lit < 0n || k.lit >= BigInt(n))) fail(`MUX: K = ${k.lit} selects no input (IN0..IN${n - 1}) — IEC T32 fn. e`);
             const decls = [];
             const kc = once(k, 'int64_t', decls);
-            const val = (r) => (t && !anyStr && !anyBool ? castTo(r, t) : r.c);
-            // Out-of-range K selects the last input (IEC leaves it undefined).
-            const chain = ins.slice(0, -1).reduceRight((acc, r, i) => `(${kc} == ${i} ? ${val(r)} : ${acc})`, val(ins[ins.length - 1]));
+            const val = (r) => (t && !anyStr && !anyBool && !env.enumTypes.has(String(t).toLowerCase()) ? castTo(r, t) : r.c);
+            // T32 fn. e: K outside 0..n-1 is a run-time ERROR — reported (or
+            // the PLC stopped) through KRON_RTE, and IN0 is the value then.
+            const bad = `(__kron_rte(KRON_RTE_MUX, ${rteSite()}, (long long)${kc}), ${val(ins[0])})`;
+            const chain = ins.reduceRight((acc, r, i) => `(${kc} == ${i} ? ${val(r)} : ${acc})`, bad);
             return { c: stmtExpr(decls, chain), t, pure: [k, ...ins].every(isPureR) };
         }
         return null;
@@ -837,8 +1082,15 @@ export const createSTExprCompiler = (env) => {
 
     const emitShift = (U, args) => {
         const [x, n] = positional(U, args, ['IN', 'N']).map(emitNode);
-        if (x.t !== null && !isIntT(x.t)) fail(`${U}: IN must be an integer/bit-string, got ${showT(x.t)}`);
-        if (n.t !== null && !isIntT(n.t)) fail(`${U}: N must be an integer, got ${showT(n.t)}`);
+        // T30: IN is ANY_BIT, N is ANY_INT, and N < 0 is an ERROR (fn. a).
+        if (x.t !== null && !isBitStrT(x.t) && x.t !== '#INT') {
+            fail(`${U}: IN must be a bit string (BYTE/WORD/DWORD/LWORD), got ${showT(x.t)}${isAnyIntT(x.t) ? ` — convert with ${convName(x.t, 'WORD')}(…)/${convName(x.t, 'DWORD')}(…)` : ''}`);
+        }
+        if (n.t !== null && !isAnyIntT(n.t)) fail(`${U}: N must be an integer (ANY_INT), got ${showT(n.t)}`);
+        if (n.lit !== undefined && n.lit < 0n) fail(`${U}: N = ${n.lit} — a negative shift count is an error (IEC T30 fn. a)`);
+        const negN = (nc, ok, unchanged) => (n.lit !== undefined || (n.t && !signedT(n.t))
+            ? ok
+            : `(${nc} < 0 ? (__kron_rte(KRON_RTE_SHIFT, ${rteSite()}, (long long)${nc}), ${unchanged}) : ${ok})`);
         // The operand's own width decides the result (BYTE 8 … LWORD 64); an
         // untyped literal or an unknown operand is a DWORD (the IEC default and
         // what the archive's uint32 SHL/SHR always did).
@@ -847,17 +1099,19 @@ export const createSTExprCompiler = (env) => {
         const decls = [];
         const xc = once({ ...x, c: castTo(x, T) }, ct, decls);
         const nc = once(n, 'int64_t', decls);
+        // On a negative N (reported through KRON_RTE) IN passes unchanged.
+        const fix = (c) => negN(nc, c, `((${ct})${xc})`);
         if (U === 'SHL' || U === 'SHR') {
             // ⚠️ A count >= the width is undefined behaviour in C (x86 masks
             // it, ARM does not) — IEC shifts every bit out, so the result is 0.
             const wide = W === 64 ? 'uint64_t' : 'uint32_t';
             const sh = U === 'SHL' ? '<<' : '>>';
             return {
-                c: stmtExpr(decls, `((uint64_t)${nc} >= ${W}u ? (${ct})0 : (${ct})((${wide})(${ut})${xc} ${sh} (unsigned)${nc}))`),
+                c: stmtExpr(decls, fix(`((uint64_t)${nc} >= ${W}u ? (${ct})0 : (${ct})((${wide})(${ut})${xc} ${sh} (unsigned)${nc}))`)),
                 t: T, pure: x.pure !== false && n.pure !== false,
             };
         }
-        return { c: stmtExpr(decls, `((${ct})${H.rotateExpr(U, xc, nc, W)})`), t: T, pure: x.pure !== false && n.pure !== false };
+        return { c: stmtExpr(decls, fix(`((${ct})${H.rotateExpr(U, xc, nc, W)})`)), t: T, pure: x.pure !== false && n.pure !== false };
     };
 
     const userCall = (fn, args) => {
@@ -884,17 +1138,27 @@ export const createSTExprCompiler = (env) => {
             }
             list = args.map(a => a.e);
         }
-        const cargs = list.map((e, i) => {
+        const rs = list.map((e, i) => {
             const p = params[i];
-            if (p.inout) {
-                const r = emitNode(e);
-                if (!r.lval || r.bitOf) fail(`${fn.name}(...) argument "${p.name}" is VAR_IN_OUT and must be a variable.`);
-                checkAssignable(p.type, r, `${fn.name}.${p.name}`);
-                return `&(${r.c})`;
-            }
             const r = emitNode(e);
-            checkAssignable(p.type, r, `${fn.name}.${p.name}`);
-            return r.c;
+            if (p.inout) {
+                if (!r.lval || r.bitOf) fail(`${fn.name}(...) argument "${p.name}" is VAR_IN_OUT and must be a variable.`);
+                checkWritable(r, `${fn.name}(...) argument "${p.name}" (VAR_IN_OUT)`);
+                coerce(p.type, r, `${fn.name}.${p.name}`, { exact: true });
+                return { ...r, c: `&(${r.c})` };
+            }
+            return { ...r, c: coerce(p.type, r, `${fn.name}.${p.name}`) };
+        });
+        // §7.3.2 rule 3 (left first): C evaluates call arguments in no fixed
+        // order, so every impure argument but the last is evaluated into a
+        // temp, in order, before the call.
+        const pre = [];
+        const impure = rs.map((r, i) => (r.pure === false ? i : -1)).filter(i => i >= 0);
+        const cargs = rs.map((r, i) => {
+            if (impure.length < 2 || i === impure[impure.length - 1] || r.pure !== false) return r.c;
+            const n = tmp();
+            pre.push(`__auto_type ${n} = ${r.c};`);
+            return n;
         });
         let c;
         if (isStrT(fn.ret)) {
@@ -908,7 +1172,7 @@ export const createSTExprCompiler = (env) => {
             c = `${fn.name}(${cargs.join(', ')})`;
         }
         const rt = !fn.ret || /^VOID$/i.test(fn.ret) ? 'VOID' : canonT(fn.ret);
-        return { c, t: rt, pure: false };
+        return { c: stmtExpr(pre, c), t: rt, pure: false };
     };
 
     const STD_MATH_C = {
@@ -927,10 +1191,21 @@ export const createSTExprCompiler = (env) => {
         const conv = /^([A-Z]+)_TO_([A-Z]+)$/.exec(U);
         if (conv) {
             const [, src, dst] = conv;
+            // T26: TIME ↔ LTIME is a change of unit (µs ↔ ns); LTIME_TO_TIME
+            // truncates toward zero (precision *impl*, Standards/iec61131-3.md §15).
+            if ((src === 'TIME' && dst === 'LTIME') || (src === 'LTIME' && dst === 'TIME')) {
+                const r = one();
+                const c = coerce(src, r, `${U} input`);
+                return { c: src === 'TIME' ? `((int64_t)(${c}) * 1000LL)` : `((int64_t)(${c}) / 1000LL)`, t: dst, pure: r.pure };
+            }
             const ks = H.IEC_KRON_NAME[src], kd = H.IEC_KRON_NAME[dst];
             if (!ks || !kd) fail(`${U} is not a supported conversion`);
             const r = one();
             if (r.t !== null && (isStrT(r.t) !== (src === 'STRING'))) fail(`${U} expects a ${src} argument, got ${showT(r.t)}`);
+            // A typed conversion's input is of its source type (§6.6.1.6
+            // rule 4: only the implicit conversions on the way in) —
+            // INT_TO_REAL(dint) is a type error, not a silent narrowing.
+            if (src !== 'STRING') r.c = coerce(src, r, `${U} input`);
             if (kd === 'STRING') {
                 if (!env.strConv) {
                     fail(`${src}_TO_STRING is only available inside a PROGRAM. ` +
@@ -939,8 +1214,10 @@ export const createSTExprCompiler = (env) => {
                 const buf = H.strConvSymbol(env.strConv.progName, `st${env.strConv.next++}`);
                 return { c: `KRON_${ks}_TO_STRING(${r.c}, S->${buf}, ${H.STRING_SHM_BYTES})`, t: 'STRING', pure: false };
             }
-            // Archive-backed (libkronconverter): its rounding is the library's.
-            return { c: `KRON_${ks}_TO_${kd}(${r.c})`, t: dst, pure: r.pure };
+            if (src === 'STRING') return { c: `KRON_${ks}_TO_${kd}(${r.c})`, t: dst, pure: r.pure };
+            // T22–T25 inline (CTranspilerService convC): rounding, saturation,
+            // binary transfer between bit strings and numbers.
+            return { c: H.convC(src, dst, r.c), t: dst, pure: r.pure };
         }
         if (ELEMENTARY_C[U] && !isTimeT(U)) {
             // INT(x): an integer target ROUNDS (IEC REAL_TO_INT semantics) —
@@ -951,19 +1228,23 @@ export const createSTExprCompiler = (env) => {
             return { c: `((${ELEMENTARY_C[U]})(${r.c}))`, t: U, pure: r.pure };
         }
         if (STD_MATH_C[U]) {
+            // T28: ANY_REAL in, the SAME type out (SIN of a REAL is a REAL).
+            // An untyped literal is an LREAL; an integer is a type error.
             const r = one();
-            if (r.t !== null && !isNumT(r.t)) fail(`${U} needs a number, got ${showT(r.t)}`);
-            return { c: `${STD_MATH_C[U]}(${r.c})`, t: 'LREAL', pure: r.pure };
+            if (r.t !== null && !isRealT(r.t) && r.t !== '#INT') {
+                fail(`${U} needs REAL or LREAL (IEC T28: ANY_REAL), got ${showT(r.t)}${isAnyIntT(r.t) ? ` — convert with ${convName(r.t, 'REAL')}(…)` : ''}`);
+            }
+            if (r.t === 'REAL') return { c: `${STD_MATH_C[U]}f(${r.c})`, t: 'REAL', pure: r.pure };
+            return { c: `${STD_MATH_C[U]}(${r.c})`, t: r.t === null ? null : 'LREAL', pure: r.pure };
         }
         switch (U) {
             case 'EXPT': {
                 const [a, b] = positional(U, node.args, ['IN1', 'IN2']).map(emitNode);
-                [a, b].forEach(r => { if (r.t !== null && !isNumT(r.t)) fail(`EXPT needs numbers, got ${showT(r.t)}`); });
-                return { c: `pow((double)${a.c}, (double)${b.c})`, t: 'LREAL', pure: a.pure !== false && b.pure !== false };
+                return emitExpt(a, b, 'EXPT', a.pure !== false && b.pure !== false);
             }
             case 'ABS': {
                 const r = one();
-                if (r.t !== null && !isNumT(r.t)) fail(`ABS needs a number, got ${showT(r.t)}`);
+                if (r.t !== null && !isAnyNumT(r.t)) fail(`ABS needs a number (ANY_NUM), got ${showT(r.t)}`);
                 // plc.h's ABS macro evaluates its argument twice: fine for a
                 // side-effect-free one, a temp otherwise.
                 if (r.pure !== false) return { c: `ABS(${r.c})`, t: r.t, pure: true };
@@ -1007,7 +1288,7 @@ export const createSTExprCompiler = (env) => {
             case 'enumlit': {
                 const et = env.enumTypes.get(node.type.toLowerCase());
                 if (!et) fail(`"${node.type}#${node.member}": ${node.type} is not an enumerated type`);
-                const em = env.enumMember(node.member);
+                const em = env.enumMemberOf ? env.enumMemberOf(et, node.member) : env.enumMember(node.member);
                 if (!em || em.type.toLowerCase() !== et.toLowerCase()) fail(`${et} has no value "${node.member}"`);
                 return { c: em.name, t: em.type, pure: true };
             }
@@ -1016,7 +1297,11 @@ export const createSTExprCompiler = (env) => {
                 const r = emitNode(node.e);
                 return { ...r, lval: false };
             }
-            case 'member': return memberAccess(node);
+            case 'member': {
+                const r = memberAccess(node);
+                if (node !== writeTarget) checkReadable(r);
+                return r;
+            }
             case 'bit': return bitAccess(node);
             case 'index': return indexAccess(node);
             case 'call': return emitCall(node);
@@ -1027,16 +1312,22 @@ export const createSTExprCompiler = (env) => {
         return null;
     };
 
-    // A value of type r.t may be stored into a `target` slot (assignment,
-    // argument)? Only gross mismatches are refused; numeric conversions stay
-    // C's (IEC would demand an explicit conversion — the regex path never
-    // did, and refusing them now would break working projects).
-    const checkAssignable = (target, r, what) => {
-        const tt = target ? String(target).trim().toUpperCase() : null;
-        if (!tt || r.t === null) return;
-        if (r.t === 'VOID') fail(`${what}: the called FUNCTION returns no value`);
-        if (isStrT(tt) && !isStrT(r.t)) fail(`${what} is ${tt}, cannot take ${showT(r.t)} (convert with ${r.t === '#INT' ? 'DINT' : r.t}_TO_STRING)`);
-        if (!isStrT(tt) && isStrT(r.t) && (ELEMENTARY_C[tt] || isTimeT(tt))) fail(`${what} is ${tt}, cannot take a STRING (convert with STRING_TO_${INT_INFO[tt] || isRealT(tt) ? tt : 'DINT'})`);
+    // May the variable an lvalue names be written here? §6.5.2.2: never a
+    // CONSTANT, never the POU's own VAR_INPUT; §7.3.3.4.2: never the control
+    // variable of an enclosing FOR; F13: never an FB instance's output or
+    // in-out from outside (its INPUT may be set, effective at the next call).
+    const checkWritable = (L, what) => {
+        const cls = L.root?.cls || '';
+        if (cls === 'constant') fail(`${what}: ${L.root.name} is a CONSTANT and cannot be written (IEC §6.5.2.2)`);
+        if (cls === 'input') fail(`${what}: ${L.root.name} is a VAR_INPUT of this POU and cannot be written inside it (IEC §6.5.2.2)`);
+        if (L.root && env.isForControl && env.isForControl(L.root.name)) fail(`${what}: ${L.root.name} is the control variable of an enclosing FOR loop and cannot be written in its body (IEC §7.3.3.4.2)`);
+        if (L.fbAccess && L.fbAccess.dir === 'output') fail(`${what}: ${L.fbAccess.fb}.${L.fbAccess.pin} is an OUTPUT — it cannot be written from outside the FUNCTION_BLOCK (IEC F13)`);
+    };
+    // F13: an FB instance's INPUT cannot be read from outside.
+    const checkReadable = (r) => {
+        if (r.fbAccess && r.fbAccess.dir === 'input') {
+            fail(`${r.fbAccess.fb}.${r.fbAccess.pin} is an INPUT — it cannot be read from outside the FUNCTION_BLOCK (IEC F13); read the value you pass to it instead`);
+        }
     };
 
     const parseText = (text) => parseST(tokenizeST(text, env));
@@ -1044,6 +1335,10 @@ export const createSTExprCompiler = (env) => {
         if (r.pendingDims) fail('an array needs all its indexes before it can be used as a value');
         return r;
     };
+    // The node an lvalue() is emitting as the WRITE target: F13's "an input
+    // cannot be read from outside" does not apply to it (`inst.IN := x` is
+    // the allowed separate input assignment).
+    let writeTarget = null;
 
     return {
         // A full expression → { c, t }.
@@ -1052,36 +1347,41 @@ export const createSTExprCompiler = (env) => {
         lvalue(text) {
             const ast = parseText(text);
             if (!['id', 'member', 'index', 'bit'].includes(ast.k)) fail(`"${String(text).trim()}" is not a variable that can be assigned`);
-            const r = emitNode(ast);
+            writeTarget = ast;
+            let r;
+            try { r = emitNode(ast); } finally { writeTarget = null; }
             if (!r.lval && !r.bitOf) fail(`"${String(text).trim()}" cannot be assigned`);
             if (r.pendingDims) fail(`"${String(text).trim()}": assigning a whole ARRAY dimension is not supported`);
             return r;
         },
         // A value for a slot of IEC type `targetType` (an FB pin): the
-        // expression, with gross type mismatches refused.
+        // expression converted to it (only the F12 implicit conversions).
         value(text, targetType, what) {
             const R = toValue(emitNode(parseText(text)));
             if (R.t === 'VOID') fail(`"${String(text).trim()}" returns no value`);
-            checkAssignable(targetType, R, what);
-            return R.c;
+            return coerce(targetType, R, what);
         },
         // `target := <already emitted C of IEC type rhsType>` (FB output
-        // captures, VAR_IN_OUT copy-back).
-        assignC(lhsText, rhsC, rhsType) {
-            return this.assignR(lhsText, { c: rhsC, t: rhsType ?? null, pure: true });
+        // captures, VAR_IN_OUT copy-back — `exact`: an in-out actual must have
+        // the formal's own type).
+        assignC(lhsText, rhsC, rhsType, { exact = false } = {}) {
+            return this.assignR(lhsText, { c: rhsC, t: rhsType ?? null, pure: true, lval: true }, '', { exact });
         },
         // `target := value` → one C statement (no trailing `;`).
         assign(lhsText, rhsText) {
             return this.assignR(lhsText, toValue(emitNode(parseText(rhsText))), rhsText);
         },
-        assignR(lhsText, R, rhsText = '') {
+        assignR(lhsText, R, rhsText = '', { exact = false } = {}) {
             const L = this.lvalue(lhsText);
-            const lt = L.t;
-            checkAssignable(L.ptrStr ? null : lt, R, `"${String(lhsText).trim()}"`);
+            const what = `"${String(lhsText).trim()}"`;
+            checkWritable(L, what);
+            // §7.3.3.2.3: a FUNCTION must assign its own name at least once.
+            if (env.fnResult && L.root && String(L.root.name).toLowerCase() === String(env.fnResult.name).toLowerCase()) env.fnResult.assigned = true;
             if (R.t === 'VOID') fail(`"${String(rhsText).trim()}" returns no value`);
-            if (isStrT(lt) && !L.ptrStr) {
+            const rc = coerce(L.ptrStr ? null : L.t, R, what, { exact });
+            if (isStrT(L.t) && !L.ptrStr) {
                 // ⚠️ STRING storage is an array: never C `=`, always a bounded copy.
-                return `KRON_STRSET(${L.c}, ${R.c})`;
+                return `KRON_STRSET(${L.c}, ${rc})`;
             }
             if (L.bitOf) {
                 if (!L.bitOf.lval) fail(`"${String(lhsText).trim()}" cannot be assigned`);
@@ -1089,9 +1389,15 @@ export const createSTExprCompiler = (env) => {
                 // would overflow a signed int.
                 const B = L.bitOf, T = B.t || 'DWORD', ct = ELEMENTARY_C[T] || 'uint32_t', w = widthOf(T) || 32;
                 const ut = w === 64 ? 'uint64_t' : 'uint32_t', one = w === 64 ? '1ULL' : '1u';
-                return `${B.c} = (${ct})(((${ut})(${UNSIGNED_C[w]})${B.c} & ~(${one} << ${L.bit})) | ((${ut})((${R.c}) ? ${one} : 0u) << ${L.bit}))`;
+                return `${B.c} = (${ct})(((${ut})(${UNSIGNED_C[w]})${B.c} & ~(${one} << ${L.bit})) | ((${ut})((${rc}) ? ${one} : 0u) << ${L.bit}))`;
             }
-            return `${L.c} = ${R.c}`;
+            // T72 1c: an ARRAY is assigned as a whole — C cannot assign an
+            // array, so the elements are copied (same type: coerce checked it).
+            if (L.t && arrayInfo(L.t)) {
+                if (!R.lval && R.t !== null) fail(`${what}: an ARRAY can only be assigned from an ARRAY variable`);
+                return `memcpy(&(${L.c}), &(${rc}), sizeof(${L.c}))`;
+            }
+            return `${L.c} = ${rc}`;
         },
         // An expression used as a statement: must be a call.
         callStatement(text) {
@@ -1100,6 +1406,27 @@ export const createSTExprCompiler = (env) => {
                 fail(`"${String(text).trim()}" is not a statement (an assignment needs ":=", a call needs parentheses)`);
             }
             return emitNode(ast).c;
+        },
+        // `sel <op> label` for a CASE (sel is an already emitted { c, t }),
+        // typed like any comparison; the label must be a constant — a
+        // literal, an enumerated value or a CONSTANT variable (Annex A
+        // Case_List_Elem : Subrange | Constant_Expr).
+        caseCompare(selR, op, labelText) {
+            const r = toValue(emitNode(parseText(labelText)));
+            const isConst = r.lit !== undefined || r.numLit || r.timeLit || r.strLit || r.t === 'BOOL' && /^(true|false|\(\(bool\))/.test(r.c)
+                || (r.t !== null && env.enumTypes.has(String(r.t).toLowerCase()) && !r.lval)
+                || r.root?.cls === 'constant';
+            if (!isConst) fail(`CASE label "${String(labelText).trim()}" is not a constant (a literal, an enumerated value or a CONSTANT)`);
+            return emitBinaryTyped(op, selR, r, true).c;
+        },
+        // Write checks of a target without emitting an assignment (FOR control
+        // variable, an in-out actual given to an FB call).
+        checkWritable(text, what) { checkWritable(this.lvalue(text), what); },
+        // Type check of an FB in-out actual (exact type, §6.6.1.6 rule 6).
+        checkInOutActual(text, targetType, what) {
+            const L = this.lvalue(text);
+            checkWritable(L, what);
+            coerce(targetType, { ...L }, what, { exact: true });
         },
     };
 };

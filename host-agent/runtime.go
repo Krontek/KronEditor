@@ -722,7 +722,7 @@ func typeSize(t string) int {
 		return 2
 	case "DINT", "UDINT", "REAL", "DWORD":
 		return 4
-	// TIME/LTIME: a signed 64-bit count of microseconds (kronstandard.h).
+	// TIME: a signed 64-bit count of microseconds, LTIME of nanoseconds.
 	case "LINT", "ULINT", "LREAL", "LWORD", "TIME", "LTIME":
 		return 8
 	case "TON", "TOF":
@@ -863,8 +863,8 @@ func encodeValue(t, value string) ([]byte, bool) {
 		binary.LittleEndian.PutUint32(out, uint32(v))
 		return out, true
 	case "LINT", "TIME", "LTIME":
-		// TIME/LTIME are int64 microseconds; the editor sends the decimal µs
-		// count (a string, so a value beyond 2^53 survives JSON exactly).
+		// TIME is int64 microseconds, LTIME int64 nanoseconds; the editor sends
+		// the decimal count of the type's unit (a string, so a value beyond 2^53 survives JSON exactly).
 		v, err := strconv.ParseInt(s, 10, 64)
 		if err != nil {
 			return nil, false

@@ -10,6 +10,11 @@
 
 set -euo pipefail
 
+# Run from the script's own directory: `go build .` and dist/ are relative,
+# so invoking it as ./server/build.sh from the repo root found no go.mod.
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+cd "$SCRIPT_DIR"
+
 echo "=== Cleaning old binaries and build cache ==="
 rm -f dist/plc-agent_linux_armv7 dist/plc-agent_linux_arm64 dist/plc-agent_linux_amd64
 go clean -cache
@@ -48,7 +53,7 @@ echo "=== Syncing binaries into resources/ (what 'Deploy Server to Target' ships
 # The host-agent's deploy_server_to_target reads the binary from
 # resources/<triple>/server/. Keep it in sync so a rebuild is actually deployed
 # (otherwise the editor would ship a stale server).
-REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 copy_to_resources() {
     local src="$1" triple="$2"
     local dst_dir="${REPO_ROOT}/resources/${triple}/server"

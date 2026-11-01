@@ -107,9 +107,10 @@ Supported PLC variable types and their sizes:
 | `float64` | 8 | `number` | `3.141592653589793` |
 
 IEC `TIME` and `LTIME` have no type of their own here: they are published as
-**`int64`**, the signed count of **microseconds** they are in the runtime
-(`T#2h` = `7200000000`, `T#-5s` = `-5000000`). Write a duration the same way
-(an integer µs count, or its decimal string). Like every 64-bit integer, a
+**`int64`**, the signed count of **microseconds** (`TIME`) or **nanoseconds**
+(`LTIME`, IEC T10 fn. m) they are in the runtime (`T#2h` = `7200000000`,
+`T#-5s` = `-5000000`, `LT#1s` = `1000000000`). Write a duration the same way
+(an integer count of the type's unit, or its decimal string). Like every 64-bit integer, a
 value beyond ±2^53 is returned as a decimal **string** so JSON clients keep it
 exact. A program built before TIME became 64-bit published it as `uint32` —
 re-run Build & Send.

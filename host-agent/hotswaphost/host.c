@@ -114,6 +114,7 @@ static void plc_sleep_until(const struct timespec *deadline) {
     }
     WaitForSingleObject(tmr, INFINITE);
 }
+#define HS_YIELD() Sleep(0)
 #else
 #include <dlfcn.h>
 #include <signal.h>
@@ -122,6 +123,7 @@ static void plc_sleep_until(const struct timespec *deadline) {
 #include <sys/mman.h>
 #include <sys/stat.h>   /* watch_files_thread (file swap/stop triggers) */
 #include <sched.h>      /* per-task SCHED_FIFO priority */
+#define HS_YIELD() sched_yield()
 /* ⚠️ struct stat's nanosecond mtime is st_mtim on Linux but st_mtimespec on
  * macOS (which has no st_mtim at all — a compile error on the Mac build). */
 #if defined(__APPLE__)
@@ -248,6 +250,18 @@ static unsigned long  g_interval[MAXT];
  * without the symbol keeps behaving exactly as it did. */
 static int            g_prio[MAXT];
 static int            g_ntask;
+/* Optional export of the module: reports an IEC run-time error (a task
+ * overrun here) through the module's own counter/log/policy (KRON_RTE_* in
+ * the generated plc.h). Re-resolved on every bind. NULL = an older module. */
+typedef void (*rte_fn)(int, const char *, long long);
+static rte_fn         g_rte;
+#define HS_RTE_OVERRUN 6
+/* "TASK <name>" per task, copied out of the module at bind (the module's own
+ * strings die with it on a swap); its address is the error's site identity. */
+static char           g_task_site[MAXT][48];
+#if defined(__linux__) && !defined(SCHED_IDLE)
+#define SCHED_IDLE 5   /* <sched.h> defines it only under _GNU_SOURCE */
+#endif
 
 /* The layout hash of the FIRST successfully bound .so (cold start). Every
  * later swap is checked against THIS reference, never the previous swap's —
@@ -586,9 +600,17 @@ static int resolve_and_bind(void *h) {
          * every bind, like the interval, so a priority edit swaps live (the
          * thread applies it on its next scan). */
         g_prio[i] = tprio ? tprio(i) : 99;
-        if (g_prio[i] < 1 || g_prio[i] > 99) g_prio[i] = 99;
+        /* 0 = the IEC background task (§6.8.2 d: programs without a task),
+         * run at SCHED_IDLE — only with an interval of 0 to go with it. */
+        if (g_prio[i] == 0 && g_interval[i] != 0) g_prio[i] = 99;
+        if (g_prio[i] < 0 || g_prio[i] > 99) g_prio[i] = 99;
     }
     g_ntask = n;
+    g_rte = (rte_fn)plc_dlsym(h, "plc_rte_report");
+    {
+        const char *(*tname)(int) = (const char *(*)(int))plc_dlsym(h, "plc_task_name");
+        for (int i = 0; i < n; i++) snprintf(g_task_site[i], sizeof g_task_site[i], "TASK %s", tname ? tname(i) : "?");
+    }
     bind(g_state);   /* adopt the SAME arena — preserves all state across swaps */
 #if defined(__linux__)
     /* ⚠️ AFTER bind(): plc_axis_ptr dereferences the module's file-scope S, which
@@ -767,7 +789,7 @@ static void *task_thread(void *arg) {
 #if defined(__linux__)
         if (g_prio[idx] != cur_prio) {
             struct sched_param sp; sp.sched_priority = g_prio[idx];
-            if (pthread_setschedparam(pthread_self(), SCHED_FIFO, &sp) == 0) {
+            if (pthread_setschedparam(pthread_self(), g_prio[idx] == 0 ? SCHED_IDLE : SCHED_FIFO, &sp) == 0) {
                 cur_prio = g_prio[idx];
             } else {
                 /* Reported once per priority value, not once per scan. */
@@ -795,6 +817,24 @@ static void *task_thread(void *arg) {
         us_tick = mono_us();
         if (g_body[idx]) g_body[idx]();
 
+        if (g_interval[idx] == 0) {
+            /* The background task: re-run as soon as it ends (§6.8.2 d) —
+             * at SCHED_IDLE, so only on otherwise idle CPU time. */
+            HS_YIELD();
+            continue;
+        }
+        /* §6.8.2: a missed deadline is an ERROR — reported through the
+         * module (count, log, project policy), and the schedule restarts from
+         * now instead of firing the missed periods back to back. */
+        {
+            struct timespec now; clock_gettime(CLOCK_MONOTONIC, &now);
+            long long late_us = ((long long)now.tv_sec - (long long)next.tv_sec) * 1000000LL
+                              + ((long long)now.tv_nsec - (long long)next.tv_nsec) / 1000LL;
+            if (late_us > 0) {
+                if (g_rte) g_rte(HS_RTE_OVERRUN, g_task_site[idx], late_us);
+                next = now;
+            }
+        }
         scan_sleep_until(&next);
     }
     /* Whatever made us leave, nobody may wait for this thread at a barrier. */

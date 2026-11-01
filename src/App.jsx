@@ -26,7 +26,7 @@ import {
 import SaveConfirmDialog from './components/SaveConfirmDialog';
 import VisualizationEditor from './components/visualization/VisualizationEditor';
 import { getEditorScope, EDITOR_SCOPE } from './utils/editorScope';
-import { isReservedTranspilerName } from './utils/reservedNames';
+import { isReservedTranspilerName, iecIdentifierProblem } from './utils/reservedNames';
 import { getBoardById } from './utils/boardDefinitions';
 import { getBoardFamilyDefine } from './utils/devicePortMapping';
 import { buildHardwarePortVars } from './utils/hwPortVars';
@@ -41,7 +41,7 @@ import { errorCodeService } from './services/ErrorCodeService';
 import { loadAllEsiDevices, saveEsiFile, deleteEsiFile } from './services/EsiLibraryService';
 import { openFile, saveFile, ask, readTextFile, writeTextFile, clearActiveFileHandle, registerPathPicker } from './services/browserFs';
 import SavePathModal from './components/SavePathModal';
-import { transpileToC, validateProjectST } from './services/CTranspilerService';
+import { transpileToC, validateProjectST, RUNTIME_ERROR_TYPES } from './services/CTranspilerService';
 import { PLCClient } from './services/PLCClient';
 import { host } from './services/HostClient';
 import { ERROR_CATEGORY, formatCompileFailure, categorize } from './utils/errorFormat';
@@ -409,7 +409,10 @@ function App() {
   const [hmiPort] = useState(() => Number(localStorage.getItem('hmiPort') || '7800'));
 
   // Remote deployment state
-  const [plcAddress, setPlcAddress] = useState(() => localStorage.getItem('plcAddress') || '');
+  // The target address belongs to the PROJECT (saved in its XML), never to the
+  // browser: seeding it from localStorage made every new project open already
+  // connected to the previous project's PLC.
+  const [plcAddress, setPlcAddress] = useState('');
   const [sshUser, setSshUser] = useState(() => localStorage.getItem('sshUser') || 'pi');
   const [sshPort, setSshPort] = useState(() => localStorage.getItem('sshPort') || '22');
   const [apiPassword, setApiPassword] = useState('krontek');
@@ -1155,6 +1158,27 @@ function App() {
     return () => clearInterval(syncId);
   }, [isRunning]);
 
+  // --- IEC run-time errors (KRON_RTE_*) ------------------------------------
+  // The runtime counts them in prog____rte_count / prog____rte_code (carried
+  // by the `prog__` subscription). A local sim also prints the first one per
+  // site on stderr (→ "Runtime:" lines); a remote PLC's stderr never reaches
+  // the editor, so the counter is what reports it — at most every 10 s.
+  const rteSeenRef = React.useRef({ count: null, at: 0 });
+  useEffect(() => {
+    if (!isRunning) { rteSeenRef.current = { count: null, at: 0 }; return; }
+    const n = Number(liveVariables?.prog____rte_count);
+    if (!Number.isFinite(n)) return;
+    const seen = rteSeenRef.current;
+    if (seen.count === null || n < seen.count) { seen.count = n; return; }
+    const now = Date.now();
+    if (n > seen.count && now - seen.at >= 10000) {
+      const code = Number(liveVariables?.prog____rte_code);
+      const label = RUNTIME_ERROR_TYPES.find(e => e.code === code)?.label || `code ${code}`;
+      addLog('error', categorize(ERROR_CATEGORY.RUNTIME, `${n - seen.count} IEC run-time error(s) since the last report (total ${n}); last: ${label}. See Task Manager → Run-time errors for the policy.`));
+      seen.count = n; seen.at = now;
+    }
+  }, [liveVariables, isRunning, addLog]);
+
   // --- Live subscription: stream only what is being looked at -------------
   // Every variable of every program used to be decoded and pushed on every
   // tick, of which the editor could display a handful. The subscription is the
@@ -1345,12 +1369,28 @@ function App() {
     setIsBoardModalOpen(true);
   }, []);
 
+  // A new/closed project has no target: dropping the address also stops the
+  // status poll and closes the client (see the plcAddress effect).
+  const resetConnectionSettings = () => {
+    setPlcAddress('');
+    setConnectionEnabled(true);
+    setApiPassword('krontek');
+    setAutoRun(false);
+    setIsDeployed(false);
+    setIsDirty(false);
+  };
+
   const handleBoardSelected = useCallback((boardId) => {
     setSelectedBoard(boardId);
     if (pendingNewProject) {
       // Creating a new project with selected board
       setProjectStructure(defaultProjectStructure);
       setBuses([]);
+      setBusConfigs({});
+      setOpenTabs([]);
+      setWatchTable([]);
+      setHmiLayout({ pages: [] });
+      resetConnectionSettings();
       setCurrentFilePath(null);
       clearActiveFileHandle();
       setActiveId(null);
@@ -1388,8 +1428,7 @@ function App() {
       setWatchTable([]);
       setHmiLayout({ pages: [] });
       setSelectedBoard(null);
-      setIsDeployed(false);
-      setIsDirty(false);
+      resetConnectionSettings();
       setIsSimulationMode(false);
       setIsRunning(false);
       setLiveVariables({});
@@ -1447,7 +1486,7 @@ function App() {
       const xml = await resp.text();
       await detachRuntimeForProjectSwitch();
       // Load with a display label, then clear the path so Save → Save As.
-      processFileContent(xml, `${plcAddress} (target)`);
+      processFileContent(xml, `${plcAddress} (target)`, { keepConnection: true });
       setCurrentFilePath(null);
       clearActiveFileHandle();
       addLog('success', t('logs.pulled', { addr: plcAddress }) || `Project pulled from ${plcAddress}.`);
@@ -1456,7 +1495,9 @@ function App() {
     }
   };
 
-  const processFileContent = (content, filePath) => {
+  // keepConnection: a project pulled from the target keeps the address it was
+  // pulled from when its XML carries none.
+  const processFileContent = (content, filePath, { keepConnection = false } = {}) => {
     try {
       const result = importProjectFromXml(content);
       if (result) {
@@ -1499,10 +1540,18 @@ function App() {
           setSelectedBoard(boardId);
         }
 
-        // Restore connection settings from XML
+        // Restore connection settings from XML — a project without an address
+        // must not inherit the previous project's target.
         if (savedAddr) {
           setPlcAddress(savedAddr);
-          localStorage.setItem('plcAddress', savedAddr);
+          setConnectionEnabled(true);
+        } else if (!keepConnection) {
+          setPlcAddress('');
+        }
+        // A pulled project IS what the target runs; a file from disk is not.
+        if (!keepConnection) {
+          setIsDeployed(false);
+          setIsDirty(false);
         }
         if (savedSshUser) {
           setSshUser(savedSshUser);
@@ -1626,14 +1675,12 @@ function App() {
           return;
         }
 
-        // Strict task semantics: only task-assigned programs run. Warn about any
-        // program that won't execute (so "I made it but no data" is diagnosable).
-        const runningProgs = new Set((cCode.variableTable?.tasks || []).map(tk => tk.program));
-        const notRunning = (projectStructure.programs || [])
-          .map(p => p.name)
-          .filter(n => n && !runningProgs.has(n.trim().replace(/\s+/g, '_')));
-        if (notRunning.length > 0) {
-          addLog('warning', `Not assigned to any task — will NOT run: ${notRunning.join(', ')}. Assign them in Task Manager.`);
+        // IEC 61131-3 §6.8.2 d: a program with no task runs in the BACKGROUND
+        // task (lowest priority, restarted as soon as it ends — interval 0 in
+        // the variable table). Said once, so "why does it run" is answerable.
+        const background = (cCode.variableTable?.tasks || []).filter(tk => !tk.interval_us).map(tk => tk.program);
+        if (background.length > 0) {
+          addLog('info', `No task assigned — running in the background task (lowest priority, continuous): ${background.join(', ')}.`);
         }
 
         // Build the simulation as a HOT-SWAP loader-host (+ logic.so), not a plain
@@ -2257,6 +2304,11 @@ function App() {
     // stray whitespace so names like "Program0 " never reach the project (they
     // break the C symbol mapping and POU lookups).
     const name = String(rawName || '').trim().replace(/\s+/g, '_');
+    const nameProblem = iecIdentifierProblem(name);
+    if (nameProblem) {
+      alert(`"${name}": ${nameProblem}`);
+      return false;
+    }
 
     // Block names the transpiler/runtime reserve at C file scope (e.g. "S" is
     // the internal PlcState pointer) — see reservedNames.js for the full list.
