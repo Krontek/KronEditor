@@ -1,10 +1,10 @@
 import { useState, useRef, useEffect, useCallback } from 'react';
 import { host } from '../services/HostClient';
 import { TOOL_DEFS, FS_TOOL_DEFS, FS_WRITE_TOOL_DEFS, FS_TOOL_NAMES, applyToolCall, buildProjectOverview, findPOU, summarizeLiveSamples, summarizeWatch } from '../services/agentTools';
+import { transpileToC } from '../services/CTranspilerService';
 import { setEditorScope, EDITOR_SCOPE } from '../utils/editorScope';
 import PasswordInput from './common/PasswordInput';
 
-const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 // Image-attachment support. Only the providers below accept multimodal
 // content blocks on the wire (see host-agent/ai.go: callAnthropic and
@@ -826,6 +826,14 @@ function buildSystemPrompt(libraryData = [], agentMode = 'manual') {
     '- "BLOCK"/"blok"/"FB" terminology: when the user calls something a "block" (e.g. "mc_power blogu", "a TON block") and its name matches a standard/library block IGNORING case and underscores (mc_power→MC_Power, ton→TON, ctu→CTU), it is a FUNCTION BLOCK INSTANCE of THAT type — NOT a plain variable. You MUST: call list_blocks for its real pins, then add_variable with type = the FB type name (e.g. type "MC_Power"), then CALL it in ST. NEVER create a BOOL merely named after a known block (a `mc_power : BOOL` coil is WRONG when the user asked for the MC_Power block). Any separate "power"/"enable"/"güç" bool the user mentions is a DISTINCT BOOL variable that feeds the FB\'s Enable input — add it too.',
     '- Stateful FBs (timers TON/TOF/TP/TONR, counters CTU/CTD, edges R_TRIG/F_TRIG, bistables SR/RS, communication, user FBs) CAN live in a ladder rung: set_ladder\'s `fb` field — power flows contact network → trigger pin → Q → coils; other pins via fb.inputs (literals or variable names) and fb.outputs (capture ET/CV into variables). Motion FBs (MC_*) CAN too — their axis goes in fb.inputs.Axis (an existing AXIS_REF global). Inline math/compare/move (ADD, GT, MOVE, …) CANNOT — write those in an ST rung. Do NOT silently downgrade an FB to a BOOL to fit ladder.',
     '- Structured Text must be valid IEC 61131-3: := assign; AND/OR/NOT logical; BAND/BOR/BXOR/BNOT bitwise; time literals like T#500ms.',
+    // Stable text (prompt cache). Mirrors Standards/iec61131-3.md §6.6 (F11/F12),
+    // which the transpiler's typer (stExpr.js) enforces as hard errors.
+    '- ⚠️ TYPES ARE STRICT (IEC 61131-3 F11/F12) — the compiler rejects every conversion that is not in this list, with no warning-and-continue:',
+    '  · Implicit (allowed silently) ONLY when widening without loss: SINT→INT→DINT→LINT, USINT→UINT→UDINT→ULINT, USINT→INT, UINT→DINT, UDINT→LINT, INT/UINT/SINT/USINT→REAL, DINT/UINT/UDINT→LREAL, REAL→LREAL, BOOL→BYTE→WORD→DWORD→LWORD, TIME→LTIME, CHAR→STRING.',
+    '  · EVERYTHING ELSE needs an explicit <SRC>_TO_<DST>(…) call: narrowing (INT→USINT, DINT→INT, LREAL→REAL), signed↔unsigned of the same width (UDINT→DINT, INT→UINT), integer↔bit string (INT↔WORD, USINT↔BYTE), DINT→REAL, BOOL→INT (BOOL_TO_INT). There is NO numeric→BOOL conversion — compare instead (`b := x <> 0;`).',
+    '  · A comparison (`a > 1500`) is BOOL; assign it to a BOOL, or wrap it in BOOL_TO_INT(…) for an integer.',
+    '  · An expression is evaluated in ITS operands\' type, then assigned: `u := 16#55 + USINT_TO_INT(i);` is INT and fails into a USINT `u` — keep the operands in the target type (`u := 16#55 + i;` with i : USINT). An untyped literal (16#55, 10) takes the type of the slot/operand it meets, if it fits.',
+    '  · ⚠️ DESIGN TO THE PIN TYPES: before declaring a variable that feeds or receives an FB pin, read that pin\'s type in list_blocks and declare the variable with EXACTLY that type (I2C Device_Address/Register_Address are USINT, TxLength/RxLength UINT, a packet counter output UDINT → its "last value" copy UDINT too). Do not default to INT/DINT and convert later. A VAR_IN_OUT pin takes exactly its own type, never a conversion.',
     '- Reference every variable by its BARE name — NEVER prefix it with `global.`, `GVL.`, a program name, or any namespace. Write `led := NOT led;` and `blink(IN := NOT blink.Q, PT := T#1s);` — NOT `global.led` or `global.blink.Q`. (This is not CODESYS; there is no global namespace object.) Member access (`blink.Q`, `blink.ET`) is only for reading an FB instance\'s output pins.',
     '- Before using a variable in ST, add it with add_variable (in the SAME response). Conversely: every variable you add_variable for MUST be referenced in the body you write — no dead vars.',
     '- Variables default to LOCAL scope. For a LOCAL variable you MUST pass BOTH scope "local" AND pou = the exact POU name it belongs to (usually the POU you just created in this same response). Never omit `pou` for a local variable. Use scope "global" ONLY when the user explicitly says global/shared, or the variable must be used by more than one POU.',
@@ -866,10 +874,9 @@ export default function AiAgentPanel({
   liveVariables = null,        // live values from the running sim/PLC (for read_live_variables)
   onApplied = null,            // (pouNames[]) → reload the open editor after a commit
   onHotSwap = null,            // (pouNames[]) → push an online change while running
-  hotSwapActive = false,       // a live hot-swap session is running
-  onStartHotSwap = null,       // () → build+run a hot-swap session (online change)
-  onStopHotSwap = null,        // () → stop the hot-swap session
   askRequest = null,           // {text, id} pushed from the output-panel "Ask agent" — auto-sends once
+  buses = [],                  // fieldbuses + their configs: the turn check transpiles the WHOLE project, as a build does
+  busConfigs = {},
 }) {
   const [config, setConfig] = useState(loadConfig);
   const [configOpen, setConfigOpen] = useState(false);
@@ -1182,7 +1189,7 @@ export default function AiAgentPanel({
       if (d.done && !d.error) {
         refreshOllama();
         // Auto-connect the freshly downloaded model.
-        setConfig(prev => {
+        setConfig(() => {
           const next = { provider: 'ollama', model: d.model, apiKey: '', baseUrl: ollamaBase };
           saveConfig(next);
           return next;
@@ -1407,6 +1414,33 @@ export default function AiAgentPanel({
     } catch (e) {
       return { error: e?.message || String(e) };
     }
+  };
+
+  // ── Turn check (transpile only, no clang) ─────────────────────────────────
+  // Read through refs: runTurn's closure outlives the render that made it.
+  const buildCtxRef = useRef({ selectedBoard, buses, busConfigs });
+  buildCtxRef.current = { selectedBoard, buses, busConfigs };
+  const headersRef = useRef(null); // Promise<[[file, text]] | null>, fetched once
+  // The error message the composed `next` introduces, or null. Errors already
+  // present in `base` (the user's own unfinished work, a bus not configured
+  // yet) are not the agent's to fix and never block a turn. ⚠️ The transpiler
+  // stops at its FIRST error, so a project that is already broken masks a new
+  // error behind the old one — the build still catches it.
+  const turnCheckError = async (next, base) => {
+    if (!headersRef.current) headersRef.current = host.getStandardHeaders().catch(() => null);
+    const headers = await headersRef.current;
+    // Without the served headers the kron*.h blocks are unregistered and every
+    // use of one would read as an error the agent cannot fix: skip the check
+    // (the build still runs the full transpile + clang).
+    if (!headers) return null;
+    const { selectedBoard: board, buses: b, busConfigs: bc } = buildCtxRef.current;
+    const run = (struct) => {
+      try { transpileToC(struct, headers, board, true, b || [], bc || {}); return null; }
+      catch (e) { return String(e?.message || e); }
+    };
+    const err = run(next);
+    if (!err) return null;
+    return err === run(base) ? null : err;
   };
 
   // One model turn: ask the provider for the assistant's next message, run any
@@ -1686,7 +1720,25 @@ export default function AiAgentPanel({
       return;
     }
 
-    const hasMutations = steps.some((s) => s.res?.mutation && s.res.ok);
+    let hasMutations = steps.some((s) => s.res?.mutation && s.res.ok);
+    // ⚠️ TURN CHECK: the composed result goes through the transpiler (pure JS,
+    // NO clang — the cost that got check_compile removed). An error this turn
+    // introduced rejects the WHOLE turn back to the model with the transpiler's
+    // own message (which names the <A>_TO_<B> fix), so it corrects itself in
+    // the same run instead of reporting success on a program that won't build.
+    if (hasMutations && steps.some((s) => s.res?.mutation && s.res.ok && !FS_TOOL_NAMES.has(s.tc.name))) {
+      setActivity('checking');
+      const err = await turnCheckError(working, turnBase);
+      if (err) {
+        for (const s of steps) {
+          if (!(s.res?.mutation && s.res.ok)) continue;
+          s.res = { ok: false, error: `NOT APPLIED — nothing from this turn was applied, because the resulting project does not compile: ${err}  Fix the cause and resend ALL of this turn's changes.` };
+        }
+        pushView({ role: 'note', text: `🔁 Turn rejected by the compile check: ${err}` });
+        working = turnBase;
+        hasMutations = false;
+      }
+    }
     if (!hasMutations) {
       // Reads / errors only — feed results back and keep going automatically.
       const toolMsgs = steps.map(toolResultMessage);

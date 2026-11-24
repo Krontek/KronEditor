@@ -2,7 +2,7 @@ import React, { useState, useRef, useCallback, useEffect } from 'react';
 import { useTranslation } from 'react-i18next';
 import { ask } from '../services/browserFs';
 import { getBoardById } from '../utils/boardDefinitions';
-import EtherCATIconSrc from '../assets/icons/ethercat.png';
+import EtherCATIconSrc from '../assets/icons/ethercat.svg';
 import {
     writeClipboard, readClipboard, refreshClipboard, useKronClipboard, CLIP_KIND,
 } from '../utils/kronClipboard';
@@ -192,7 +192,7 @@ const CANIcon = () => (
 );
 
 const BUS_META = {
-    ethercat: { label: 'Master', icon: <EtherCATImg /> },
+    ethercat: { label: 'EtherCAT Master', icon: <EtherCATImg /> },
     canbus:   { label: 'CANbus', icon: <CANIcon /> },
 };
 
@@ -236,7 +236,6 @@ const ProjectSidebar = ({
     const clipboardEntry = useKronClipboard();
     const clipboardCategory =
         clipboardEntry?.kind === CLIP_KIND.POU ? clipboardEntry.meta?.category : null;
-    const canPasteGlobals = clipboardEntry?.kind === CLIP_KIND.GLOBALS;
 
     /* Context menu */
     const [ctxMenu, setCtxMenu] = useState(null); // { x, y, items }

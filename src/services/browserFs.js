@@ -28,7 +28,7 @@ let activeHandle = null;
 // Absolute path of the currently-open project file, used when the browser has
 // no File System Access API (Firefox). Save (saveAs=false) writes straight
 // back to this path via the host-agent, with no prompt — the in-place Save
-// equivalent of activeHandle. Set by openFile()/saveFile() in the agent-path
+// equivalent of activeHandle. Set by an opened file's adopt() / saveFile() in the agent-path
 // branch; cleared together with activeHandle.
 let activeAgentPath = null;
 
@@ -75,13 +75,15 @@ async function verifyPermission(handle, writable) {
  * back further to <input type=file> only if no picker is registered (no
  * handle, no path → Save acts as Save As via a download).
  *
- * ⚠️ `adopt` (default false) is what makes the opened file the in-place Save
- * target. ONLY the project-open path may pass true: loading any other .xml
- * (e.g. an ESI device description) used to adopt it unconditionally, so the
- * next Save silently overwrote that file with the project — it is gone, with
- * no picker and no warning.
+ * ⚠️ Opening never changes the in-place Save target by itself. The result
+ * carries `adopt()`, which makes this file the Save target; ONLY the
+ * project-open path may call it, and only AFTER the project loaded. Loading
+ * any other .xml (e.g. an ESI device description) used to adopt it, so the
+ * next Save silently overwrote that file with the project; and adopting
+ * before validation did the same with a file the loader then rejected (the
+ * old project stayed on screen, its Save went to the rejected file).
  */
-export async function openFile({ accept = '.xml', adopt = false } = {}) {
+export async function openFile({ accept = '.xml' } = {}) {
   if (typeof window.showOpenFilePicker === 'function') {
     try {
       const [handle] = await window.showOpenFilePicker({
@@ -90,11 +92,11 @@ export async function openFile({ accept = '.xml', adopt = false } = {}) {
       });
       const file = await handle.getFile();
       const content = await file.text();
-      if (adopt) {
+      const adopt = () => {
         activeHandle = handle; // reuse for subsequent in-place Save
         activeAgentPath = null;
-      }
-      return { name: handle.name, path: handle.name, content };
+      };
+      return { name: handle.name, path: handle.name, content, adopt };
     } catch (err) {
       if (err && (err.name === 'AbortError' || err.code === 20)) return null;
       // Fall through to the host-agent / <input> path on any other failure.
@@ -105,11 +107,11 @@ export async function openFile({ accept = '.xml', adopt = false } = {}) {
     const path = await promptForPath({ mode: 'open' });
     if (!path) return null;
     const content = await host.readFile(path);
-    if (adopt) {
+    const adopt = () => {
       activeHandle = null;
       activeAgentPath = path;
-    }
-    return { name: path.split(/[/\\]/).pop(), path, content };
+    };
+    return { name: path.split(/[/\\]/).pop(), path, content, adopt };
   }
 
   return new Promise((resolve, reject) => {
@@ -124,11 +126,11 @@ export async function openFile({ accept = '.xml', adopt = false } = {}) {
       }
       const reader = new FileReader();
       reader.onload = (e) => {
-        if (adopt) {
+        const adopt = () => {
           activeHandle = null; // no writable handle from <input> → Save = Save As
           activeAgentPath = null;
-        }
-        resolve({ name: file.name, path: file.name, content: String(e.target.result) });
+        };
+        resolve({ name: file.name, path: file.name, content: String(e.target.result), adopt });
       };
       reader.onerror = () => reject(reader.error || new Error('FileReader error'));
       reader.readAsText(file);

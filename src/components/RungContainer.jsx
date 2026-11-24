@@ -487,11 +487,11 @@ const BlockNode = ({ id, data, selected }) => {
   // declared anywhere. Literals (numbers, T#/TIME#, 16#/2#/8# radix, TRUE/FALSE)
   // and member/array access on a declared base are NOT flagged.
   const undeclaredRefBase = React.useCallback((raw) => {
-    const c = String(raw || '').replace(/[🌍🏠⊞⊡⊟]/g, '').trim();
+    const c = String(raw || '').replace(/[🌍🏠⊞⊡⊟]/gu, '').trim();
     if (!c || c.includes('#')) return null;               // empty or T#/16#… literal
     if (!/^[A-Za-z_]/.test(c)) return null;               // numeric/other literal
     if (/^(TRUE|FALSE|NULL)$/i.test(c)) return null;       // keyword literals
-    const base = c.split(/[\[.]/)[0];
+    const base = c.split(/[[.]/)[0];
     return base && !declaredNames.has(base.toLowerCase()) ? base : null;
   }, [declaredNames]);
 
@@ -588,7 +588,7 @@ const BlockNode = ({ id, data, selected }) => {
         border: selected ? '2px solid #a78bfa' : (
           isTypeMismatch ? '2px solid #ff9800' // ORANGE: variable exists but not BOOL
           : ((data.type === 'Contact' || data.type === 'Coil') && instanceName !== '' &&
-              !findVarByName(allVars, instanceName.replace(/[🌍🏠⊞⊡⊟]/g, '').trim().split(/[\[.]/)[0]))
+              !findVarByName(allVars, instanceName.replace(/[🌍🏠⊞⊡⊟]/gu, '').trim().split(/[[.]/)[0]))
             ? '2px solid #f44336' // RED: variable not found
             : '1px solid transparent'
         ),
@@ -642,9 +642,9 @@ const BlockNode = ({ id, data, selected }) => {
               if (data.readOnly) return;
               const rawValue = e.target.value;
               setLocalInstanceName(rawValue);
-              const val = rawValue.replace(/[🌍🏠⊞⊡⊟]/g, '').trim();
+              const val = rawValue.replace(/[🌍🏠⊞⊡⊟]/gu, '').trim();
               // Block assignment if variable exists but is not BOOL type
-              const typedVarDef = findVarByName(allVars, val.split(/[\[.]/)[0]);
+              const typedVarDef = findVarByName(allVars, val.split(/[[.]/)[0]);
               if (typedVarDef && typedVarDef.type !== 'BOOL') return;
               handleUpdate({ instanceName: val });
             }}
@@ -653,9 +653,9 @@ const BlockNode = ({ id, data, selected }) => {
             // — that would declare every typed prefix ("m", "mo", "mot", …).
             onBlur={() => {
               if (data.readOnly) return;
-              const val = (localInstanceName || '').replace(/[🌍🏠⊞⊡⊟]/g, '').trim();
+              const val = (localInstanceName || '').replace(/[🌍🏠⊞⊡⊟]/gu, '').trim();
               if (!val) return;
-              const typedVarDef = findVarByName(allVars, val.split(/[\[.]/)[0]);
+              const typedVarDef = findVarByName(allVars, val.split(/[[.]/)[0]);
               if (typedVarDef && typedVarDef.type !== 'BOOL') return;
               handleUpdate({ instanceName: val, __declare: true });
             }}
@@ -828,7 +828,7 @@ const BlockNode = ({ id, data, selected }) => {
     let inferredType = 'ANY_NUM';
     for (const pinName of numPinNames) {
       const raw = (localPinValues[pinName] ?? data.values?.[pinName] ?? '');
-      const val = String(raw).replace(/[🌍🏠⊞⊡⊟]/g, '').trim();
+      const val = String(raw).replace(/[🌍🏠⊞⊡⊟]/gu, '').trim();
       if (!val) continue;
       // Decimal literal → REAL
       if (/^-?\d*\.\d+$|^-?\d+\.\d*$/.test(val)) { inferredType = 'REAL'; break; }
@@ -838,7 +838,7 @@ const BlockNode = ({ id, data, selected }) => {
         continue;
       }
       // Variable reference → use its declared type
-      const baseName = val.split(/[\[.]/)[0];
+      const baseName = val.split(/[[.]/)[0];
       const varDef = findVarByName(allVars, baseName);
       if (varDef) {
         if (varDef.type === 'REAL' || varDef.type === 'LREAL') { inferredType = 'REAL'; break; }
@@ -980,8 +980,8 @@ const BlockNode = ({ id, data, selected }) => {
             const TIME_FORMAT_REGEX = /^(LTIME|TIME|LT|T)#[-+]?(\d+(\.\d+)?(ms|us|ns|d|h|m|s)_?)+$/i;
             const TIME_CHAR_REGEX = /^[0-9tihmdsluen._#+-]*$/i;
 
-            const cleanVal = val.replace(/[🌍🏠⊞⊡⊟]/g, '').trim();
-            const baseValName = cleanVal.split(/[\[.]/)[0];
+            const cleanVal = val.replace(/[🌍🏠⊞⊡⊟]/gu, '').trim();
+            const baseValName = cleanVal.split(/[[.]/)[0];
             const valVarDef = findVarByName([...variables, ...globalVars], baseValName);
             const allowsWholeArrayRef = !!pin.passByReference;
             const isArrayWithoutIndex = valVarDef && arrayTypeMap[valVarDef.type] && !cleanVal.includes('[');
@@ -1039,7 +1039,7 @@ const BlockNode = ({ id, data, selected }) => {
                       // Open the write-value dialog for whatever this badge is showing:
                       // the variable assigned to the pin, else the pin's own shadow field.
                       const openWriteModal = () => {
-                        const cleanedVal = (val || '').replace(/[🌍🏠⊞⊡⊟]/g, '').trim();
+                        const cleanedVal = (val || '').replace(/[🌍🏠⊞⊡⊟]/gu, '').trim();
                         const isVarRefBadge = cleanedVal && /^[A-Za-z_]/.test(cleanedVal);
                         let writeKey = shadowKey;
                         let writeCurrent = liveVariables?.[shadowKey];
@@ -1111,7 +1111,7 @@ const BlockNode = ({ id, data, selected }) => {
                       onClick={(e) => {
                         e.stopPropagation();
                         if (!data.readOnly || !data.onWriteVariable) return;
-                        const cleanedVal = (val || '').replace(/[🌍🏠⊞⊡⊟]/g, '').trim();
+                        const cleanedVal = (val || '').replace(/[🌍🏠⊞⊡⊟]/gu, '').trim();
                         const isVarRef = cleanedVal && /^[A-Za-z_]/.test(cleanedVal);
                         let writeKey = shadowKey;
                         let writeCurrent = liveVariables?.[shadowKey];
@@ -1133,7 +1133,7 @@ const BlockNode = ({ id, data, selected }) => {
                         setLocalPinValues(prev => ({ ...prev, [pin.name]: rawValue }));
 
                         // Strip emojis coming from autocomplete suggestions (globally and trim)
-                        const newValue = rawValue.replace(/[🌍🏠⊞⊡⊟]/g, '').trim();
+                        const newValue = rawValue.replace(/[🌍🏠⊞⊡⊟]/gu, '').trim();
 
                         if (isTime && !TIME_CHAR_REGEX.test(newValue)) return;
                         handleInputChange(pin.name, newValue);
@@ -1145,7 +1145,7 @@ const BlockNode = ({ id, data, selected }) => {
                         // refs and unrecognised text are left untouched.
                         if (data.readOnly || !isTime) return;
                         const cur = localPinValues[pin.name] !== undefined ? localPinValues[pin.name] : (val || '');
-                        const norm = normalizeTimeLiteral((cur || '').replace(/[🌍🏠⊞⊡⊟]/g, '').trim());
+                        const norm = normalizeTimeLiteral((cur || '').replace(/[🌍🏠⊞⊡⊟]/gu, '').trim());
                         if (norm !== cur) {
                           setLocalPinValues(prev => ({ ...prev, [pin.name]: norm }));
                           handleInputChange(pin.name, norm);
@@ -1204,8 +1204,8 @@ const BlockNode = ({ id, data, selected }) => {
             const handleId = `out_${pin.name}`;
             const connected = isHandleConnected(handleId, 'source');
             const val = data.values?.[pin.name] || '';
-            const outCleanVal = val.replace(/[🌍🏠⊞⊡⊟]/g, '').trim();
-            const outBaseVarName = outCleanVal.split(/[\[.]/)[0];
+            const outCleanVal = val.replace(/[🌍🏠⊞⊡⊟]/gu, '').trim();
+            const outBaseVarName = outCleanVal.split(/[[.]/)[0];
             const outVarDef = findVarByName([...variables, ...globalVars], outBaseVarName);
             const outIsArrayWithoutIndex = outVarDef && arrayTypeMap[outVarDef.type] && !outCleanVal.includes('[');
             const undeclaredOut = undeclaredRefBase(val);
@@ -1225,7 +1225,7 @@ const BlockNode = ({ id, data, selected }) => {
             if (lv) {
               const safeProgName = (data.parentName || '').trim().replace(/\s+/g, '_');
               const safeInstName = (data.instanceName || '').trim().replace(/\s+/g, '_');
-              const assignedVar = val.replace(/[🌍🏠⊞⊡⊟]/g, '').trim();
+              const assignedVar = val.replace(/[🌍🏠⊞⊡⊟]/gu, '').trim();
               if (assignedVar && /^[A-Za-z_]/.test(assignedVar)) {
                 const safeVar = assignedVar.replace(/\s+/g, '_');
                 const k = liveResolveKey(lv, `prog_${safeProgName}_${safeVar}`)
@@ -1339,10 +1339,11 @@ const BlockNode = ({ id, data, selected }) => {
                             // this was unconditionally 'none' the double-click fell straight
                             // through to the canvas and opened Block Settings.
                             pointerEvents: (errInfo || isError || (hasLive && outLiveKey && data.onWriteVariable)) ? 'auto' : 'none',
-                            cursor: hasLive && outLiveKey && data.onWriteVariable ? 'pointer' : 'default',
+                            // ONE cursor key: a second one silently overrode the
+                            // write affordance with 'default'.
+                            cursor: errInfo ? 'help' : (hasLive && outLiveKey && data.onWriteVariable ? 'pointer' : 'default'),
                             zIndex: 10,
                             whiteSpace: 'nowrap',
-                            cursor: errInfo ? 'help' : 'default'
                           }}>
                           {hasLive ? liveDisplay : '---'}
                         </span>
@@ -1362,7 +1363,7 @@ const BlockNode = ({ id, data, selected }) => {
                         if (data.readOnly) return;
                         const rawValue = e.target.value;
                         setLocalPinValues(prev => ({ ...prev, [pin.name]: rawValue }));
-                        const newValue = rawValue.replace(/[🌍🏠⊞⊡⊟]/g, '').trim();
+                        const newValue = rawValue.replace(/[🌍🏠⊞⊡⊟]/gu, '').trim();
                         handleInputChange(pin.name, newValue);
                       }}
                       style={{
@@ -1673,7 +1674,7 @@ const RungContainer = ({
       const safeProgName = (parentName || '').trim().replace(/\s+/g, '_');
       nodes.forEach(node => {
         if (!node.selected || node.data?.type !== 'Contact') return;
-        const varName = ((node.data.values?.var || node.data.instanceName) + '').replace(/[🌍🏠⊞⊡⊟]/g, '').trim();
+        const varName = ((node.data.values?.var || node.data.instanceName) + '').replace(/[🌍🏠⊞⊡⊟]/gu, '').trim();
         if (!varName) return;
         const safeVar = varName.replace(/\s+/g, '_');
         const progKey = `prog_${safeProgName}_${safeVar}`;
@@ -1875,7 +1876,7 @@ const RungContainer = ({
 
     const lookupVar = (name) => {
       if (!name) return false;
-      const safeName = (name + '').replace(/[🌍🏠⊞⊡⊟]/g, '').trim();
+      const safeName = (name + '').replace(/[🌍🏠⊞⊡⊟]/gu, '').trim();
       if (!safeName) return false;
       let v = liveGet(liveVariables, `prog_${safeProgName}_${safeName}`);
       if (v === undefined) v = liveGet(liveVariables, `prog__${safeName}`);
@@ -1957,7 +1958,7 @@ const RungContainer = ({
 
             let pinVal;
             // 1. Check if a variable is assigned to this output pin
-            const assignedVar = (vals[pinName] || '').replace(/[🌍🏠⊞⊡⊟]/g, '').trim();
+            const assignedVar = (vals[pinName] || '').replace(/[🌍🏠⊞⊡⊟]/gu, '').trim();
             if (assignedVar && /^[A-Za-z_]/.test(assignedVar)) {
               const safeVar = assignedVar.replace(/\s+/g, '_');
               pinVal = liveGet(liveVariables, `prog_${safeProgName}_${safeVar}`);

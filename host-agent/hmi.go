@@ -9,8 +9,10 @@ import (
 // HmiState is a minimal stand-in for the Tauri HMI server. The Tauri
 // implementation runs a separate HTTP server on a configurable port that
 // serves an embedded HTML page + variable poll/write JSON endpoints. Porting
-// that page (~600 lines of embedded HTML/JS) is deferred — for now the editor
-// can still call start/stop/push/poll, but no real HTTP server is launched.
+// that page (~600 lines of embedded HTML/JS) is deferred. ⚠️ Until it is,
+// start-hmi-server answers 501 — it used to answer ok:true while nothing
+// listened, and the editor announced a reachable HMI URL. The target's
+// KronServer HMI is real; only the local-simulation preview is missing.
 
 type HmiState struct {
 	mu      sync.Mutex
@@ -42,16 +44,8 @@ func (s *Server) handleStartHmiServer(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusMethodNotAllowed, "POST required")
 		return
 	}
-	var req startHmiReq
-	_ = json.NewDecoder(r.Body).Decode(&req)
-	s.hmi.mu.Lock()
-	s.hmi.running = true
-	s.hmi.port = req.Port
-	s.hmi.mu.Unlock()
-	writeJSON(w, http.StatusOK, map[string]any{
-		"ok":      true,
-		"message": "HMI server is a stub in host-agent — embedded HTML not yet ported",
-	})
+	writeError(w, http.StatusNotImplemented,
+		"the local HMI preview is not implemented in the host agent yet — deploy to a target (KronServer serves the HMI)")
 }
 
 func (s *Server) handleStopHmiServer(w http.ResponseWriter, r *http.Request) {

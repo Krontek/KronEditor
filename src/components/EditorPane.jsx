@@ -9,6 +9,7 @@ import DragDropManager from '../utils/DragDropManager';
 import WriteValueModal from './common/WriteValueModal';
 import { liveGet, memberGet, liveEntriesWithPrefix, findVarByName, hasVarNamed } from '../utils/iecNames';
 import { stLiveKeyAt } from '../utils/stLiveKey';
+import { declarationHover } from '../utils/stDeclHover';
 
 // IEC scalar (elementary) types — anything else (FB instances like TON/CTU,
 // UDTs, ARRAY[...]) is a COMPOSITE whose live value is a struct/array, shown in
@@ -671,6 +672,27 @@ const EditorPane = ({
     return () => disposable.dispose();
   }, [monacoInstance]);
 
+  // --- DECLARATION HOVER (edit mode) ---
+  // While the PLC is NOT running, hovering a declared variable shows its
+  // declaration: type, class, initial value (+ address / description). While
+  // running, the live-value hover above owns the tooltip instead.
+  const isRunningRef = useRef(isRunning);
+  useEffect(() => { isRunningRef.current = isRunning; }, [isRunning]);
+  useEffect(() => {
+    if (!monacoInstance) return;
+    const disposable = monacoInstance.languages.registerHoverProvider('iec-st', {
+      provideHover: (model, position) => {
+        if (isRunningRef.current) return null;
+        // Hover providers are per LANGUAGE: answer only for this pane's own
+        // editor — the SCL inline rung editors register their own.
+        if (!editorRef.current || editorRef.current.getModel() !== model) return null;
+        const masked = maskCommentsAndStrings(model.getValue())[position.lineNumber - 1];
+        return declarationHover(monacoInstance, model, position, masked, variablesRef.current, globalVarsRef.current);
+      },
+    });
+    return () => disposable.dispose();
+  }, [monacoInstance]);
+
   // --- ST EDITOR CONFIGURATION & DRAG-DROP ---
   const handleEditorDidMount = (editor, monaco) => {
     editorRef.current = editor;
@@ -822,16 +844,16 @@ const EditorPane = ({
         }
         lastPosRef.current = target.position;
         const widget = createWidget(target.position, snippet);
-        try { editor.removeContentWidget({ getId: () => widgetId }); } catch (err) { }
+        try { editor.removeContentWidget({ getId: () => widgetId }); } catch (_err) { /* not mounted */ }
         editor.addContentWidget(widget);
       }
     };
 
     const handleDragLeave = () => {
-      try { editor.removeContentWidget({ getId: () => widgetId }); } catch (err) { }
+      try { editor.removeContentWidget({ getId: () => widgetId }); } catch (_err) { /* not mounted */ }
     };
     const handleDropClean = () => {
-      try { editor.removeContentWidget({ getId: () => widgetId }); } catch (err) { }
+      try { editor.removeContentWidget({ getId: () => widgetId }); } catch (_err) { /* not mounted */ }
     };
 
     window.stHandleDragOver = handleDragOver;
@@ -842,7 +864,7 @@ const EditorPane = ({
       delete window.stHandleDragOver;
       delete window.stHandleDragLeave;
       delete window.stHandleDropClean;
-      try { editor.removeContentWidget({ getId: () => widgetId }); } catch (err) { }
+      try { editor.removeContentWidget({ getId: () => widgetId }); } catch (_err) { /* not mounted */ }
     };
   }, [monacoInstance, fileType]);
 

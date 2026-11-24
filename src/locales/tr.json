@@ -149,7 +149,14 @@
         "unassignedPrograms": "Atanmamış Programlar",
         "noProgramsAssigned": "Bu göreve atanmış program yok",
         "assignProgram": "Program Ata",
-        "allProgramsAssigned": "✓ Tüm programlar atandı"
+        "allProgramsAssigned": "✓ Tüm programlar atandı",
+        "taskPriority": "Öncelik",
+        "taskPriorityHint": "0 = yüksek · {{max}} = düşük",
+        "taskPriorityHelp": "IEC 61131-3 görev önceliği: 0 en yüksek, {{max}} en düşük. Linux SCHED_FIFO 99 - öncelik ile çalışır; 0 çekirdek gerçek zamanlı iş parçacıklarının da önüne geçer.",
+        "backgroundPrograms": "Bunlar ARKA PLAN görevinde çalışır: en düşük öncelik, biter bitmez yeniden başlatılır (IEC 61131-3 §6.8.2 d).",
+        "runtimeErrors": "Çalışma zamanı hataları",
+        "rteReport": "Raporla, çalışmaya devam et",
+        "rteStop": "PLC'yi durdur (güvenli durum)"
     },
     "resources": {
         "globalVariables": "Global Değişkenler"
@@ -168,7 +175,7 @@
     "errors": {
         "nameRequired": "İsim zorunludur",
         "nameExists": "İsim zaten mevcut",
-        "invalidIdentifier": "Geçersiz Tanımlayıcı: \"{name}\". Bir harf veya alt çizgi ile başlamalı ve yalnızca alfasayısal karakterler içermelidir.",
+        "invalidIdentifier": "Geçersiz Tanımlayıcı: \"{{name}}\". Bir harf veya alt çizgi ile başlamalı ve yalnızca alfasayısal karakterler içermelidir.",
         "varExistsScope": "Değişken adı '{{name}}' bu kapsamda zaten mevcut!",
         "varExistsOtherScope": "Değişken adı '{{name}}' başka bir programda/blokta yerel değişken olarak zaten mevcut!",
         "varExistsWithType": "'{{name}}' adında ve '{{type}}' tipinde değişken zaten mevcut!",

@@ -35,9 +35,9 @@
  * `extern volatile uint64_t us_tick;` AFTER the #include of this header, so
  * the symbol is not visible here; and its origin differs per platform (since
  * boot on Linux, since process start on Windows). Reading the clock in the
- * block also makes the value exact per task thread — every task thread writes
- * the shared us_tick just before its own body, so on a multi-task project a
- * us_tick read can belong to another thread's scan.
+ * block also makes the value exact per task thread. (IEC timers no longer use
+ * us_tick either: they read the task's scan-start snapshot __kron_scan_us,
+ * plc.h — us_tick was written by every task thread.)
  *
  * Dependencies: stdbool.h, stdint.h, stdio.h, stdlib.h, string.h, errno.h,
  * math.h, time.h, and sys/statvfs.h on POSIX only.
@@ -590,6 +590,49 @@ static inline void Read_Uptime_Call(Read_Uptime *inst)
     inst->HOURS     = (uint8_t)((secs / 3600ULL) % 24ULL);
     inst->MINUTES   = (uint8_t)((secs / 60ULL) % 60ULL);
     inst->SECONDS   = (uint8_t)(secs % 60ULL);
+}
+
+/* ── Read_Live_Time ───────────────────────────────────────────────────────
+ * The LIVE monotonic clock, read at the moment of the call — for measuring a
+ * duration INSIDE one scan (how long a block of logic took, the age of the
+ * scan when an event was seen). Only differences of two readings mean
+ * anything; the origin is arbitrary (boot on Linux).
+ *
+ * ⚠️ Deliberately NOT what IEC timers use. TON/TP/TOF/TONR read the task's
+ * SCAN-START snapshot (`__kron_scan_us`, plc.h): one frozen "now" per scan, so
+ * two timers started on the same scan expire on the same scan whatever their
+ * order in the code, and a timer's Q cannot change between two lines of one
+ * scan. A program that compares this live value with a timer's ET is comparing
+ * two different clocks' moments — fine for diagnostics, not for logic.
+ *
+ * VALID is FALSE (and both outputs 0) if the clock cannot be read — never a
+ * plausible-looking number.
+ */
+typedef struct {
+    int64_t  NOW;      /* monotonic time, MICROseconds (TIME)     (output) */
+    int64_t  NOW_NS;   /* monotonic time, NANOseconds (LTIME)     (output) */
+    bool     VALID;    /* FALSE = clock unavailable               (output) */
+    bool     EN;       /* enable — power flow                     (input)  */
+    bool     ENO;      /* echoes EN                               (output) */
+} Read_Live_Time;
+
+static inline void Read_Live_Time_Call(Read_Live_Time *inst)
+{
+    struct timespec ts;
+
+    inst->ENO = inst->EN;
+    if (!inst->EN) return;
+#if defined(CLOCK_MONOTONIC)
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
+#else
+    if (clock_gettime(CLOCK_REALTIME, &ts) != 0) {
+#endif
+        inst->NOW = 0; inst->NOW_NS = 0; inst->VALID = false;
+        return;
+    }
+    inst->NOW_NS = (int64_t)ts.tv_sec * 1000000000LL + (int64_t)ts.tv_nsec;
+    inst->NOW    = inst->NOW_NS / 1000LL;
+    inst->VALID  = true;
 }
 
 /* ── Cycle_Time_Monitor ───────────────────────────────────────────────────

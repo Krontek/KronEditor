@@ -30,7 +30,10 @@
 //	+20 u32 consumer lock    runtime-private try-lock (task threads)
 //	+24 u64 head             WRITER — last posted seq
 //	+32 u64 ack              runtime — last consumed seq (release)
-//	+40 u64 reserved
+//	+40 u32 idle             AGENT — 1 = no live reader: the runtime may skip
+//	                         the non-addressed slots (SetIdle). 0 = mirror all,
+//	                         which is what an agent predating it leaves.
+//	+44 u32 reserved
 //
 // Entry (at MailboxBase + 64 + (seq % capacity) × 32):
 //
@@ -74,6 +77,7 @@ const (
 	offNvars   = 16
 	offHead    = 24
 	offAck     = 32
+	offIdle    = 40
 
 	entSeq    = 0
 	entIndex  = 8
@@ -275,6 +279,27 @@ func (m *Mailbox) Reset() {
 	atomic.StoreUint32(m.u32p(MailboxBase+20), 0)
 }
 
+// SetIdle publishes whether any live reader (an editor stream) is attached.
+// idle=true lets a target runtime skip every NON-addressed slot in its
+// per-task sync; addressed slots are mirrored regardless (REST, HMI and the
+// capture ring read them with no editor connected). The runtime never writes
+// this word and its init leaves it alone, so it survives a runtime restart.
+// ⚠️ Fail-open by design: 0 (the zero value, and what an older agent leaves)
+// means "mirror everything" — a missing setter can cost scan time, never
+// freeze a value the editor shows.
+func (m *Mailbox) SetIdle(idle bool) {
+	var v uint32
+	if idle {
+		v = 1
+	}
+	atomic.StoreUint32(m.u32p(MailboxBase+offIdle), v)
+}
+
+// Idle reports the current idle word (tests, /status).
+func (m *Mailbox) Idle() bool {
+	return atomic.LoadUint32(m.u32p(MailboxBase+offIdle)) != 0
+}
+
 // Post sends cmd and waits until the runtime has applied it. nil means the
 // runtime acknowledged AND applied it; every failure is an *Error.
 func (m *Mailbox) Post(cmd Command, opt WaitOptions) error {
@@ -411,7 +436,7 @@ func (m *Mailbox) result(e int, seq uint64) error {
 	case stBadSize:
 		return errf(KindRejected, "runtime rejected the write: value size does not match the variable (variable table and running program differ — Build & Send)")
 	case stReadOnly:
-		return errf(KindRejected, "runtime rejected the write: the variable is read-only (STRING)")
+		return errf(KindRejected, "runtime rejected the write: the variable is read-only (a STRING or a CONSTANT)")
 	case stBadOp:
 		return errf(KindRejected, "runtime rejected the write: unknown command")
 	case stCancelled:

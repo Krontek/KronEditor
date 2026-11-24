@@ -17,7 +17,19 @@ Read the root [`CLAUDE.md`](../CLAUDE.md) first. This file is the **register of 
 - **Missing standard features (§16.3 of Standards/iec61131-3.md)** — `TO_INT`/`TO_REAL`, `TRUNC_<type>`, `GT(a, b, c)` function forms, STRING ordering, array/struct comparison, incomplete formal function calls, function `=>` outputs, negative array lower bounds, subranges, `REF_TO`, DATE/TOD/DT, `R_EDGE`/`F_EDGE`. Each is a loud error today; the developer has not decided the order yet.
 - **`TRUNC` (deprecated) is `(int64_t)x`** — undefined behaviour out of range; should saturate like `KRON_F2I`.
 
+
+Found by `tests/transpiler/` (each is a `todo` case there — delete the `todo` with the fix):
+- ⚠️ **SILENT: a multi-value array repetition `[2(1, 2, 3)]` is emitted as the C comma expression** `x[0] = 1, 2, 3;` → `[1,1,0,0,0,0]` instead of `1,2,3,1,2,3` (§6.4.4.5.2). Single-value `3(0)` is right (`userTypeInitLines`).
+- ⚠️ **SILENT: two names differing only in case (`B`, `b`) in one POU are accepted** — two `PlcState` fields, and ST reads of `B` resolve to `b`. The transpiler has no case-insensitive duplicate-declaration check (`checkProjectIdentifiers` only checks spelling/keywords); IEC names are one name (T1 fn. a).
+- **A variable typed inline `ARRAY[..] OF T` is dropped from `PlcState`** — clang reports `no member named 'prog_…'`. §6.5.1 allows instant types; until supported, the transpiler must throw (the agent auto-converts it, `agentTools.js`).
+- **A user FB named like a `kron*.h` block (`Debounce`) reaches clang** as `no member named …` — the library struct wins over the user's; either rename/prefer the user type or throw.
+- **An unmatched `END_FOR`/`END_IF`/`END_WHILE` is emitted as a bare `}`** — only clang fails. (Unclosed or crossed blocks are caught.)
+- **ST layout: a line starting with `)` is not merged backward, and `THEN`/`DO` on the line after the condition is not parsed** — §7.3.2 makes end of line a space. Loud errors.
+- **Nested `/* /* */ */` comments fail** (T3 3b); `(* (* *) *)` works (`stripIecComments`).
+- **More missing standard functions (loud):** the T29 function forms `ADD/SUB/MUL/DIV(…)`, `ATAN2`, partial access `v.%Xn/%Bn/%Wn/%Dn` (T17; `v.n` works), the T34 string functions `LEN/LEFT/RIGHT/MID/CONCAT/INSERT/DELETE/REPLACE/FIND`.
+
 ## Runtime
 
 - **`plc_rte_report` sees a site by the ADDRESS of its string.** A hot swap loads new string literals, so a site that faulted before the swap is reported once more after it. Harmless (one extra log line); the counter is exact.
 - **A remote PLC's run-time error text stays on the target** (stderr → KronServer). The editor sees only the counter (`prog____rte_count`/`prog____rte_code`, `App.jsx`), i.e. the type of the last error, not its site.
+- **A Stop can take 5 s and skip the safe state when an EtherCAT bus is not healthy.** `main()` joins the bus threads before `PLC_Cleanup` (`CTranspilerService.js ecThreadJoinCode`; hot-swap: `__hs_ec_stop`), but `__ec_watchdog_thread` sleeps its whole back-off (up to 30 s) in ONE `nanosleep`, and `kron_ec_check_state` itself blocks for `EC_TIMEOUTSTATE` (2 s) per slave during recovery. KronServer's 5 s grace then SIGKILLs the runtime: no `HAL_Cleanup`, GPIO outputs stay at their last level (the EtherCAT zero frames still go out — the IO_Bus thread exits on its own). A fix must sleep in ≤50 ms slices like `plc_sleep_until`, and must not let `HAL_Cleanup` wait behind a blocking recovery.

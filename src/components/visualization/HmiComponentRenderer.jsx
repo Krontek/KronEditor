@@ -82,7 +82,7 @@ const AlarmComp = ({ w, h, p, value }) => {
 };
 
 /* ─── Numeric Display ───────────────────────────────────────── */
-const NumericDisplayComp = ({ w, h, p, value }) => {
+const NumericDisplayComp = ({ h, p, value }) => {
     const dec = Number(p.decimals) || 0;
     let display = '---';
     if (value !== null && value !== undefined) {
@@ -110,7 +110,7 @@ const NumericDisplayComp = ({ w, h, p, value }) => {
 };
 
 /* ─── Progress Bar ──────────────────────────────────────────── */
-const ProgressComp = ({ w, h, p, value }) => {
+const ProgressComp = ({ p, value }) => {
     const min = Number(p.min) || 0;
     const max = Number(p.max) || 100;
     const val = Math.min(max, Math.max(min, Number(value) || min));
@@ -260,7 +260,7 @@ const ChartComp = ({ w, h, p, value }) => {
 };
 
 /* ─── Button ────────────────────────────────────────────────── */
-const ButtonComp = ({ w, h, p, value, onWrite, liveKey, isPreview }) => {
+const ButtonComp = ({ p, value, onWrite, liveKey, isPreview }) => {
     const [pressed, setPressed] = useState(false);
     const on = value === true || value === 1 || value === 'TRUE' || value === '1';
     const active = p.mode === 'toggle' ? on : pressed;
@@ -330,7 +330,7 @@ const ButtonComp = ({ w, h, p, value, onWrite, liveKey, isPreview }) => {
 };
 
 /* ─── Toggle Button ─────────────────────────────────────────── */
-const ToggleButtonComp = ({ w, h, p, value, onWrite, liveKey, isPreview }) => {
+const ToggleButtonComp = ({ p, value, onWrite, liveKey, isPreview }) => {
     const on = value === true || value === 1 || value === 'TRUE' || value === '1';
     const bg = on ? (p.onColor || '#007a4d') : (p.offColor || '#252525');
     return (
@@ -392,7 +392,7 @@ const SwitchComp = ({ w, h, p, value, onWrite, liveKey, isPreview }) => {
 };
 
 /* ─── Slider ────────────────────────────────────────────────── */
-const SliderComp = ({ w, h, p, value, onWrite, liveKey, isPreview }) => {
+const SliderComp = ({ p, value, onWrite, liveKey, isPreview }) => {
     const min  = Number(p.min) ?? 0;
     const max  = Number(p.max) ?? 100;
     const step = Number(p.step) || 1;
@@ -415,7 +415,7 @@ const SliderComp = ({ w, h, p, value, onWrite, liveKey, isPreview }) => {
 };
 
 /* ─── Numeric Input ─────────────────────────────────────────── */
-const NumericInputComp = ({ w, h, p, value, onWrite, liveKey, isPreview }) => {
+const NumericInputComp = ({ p, value, onWrite, liveKey, isPreview }) => {
     const [draft, setDraft] = useState('');
     const [editing, setEditing] = useState(false);
     const dec = Number(p.decimals) || 0;
@@ -471,7 +471,7 @@ const NumericInputComp = ({ w, h, p, value, onWrite, liveKey, isPreview }) => {
 };
 
 /* ─── Label ─────────────────────────────────────────────────── */
-const LabelComp = ({ w, h, p, value }) => {
+const LabelComp = ({ p, value }) => {
     const dec  = Number(p.decimals) || 0;
     let   text = p.text || '';
     if (p.variable && value !== null && value !== undefined) {
@@ -503,7 +503,7 @@ const LabelComp = ({ w, h, p, value }) => {
 };
 
 /* ─── Rectangle ─────────────────────────────────────────────── */
-const RectangleComp = ({ w, h, p }) => (
+const RectangleComp = ({ p }) => (
     <div style={{
         width: '100%', height: '100%',
         background: p.background || 'transparent',
@@ -533,7 +533,7 @@ const CircleComp = ({ w, h, p }) => {
 };
 
 /* ─── Line ──────────────────────────────────────────────────── */
-const LineComp = ({ w, h, p }) => {
+const LineComp = ({ p }) => {
     const horiz = (p.orientation || 'horizontal') === 'horizontal';
     return (
         <div style={{
@@ -569,7 +569,7 @@ const RENDERERS = {
     LINE:             LineComp,
 };
 
-const HmiComponentRenderer = ({ id, type, w, h, compProps = {}, value, onWrite, liveKey, isPreview = false }) => {
+const HmiComponentRenderer = ({ type, w, h, compProps = {}, value, onWrite, liveKey, isPreview = false }) => {
     const Comp = RENDERERS[type];
     if (!Comp) {
         return (

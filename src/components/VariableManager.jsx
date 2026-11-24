@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { DataTypeSelector, ModernSelect } from './common/Selectors';
+import { DataTypeSelector } from './common/Selectors';
 import WriteValueModal from './common/WriteValueModal';
 import { useTranslation } from 'react-i18next';
 import { formatTimeUs, formatDuration, isTimeType, normalizeTimeLiteral } from '../utils/plcStandards';
@@ -245,15 +245,6 @@ const VariableManager = ({
       description: '',
       address: ''
     }, insertAfterIndex);
-  };
-
-  const handleRemoveClick = () => {
-    if (!onDelete || selectedIds.size === 0) return;
-    // Delete in reverse order so earlier indices stay valid for the parent.
-    const toDelete = variables.filter(v => selectedIds.has(v.id)).map(v => v.id);
-    toDelete.forEach(id => onDelete(id));
-    setSelectedIds(new Set());
-    setAnchorId(null);
   };
 
   // ── Row selection (single / Ctrl-toggle / Shift-range) ────────────────────
@@ -723,7 +714,7 @@ const VariableManager = ({
                   <td style={bCell}>
                     <EditableCell
                       value={v.address || ''}
-                      onCommit={(val, e) => {
+                      onCommit={(val) => {
                         if (disabled || isSimulationMode) return;
                         const res = formatIECAddress(val, v.type);
                         if (!res.ok) {

@@ -77,7 +77,7 @@ export function registerIECSTLanguage(monaco) {
         }],
         [/:=|=>|<>|<=|>=|\*\*/, 'operator'],
         [/[=<>+\-*/]/, 'operator'],
-        [/[;,.:()\[\]]/, 'delimiter'],
+        [/[;,.:()[\]]/, 'delimiter'],
         [/\s+/, 'white'],
       ],
       blockComment: [

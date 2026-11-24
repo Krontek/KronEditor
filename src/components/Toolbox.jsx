@@ -1,6 +1,6 @@
 import React, { useState, useMemo, useRef } from 'react';
 import { useTranslation } from 'react-i18next';
-import EtherCATIconSrc from '../assets/icons/ethercat.png';
+import EtherCATIconSrc from '../assets/icons/ethercat.svg';
 import { PLC_BLOCKS } from '../utils/plcStandards';
 import { LIBRARY_TREE, ETHERCAT_LIBRARY_TREE, GENERIC_FB_DEFS } from '../utils/libraryTree';
 import { getBoardLibraryTree, COMM_PROTO_BLOCKS } from '../utils/boardLibraryBlocks';
@@ -199,7 +199,7 @@ const COIL_COLOR = '#8b3a0f'; // coils (brown-red)
 const BOARD_COLOR = '#00695c'; // board-specific blocks (teal)
 const EC_COLOR    = '#1565c0'; // EtherCAT blocks (blue)
 
-const Toolbox = ({ userDefinedBlocks = [], libraryData = [], activeFileType, selectedBoard, buses = [], interfaceConfig = {} }) => {
+const Toolbox = ({ userDefinedBlocks = [], libraryData = [], selectedBoard, buses = [], interfaceConfig = {} }) => {
   const { t } = useTranslation();
   const hasEtherCAT = buses.some(b => b.type === 'ethercat');
   // expand state: category-level and subcategory-level
@@ -547,7 +547,7 @@ const Toolbox = ({ userDefinedBlocks = [], libraryData = [], activeFileType, sel
               {expandedCats['ethercat'] ? '▼' : '▶'}
             </span>
             <img src={EtherCATIconSrc} height="13" style={{ objectFit: 'contain', verticalAlign: 'middle', marginRight: 5, flexShrink: 0 }} alt="EtherCAT" />
-            Master
+            EtherCAT Master
           </div>
 
           {expandedCats['ethercat'] && (

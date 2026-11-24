@@ -705,13 +705,7 @@ func (s *Server) tofuHostKeyCallback(progress func(string)) (ssh.HostKeyCallback
 			progress(fmt.Sprintf("Host %s key changed (device reinstalled?) — updating stored key.", hostname))
 		}
 		// First-use or just-cleared entry → trust and persist the new key.
-		line := knownhosts.Line([]string{norm}, key)
-		f, oerr := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o600)
-		if oerr != nil {
-			return oerr
-		}
-		defer f.Close()
-		if _, werr := f.WriteString(line + "\n"); werr != nil {
+		if werr := appendKnownHostsLine(path, knownhosts.Line([]string{norm}, key)); werr != nil {
 			return werr
 		}
 		if len(keyErr.Want) == 0 {
@@ -745,7 +739,34 @@ func removeKnownHostsEntry(path, norm string) error {
 		kept = append(kept, '\n')
 	skip:
 	}
-	return os.WriteFile(path, bytes.TrimRight(kept, "\n"), 0o600)
+	// ⚠️ Keep the trailing newline: the caller APPENDS the new key next, and a
+	// file ending mid-line glued it onto the last kept entry — one corrupt line
+	// ("illegal base64 data") that failed every later deploy, to every host.
+	kept = bytes.TrimRight(kept, "\n")
+	if len(kept) > 0 {
+		kept = append(kept, '\n')
+	}
+	return os.WriteFile(path, kept, 0o600)
+}
+
+// appendKnownHostsLine appends one entry, first terminating the file's last
+// line if something (an editor, an older agent) left it without a newline —
+// an append must never extend an existing entry.
+func appendKnownHostsLine(path, line string) error {
+	f, err := os.OpenFile(path, os.O_RDWR|os.O_APPEND, 0o600)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	prefix := ""
+	if st, serr := f.Stat(); serr == nil && st.Size() > 0 {
+		last := make([]byte, 1)
+		if _, rerr := f.ReadAt(last, st.Size()-1); rerr == nil && last[0] != '\n' {
+			prefix = "\n"
+		}
+	}
+	_, err = f.WriteString(prefix + line + "\n")
+	return err
 }
 
 // httpStatusOK GETs a URL and returns nil only on a 2xx response.

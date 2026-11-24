@@ -19,7 +19,7 @@ const BlockSettingsModal = ({ isOpen, onClose, blockData, onSave, blockConfig, v
         }
     }, [isOpen, blockData]);
 
-    const cleanVal = (val) => val.replace(/[🌍🏠⚙]\s*/g, '').trim();
+    const cleanVal = (val) => val.replace(/[🌍🏠⚙]\s*/gu, '').trim();
 
     if (!isOpen || !blockData) return null;
 

@@ -121,6 +121,8 @@ re-run Build & Send.
 
 Uploaded via `POST /deploy/variable-table`. Defines the symbol table for SHM access.
 
+A table belongs to the runtime binary it was built with. When it arrives after a new `runtime.bin` while the PREVIOUS runtime still runs, it is **staged**: the response carries `"staged": true`, the running program keeps being served by its own table, and the staged one becomes active when the next runtime starts (normally the `restart` of `POST /deploy/config`). `GET /status` reports `variable_table_staged`.
+
 ```json
 {
   "variables": [
@@ -691,7 +693,7 @@ Files created/managed in `{deploy-dir}` (default `/opt/plc`):
 
 ### `runtime_config.json`
 
-Persisted across restarts. Written by `POST /deploy/config` and `POST /api/v1/runtime/config`; both endpoints accept partial updates and merge field-by-field.
+Persisted across restarts. Written by `POST /deploy/config` and `POST /api/v1/runtime/config`; both endpoints accept partial updates and merge field-by-field. When the update asks for a start (`"restart": true`, or `auto_run` turned on while idle) and the start fails, the config is still saved but the answer is **HTTP 500** with the snapshot plus `"error": "runtime start failed: …"`.
 
 ```json
 {

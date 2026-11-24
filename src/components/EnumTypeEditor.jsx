@@ -1,6 +1,8 @@
 import React, { useState } from 'react';
+import { useTranslation } from 'react-i18next';
 
 const EnumTypeEditor = ({ content, onContentChange }) => {
+    const { t } = useTranslation();
     // Content structure: { values: [ { id, name, value (optional) } ] }
     const values = content.values || [];
 

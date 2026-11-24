@@ -311,7 +311,7 @@ export const LIBRARY_TREE = [
       {
         id: 'sys_diagnostics',
         title: 'Runtime Diagnostics',
-        fromLibrary: ['Read_Uptime', 'Cycle_Time_Monitor', 'Hour_Meter', 'Watchdog']
+        fromLibrary: ['Read_Uptime', 'Read_Live_Time', 'Cycle_Time_Monitor', 'Hour_Meter', 'Watchdog']
       },
       {
         id: 'sys_health',

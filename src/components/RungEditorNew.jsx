@@ -6,6 +6,7 @@ import ErrorBoundary from './ErrorBoundary';
 import BlockSettingsModal from './BlockSettingsModal';
 import WriteValueModal from './common/WriteValueModal';
 import { stLiveKeyAt } from '../utils/stLiveKey';
+import { declarationHover } from '../utils/stDeclHover';
 import DragDropManager from '../utils/DragDropManager';
 import { registerIECSTLanguage } from '../utils/iecSTLanguage';
 import { findStMarkers } from '../utils/stValidation';
@@ -315,6 +316,22 @@ const SCLInlineEditor = ({ code, readOnly, onCodeChange, onBlur, variables = [],
               currentValue: value,
             });
           });
+          // Declaration hover (edit mode only): type + initial value. Hover
+          // providers are per LANGUAGE and every rung has its own editor, so
+          // each one answers only for its own model. "Running" = live values
+          // are streaming (liveVariables is {} in sim mode before a start).
+          if (mc) {
+            const hover = mc.languages.registerHoverProvider('iec-st', {
+              provideHover: (m, position) => {
+                if (m !== editor.getModel()) return null;
+                const lv = writeCtxRef.current?.liveVariables;
+                if (lv && Object.keys(lv).length > 0) return null;
+                const masked = maskCommentsAndStrings(m.getValue())[position.lineNumber - 1];
+                return declarationHover(mc, m, position, masked, variablesRef.current, globalVarsRef.current);
+              },
+            });
+            editor.onDidDispose(() => hover.dispose());
+          }
           // Initial validation
           const model = editor.getModel();
           if (model && mc) {
@@ -788,7 +805,7 @@ const RungEditorNew = ({ variables, setVariables, rungs, setRungs, availableBloc
         node.data.values?.var ||
         node.data.values?.coil ||
         ''
-      ).replace(/[🌍🏠⊞⊡⊟]/g, '').trim();
+      ).replace(/[🌍🏠⊞⊡⊟]/gu, '').trim();
       if (!instanceName) return;
       const safeProgName = (parentName || '').trim().replace(/\s+/g, '_');
       // Resolve to the key AS STORED (built from the declared spelling), not the
@@ -1112,7 +1129,6 @@ const RungEditorNew = ({ variables, setVariables, rungs, setRungs, availableBloc
       else {
         return insertBlock(rungId, blockType, position, '', customData, variables);
       }
-      return;
     }
 
     // 2. Other blocks (Standard / UserDefined)

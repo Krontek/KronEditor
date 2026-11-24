@@ -73,7 +73,11 @@ func main() {
 	//   • the write mailbox — every pending command dropped and the
 	//     mailbox unpublished, so nothing posted to the previous runtime is
 	//     ever applied by the next one (which re-publishes it at init).
+	//   • a staged variable table — installed FIRST, so the initials below
+	//     and every read/write after the spawn use the table that belongs to
+	//     the binary being started (Server.ActivateStagedTable).
 	pm.SetPreStartHook(func() {
+		srv.ActivateStagedTable()
 		ipc.ResetMailbox()
 		ipc.WriteInitialValues()
 		srv.SizeRingSegment()

@@ -5,7 +5,7 @@
  */
 
 import { useState, useCallback, useEffect } from 'react';
-import EtherCATIconSrc from '../assets/icons/ethercat.png';
+import EtherCATIconSrc from '../assets/icons/ethercat.svg';
 import { host } from '../services/HostClient';
 
 /* ── Styles ────────────────────────────────────────────────────────────────── */
@@ -107,7 +107,7 @@ export default function EtherCATEditor({ busConfig, onChange, isRunning = false 
       {/* ── Header ── */}
       <div style={S.header}>
         <img src={EtherCATIconSrc} height="18" style={{ objectFit: 'contain', flexShrink: 0 }} alt="EtherCAT" />
-        <span style={S.title}>Master Configuration</span>
+        <span style={S.title}>EtherCAT Master Configuration</span>
         {log && <span style={{ color: '#4caf50', fontSize: 10, marginLeft: 'auto' }}>{log}</span>}
       </div>
 

@@ -183,8 +183,9 @@ const countStringConvCalls = (code) => ((stripIecComments(code, { blankStrings: 
 // SHM layout v3 (the byte contract is server/RING_FORMAT.md § "Variable
 // segment"): data slots from 0 at NATURAL alignment up to SHM_DATA_END, and the
 // write-command mailbox at SHM_MAILBOX_BASE. The mirror is one-way: the runtime
-// copies PlcState → slots after every scan (plc_shm_sync) and NEVER reads a slot
-// back. A write from outside (KronServer, the host agent) is a mailbox command
+// copies PlcState → slots at the end of a scan (plc_shm_sync_<task>, each slot
+// owned by one task; non-addressed slots only while an editor streams, on a
+// target) and NEVER reads a slot back. A write from outside (KronServer, the host agent) is a mailbox command
 // the runtime applies to PlcState at the start of a scan and acknowledges.
 // There is no forcing (holding a value against the logic) — it was removed in
 // v3 together with the per-variable flag bytes and the __plc_fv shadow, so a
@@ -264,11 +265,11 @@ const generateShmMailbox = (shmEntries) => {
     c += `    case 8: { uint64_t v; memcpy(&v, s, 8); __atomic_store_n((uint64_t *)d, v, __ATOMIC_RELAXED); } break;\n`;
     c += `    default: break;\n    }\n}\n`;
     // index (the table's mb_index) → (slot offset, PlcState address, size);
-    // -1 = read-only (STRING), 0 = unknown index.
+    // -1 = read-only (STRING, or a CONSTANT), 0 = unknown index.
     c += `static int plc_mb_target(uint32_t i, uint32_t *off, void **st) {\n`;
     c += `    switch (i) {\n`;
     shmEntries.forEach((e, i) => {
-        c += e.isString
+        c += (e.isString || e.readOnly)
             ? `    case ${i}u: return -1;\n`
             : `    case ${i}u: *off = ${e.offset}u; *st = (void *)&(S->${e.c_symbol}); return ${e.size};\n`;
     });
@@ -563,8 +564,6 @@ const IEC_SCALAR_C = {
     USINT: 'uint8_t', UINT: 'uint16_t', UDINT: 'uint32_t', ULINT: 'uint64_t',
     REAL: 'float', LREAL: 'double',
 };
-const IEC_INT_TYPES = new Set(['SINT', 'INT', 'DINT', 'LINT', 'USINT', 'UINT', 'UDINT', 'ULINT',
-    'BYTE', 'WORD', 'DWORD', 'LWORD']);
 const IEC_BIT_WIDTH = {
     BOOL: 1, SINT: 8, USINT: 8, BYTE: 8, INT: 16, UINT: 16, WORD: 16,
     DINT: 32, UDINT: 32, DWORD: 32, LINT: 64, ULINT: 64, LWORD: 64,
@@ -606,7 +605,7 @@ const cIdent = (name) => {
 
 const resolveHardwarePortSymbol = (value) => {
     if (value === undefined || value === null) return null;
-    const normalized = String(value).replace(/[🌍🏠⊞⊡⊟]/g, '').trim().toUpperCase();
+    const normalized = String(value).replace(/[🌍🏠⊞⊡⊟]/gu, '').trim().toUpperCase();
     if (!normalized) return null;
 
     const i2cMatch = normalized.match(/^I2C(?:_|)?(\d+)(?:_PORT)?$/);
@@ -1017,7 +1016,27 @@ const checkProjectIdentifiers = (ps) => {
     (ps.taskConfig?.tasks || []).forEach(t => bad(t.name, 'task'));
 };
 
-export const transpileToC = (projectStructure, standardHeaders = [], boardId = null, simMode = true, buses = [], busConfigs = {}) => {
+// ⚠️ transpileToCImpl registers the board's HAL / device blocks into the
+// module-level FB tables for the duration of ONE call and removes them in its
+// cleanup section — which a THROW (every transpile error) skips. The leftover
+// keys then outlive the call: a block of the previously selected board stays
+// "known" after a board switch. Undo exactly what the failed call added.
+// (The agent's turn check runs failing transpiles routinely.)
+export const transpileToC = (...args) => {
+    const tables = [FB_TRIGGER_PIN, FB_Q_OUTPUT, FB_INPUTS, FB_OUTPUTS, FB_INPUT_TYPES, GENERATED_FB_OUTPUT_TYPES];
+    const before = tables.map(t => new Set(Object.keys(t)));
+    const halBefore = new Set(HAL_BLOCK_TYPES);
+    try {
+        return transpileToCImpl(...args);
+    } catch (e) {
+        tables.forEach((t, i) => Object.keys(t).forEach(k => { if (!before[i].has(k)) delete t[k]; }));
+        [...HAL_BLOCK_TYPES].forEach(k => { if (!halBefore.has(k)) HAL_BLOCK_TYPES.delete(k); });
+        EC_PDO_VAR_NAMES.clear();
+        throw e;
+    }
+};
+
+const transpileToCImpl = (projectStructure, standardHeaders = [], boardId = null, simMode = true, buses = [], busConfigs = {}) => {
     checkProjectIdentifiers(projectStructure);
     let stdFunctions = {};
     let customIncludes = ``;
@@ -1100,10 +1119,18 @@ export const transpileToC = (projectStructure, standardHeaders = [], boardId = n
     // Data grows from 0 up to SHM_DATA_END; the command mailbox owns the top of
     // the segment (SHM layout v3 — server/RING_FORMAT.md § "Variable segment").
     let shmOffset = 0;
-    // {c_symbol, offset, size, isString} → plc_shm_sync(); the ARRAY POSITION is
-    // the variable's mailbox index (mb_index in the variable table).
+    // {c_symbol, offset, size, isString, readOnly, ownerProgram, addressed} → the per-task
+    // plc_shm_sync_<i>(); the ARRAY POSITION is the variable's mailbox index
+    // (mb_index in the variable table). ownerProgram = the PROGRAM whose task
+    // mirrors the slot (null = global / runtime-wide → the fastest task);
+    // `addressed` is filled in once the whole table is known (see below).
     const shmEntries = [];
-    const tryAssignShm = (type, c_symbol) => {
+    // ⚠️ readOnly = a CONSTANT (or an element/member of one): the slot is
+    // mirrored for monitoring, but plc_mb_target refuses a write to it
+    // (PLC_MB_ST_READ_ONLY) — §6.5.2.2 makes modifying a CONSTANT an error,
+    // and the program may have folded its value. The returned `constant` flag
+    // rides into debugDefaults so the editor refuses before posting.
+    const tryAssignShm = (type, c_symbol, ownerProgram = null, readOnly = false) => {
         const size = IEC_TYPE_SIZES[type?.toUpperCase()];
         if (!size) return {}; // FB, user-defined type or unknown — no SHM slot
         // ⚠️ NATURAL alignment (a = min(size, 8)). Packed slots put an LREAL at
@@ -1124,8 +1151,8 @@ export const transpileToC = (projectStructure, standardHeaders = [], boardId = n
         // isString rides on the ENTRY, not a closure: generateMainLoop emits
         // plc_shm_sync from this array and has no other way to tell text from
         // a number.
-        shmEntries.push({ c_symbol, offset, size, isString: isStringInputType(type) });
-        return { offset, size, mb_index: mbIndex };
+        shmEntries.push({ c_symbol, offset, size, isString: isStringInputType(type), readOnly, ownerProgram, addressed: false });
+        return { offset, size, mb_index: mbIndex, ...(readOnly ? { constant: true } : {}) };
     };
 
     // Parse a Variable Manager initial value into the JS value stored in
@@ -1390,6 +1417,17 @@ ${boardDefines}${runtimePortHelpers}${customIncludes}#if defined(KRON_SYS_TEXT_L
 _Static_assert(KRON_SYS_TEXT_LEN == KRON_STRING_LEN, "kronsystem.h KRON_SYS_TEXT_LEN must equal the transpiler's STRING size");
 #endif
 ${ecCfgEarly.motionIncludes ? ecCfgEarly.motionIncludes + '\n' : ''}${ecCfgEarly.axisLockMacros || '#define KRON_AXIS_LOCK()   ((void)0)\n#define KRON_AXIS_UNLOCK() ((void)0)\n'}extern volatile uint64_t us_tick;
+/* ⚠️ SCAN-START TIME SNAPSHOT — what every timer (TON/TP/TOF/TONR) reads.
+ * Set once per scan by plc_task_body_ts_<i>(now) from CLOCK_MONOTONIC, on the
+ * task's OWN thread, so a whole scan sees one frozen "now" (like the input
+ * image) and no other task can change it underneath. It replaced reading the
+ * shared us_tick, which all task threads wrote: a timer saw whichever thread
+ * stored last, and a store preempted between clock read and write published a
+ * time in the PAST, which TP_Call's re-anchor turned into a truncated pulse.
+ * Thread-local and module-private (never exported — Windows cannot export TLS
+ * from an exe into a DLL). Live, intra-scan time: Read_Live_Time
+ * (kronsystem.h). */
+static _Thread_local uint64_t __kron_scan_us;
 
 `;
 
@@ -1633,7 +1671,8 @@ ${ecCfgEarly.motionIncludes ? ecCfgEarly.motionIncludes + '\n' : ''}${ecCfgEarly
             if (gRetain) retainEntries.push({ key: v.name, field: gC });
             variableTable.globalVars[v.name] = { type: v.type, initialValue: gInitVal, ...(gRetain ? { retain: true } : {}) };
             // Debug: top-level entry (scalar types get a SHM slot)
-            const gShmSlot = !isUserType ? tryAssignShm(v.type, gC) : {};
+            const gConst = String(v.class || '').toLowerCase() === 'constant';
+            const gShmSlot = !isUserType ? tryAssignShm(v.type, gC, null, gConst) : {};
             variableTable.debugDefaults[`prog__${v.name}`] = {
                 type: v.type, c_symbol: gC, defaultValue: gInitVal, address: v.address || '', ...gShmSlot,
                 ...(gRetain ? { retain: true } : {})
@@ -1644,7 +1683,7 @@ ${ecCfgEarly.motionIncludes ? ecCfgEarly.motionIncludes + '\n' : ''}${ecCfgEarly
                 const { baseType, elements } = expandArrayElements(dtDef);
                 elements.forEach(({ suffix, offset }) => {
                     const elemCSym = `${gC}${suffix}`;
-                    const elemShmSlot = tryAssignShm(baseType, elemCSym);
+                    const elemShmSlot = tryAssignShm(baseType, elemCSym, null, gConst);
                     variableTable.debugDefaults[`prog__${v.name}${suffix}`] = {
                         type: baseType, c_symbol: elemCSym,
                         base_symbol: gC, byte_offset: offset,
@@ -1654,7 +1693,7 @@ ${ecCfgEarly.motionIncludes ? ecCfgEarly.motionIncludes + '\n' : ''}${ecCfgEarly
             } else if (dtDef?.type === 'Structure') {
                 structMemberOffsets(dtDef.content.members).forEach(({ member, offset }) => {
                     const memCSym = `${gC}.${cIdent(member.name)}`;
-                    const memShmSlot = tryAssignShm(member.type, memCSym);
+                    const memShmSlot = tryAssignShm(member.type, memCSym, null, gConst);
                     variableTable.debugDefaults[`prog__${v.name}.${member.name}`] = {
                         type: member.type, c_symbol: memCSym,
                         base_symbol: gC, byte_offset: offset,
@@ -1820,7 +1859,8 @@ ${ecCfgEarly.motionIncludes ? ecCfgEarly.motionIncludes + '\n' : ''}${ecCfgEarly
                     type: vType, c_symbol: cSym, initialValue: initVal, ...(vRetain ? { retain: true } : {})
                 };
                 // Debug: top-level entry (non-FB scalars get a SHM slot)
-                const vShmSlot = !isFB ? tryAssignShm(vType, cSym) : {};
+                const vConst = String(v.class || '').toLowerCase() === 'constant';
+                const vShmSlot = !isFB ? tryAssignShm(vType, cSym, progName, vConst) : {};
                 variableTable.debugDefaults[`prog_${progName}_${vName}`] = {
                     type: vType, c_symbol: cSym, defaultValue: initVal, address: v.address || '', ...vShmSlot,
                     ...(vRetain ? { retain: true } : {})
@@ -1836,7 +1876,7 @@ ${ecCfgEarly.motionIncludes ? ecCfgEarly.motionIncludes + '\n' : ''}${ecCfgEarly
                         const pinType = getOutputPinType(vType, pin);
                         if (!IEC_TYPE_SIZES[pinType?.toUpperCase()]) return; // scalar pins only
                         const pinCSym = `${cSym}.${pin}`;
-                        const pinSlot = tryAssignShm(pinType, pinCSym);
+                        const pinSlot = tryAssignShm(pinType, pinCSym, progName);
                         variableTable.debugDefaults[`prog_${progName}_${vName}.${pin}`] = {
                             type: pinType, c_symbol: pinCSym, defaultValue: 0, ...pinSlot
                         };
@@ -1849,7 +1889,7 @@ ${ecCfgEarly.motionIncludes ? ecCfgEarly.motionIncludes + '\n' : ''}${ecCfgEarly
                         const { baseType, elements } = expandArrayElements(dtDef);
                         elements.forEach(({ suffix, offset }) => {
                             const elemCSym = `${cSym}${suffix}`;
-                            const elemShmSlot = tryAssignShm(baseType, elemCSym);
+                            const elemShmSlot = tryAssignShm(baseType, elemCSym, progName, vConst);
                             variableTable.debugDefaults[`prog_${progName}_${vName}${suffix}`] = {
                                 type: baseType, c_symbol: elemCSym,
                                 base_symbol: cSym, byte_offset: offset,
@@ -1859,7 +1899,7 @@ ${ecCfgEarly.motionIncludes ? ecCfgEarly.motionIncludes + '\n' : ''}${ecCfgEarly
                     } else if (dtDef?.type === 'Structure') {
                         structMemberOffsets(dtDef.content.members).forEach(({ member, offset }) => {
                             const memCSym = `${cSym}.${cIdent(member.name)}`;
-                            const memShmSlot = tryAssignShm(member.type, memCSym);
+                            const memShmSlot = tryAssignShm(member.type, memCSym, progName, vConst);
                             variableTable.debugDefaults[`prog_${progName}_${vName}.${member.name}`] = {
                                 type: member.type, c_symbol: memCSym,
                                 base_symbol: cSym, byte_offset: offset,
@@ -1896,7 +1936,7 @@ ${ecCfgEarly.motionIncludes ? ecCfgEarly.motionIncludes + '\n' : ''}${ecCfgEarly
                     c_symbol: cSym,
                     initialValue: svDefault
                 };
-                const svShmSlot = tryAssignShm(sv.type, cSym);
+                const svShmSlot = tryAssignShm(sv.type, cSym, progName);
                 // ⚠️ Flagged so the editor can tell a pin shadow (pure debug
                 // mirror of an FB/block pin, NOT program state) from a real
                 // variable without guessing from the `in_`/`out_` name shape.
@@ -1929,7 +1969,7 @@ ${ecCfgEarly.motionIncludes ? ecCfgEarly.motionIncludes + '\n' : ''}${ecCfgEarly
                     c_symbol: sv.symbol,
                     initialValue: sv.initVal
                 };
-                const isvShmSlot = tryAssignShm(sv.type, sv.symbol);
+                const isvShmSlot = tryAssignShm(sv.type, sv.symbol, progName);
                 variableTable.debugDefaults[`prog_${progName}_${shortKey}`] = {
                     type: sv.type,
                     c_symbol: sv.symbol,
@@ -1969,7 +2009,7 @@ ${ecCfgEarly.motionIncludes ? ecCfgEarly.motionIncludes + '\n' : ''}${ecCfgEarly
         const pName = (p.name || '').trim().replace(/\s+/g, '_');
         const cSym = `__exec_us_${pName}`;
         const liveKey = `prog____exec_us_${pName}`;
-        const shmSlot = tryAssignShm('UDINT', cSym);
+        const shmSlot = tryAssignShm('UDINT', cSym, pName);
         variableTable.debugDefaults[liveKey] = { type: 'UDINT', c_symbol: cSym, defaultValue: 0, ...shmSlot };
         stateFields.push(`uint32_t ${cSym};`);
         return { progName: pName, cSym, liveKey };
@@ -2110,7 +2150,7 @@ ${ecCfgEarly.motionIncludes ? ecCfgEarly.motionIncludes + '\n' : ''}${ecCfgEarly
     // common case (%MW0, %ML0…). Order/task grouping happens in generateMainLoop.
     const addressedRingVars = Object.entries(variableTable.debugDefaults)
         .filter(([, info]) => info.address && info.offset !== undefined && info.size > 0
-            && info.c_symbol && !/[.\[]/.test(info.c_symbol))
+            && info.c_symbol && !/[.[]/.test(info.c_symbol))
         .map(([key, info]) => ({
             name: key,
             cSymbol: info.c_symbol,
@@ -2119,6 +2159,15 @@ ${ecCfgEarly.motionIncludes ? ecCfgEarly.motionIncludes + '\n' : ''}${ecCfgEarly
             serverType: IEC_TO_SERVER_TYPE[info.type?.toUpperCase()] ?? 'int32',
             isGlobal: key.startsWith('prog__'),
         }));
+
+    // A slot is ADDRESSED when any table entry that lives in it carries an IEC
+    // address — exactly what KronServer's IsAddressed/ReadAddressedVariables
+    // serve (REST, HMI, the ring) whether or not an editor is connected, so
+    // those slots are mirrored on every scan unconditionally (plc_shm_sync_<i>).
+    const addressedShmOffsets = new Set(Object.values(variableTable.debugDefaults)
+        .filter(info => info.address && info.offset !== undefined)
+        .map(info => info.offset));
+    shmEntries.forEach(e => { e.addressed = addressedShmOffsets.has(e.offset); });
 
     // Retain support must precede the scan loop: PLC_Init/PLC_Cleanup and the
     // flusher thread below call plc_retain_load/save, and C needs them declared
@@ -2145,7 +2194,12 @@ ${ecCfgEarly.motionIncludes ? ecCfgEarly.motionIncludes + '\n' : ''}${ecCfgEarly
         plcStateLayoutHash,
         addressedRingVars,
         retainEntries.length > 0,
-        ecCfg.axisNames || []
+        ecCfg.axisNames || [],
+        // Target builds only: KronServer raises the mailbox IDLE word while no
+        // editor streams, and the runtime then skips non-addressed slots. The
+        // local simulation keeps mirroring everything (developer decision —
+        // server/RING_FORMAT.md § Variable segment).
+        !simMode
     );
     source += mainLoop.src;
     if (mainLoop.ringConfig) variableTable.ring = mainLoop.ringConfig;
@@ -3139,7 +3193,7 @@ extern KRON_Process_Image __gpi;
         // host-agent/hotswap.go ecSimFlag and compile.go's plain sim), so it is
         // the one condition under which a faked axis is the right answer.
         axisInitCode += `#ifdef KRON_EC_SIM\n    const bool __kron_bus_sim = true;   /* EtherCAT master is a stub */\n#else\n    const bool __kron_bus_sim = false;  /* real SOEM master on this build */\n#endif\n`;
-        axisSlaves.forEach(({ slave }, i) => {
+        axisSlaves.forEach(({ slave }) => {
             const axisName = (slave.axisRef.name || `Axis_${slave.position}`).replace(/[^A-Za-z0-9_]/g, '_');
             const axisNo   = Math.max(0, parseInt(slave.axisRef.axisNo) || 0);
             const stBits   = parseInt(slave.axisRef.singleTurnBits) || 13;
@@ -3752,7 +3806,7 @@ const generateRetainSupport = (retainEntries) => {
     return s;
 };
 
-const generateMainLoop = (projectStructure, config, boardId = null, shmEnabled = false, execTimeVars = [], initCode = '', cleanupCode = '', ecPdoReadCode = '', ecPdoWriteCode = '', ecThreadCode = '', ecThreadStartCode = '', ecThreadJoinCode = '', gpiMutexEnabled = false, shmEntries = [], plcStateLayoutHash = '0', addressedRingVars = [], retainEnabled = false, axisNames = []) => {
+const generateMainLoop = (projectStructure, config, boardId = null, shmEnabled = false, execTimeVars = [], initCode = '', cleanupCode = '', ecPdoReadCode = '', ecPdoWriteCode = '', ecThreadCode = '', ecThreadStartCode = '', ecThreadJoinCode = '', gpiMutexEnabled = false, shmEntries = [], plcStateLayoutHash = '0', addressedRingVars = [], retainEnabled = false, axisNames = [], shmIdleGate = false) => {
     let mainSrc = `\n// --- DETERMINISTIC SCAN LOOP ---\n`;
 
     // --- 1. Discover task→program groupings (priority: taskConfig > res_config > fallback) ---
@@ -3873,8 +3927,11 @@ const generateMainLoop = (projectStructure, config, boardId = null, shmEnabled =
     } : null;
 
     // --- 2. Global shared state ---
-    // us_tick is defined for ALL platforms.
-    // Linux/Apple: updated from clock_gettime inside each task thread → always accurate.
+    // us_tick is defined for ALL platforms, but timers no longer read it — they
+    // read the per-thread scan snapshot __kron_scan_us (plc.h).
+    // Linux:       NOT written by the task threads any more (each passes its own
+    //              clock reading to plc_task_body_ts_<i>); only the compat
+    //              wrapper plc_task_body_<i>() reads it.
     // Windows:     updated from QueryPerformanceCounter in the main loop.
     // Bare-metal:  must be incremented by a hardware timer ISR every ~${formatUsDisplay(baseTickUs)}.
     // In a hot-swap build the loader-host owns the scan loop, so it defines
@@ -3984,19 +4041,14 @@ const generateMainLoop = (projectStructure, config, boardId = null, shmEnabled =
           `#endif\n`
         : '';
 
-    // SHM pull/sync — ONE copy shared by every task. ⚠️ Never emit a copy per
-    // task again: each held the full variable set, so N tasks multiplied the
-    // biggest functions in plc.c (and the compile time) by N for nothing.
-    // pull drains the mailbox FIRST, so a write takes effect on this very scan
-    // (see generateShmMailbox); there is nothing per-variable to pull.
+    // SHM pull — ONE copy shared by every task: it drains the mailbox FIRST, so
+    // a write takes effect on this very scan (see generateShmMailbox); there is
+    // nothing per-variable to pull. The sync half is per task (partitioned,
+    // emitted with the task bodies below).
     if (shmEnabled && shmEntries.length > 0) {
         mainSrc += `static void plc_shm_pull(void) {\n`;
         mainSrc += `    if (!__plc_shm) return;\n`;
         mainSrc += `    plc_mb_consume();\n`;
-        mainSrc += `}\n`;
-        mainSrc += `static void plc_shm_sync(void) {\n`;
-        mainSrc += `    if (!__plc_shm) return;\n`;
-        shmEntries.forEach(e => { mainSrc += shmSyncLine(e); });
         mainSrc += `}\n\n`;
     }
 
@@ -4122,12 +4174,72 @@ const generateMainLoop = (projectStructure, config, boardId = null, shmEnabled =
         backgroundPrograms.forEach(name => programTasks.push({ name, intervalUs: 0 }));
     }
 
+    // SHM sync — PARTITIONED: every slot is mirrored by exactly ONE task, its
+    // owner (server/RING_FORMAT.md § Variable segment). A program's slots go to
+    // the first task that runs the program, globals and runtime-wide counters
+    // (rte) to the fastest timed task — the ring's rule — or to the background
+    // task when nothing is timed. One copy of each line in total, so plc.c is
+    // no bigger than with one shared function (⚠️ never emit the FULL set per
+    // task — that multiplied the biggest function by N, and clang's SLP
+    // vectorizer went superlinear on it). It used to be one shared function
+    // run by EVERY task, so a 20 µs task stored all ~1100 slots 50 000 times a
+    // second while the other tasks wrote the same cache lines.
+    // Inside a task: ADDRESSED slots first, every scan (REST/HMI/ring read them
+    // with no editor connected); then, on target builds (shmIdleGate), the rest
+    // only while the mailbox IDLE word is 0 — KronServer sets it to 1 while no
+    // editor stream is open. 0 is what an older KronServer leaves, so an old
+    // agent still sees everything (fail-open, never a frozen value).
+    const shmSyncOwner = (() => {
+        const timed = taskGroups.map((tg, i) => ({ tg, i })).filter(({ tg }) => !tg.background);
+        const fastest = timed.length > 0
+            ? timed.reduce((b, c) => (c.tg.intervalUs < b.tg.intervalUs ? c : b)).i
+            : taskGroups.findIndex(tg => tg.background);
+        const byProgram = new Map();
+        taskGroups.forEach((tg, i) => tg.programs.forEach(P => {
+            const k = String(P).toLowerCase();
+            if (!byProgram.has(k)) byProgram.set(k, i);
+        }));
+        // An owner that cannot be resolved falls back to the fastest task —
+        // dropping the slot would freeze it silently.
+        return (e) => (e.ownerProgram != null && byProgram.has(String(e.ownerProgram).toLowerCase()))
+            ? byProgram.get(String(e.ownerProgram).toLowerCase())
+            : fastest;
+    })();
+    const shmSyncByTask = {};
+    if (shmEnabled && shmEntries.length > 0 && taskGroups.length > 0) {
+        shmEntries.forEach(e => {
+            const ti = shmSyncOwner(e);
+            if (ti < 0) return;
+            (shmSyncByTask[ti] = shmSyncByTask[ti] || []).push(e);
+        });
+        mainSrc += `#define PLC_MB_IDLE_OFF 40u /* mailbox header: 1 = no live reader (KronServer) */\n`;
+        Object.keys(shmSyncByTask).map(Number).sort((a, b) => a - b).forEach(ti => {
+            const list = shmSyncByTask[ti];
+            const addr = list.filter(e => e.addressed);
+            const rest = list.filter(e => !e.addressed);
+            mainSrc += `static void plc_shm_sync_${ti}(void) {\n`;
+            mainSrc += `    if (!__plc_shm) return;\n`;
+            addr.forEach(e => { mainSrc += shmSyncLine(e); });
+            if (rest.length > 0) {
+                if (shmIdleGate) {
+                    mainSrc += `    if (__atomic_load_n((const uint32_t *)(__plc_shm + PLC_MB_BASE + PLC_MB_IDLE_OFF), __ATOMIC_RELAXED) != 0u) return;\n`;
+                }
+                rest.forEach(e => { mainSrc += shmSyncLine(e); });
+            }
+            mainSrc += `}\n`;
+        });
+        mainSrc += `\n`;
+    }
+
     // Per-task scan BODY (SHM pull → programs → SHM sync). Extracted into its own
     // function so the SAME body is run by the in-binary thread loop (normal build)
     // AND by the hot-swap loader-host, which calls plc_task_body_<i> through dlsym
     // after dlopen'ing this translation unit as logic.so. Hot-swappable.
     taskGroups.forEach((tg, ti) => {
-        mainSrc += `void plc_task_body_${ti}(void) {\n`;
+        // ⚠️ The scan's "now" arrives as an ARGUMENT and lands in this thread's
+        // __kron_scan_us before anything runs — see the note on it in plc.h.
+        mainSrc += `void plc_task_body_ts_${ti}(uint64_t __now_us) {\n`;
+        mainSrc += `    __kron_scan_us = __now_us;\n`;
         if (shmEnabled) mainSrc += `    plc_shm_pull();\n`;
         if (gpiMutexEnabled) mainSrc += `    __gpi_snap = atomic_load_explicit(&__gpi, memory_order_acquire);\n`;
         if (ti === motionTaskIdx) mainSrc += axisReadPhase;
@@ -4147,13 +4259,19 @@ const generateMainLoop = (projectStructure, config, boardId = null, shmEnabled =
         // trajectory core answers on the same one, which is what makes a new
         // target take effect next cycle with no profile to re-plan.
         if (ti === motionTaskIdx) mainSrc += axisWritePhase;
-        if (shmEnabled) mainSrc += `    plc_shm_sync();\n`;
+        if (shmSyncByTask[ti]) mainSrc += `    plc_shm_sync_${ti}();\n`;
         // Capture ring: append this task's addressed vars AFTER shm sync (values
         // final for the scan). No-op unless this task has addressed vars.
         if (ringEnabled && ringTasks.find((t) => t.taskId === ti)) {
             mainSrc += `    plc_ring_append_${taskGroups[ti].taskName}();\n`;
         }
-        mainSrc += `}\n\n`;
+        mainSrc += `}\n`;
+        // Compatibility entry point (old hot-swap ABI, the test harness, the
+        // Windows wheel): takes the time from the global us_tick. Safe ONLY
+        // where one thread writes us_tick and runs every body — an old
+        // loader-host still running when a new logic.so is swapped in keeps
+        // working exactly as before instead of reading garbage for "now".
+        mainSrc += `void plc_task_body_${ti}(void) { plc_task_body_ts_${ti}(us_tick); }\n\n`;
     });
 
     // --- 3. Linux: one pthread function per task group ---
@@ -4188,8 +4306,7 @@ const generateMainLoop = (projectStructure, config, boardId = null, shmEnabled =
             mainSrc += `    { struct sched_param __sp = { .sched_priority = 0 }; pthread_setschedparam(pthread_self(), SCHED_IDLE, &__sp); }\n`;
             mainSrc += `    while (!plc_stop) {\n`;
             mainSrc += `        { struct timespec __ts; clock_gettime(CLOCK_MONOTONIC, &__ts);\n`;
-            mainSrc += `          us_tick = (uint64_t)__ts.tv_sec * 1000000ULL + (uint64_t)__ts.tv_nsec / 1000ULL; }\n`;
-            mainSrc += `        plc_task_body_${ti}();\n`;
+            mainSrc += `          plc_task_body_ts_${ti}((uint64_t)__ts.tv_sec * 1000000ULL + (uint64_t)__ts.tv_nsec / 1000ULL); }\n`;
             mainSrc += `        sched_yield();\n`;
             mainSrc += `    }\n    return NULL;\n}\n\n`;
             return;
@@ -4206,10 +4323,12 @@ const generateMainLoop = (projectStructure, config, boardId = null, shmEnabled =
         mainSrc += `        __next.tv_nsec += ${(tg.intervalUs % 1000000) * 1000}L;\n`;
         mainSrc += `        while (__next.tv_nsec >= 1000000000L) { __next.tv_sec++; __next.tv_nsec -= 1000000000L; }\n`;
         if (!gpiMutexEnabled && isIoTask && ecPdoReadCode) mainSrc += ecPdoReadCode;
-        // us_tick → wall-clock so IEC timers stay accurate even if a scan overruns.
+        // The scan-start snapshot comes from the monotonic clock (so IEC
+        // timers stay accurate even when a scan overruns) and is handed to the
+        // body on THIS thread — ⚠️ never via the shared us_tick, which five
+        // task threads used to overwrite under each other's timers.
         mainSrc += `        { struct timespec __ts; clock_gettime(CLOCK_MONOTONIC, &__ts);\n`;
-        mainSrc += `          us_tick = (uint64_t)__ts.tv_sec * 1000000ULL + (uint64_t)__ts.tv_nsec / 1000ULL; }\n`;
-        mainSrc += `        plc_task_body_${ti}();\n`;
+        mainSrc += `          plc_task_body_ts_${ti}((uint64_t)__ts.tv_sec * 1000000ULL + (uint64_t)__ts.tv_nsec / 1000ULL); }\n`;
         if (!gpiMutexEnabled && isIoTask && ecPdoWriteCode) mainSrc += ecPdoWriteCode;
         // §6.8.2: missing the deadline is an ERROR — counted and reported
         // (KRON_RTE_OVERRUN); the schedule restarts from now instead of
@@ -4290,8 +4409,8 @@ const generateMainLoop = (projectStructure, config, boardId = null, shmEnabled =
     // pull/sync pair, so calling the programs directly left the mirror (and
     // therefore every live value and write) permanently empty.
     taskGroups.forEach((tg, ti) => {
-        if (tg.background) mainSrc += `        plc_task_body_${ti}();\n`;
-        else mainSrc += `        if (us_tick / ${tg.intervalUs} != __prev_us / ${tg.intervalUs}) { plc_task_body_${ti}(); }\n`;
+        if (tg.background) mainSrc += `        plc_task_body_ts_${ti}(us_tick);\n`;
+        else mainSrc += `        if (us_tick / ${tg.intervalUs} != __prev_us / ${tg.intervalUs}) { plc_task_body_ts_${ti}(us_tick); }\n`;
     });
     mainSrc += `        __prev_us = us_tick;\n`;
     if (retainEnabled) {
@@ -4313,6 +4432,7 @@ const generateMainLoop = (projectStructure, config, boardId = null, shmEnabled =
     mainSrc += `// Bare-metal / RTOS-less execution engine.\n`;
     mainSrc += `// us_tick must be incremented by a hardware timer ISR every ${formatUsDisplay(baseTickUs)}.\n`;
     mainSrc += `void PLC_Run(void) {\n`;
+    mainSrc += `    __kron_scan_us = us_tick;\n`;
     if (ecPdoReadCode) mainSrc += ecPdoReadCode.replace(/^ {8}/gm, '    '); // 4-space indent for PLC_Run
     programTasks.forEach(pt => {
         if (!pt.intervalUs) mainSrc += `    ${pt.name}();\n`;
@@ -4771,7 +4891,7 @@ const FB_TRIGGER_PIN = {
     'Read_System_Time': 'EN', 'Read_System_Date': 'EN', 'Read_Epoch_Time': 'EN',
     'Epoch_To_Date': 'EN',
     'Time_Switch': 'EN', 'Daily_Trigger': 'EN', 'Astro_Clock': 'EN',
-    'Read_Uptime': 'EN', 'Cycle_Time_Monitor': 'EN',
+    'Read_Uptime': 'EN', 'Read_Live_Time': 'EN', 'Cycle_Time_Monitor': 'EN',
     'Read_CPU_Temperature': 'EN', 'Read_System_Load': 'EN', 'Read_Disk_Free': 'EN',
     'Read_Sys_File': 'EN', 'Read_Hwmon': 'EN',
     'T_To_Ms': 'EN', 'Ms_To_T': 'EN', 'T_To_Sec': 'EN', 'Sec_To_T': 'EN',
@@ -4830,7 +4950,7 @@ const FB_Q_OUTPUT = {
     'Read_System_Time': 'ENO', 'Read_System_Date': 'ENO', 'Read_Epoch_Time': 'ENO',
     'Epoch_To_Date': 'ENO',
     'Time_Switch': 'Q', 'Daily_Trigger': 'Q', 'Astro_Clock': 'IS_DAY',
-    'Read_Uptime': 'ENO', 'Cycle_Time_Monitor': 'ENO', 'Hour_Meter': 'Q',
+    'Read_Uptime': 'ENO', 'Read_Live_Time': 'ENO', 'Cycle_Time_Monitor': 'ENO', 'Hour_Meter': 'Q',
     'Watchdog': 'EXPIRED',
     'Read_CPU_Temperature': 'ENO', 'Read_System_Load': 'ENO', 'Read_Disk_Free': 'ENO',
     'Read_Sys_File': 'ENO', 'Read_Hwmon': 'ENO',
@@ -4875,6 +4995,7 @@ const SYSTEM_FB_OUTPUT_TYPES = {
                               'Minute': 'USINT', 'Second': 'USINT', 'Millisecond': 'UINT', 'Weekday': 'USINT' },
     'Astro_Clock':          { 'SUNRISE_MIN': 'UINT', 'SUNSET_MIN': 'UINT', 'IS_DAY': 'BOOL', 'VALID': 'BOOL' },
     'Read_Uptime':          { 'DAYS': 'UINT', 'HOURS': 'USINT', 'MINUTES': 'USINT', 'SECONDS': 'USINT', 'TOTAL_SEC': 'UDINT' },
+    'Read_Live_Time':       { 'NOW': 'TIME', 'NOW_NS': 'LTIME', 'VALID': 'BOOL' },
     'Cycle_Time_Monitor':   { 'LAST_US': 'UDINT', 'MIN_US': 'UDINT', 'MAX_US': 'UDINT',
                               'AVG_US': 'UDINT', 'JITTER_US': 'UDINT', 'SAMPLES': 'UDINT' },
     // Hour_Meter counts a total, so SECONDS is a UDINT here and a 0..59
@@ -5074,7 +5195,7 @@ const collectInputShadowVars = (rungs, progName) => {
     const vars = [];
     const isVarRef = (val) => {
         if (!val) return false;
-        const v = (val + '').replace(/[🌍🏠⊞⊡⊟]/g, '').trim();
+        const v = (val + '').replace(/[🌍🏠⊞⊡⊟]/gu, '').trim();
         if (isBooleanLiteral(v)) return false;
         if (/^ADR\s*\(.+\)$/i.test(v)) return true;
         if (/^NULL$/i.test(v)) return true;
@@ -5103,7 +5224,7 @@ const collectInputShadowVars = (rungs, progName) => {
                 const sym = `prog_${progName}_in_${instName}_${editorPin}`;
                 if (seen.has(sym)) return;
                 seen.add(sym);
-                const cleanVal = rawVal ? (rawVal + '').replace(/[🌍🏠⊞⊡⊟]/g, '').trim() : '';
+                const cleanVal = rawVal ? (rawVal + '').replace(/[🌍🏠⊞⊡⊟]/gu, '').trim() : '';
                 let initStr = '0';
                 let initVal = 0;
                 if (cleanVal) {
@@ -5128,53 +5249,6 @@ const collectInputShadowVars = (rungs, progName) => {
                     }
                 }
                 vars.push({ symbol: sym, type: iecType, instName, editorPin, initStr, initVal });
-            });
-        });
-    });
-    return vars;
-};
-
-// Scan all blocks for variable references in pin fields that are not yet declared.
-// Returns shadow-style entries so the caller can declare them in the header.
-const collectUndeclaredPinVars = (rungs, progName, declaredVarNames, globalVarNames) => {
-    const seen = new Set();
-    const vars = [];
-    const isLiteral = (s) =>
-        /^-?[0-9]/.test(s) || /^(true|false)$/i.test(s) || isTimeLiteral(s);
-
-    (rungs || []).forEach(rung => {
-        (rung.blocks || []).forEach(b => {
-            const type = (b.type || '').trim();
-            const data = b.data || {};
-            const vals = data.values || {};
-
-            // Contact/Coil variable references
-            if (type === 'Contact' || type === 'Coil') {
-                const pinKey = type === 'Contact' ? 'var' : 'coil';
-                const raw = (vals[pinKey] || data.instanceName || '') + '';
-                const v = raw.replace(/[🌍🏠⊞⊡⊟]/g, '').trim();
-                if (v && IDENTIFIER_REF_REGEX.test(v) && !isLiteral(v)) {
-                    const baseName = v.split(/[.[]/)[0];
-                    if (!globalVarNames.includes(baseName) && !declaredVarNames.has(baseName) && !seen.has(baseName)) {
-                        seen.add(baseName);
-                        vars.push({ symbol: `prog_${progName}_${baseName}`, type: 'BOOL' });
-                    }
-                }
-                return;
-            }
-
-            // All other blocks — scan every pin value
-            Object.entries(vals).forEach(([pinName, rawVal]) => {
-                const v = rawVal ? (rawVal + '').replace(/[🌍🏠⊞⊡⊟]/g, '').trim() : '';
-                if (!v || !IDENTIFIER_REF_REGEX.test(v) || isLiteral(v)) return;
-                // A bare word on a STRING pin is literal text, not a variable —
-                // declaring it here would mint a BOOL and break the C assignment.
-                if (isStringInputType(FB_INPUT_TYPES[type]?.[pinName])) return;
-                const baseName = v.split(/[.[]/)[0];
-                if (globalVarNames.includes(baseName) || declaredVarNames.has(baseName) || seen.has(baseName)) return;
-                seen.add(baseName);
-                const pinType = getOutputPinType(type, pinName);
-                vars.push({ symbol: `prog_${progName}_${baseName}`, type: pinType });
             });
         });
     });
@@ -5248,6 +5322,7 @@ const FB_OUTPUTS = {
     'Daily_Trigger': ['ENO', 'Q'],
     'Astro_Clock': ['ENO', 'SUNRISE_MIN', 'SUNSET_MIN', 'IS_DAY', 'VALID'],
     'Read_Uptime': ['ENO', 'DAYS', 'HOURS', 'MINUTES', 'SECONDS', 'TOTAL_SEC'],
+    'Read_Live_Time': ['ENO', 'NOW', 'NOW_NS', 'VALID'],
     'Cycle_Time_Monitor': ['ENO', 'LAST_US', 'MIN_US', 'MAX_US', 'AVG_US', 'JITTER_US', 'SAMPLES'],
     'Hour_Meter': ['Q', 'HOURS', 'SECONDS'],
     'Watchdog': ['EXPIRED', 'ET'],
@@ -5458,7 +5533,7 @@ const SYSTEM_FB_TYPES = new Set([
     // Clock-driven scheduling
     'Time_Switch', 'Daily_Trigger', 'Astro_Clock',
     // Runtime diagnostics
-    'Read_Uptime', 'Cycle_Time_Monitor',
+    'Read_Uptime', 'Read_Live_Time', 'Cycle_Time_Monitor',
     // Host health + generic sysfs readers
     'Read_CPU_Temperature', 'Read_System_Load', 'Read_Disk_Free',
     'Read_Sys_File', 'Read_Hwmon',
@@ -5566,6 +5641,7 @@ const FB_INPUTS = {
     'Daily_Trigger': ['EN', 'H', 'M', 'S'],
     'Astro_Clock': ['EN', 'LAT', 'LON'],
     'Read_Uptime': ['EN'],
+    'Read_Live_Time': ['EN'],
     'Cycle_Time_Monitor': ['EN', 'RESET'],
     'Hour_Meter': ['IN', 'RESET'],
     'Watchdog': ['KICK', 'PT'],
@@ -5783,6 +5859,8 @@ const transpileSTLogics = (code, stdFunctions = {}, parentName = '', category = 
     // String literals become `\x0e<n>\x0f` placeholders for the same reason
     // (`'go THEN stop'` must not be split); the expression tokenizer reads them.
     const strTable = [];
+    // \x0e…\x0f are the deliberate placeholder brackets of masked string literals.
+    // eslint-disable-next-line no-control-regex
     const restoreStr = (t) => String(t).replace(/\x0e(\d+)\x0f/g, (_, i) => strTable[+i]);
     const stripped = stripIecComments(code, { strTable })
         // Drop a leading `global.` / `GVL.` namespace prefix that some models
@@ -6292,14 +6370,21 @@ const transpileSTLogics = (code, stdFunctions = {}, parentName = '', category = 
         }
 
         // ── FOR ... TO ... BY ... DO (BY clause first — more specific) ────
-        // ⚠️ The loop runs on a HIDDEN int64_t counter and assigns the control
+        // ⚠️ The loop runs on a HIDDEN 64-bit counter and assigns the control
         // variable at the top of every iteration. Iterating the control
         // variable itself never terminated whenever `end` is the top of its
         // type: `FOR k := 0 TO 255` on a USINT wraps 255 → 0 and `<= 255`
-        // holds for ever; an unsigned count-down to 0 likewise. End and step
-        // are evaluated once, before the first iteration (IEC forbids the
-        // body from changing them). After the loop the control variable holds
-        // the last value it was given (IEC leaves it implementation-defined).
+        // holds for ever; an unsigned count-down to 0 likewise. ⚠️ The counter
+        // is never stepped PAST the end either: before each increment the loop
+        // stops when the distance left (computed in uint64_t, exact for any
+        // pair of 64-bit bounds) is smaller than the step — `i += st; i <= e`
+        // overflowed at LINT's top (endless), and a signed counter cast ULINT
+        // bounds above 2^63-1 negative (no iteration). ULINT gets a uint64_t
+        // counter; an unsigned step cannot be negative (it converts to the
+        // control variable's type), so ULINT only counts up. End and step are
+        // evaluated once, before the first iteration (IEC forbids the body
+        // from changing them). After the loop the control variable holds the
+        // last value it was given (IEC leaves it implementation-defined).
         // §7.3.3.4.2: the control variable, the initial value and the final
         // value are expressions of the SAME integer type (ANY_INT — no REAL,
         // no bit string); the control variable is not written in the body
@@ -6320,20 +6405,28 @@ const transpileSTLogics = (code, stdFunctions = {}, parentName = '', category = 
             const bound = (text, what) => X.value(text, ct, `FOR ${what}`);
             const cv = L.c;
             const n = labelSeq.next++;
-            const i = `__for_i${n}`, e = `__for_e${n}`, st = `__for_s${n}`;
+            const i = `__for_i${n}`, e = `__for_e${n}`, st = `__for_s${n}`, d = `__for_d${n}`;
+            const unsigned64 = String(ct || '').toUpperCase() === 'ULINT';
+            const CT = unsigned64 ? 'uint64_t' : 'int64_t';
             const stepExpr = step === null ? '1' : bound(step, 'BY value').trim();
             if (/^\(?\s*[-+]?\s*0+\s*\)?$/.test(stepExpr)) throw new STExprError('FOR … BY 0 never ends (IEC §7.3.3.4.2)');
-            const literalStep = /^\+?\s*\d+$/.test(stepExpr) ? 1 : /^\(?-\s*\d+\)?$/.test(stepExpr) ? -1 : 0;
-            let cond;
-            if (literalStep > 0) cond = `${i} <= ${e}`;
-            else if (literalStep < 0) cond = `${i} >= ${e}`;
-            else cond = `(${st} >= 0 ? ${i} <= ${e} : ${i} >= ${e})`;
+            // +1 up, -1 down, 0 = sign known only at run time. ULINT is always up.
+            const literalStep = unsigned64 || /^\+?\s*\d+$/.test(stepExpr) ? 1 : /^\(?-\s*\d+\)?$/.test(stepExpr) ? -1 : 0;
+            const U = (x) => `(uint64_t)${x}`;
+            const upIn = `${i} <= ${e}`, downIn = `${i} >= ${e}`;
+            // "the next step would pass the end" — distance left < |step|.
+            const upLast = `${U(e)} - ${U(i)} < ${U(st)}`;
+            const downLast = `${U(i)} - ${U(e)} < (uint64_t)0 - ${U(st)}`;
+            const inRange = literalStep > 0 ? upIn : literalStep < 0 ? downIn : `(${st} > 0 ? ${upIn} : ${downIn})`;
+            const isLast = literalStep > 0 ? upLast : literalStep < 0 ? downLast : `(${st} > 0 ? ${upLast} : ${downLast})`;
             out += `${indent()}{\n`;
             indentLevel++;
-            out += `${indent()}const int64_t ${e} = (int64_t)(${bound(end, 'TO value')});\n`;
-            out += `${indent()}const int64_t ${st} = (int64_t)(${stepExpr});\n`;
+            out += `${indent()}const ${CT} ${e} = (${CT})(${bound(end, 'TO value')});\n`;
+            out += `${indent()}const ${CT} ${st} = (${CT})(${stepExpr});\n`;
             if (!literalStep) out += `${indent()}if (${st} == 0) __kron_rte(KRON_RTE_FOR_STEP, "${cEscapeString(exprEnv.rteSite())}", 0); else\n`;
-            out += `${indent()}for (int64_t ${i} = (int64_t)(${bound(start, 'start value')}); ${cond}; ${i} += ${st}) {\n`;
+            // CONTINUE (a C `continue`) reaches the increment clause, so the
+            // end test there covers it too.
+            out += `${indent()}for (${CT} ${i} = (${CT})(${bound(start, 'start value')}), ${d} = !(${inRange}); !${d}; ${d} = (${isLast}), (${d} ? (void)0 : (void)(${i} += ${st}))) {\n`;
             indentLevel++;
             out += `${indent()}${cv} = (__typeof__(${cv}))${i};\n`;
             blockStack.push({ kind: 'FOR', wrapped: true, ctrl: String(vn).toLowerCase() });
@@ -6588,7 +6681,7 @@ const transpileSTLogics = (code, stdFunctions = {}, parentName = '', category = 
                 } else if (EC_FB_CFG_PARAM.has(fbType)) {
                     out += `${indent()}${fbType}_Call(&${cInst}, &__ec_cfg);\n`;
                 } else if (stdFunctions[fbType]?.hasTime) {
-                    out += `${indent()}${fbType}_Call(&${cInst}, us_tick);\n`;
+                    out += `${indent()}${fbType}_Call(&${cInst}, __kron_scan_us);\n`;
                 } else if (userFBTypes.has(fbType)) {
                     // User-defined FB bodies are emitted as <Name>_Execute(inst).
                     out += `${indent()}${fbType}_Execute(&${cInst});\n`;
@@ -6636,7 +6729,6 @@ const transpileLDLogics = (rungs, stdFunctions = {}, parentName = '', category =
         }
         return null;
     };
-    const isRealExpr = (val) => ['REAL', 'LREAL'].includes(operandType(val));
 
     // `[…]` in an LD operand: every index is an operand of its own, resolved
     // like any other — it used to be copied verbatim, so `arr[i]` only compiled
@@ -6733,7 +6825,7 @@ const transpileLDLogics = (rungs, stdFunctions = {}, parentName = '', category =
     const resolveVal = (val) => {
         if (!val && val !== 0) return null;
         // Strip any UI scope/type icons (🌍🏠⊞⊡⊟)
-        const s = val.toString().replace(/[🌍🏠⊞⊡⊟]/g, '').trim();
+        const s = val.toString().replace(/[🌍🏠⊞⊡⊟]/gu, '').trim();
         if (!s) return null;
         if (/^NULL$/i.test(s)) return 'NULL';
         const adrMatch = s.match(/^ADR\s*\(\s*(.+?)\s*\)$/i);
@@ -6806,7 +6898,7 @@ const transpileLDLogics = (rungs, stdFunctions = {}, parentName = '', category =
 
     const resolveInputPinValue = (blockType, pinName, rawValue, customData = null) => {
         if (rawValue === undefined || rawValue === null || rawValue === '') return null;
-        const cleanValue = String(rawValue).replace(/[🌍🏠⊞⊡⊟]/g, '').trim();
+        const cleanValue = String(rawValue).replace(/[🌍🏠⊞⊡⊟]/gu, '').trim();
         if (!cleanValue) return null;
 
         if (pinName === 'Port_ID') {
@@ -6876,7 +6968,7 @@ const transpileLDLogics = (rungs, stdFunctions = {}, parentName = '', category =
         const ldFail = (msg) => { throw new Error(`LD ${ldKind} ${parentName}, rung ${ldRungNo}: ${msg}`); };
         const blockLabel = (b) => {
             const d = b.data || {};
-            const v = String(d.values?.var || d.values?.coil || d.instanceName || '').replace(/[🌍🏠⊞⊡⊟]/g, '').trim();
+            const v = String(d.values?.var || d.values?.coil || d.instanceName || '').replace(/[🌍🏠⊞⊡⊟]/gu, '').trim();
             return `${b.type}${v ? ` "${v}"` : ''}`;
         };
         out += `    // Rung ${rungIdx}\n`;
@@ -6952,13 +7044,14 @@ const transpileLDLogics = (rungs, stdFunctions = {}, parentName = '', category =
         // read `<instance>.OUT`: that member does not exist and clang failed with
         // "no member named 'prog_X_INT_TO_UINT0' in 'struct PlcState'". Only the
         // MATH_FB_BLOCKS subset had a local-variable escape hatch; every other
-        // inline family fell through to the struct reference. Substitution is
-        // safe because the expressions are pure — they may be evaluated more than
-        // once and are not gated on the source block's power flow (the consumer
-        // has its own EN). Sorted (topological) order guarantees the producer
-        // registers here before any consumer reads it, and every symbol the
-        // expression names is declared earlier in the SAME emitted C block.
-        //   sorted block index → the block's C result expression
+        // inline family fell through to the struct reference. A WIRED result is
+        // computed once into a rung-local `_ie_r<r>_b<i>` and that local is what
+        // is registered — re-evaluating the expression at the consumer saw the
+        // producer's own OUT write (`BNOT(IN := x, OUT := x)`). Not gated on the
+        // source block's power flow (the consumer has its own EN). Sorted
+        // (topological) order guarantees the producer registers here before any
+        // consumer reads it, in the SAME emitted C block.
+        //   sorted block index → the block's C result (local or expression)
         const inlineOutExpr = new Map();
 
         // Resolve a wired named output pin (out_OUT / out_Q / out_ENO) of an
@@ -7050,7 +7143,7 @@ const transpileLDLogics = (rungs, stdFunctions = {}, parentName = '', category =
             };
 
             if (type === 'Contact') {
-                const varName = ((data.values?.var || data.instanceName) + '').replace(/[🌍🏠⊞⊡⊟]/g, '').trim() || null;
+                const varName = ((data.values?.var || data.instanceName) + '').replace(/[🌍🏠⊞⊡⊟]/gu, '').trim() || null;
                 if (varName) {
                     const v = resolveVar(varName);
                     if (subType === 'Rising' || subType === 'Falling') {
@@ -7076,7 +7169,7 @@ const transpileLDLogics = (rungs, stdFunctions = {}, parentName = '', category =
                 }
 
             } else if (type === 'Coil') {
-                const varName = ((data.values?.coil || data.instanceName) + '').replace(/[🌍🏠⊞⊡⊟]/g, '').trim() || null;
+                const varName = ((data.values?.coil || data.instanceName) + '').replace(/[🌍🏠⊞⊡⊟]/gu, '').trim() || null;
                 out += `    ${bOut} = ${inExpr};\n`;
                 if (varName) {
                     const v = resolveVar(varName);
@@ -7185,7 +7278,7 @@ const transpileLDLogics = (rungs, stdFunctions = {}, parentName = '', category =
                 // variable, and KRON_GT/KRON_LIMIT dispatch on their FIRST argument
                 // only, so `GT(5, r)` compared as int32.
                 const outRawCheck = data.values?.OUT;
-                const outVarCheck = outRawCheck ? (outRawCheck + '').replace(/[🌍🏠⊞⊡⊟]/g, '').trim() : '';
+                const outVarCheck = outRawCheck ? (outRawCheck + '').replace(/[🌍🏠⊞⊡⊟]/gu, '').trim() : '';
                 const outCSym = (outVarCheck && IDENTIFIER_REF_REGEX.test(outVarCheck)) ? resolveVar(outVarCheck) : null;
                 const kindOf = (types) => {
                     const T = types.map(t => String(t || '').toUpperCase());
@@ -7280,7 +7373,7 @@ const transpileLDLogics = (rungs, stdFunctions = {}, parentName = '', category =
 
                     // ENO write-back (power-flow passthrough)
                     const enoRaw = data.values?.ENO;
-                    const enoVar = enoRaw ? (enoRaw + '').replace(/[🌍🏠⊞⊡⊟]/g, '').trim() : '';
+                    const enoVar = enoRaw ? (enoRaw + '').replace(/[🌍🏠⊞⊡⊟]/gu, '').trim() : '';
                     if (enoVar && IDENTIFIER_REF_REGEX.test(enoVar)) {
                         out += `    ${resolveVar(enoVar)} = ${bOut};\n`;
                     }
@@ -7388,7 +7481,23 @@ const transpileLDLogics = (rungs, stdFunctions = {}, parentName = '', category =
                     }
                     inlineOutType.set(idx, resultType);
 
-                    // Publish the expression for any block wired to this one's
+                    // ⚠️ A WIRED result is computed ONCE, here, into a rung-local,
+                    // and every consumer — and this block's own OUT/Q write —
+                    // reads that local. Substituting the expression text at the
+                    // consumer re-evaluated it AFTER this block's OUT write, so
+                    // `BNOT(IN := x, OUT := x)` → MOVE handed the consumer
+                    // `~x` of the NEW x (y = 1 while x = 16#FFFFFFFE). Not gated
+                    // on this block's power flow, as before: the consumer has its
+                    // own EN. Unwired blocks keep the inline expression (no
+                    // extra evaluation for the debug shadow / OUT field alone).
+                    const outWired = (rung.connections || []).some(c => c.source === blockId
+                        && /^out_/.test(c.sourcePin || '') && !/^out_(\d+|ENO)$/.test(c.sourcePin));
+                    if (outWired) {
+                        const localOut = `_ie_r${rungIdx}_b${idx}`;
+                        out += `    __auto_type ${localOut} = ${resultExpr};\n`;
+                        resultExpr = localOut;
+                    }
+                    // Publish the result for any block wired to this one's
                     // OUT/Q pin (see inlineOutExpr above). Registered BEFORE the
                     // emit branches below, which only cover the case where the
                     // user typed a variable name into the OUT/Q field.
@@ -7416,7 +7525,7 @@ const transpileLDLogics = (rungs, stdFunctions = {}, parentName = '', category =
                         out += `    ${bOut} = ${inExpr};\n`;
                         if (dbgOut('Q')) out += `    ${dbgOut('Q')} = ${resultExpr};\n`;
                         const qRaw = data.values?.Q;
-                        const qVar = qRaw ? (qRaw + '').replace(/[🌍🏠⊞⊡⊟]/g, '').trim() : '';
+                        const qVar = qRaw ? (qRaw + '').replace(/[🌍🏠⊞⊡⊟]/gu, '').trim() : '';
                         if (qVar && IDENTIFIER_REF_REGEX.test(qVar)) {
                             out += `    ${resolveVar(qVar)} = ${resultExpr};\n`;
                         }
@@ -7424,7 +7533,7 @@ const transpileLDLogics = (rungs, stdFunctions = {}, parentName = '', category =
                         out += `    ${bOut} = ${inExpr};\n`;
                         // Assign OUT to target variable
                         const outRaw = data.values?.OUT;
-                        const outVar = outRaw ? (outRaw + '').replace(/[🌍🏠⊞⊡⊟]/g, '').trim() : '';
+                        const outVar = outRaw ? (outRaw + '').replace(/[🌍🏠⊞⊡⊟]/gu, '').trim() : '';
                         const outAssigned = outVar && IDENTIFIER_REF_REGEX.test(outVar);
                         if (!isToString && !hasTextArg && dbgOut('OUT')) {
                             out += `    if (${bOut}) { ${dbgOut('OUT')} = ${resultExpr}; }\n`;
@@ -7441,7 +7550,7 @@ const transpileLDLogics = (rungs, stdFunctions = {}, parentName = '', category =
 
                     // ENO write-back (if assigned to a variable)
                     const enoRaw = data.values?.ENO;
-                    const enoVar = enoRaw ? (enoRaw + '').replace(/[🌍🏠⊞⊡⊟]/g, '').trim() : '';
+                    const enoVar = enoRaw ? (enoRaw + '').replace(/[🌍🏠⊞⊡⊟]/gu, '').trim() : '';
                     if (enoVar && IDENTIFIER_REF_REGEX.test(enoVar)) {
                         out += `    ${resolveVar(enoVar)} = ${bOut};\n`;
                     }
@@ -7611,7 +7720,7 @@ const transpileLDLogics = (rungs, stdFunctions = {}, parentName = '', category =
                 } else if (MOTION_FB_AXIS_PARAM.has(type)) {
                     // PLCopen motion FB: MC_xxx_Call(&inst, &axisVar)
                     const axisRaw = data.values?.Axis;
-                    const axisClean = axisRaw ? String(axisRaw).replace(/[🌍🏠⊞⊡⊟]/g, '').trim() : '';
+                    const axisClean = axisRaw ? String(axisRaw).replace(/[🌍🏠⊞⊡⊟]/gu, '').trim() : '';
                     const axisExpr = (axisClean && IDENTIFIER_REF_REGEX.test(axisClean))
                         ? `&${resolveVar(axisClean)}`
                         : 'NULL';
@@ -7620,7 +7729,7 @@ const transpileLDLogics = (rungs, stdFunctions = {}, parentName = '', category =
                         + out.slice(motionLockAt) + `    KRON_AXIS_UNLOCK();\n`;
                 } else if (stdFunctions[type]?.hasTime) {
                     if (stdFunctions[type]?.isFB !== false || Object.keys(FB_INPUTS).includes(type)) {
-                        out += `    ${type}_Call(&${callTarget}, us_tick);\n`;
+                        out += `    ${type}_Call(&${callTarget}, __kron_scan_us);\n`;
                     } else {
                         out += `    ${bOut} = ${type}_Call(${inExpr}); // Unhandled function with time\n`;
                     }
@@ -7660,7 +7769,7 @@ const transpileLDLogics = (rungs, stdFunctions = {}, parentName = '', category =
                 // Step 4: output pin write-back — all pins, to assigned var AND shadow tracking var
                 outputPinNames.forEach(pinName => {
                     const rawVal = data.values?.[pinName];
-                    const varStr = rawVal ? (rawVal + '').replace(/[🌍🏠⊞⊡⊟]/g, '').trim() : '';
+                    const varStr = rawVal ? (rawVal + '').replace(/[🌍🏠⊞⊡⊟]/gu, '').trim() : '';
                     const isVarAssigned = varStr && IDENTIFIER_REF_REGEX.test(varStr);
                     // A STRING output (Read_Sys_File.VALUE, a user FB's STRING
                     // pin) is COPIED: the target and the shadow are arrays.
@@ -7679,7 +7788,7 @@ const transpileLDLogics = (rungs, stdFunctions = {}, parentName = '', category =
                 if (isUserDefinedFB) {
                     (data.customData.content.variables || []).filter(isInOutClass).forEach(v => {
                         const raw = data.values?.[v.name];
-                        const vs = raw ? (raw + '').replace(/[🌍🏠⊞⊡⊟]/g, '').trim() : '';
+                        const vs = raw ? (raw + '').replace(/[🌍🏠⊞⊡⊟]/gu, '').trim() : '';
                         if (vs && IDENTIFIER_REF_REGEX.test(vs)) {
                             out += isStringInputType(v.type)
                                 ? `    ${kronStrset(resolveVar(vs), `${callTarget}.${memberOf(v.name)}`)};\n`

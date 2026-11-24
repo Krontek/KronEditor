@@ -110,6 +110,18 @@
 
     <!-- ── Runtime diagnostics ──────────────────────────────────────────── -->
 
+    <Block type="Read_Live_Time" description="Live monotonic clock at the moment of the call (NOW in us, NOW_NS in ns). For measuring durations inside a scan; IEC timers use the scan-start time instead" class="FunctionBlock">
+      <Inputs>
+        <Variable name="EN" type="BOOL" default="FALSE" />
+      </Inputs>
+      <Outputs>
+        <Variable name="ENO"    type="BOOL" />
+        <Variable name="NOW"    type="TIME" />
+        <Variable name="NOW_NS" type="LTIME" />
+        <Variable name="VALID"  type="BOOL" />
+      </Outputs>
+    </Block>
+
     <Block type="Read_Uptime" description="Time since the runtime started" class="FunctionBlock">
       <Inputs>
         <Variable name="EN" type="BOOL" default="FALSE" />

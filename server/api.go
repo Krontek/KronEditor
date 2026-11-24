@@ -40,7 +40,7 @@ type RuntimeController interface {
 	StopRuntime() error
 	RuntimeStatus() (pid int, running bool)
 	RuntimeConfigSnapshot() map[string]any
-	UpdateRuntimeConfig(u runtimeConfigUpdate) map[string]any
+	UpdateRuntimeConfig(u runtimeConfigUpdate) (map[string]any, error)
 }
 
 // APIManager handles the /api/v1/ REST endpoints.
@@ -322,7 +322,8 @@ func (am *APIManager) handleRuntimeConfig(w http.ResponseWriter, r *http.Request
 		jsonError(w, http.StatusBadRequest, "invalid JSON")
 		return
 	}
-	jsonOK(w, am.rt.UpdateRuntimeConfig(u))
+	snap, err := am.rt.UpdateRuntimeConfig(u)
+	writeConfigResult(w, snap, err)
 }
 
 // typeCode maps a VarType to a 1-byte wire code so a binary client knows how to

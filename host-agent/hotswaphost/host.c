@@ -16,6 +16,8 @@
  *   int           plc_task_count(void);
  *   unsigned long plc_task_interval_us(int i);
  *   void          plc_task_body_<i>(void);        // one scan of task i
+ *   void          plc_task_body_ts_<i>(uint64_t); // OPTIONAL: one scan, with
+ *                                                 // its scan-start time (us)
  *
  * Online change: write the new .so path into ./swap_request, send SIGUSR1. At
  * the next scan boundary all task threads park on a barrier, thread 0 dlopen's
@@ -24,6 +26,14 @@
  *
  * us_tick / plc_stop are defined HERE and exported (-rdynamic) so the logic.so
  * resolves them at load (they are `extern` in plc.h).
+ *
+ * ⚠️ Scan time: every task thread reads the clock into a LOCAL and hands it to
+ * plc_task_body_ts_<i>(now), which stores it in the module's thread-local
+ * __kron_scan_us — the only time IEC timers read. The shared us_tick is still
+ * written for a logic.so that predates the _ts entry (it then runs
+ * plc_task_body_<i>(), which reads us_tick: the old, racy behaviour, kept
+ * only so an older module still loads). Never make timers read us_tick again:
+ * all task threads write it, so a timer saw another thread's (or a stale) time.
  */
 #define _GNU_SOURCE
 #include <stdio.h>
@@ -240,10 +250,12 @@ unsigned char *__plc_shm = NULL;
 
 #define MAXT 16
 typedef void (*body_fn)(void);
+typedef void (*body_ts_fn)(uint64_t);
 
 static plc_module_t   g_handle;
 static void          *g_state;
 static body_fn        g_body[MAXT];
+static body_ts_fn     g_body_ts[MAXT];   /* NULL = module predates the _ts ABI */
 static unsigned long  g_interval[MAXT];
 /* SCHED_FIFO priority per task, from the optional plc_task_priority export.
  * 99 is the value the runtime hardcoded before the field existed, so a logic.so
@@ -595,6 +607,10 @@ static int resolve_and_bind(void *h) {
         body_fn b = (body_fn)plc_dlsym(h, nm);
         if (!b) return RB_ERR_SYMBOL;
         g_body[i] = b;
+        /* Optional, re-resolved on every bind: a swap may move between a module
+         * with and one without it. */
+        snprintf(nm, sizeof nm, "plc_task_body_ts_%d", i);
+        g_body_ts[i] = (body_ts_fn)plc_dlsym(h, nm);
         g_interval[i] = tiv(i);
         /* Optional: absent in a logic.so built before the field. Re-read on
          * every bind, like the interval, so a priority edit swaps live (the
@@ -814,8 +830,12 @@ static void *task_thread(void *arg) {
             if (hs_barrier_wait(&g_barrier) != 0) break;
         }
 
-        us_tick = mono_us();
-        if (g_body[idx]) g_body[idx]();
+        {
+            const uint64_t now = mono_us();   /* this scan's snapshot — a local */
+            us_tick = now;                    /* only for a pre-_ts module */
+            if (g_body_ts[idx]) g_body_ts[idx](now);
+            else if (g_body[idx]) g_body[idx]();
+        }
 
         if (g_interval[idx] == 0) {
             /* The background task: re-run as soon as it ends (§6.8.2 d) —

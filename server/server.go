@@ -95,6 +95,19 @@ type Server struct {
 	hmiMu   sync.Mutex   // guards the dedicated HMI listener
 	hmiSrv  *http.Server // dedicated operator-facing HMI server (nil if none)
 	hmiPort uint16       // port hmiSrv is currently bound to (0 if none)
+
+	// ⚠️ A variable table belongs to ONE runtime binary: its offsets and
+	// mb_index values are that program's layout. Build & Send uploads
+	// runtime.bin, then the table, and only then restarts — applying the table
+	// at upload let the OLD runtime run under the NEW table (wrong reads, and
+	// a write routed by the new mb_index to a same-size variable of the old
+	// program). So a table that arrives while a runtime spawned from an older
+	// runtime.bin is running is STAGED and installed by ActivateStagedTable,
+	// from pm's pre-start hook, right before the next spawn of the new binary.
+	tableMu     sync.Mutex
+	binGen      uint64               // bumped by every runtime.bin upload
+	spawnedGen  uint64               // binGen of the binary the last spawn ran
+	stagedTable *parsedVariableTable // waiting for the next spawn (nil = none)
 }
 
 func NewServer(cfg Config, ipc *IPCManager, pm *ProcessManager, hmi *HMIManager) *Server {
@@ -331,6 +344,9 @@ func (s *Server) handleDeployRuntime(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	slog.Info("runtime.bin uploaded successfully", "dest", dest)
+	s.tableMu.Lock()
+	s.binGen++
+	s.tableMu.Unlock()
 	s.dropStaleLogicSlots()
 	jsonOK(w, map[string]string{"status": "ok", "path": dest})
 }
@@ -388,10 +404,66 @@ func (s *Server) handleDeployVariableTable(w http.ResponseWriter, r *http.Reques
 		http.Error(w, "failed to save file: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
-	s.ipc.ApplyVariableTable(parsed)
+	staged := s.installVariableTable(parsed)
 	count := s.ipc.VariableCount()
-	slog.Info("variable_table.json loaded", "dest", dest, "variables", count)
-	jsonOK(w, map[string]any{"status": "ok", "path": dest, "variable_count": count})
+	if staged {
+		slog.Info("variable_table.json staged until the new runtime starts", "dest", dest, "variables", len(parsed.vars))
+	} else {
+		slog.Info("variable_table.json loaded", "dest", dest, "variables", count)
+	}
+	jsonOK(w, map[string]any{"status": "ok", "path": dest, "variable_count": count, "staged": staged})
+}
+
+// installVariableTable applies a freshly uploaded table now, or stages it when
+// the running process was spawned from an older runtime.bin than the one on
+// disk (see Server.tableMu). Returns true when staged.
+func (s *Server) installVariableTable(pt *parsedVariableTable) bool {
+	// ⚠️ pm.Status takes pm.mu, and the pre-start hook (ActivateStagedTable)
+	// runs UNDER pm.mu and takes tableMu — so never hold tableMu across it.
+	// A spawn slipping in between is harmless: it sets spawnedGen = binGen,
+	// and the check below then applies the table to the new process directly.
+	running := false
+	if s.pm != nil {
+		_, running = s.pm.Status()
+	}
+	return s.placeVariableTable(pt, running)
+}
+
+// placeVariableTable is installVariableTable's decision, given whether a
+// runtime runs right now.
+func (s *Server) placeVariableTable(pt *parsedVariableTable, running bool) bool {
+	s.tableMu.Lock()
+	defer s.tableMu.Unlock()
+	if running && s.spawnedGen != s.binGen {
+		s.stagedTable = pt
+		return true
+	}
+	s.stagedTable = nil
+	s.ipc.ApplyVariableTable(pt)
+	return false
+}
+
+// ActivateStagedTable runs from pm's pre-start hook (old process stopped, new
+// one about to spawn from the runtime.bin on disk): it records which binary
+// generation is being spawned and installs a staged table for it. Must run
+// BEFORE WriteInitialValues, which writes the initials of the active table.
+func (s *Server) ActivateStagedTable() {
+	s.tableMu.Lock()
+	defer s.tableMu.Unlock()
+	s.spawnedGen = s.binGen
+	if s.stagedTable != nil {
+		s.ipc.ApplyVariableTable(s.stagedTable)
+		s.stagedTable = nil
+		slog.Info("staged variable table activated", "variables", s.ipc.VariableCount())
+	}
+}
+
+// VariableTableStaged reports whether an uploaded table waits for the next
+// runtime start (surfaced in /status).
+func (s *Server) VariableTableStaged() bool {
+	s.tableMu.Lock()
+	defer s.tableMu.Unlock()
+	return s.stagedTable != nil
 }
 
 // handleProjectFile stores (POST) or returns (GET) the editor project source
@@ -509,13 +581,33 @@ func (s *Server) handleDeployConfig(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, http.StatusBadRequest, "invalid JSON")
 		return
 	}
-	snap := s.UpdateRuntimeConfig(u)
-	jsonOK(w, snap)
+	snap, err := s.UpdateRuntimeConfig(u)
+	writeConfigResult(w, snap, err)
+}
+
+// writeConfigResult answers a runtime-config update: 200 with the snapshot,
+// or — when the requested (re)start failed — 500 with the snapshot plus
+// "error", so Build & Send never reports a deploy whose runtime is not running.
+func writeConfigResult(w http.ResponseWriter, snap map[string]any, startErr error) {
+	if startErr == nil {
+		jsonOK(w, snap)
+		return
+	}
+	snap["error"] = "runtime start failed: " + startErr.Error()
+	data, err := json.Marshal(snap)
+	if err != nil {
+		jsonError(w, http.StatusInternalServerError, snap["error"].(string))
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusInternalServerError)
+	_, _ = w.Write(append(data, '\n'))
 }
 
 // UpdateRuntimeConfig merges a partial update into rtCfg, persists it,
 // pushes side-effects (streaming cadence) into the live atomic, and
-// returns the resulting snapshot. Implements RuntimeController.
+// returns the resulting snapshot, plus the error of a (re)start it was asked to
+// do — the config itself is saved either way. Implements RuntimeController.
 //
 // Side-effects:
 //   - Restart=true                → stop (if running) + start with the deployed
@@ -524,7 +616,7 @@ func (s *Server) handleDeployConfig(w http.ResponseWriter, r *http.Request) {
 //   - AutoRun=true  + running      → no-op (already serving; Restart restarts it)
 //   - AutoRun=false               → cancel any pending auto-restart timer;
 //     a currently running runtime is left alone (user manually stops if desired)
-func (s *Server) UpdateRuntimeConfig(u runtimeConfigUpdate) map[string]any {
+func (s *Server) UpdateRuntimeConfig(u runtimeConfigUpdate) (map[string]any, error) {
 	s.rtMu.Lock()
 	if u.AutoRun != nil {
 		s.rtCfg.AutoRun = *u.AutoRun
@@ -581,10 +673,12 @@ func (s *Server) UpdateRuntimeConfig(u runtimeConfigUpdate) map[string]any {
 	// Without this, overwriting runtime.bin on disk does NOT affect the
 	// already-running process — the classic "I pushed but it still runs the old
 	// code" trap, especially with AutoRun keeping a stale process alive.
+	var startErr error
 	if restartRequested {
 		slog.Info("Restart requested — (re)starting runtime with deployed binary")
 		if _, err := s.StartRuntime(); err != nil {
 			slog.Warn("Restart: start failed", "err", err)
+			startErr = err
 		}
 	} else if u.AutoRun != nil && autoRun {
 		// AutoRun turned on WITHOUT an explicit restart: start only when idle
@@ -593,11 +687,12 @@ func (s *Server) UpdateRuntimeConfig(u runtimeConfigUpdate) map[string]any {
 			slog.Info("AutoRun enabled — starting runtime")
 			if _, err := s.StartRuntime(); err != nil {
 				slog.Warn("AutoRun: start failed", "err", err)
+				startErr = err
 			}
 		}
 	}
 
-	return snap
+	return snap, startErr
 }
 
 // RuntimeConfigSnapshot returns the live config view (includes the effective
@@ -698,18 +793,22 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	s.rtMu.Unlock()
 	ringBytes, memTotal, memAvail, ringPct, ringProduced := s.resolvedRingBytes()
 	resp := map[string]any{
-		"running":             running,
-		"pid":                 pid,
-		"variable_count":      s.ipc.VariableCount(),
-		"shm_name":            s.cfg.ShmName,
-		"deploy_dir":          s.cfg.DeployDir,
-		"auto_run":            autoRun,
-		"stream_interval_ms":  uint32(GetAPIStreamInterval() / time.Millisecond),
-		"hmi_port":            hmiPort,
-		"mem_total_bytes":     memTotal,
-		"mem_available_bytes": memAvail,
-		"ring_ram_percent":    ringPct,
-		"ring_bytes":          ringBytes,
+		"running":        running,
+		"pid":            pid,
+		"variable_count": s.ipc.VariableCount(),
+		// true: a deployed table waits for the new runtime to start (the
+		// running process is still the previous program, served by its table).
+		"variable_table_staged": s.VariableTableStaged(),
+		"live_readers":          s.ipc.LiveReaders(), // open editor streams; 0 = runtime mirrors addressed slots only
+		"shm_name":              s.cfg.ShmName,
+		"deploy_dir":            s.cfg.DeployDir,
+		"auto_run":              autoRun,
+		"stream_interval_ms":    uint32(GetAPIStreamInterval() / time.Millisecond),
+		"hmi_port":              hmiPort,
+		"mem_total_bytes":       memTotal,
+		"mem_available_bytes":   memAvail,
+		"ring_ram_percent":      ringPct,
+		"ring_bytes":            ringBytes,
 		// Ring bytes/s the deployed project writes. Lets the editor show the
 		// buffer's real stall tolerance (ring_bytes / this) instead of guessing
 		// it from the variable list — a guess that ignored the record header and
@@ -878,6 +977,9 @@ func (s *Server) handleSSEVars(w http.ResponseWriter, r *http.Request) {
 
 	match := streamVarMatcher(r.URL.Query())
 	slog.Info("SSE stream started", "remote", r.RemoteAddr, "filtered", match != nil)
+	// This stream serves NON-addressed variables: hold a live reader so the
+	// runtime keeps mirroring them while it is open (mailbox idle word).
+	defer s.ipc.AcquireLiveReader()()
 	ticker := time.NewTicker(streamInterval)
 	heartbeat := time.NewTicker(25 * time.Second)
 	defer ticker.Stop()

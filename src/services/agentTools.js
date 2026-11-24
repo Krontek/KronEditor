@@ -75,7 +75,7 @@ function findDataType(struct, name) {
 // unambiguous enough to auto-recover. Returns { baseType, dimensions:
 // [{min,max}, ...] } or null if it doesn't match.
 function parseInlineArrayType(typeStr) {
-  const m = /^ARRAY\s*\[\s*([0-9\s,.\-]+)\]\s*OF\s+([A-Za-z_]\w*)\s*$/i.exec(String(typeStr || '').trim());
+  const m = /^ARRAY\s*\[\s*([0-9\s,.-]+)\]\s*OF\s+([A-Za-z_]\w*)\s*$/i.exec(String(typeStr || '').trim());
   if (!m) return null;
   const dimensions = [];
   for (const part of m[1].split(',')) {
@@ -341,8 +341,17 @@ export function buildProjectOverview(struct, board) {
 // Output → outputs. Mirrors how the transpiler / RungContainer read FB pins.
 function pouPins(pou) {
   const vars = pou.content?.variables || [];
-  const inputs = vars.filter((v) => v.class === 'Input' || v.class === 'InOut').map((v) => ({ name: v.name, type: v.type }));
-  const outputs = vars.filter((v) => v.class === 'Output').map((v) => ({ name: v.name, type: v.type }));
+  // Same pin shape as buildBlockCatalog's pinList (description/default/inOut),
+  // since project blocks go to the catalogue as-is; the other caller reads only
+  // name/type.
+  const pin = (v) => ({
+    name: v.name, type: v.type,
+    ...(v.description ? { description: v.description } : {}),
+    ...(v.initialValue ? { default: v.initialValue } : {}),
+    ...(v.class === 'InOut' ? { inOut: 'VAR_IN_OUT: pass a variable of EXACTLY this type (no conversion)' } : {}),
+  });
+  const inputs = vars.filter((v) => v.class === 'Input' || v.class === 'InOut').map(pin);
+  const outputs = vars.filter((v) => v.class === 'Output').map(pin);
   return { inputs, outputs };
 }
 
@@ -392,7 +401,16 @@ function hardwareBlockDef(hardware, type) {
 export function buildBlockCatalog(struct, library, filter, hardware) {
   const f = (filter || '').trim().toLowerCase();
   const matches = (type, category) => !f || (type || '').toLowerCase().includes(f) || (category || '').toLowerCase().includes(f);
-  const pinList = (arr) => (arr || []).map((p) => ({ name: p.name, type: p.type }));
+  // A pin's description, default and by-reference nature are what tell the
+  // model what to wire — name + type alone left it guessing what
+  // `pRxBuffer` wants or which pins may stay unconnected.
+  const pinList = (arr) => (arr || []).map((p) => {
+    const pin = { name: p.name, type: p.type };
+    if (p.desc) pin.description = p.desc;
+    if (p.default != null && p.default !== '') pin.default = p.default;
+    if (p.passByReference || p.storageType === 'POINTER') pin.byReference = 'pass a variable (buffer); its address is taken automatically — NULL = unused';
+    return pin;
+  });
   // ⚠️ Naming the trigger/power pins is the difference between a model that can
   // wire a rung and one that guesses. set_ladder wires power INTO `trigger` from
   // the contact network and OUT of `powerOutput` to the coils, so the trigger
@@ -1412,12 +1430,12 @@ function extractStDeclarations(code) {
     // stripStWrappers). Only count lines that look like a declaration, not a `:=`
     // assignment statement.
   const withoutBlocks = src.replace(blockRe, '');
-  parseDeclLines(withoutBlocks, 'Local', pushDecl, /* bareOnly */ true);
+  parseDeclLines(withoutBlocks, 'Local', pushDecl);
   return decls;
 }
 
 // Parse `a, b : TYPE := init;` style lines from a chunk of text.
-function parseDeclLines(chunk, cls, push, bareOnly = false) {
+function parseDeclLines(chunk, cls, push) {
   for (let line of String(chunk || '').split(/\r?\n/)) {
     line = line.replace(/\/\/.*$/, '').trim();           // drop line comment
     if (!line) continue;

@@ -1,6 +1,6 @@
 import { DataTypeSelector } from './common/Selectors';
 
-const ArrayTypeEditor = ({ content, onContentChange, projectStructure, currentId, derivedTypes = [] }) => {
+const ArrayTypeEditor = ({ content, onContentChange, derivedTypes = [] }) => {
 
     // Helper to update content
     const update = (changes) => {

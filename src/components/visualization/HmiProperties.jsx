@@ -112,7 +112,6 @@ const PropsForType = ({ type, props, onChange, vars }) => {
     const set = (key, val) => onChange({ ...props, [key]: val });
 
     const hasVar = !['RECTANGLE', 'CIRCLE', 'LINE'].includes(type);
-    const hasColors = !['CHART', 'LINE'].includes(type);
 
     return (
         <>
@@ -334,7 +333,7 @@ const PropsForType = ({ type, props, onChange, vars }) => {
 };
 
 /* ─── Main HmiProperties ────────────────────────────────────── */
-const HmiProperties = ({ selected, page, onUpdateComponent, projectStructure }) => {
+const HmiProperties = ({ selected, onUpdateComponent, projectStructure }) => {
     const vars = useMemo(() => collectVars(projectStructure), [projectStructure]);
 
     if (!selected) {

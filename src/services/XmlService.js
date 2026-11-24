@@ -103,6 +103,13 @@ export const importProjectFromXml = (xmlString) => {
             console.error("XML Parsing Error:", parserError[0].textContent);
             return null;
         }
+        // Well-formed is not enough: any other XML (an ESI device file, say)
+        // loaded as an EMPTY project, and the next Save overwrote it. Every
+        // project this editor ever wrote has the PLCProject root.
+        if (doc.documentElement?.nodeName !== "PLCProject") {
+            console.error("Not a KronEditor project: root element is", doc.documentElement?.nodeName);
+            return null;
+        }
 
         const projectStructure = {
             dataTypes: [],

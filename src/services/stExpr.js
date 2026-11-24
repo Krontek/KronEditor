@@ -545,17 +545,6 @@ export const createSTExprCompiler = (env) => {
         if (INT_INFO[ta] && INT_INFO[tb]) return commonInt(ta, tb);
         return ta === tb ? ta : null;
     };
-    // C performs the WRONG conversion only when signed meets unsigned at or
-    // above int rank (and when a negative literal meets an unsigned 32/64-bit
-    // operand). Those pairs get explicit casts to the common type; same-sign
-    // widenings and int→real are value-preserving in C already.
-    const needsSignCast = (a, b, ct) => {
-        const ta = effType(a, b), tb = effType(b, a);
-        const ints = [ta, tb].every(t => INT_INFO[t] || isTimeT(t));
-        if (!ints || ct === null) return false;
-        if (signedT(ta) === signedT(tb)) return false;
-        return Math.max(widthOf(ta), widthOf(tb)) >= 32;
-    };
 
     const isPureR = (r) => r.pure !== false;
     const intLit = (v, c) => ({ c, t: '#INT', lit: v, pure: true });

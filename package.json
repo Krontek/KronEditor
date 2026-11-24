@@ -10,7 +10,8 @@
     "build:frontend": "vite build",
     "build:host-agent": "cd host-agent && go build -ldflags \"-X main.appVersion=$npm_package_version\" -o ../dist-binary/kron-host-agent .",
     "build": "npm run build:frontend && npm run build:host-agent",
-    "lint": "eslint . --ext ts,tsx --report-unused-disable-directives --max-warnings 0",
+    "lint": "eslint src --ext js,jsx,ts,tsx --report-unused-disable-directives",
+    "test:transpiler": "node --test tests/transpiler/",
     "preview": "vite preview"
   },
   "dependencies": {

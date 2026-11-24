@@ -366,3 +366,25 @@ func TestWaitsForAStartingRuntime(t *testing.T) {
 		t.Fatalf("v1 runtime: %v", err)
 	}
 }
+
+// The idle word is the agent's: a runtime (re)init and a mailbox Reset must
+// both leave it alone, and 0 — what an older agent leaves — means "not idle".
+func TestIdleWordSurvivesInitAndReset(t *testing.T) {
+	r, m := newRuntime(t, 4)
+	if m.Idle() {
+		t.Fatal("zero-value segment must read as NOT idle (fail-open)")
+	}
+	m.SetIdle(true)
+	r.init(LayoutVersion)
+	m.Reset()
+	if !m.Idle() {
+		t.Fatal("runtime init / Reset cleared the agent-owned idle word")
+	}
+	if got := atomic.LoadUint32(r.u32p(MailboxBase + 40)); got != 1 {
+		t.Fatalf("idle word at +40 = %d, want 1 (RING_FORMAT.md offset)", got)
+	}
+	m.SetIdle(false)
+	if m.Idle() {
+		t.Fatal("SetIdle(false) not applied")
+	}
+}

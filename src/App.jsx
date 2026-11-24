@@ -39,14 +39,14 @@ import { exportProjectToXml, importProjectFromXml } from './services/XmlService'
 import { libraryService } from './services/LibraryService'; // Import Service
 import { errorCodeService } from './services/ErrorCodeService';
 import { loadAllEsiDevices, saveEsiFile, deleteEsiFile } from './services/EsiLibraryService';
-import { openFile, saveFile, ask, readTextFile, writeTextFile, clearActiveFileHandle, registerPathPicker } from './services/browserFs';
+import { openFile, saveFile, ask, clearActiveFileHandle, registerPathPicker } from './services/browserFs';
 import SavePathModal from './components/SavePathModal';
 import { transpileToC, validateProjectST, RUNTIME_ERROR_TYPES } from './services/CTranspilerService';
 import { PLCClient } from './services/PLCClient';
 import { host } from './services/HostClient';
 import { ERROR_CATEGORY, formatCompileFailure, categorize } from './utils/errorFormat';
 import PlcIcon from './assets/icons/plc-icon.png';
-import EtherCATIconSrc from './assets/icons/ethercat.png';
+import EtherCATIconSrc from './assets/icons/ethercat.svg';
 const EtherCATTabIcon = <img src={EtherCATIconSrc} height="13" style={{ objectFit: 'contain', verticalAlign: 'middle' }} alt="EtherCAT" />;
 import './App.css';
 
@@ -464,7 +464,7 @@ function App() {
       runStructSnapRef.current = null;
       setPendingOnlineChange(false);
     }
-  }, [hotSwapLive]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [hotSwapLive]);
   useEffect(() => {
     // Structural edit while a hot-swap runtime is live → offer Hot Reload.
     if (runStructSnapRef.current && projectStructure !== runStructSnapRef.current) {
@@ -476,10 +476,6 @@ function App() {
   const [saveConfirmOpen, setSaveConfirmOpen] = useState(false);
   const saveConfirmResolveRef = React.useRef(null); // resolves with 'save' | 'discard' | 'cancel'
 
-  const showSaveConfirm = () => new Promise((resolve) => {
-    saveConfirmResolveRef.current = resolve;
-    setSaveConfirmOpen(true);
-  });
   const handleSaveConfirmSave    = () => { setSaveConfirmOpen(false); saveConfirmResolveRef.current?.('save'); };
   const handleSaveConfirmDiscard = () => { setSaveConfirmOpen(false); saveConfirmResolveRef.current?.('discard'); };
   const handleSaveConfirmCancel  = () => { setSaveConfirmOpen(false); saveConfirmResolveRef.current?.('cancel'); };
@@ -493,6 +489,16 @@ function App() {
   const remoteStreamedKeysRef = React.useRef(new Set());
   // FB INPUT-pin shadow keys of the last Build & Send (debugDefaults.isPinShadow).
   const remotePinShadowInKeysRef = React.useRef(new Set());
+  // Live keys (lower-cased — IEC names are case-insensitive) of CONSTANT
+  // variables in the last build. The runtime refuses a write to them
+  // (PLC_MB_ST_READ_ONLY); this set lets the editor say so before posting and
+  // keeps the sim restart carry-over from writing an edited CONSTANT's OLD
+  // value back.
+  const constantKeysRef = React.useRef(new Set());
+  const rememberConstantKeys = (debugDefaults) => {
+    constantKeysRef.current = new Set(Object.entries(debugDefaults || {})
+      .filter(([, info]) => info?.constant).map(([k]) => k.toLowerCase()));
+  };
   const onRemoteVars = React.useCallback((vars) => {
     if (!vars) return;
     Object.assign(liveVarsRef.current, vars);
@@ -562,25 +568,24 @@ function App() {
     // Single-packet jitter / agent under load shouldn't blink the indicator.
     let consecutiveFailures = 0;
     const FAILURE_THRESHOLD = 2;
-    // ⚠️ The host-agent's outbound check to the target device can take up to
-    // 5s to time out (deploy.go handleCheckServerStatus), but this poll fires
-    // every 3s regardless of whether the previous call has resolved yet — so
-    // right after connecting (cold TCP/ARP, slowest round-trips) it's normal
-    // to have 2+ requests in flight at once, and their responses can arrive
-    // OUT OF ORDER. Without a sequence guard, a slow/failed response from an
-    // OLDER request could resolve after a newer SUCCESS and increment
-    // consecutiveFailures anyway — two such stale failures (even straddling
-    // real successes in between) hit FAILURE_THRESHOLD and flip the toolbar
-    // to "Disconnected" right after it just showed "Connected", then the next
-    // healthy poll flips it back — a flap with no real connectivity problem.
-    // Same class of bug as `modelReqRef` in AiAgentPanel.jsx: only the result
-    // of the MOST RECENTLY ISSUED request may update state.
-    let reqSeq = 0;
+    // ⚠️ ONE status request at a time. The host-agent's outbound check can
+    // take up to 5s to time out (deploy.go handleCheckServerStatus) while this
+    // poll ticks every 3s. Overlapping requests used to be ordered by a
+    // "newest request wins" sequence guard — but then every TIMEOUT arrived
+    // after a newer request had been issued, was dropped as stale, and
+    // consecutiveFailures never grew: a powered-off target (no RST, so every
+    // check is a full timeout) stayed "Connected" for ever. A tick that finds
+    // a request in flight is skipped instead, so responses are in order by
+    // construction. `disposed` drops a response that lands after the address
+    // changed (its effect was torn down).
+    let inFlight = false;
+    let disposed = false;
     const checkStatus = () => {
-      const seq = ++reqSeq;
+      if (inFlight) return;
+      inFlight = true;
       host.checkServerStatus(plcAddress)
         .then((jsonStr) => {
-          if (seq !== reqSeq) return; // a newer request already resolved — this one is stale
+          if (disposed) return;
           consecutiveFailures = 0;
           setIsPlcConnected(true);
           try {
@@ -616,7 +621,7 @@ function App() {
           } catch (_) { /* ignore parse errors */ }
         })
         .catch(() => {
-          if (seq !== reqSeq) return; // a newer request already resolved — this one is stale
+          if (disposed) return;
           // A stream that is still DELIVERING data proves the server is alive, so
           // a jittery status poll shouldn't blink the indicator.
           // ⚠️ Must be isStreamHealthy, NOT isStreaming: EventSource retries a
@@ -639,11 +644,12 @@ function App() {
               setLiveVariables({});
             }
           }
-        });
+        })
+        .finally(() => { inFlight = false; });
     };
     checkStatus();
     const interval = setInterval(checkStatus, 3000);
-    return () => clearInterval(interval);
+    return () => { disposed = true; clearInterval(interval); };
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [plcAddress, connectionEnabled]);
 
@@ -684,10 +690,6 @@ function App() {
   // said no must be able to keep simulating without a dialog on every start.
   const ecCapsOfferedRef = React.useRef(false);
   const isLoadingProjectRef = React.useRef(false); // suppresses change tracking during load
-  useEffect(() => {
-    if (isLoadingProjectRef.current) return;
-    if (isProjectOpen) hasUnsavedRef.current = true;
-  }, [projectStructure, buses, busConfigs]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Keep a ref to handleSave so the close handler can call it without stale closure
   const handleSaveRef = React.useRef(null);
@@ -725,7 +727,7 @@ function App() {
     setBuses(prev => [...prev, { id: newId, type }]);
     setActiveId(newId);
     openTab(newId, type === 'ethercat' ? 'Master' : type, type === 'ethercat' ? EtherCATTabIcon : '🔌');
-  }, [buses]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [buses]);
 
   const handleDeleteBus = useCallback(async (busId) => {
     const confirmed = await ask(t('messages.removeFieldbusConfirm') || 'Do you want to remove this fieldbus connection?', {
@@ -779,7 +781,7 @@ function App() {
     setActiveId(busId);
     const bus = buses.find(b => b.id === busId);
     if (bus) openTab(busId, bus.type === 'ethercat' ? 'Master' : bus.type, bus.type === 'ethercat' ? EtherCATTabIcon : '🔌');
-  }, [buses]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [buses]);
 
   const handleBusConfigChange = useCallback((busId, masterSettings) => {
     // Preserve slaves — EtherCATEditor only sends master settings now
@@ -806,7 +808,7 @@ function App() {
     }));
     setActiveId(id);
     openTab(id, newSlave.name, '🔌');
-  }, [busConfigs]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [busConfigs]);
 
   const [esiPickerBusId, setEsiPickerBusId] = useState(null);
 
@@ -839,7 +841,7 @@ function App() {
     }));
     setActiveId(id);
     openTab(id, newSlave.name, '🔌');
-  }, [busConfigs, esiPickerBusId]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [busConfigs, esiPickerBusId]);
 
   const handleDeleteSlave = useCallback(async (busId, slaveId) => {
     const slave = (busConfigs[busId]?.slaves || []).find(s => s.id === slaveId);
@@ -857,7 +859,7 @@ function App() {
     const slave = (busConfigs[busId]?.slaves || []).find(s => s.id === slaveId);
     setActiveId(slaveId);
     openTab(slaveId, slave?.name || 'Slave', '🔌');
-  }, [busConfigs]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [busConfigs]);
 
   const handleUpdateSlave = useCallback((busId, slaveId, updatedSlave) => {
     // Sync AXIS_REF to global variables automatically
@@ -1003,6 +1005,15 @@ function App() {
 
   // Watch table state
   const [watchTable, setWatchTable] = useState([]);
+  // hasUnsaved tracking (refs declared above). Placed after the last state it
+  // watches — watchTable — so the deps are initialised when it is read.
+  // ⚠️ The deps must cover EVERYTHING persistProject writes into the file
+  // (exportProjectToXml's arguments) — an HMI, watch-table, board or
+  // connection edit alone used to close without the unsaved warning.
+  useEffect(() => {
+    if (isLoadingProjectRef.current) return;
+    if (isProjectOpen) hasUnsavedRef.current = true;
+  }, [projectStructure, buses, busConfigs, watchTable, hmiLayout, selectedBoard, plcAddress, sshUser, sshPort, apiPassword, autoRun]); // eslint-disable-line react-hooks/exhaustive-deps
   const addToWatchTable = useCallback((entry) => {
     setWatchTable(prev => prev.some(e => e.liveKey === entry.liveKey) ? prev : [...prev, entry]);
   }, []);
@@ -1449,10 +1460,15 @@ function App() {
       // adopt: this is THE project file — only a project open may become the
       // in-place Save target (an ESI/other import must never hijack it).
       if (!confirmStopSimForSwitch()) return;
-      const picked = await openFile({ accept: '.xml', adopt: true });
+      const picked = await openFile({ accept: '.xml' });
       if (!picked) return;
+      // ⚠️ Validate BEFORE anything changes: a rejected file must leave the
+      // current project, its running simulation and its Save target alone
+      // (adopting first made the next Save overwrite the rejected file).
+      const parsed = parseProjectXml(picked.content);
+      if (!parsed) return;
       await detachRuntimeForProjectSwitch();
-      processFileContent(picked.content, picked.path);
+      if (processFileContent(picked.content, picked.path, { parsed })) picked.adopt();
     } catch (error) {
       console.error(error);
       addLog('error', t('logs.openError', { error: error }) || `Open Error: ${error} `);
@@ -1468,7 +1484,6 @@ function App() {
       addLog('error', t('logs.pullNotConnected') || 'Cannot pull: not connected to PLC server.');
       return;
     }
-    // eslint-disable-next-line no-alert
     if (!window.confirm(t('actions.pullConfirm') || 'The current project will be closed and replaced by the one on the target. Continue?')) {
       return;
     }
@@ -1484,9 +1499,12 @@ function App() {
         return;
       }
       const xml = await resp.text();
+      // Validate before closing the current project (same rule as Open).
+      const parsed = parseProjectXml(xml);
+      if (!parsed) return;
       await detachRuntimeForProjectSwitch();
       // Load with a display label, then clear the path so Save → Save As.
-      processFileContent(xml, `${plcAddress} (target)`, { keepConnection: true });
+      if (!processFileContent(xml, `${plcAddress} (target)`, { keepConnection: true, parsed })) return;
       setCurrentFilePath(null);
       clearActiveFileHandle();
       addLog('success', t('logs.pulled', { addr: plcAddress }) || `Project pulled from ${plcAddress}.`);
@@ -1495,88 +1513,102 @@ function App() {
     }
   };
 
-  // keepConnection: a project pulled from the target keeps the address it was
-  // pulled from when its XML carries none.
-  const processFileContent = (content, filePath, { keepConnection = false } = {}) => {
+  // Parse a project file. null (after logging why) when it is not one.
+  const parseProjectXml = (content) => {
     try {
       const result = importProjectFromXml(content);
-      if (result) {
-        // Fold any legacy LD/ST POUs into the unified rung model on load.
-        const newStructure = normalizeProjectToRungs(result.projectStructure);
-        const { boardId, plcAddress: savedAddr, sshUser: savedSshUser, sshPort: savedSshPort, apiPassword: savedApiPassword, apiPasswordRedacted, autoRun: savedAutoRun } = result;
-        // Ensure Configuration Resource Exists
-        if (!newStructure.resources || newStructure.resources.length === 0) {
-          newStructure.resources = [
-            {
-              id: 'res_config',
-              name: 'Configuration',
-              type: 'RESOURCE_EDITOR',
-              content: { globalVars: [], tasks: [], instances: [] }
-            }
-          ];
-          addLog('warning', t('logs.missingConfigRestored') || 'Project had no configuration; restored default.');
-        }
+      if (!result) addLog('error', t('logs.invalidFormat') || 'Failed to parse project file (Invalid Format).');
+      return result || null;
+    } catch (error) {
+      console.error(error);
+      addLog('error', t('logs.openError', { error: error }) || `Open Error: ${error} `);
+      return null;
+    }
+  };
 
-        // Ensure taskConfig exists for projects saved before Task Manager was added
-        if (!newStructure.taskConfig) {
-          newStructure.taskConfig = { tasks: [] };
-        }
-
-        isLoadingProjectRef.current = true;
-        setProjectStructure(newStructure);
-        setCurrentFilePath(filePath);
-        setActiveId(null);
-        setOpenTabs([]);
-        setBuses(result.buses || []);
-        setBusConfigs(result.busConfigs || {});
-        setWatchTable(result.watchTable || []);
-        setHmiLayout(result.hmiLayout || { pages: [] });
-        setIsProjectOpen(true);
-        // Reset after state batch; setTimeout ensures effects ran first
-        setTimeout(() => { isLoadingProjectRef.current = false; hasUnsavedRef.current = false; }, 0);
-
-        // Restore board from XML
-        if (boardId) {
-          setSelectedBoard(boardId);
-        }
-
-        // Restore connection settings from XML — a project without an address
-        // must not inherit the previous project's target.
-        if (savedAddr) {
-          setPlcAddress(savedAddr);
-          setConnectionEnabled(true);
-        } else if (!keepConnection) {
-          setPlcAddress('');
-        }
-        // A pulled project IS what the target runs; a file from disk is not.
-        if (!keepConnection) {
-          setIsDeployed(false);
-          setIsDirty(false);
-        }
-        if (savedSshUser) {
-          setSshUser(savedSshUser);
-          localStorage.setItem('sshUser', savedSshUser);
-        }
-        if (savedSshPort) {
-          setSshPort(savedSshPort);
-          localStorage.setItem('sshPort', savedSshPort);
-        }
-        // `??`, not `||`: '' is a deliberately disabled API; only a file with no
-        // attribute at all (older project) gets the default.
-        // A copy pulled from the target carries no password (redacted at
-        // Build & Send) — keep the one this editor already has.
-        if (!apiPasswordRedacted) setApiPassword(savedApiPassword ?? 'krontek');
-        if (savedAutoRun !== undefined) {
-          setAutoRun(savedAutoRun);
-        }
-
-        addLog('success', t('logs.projectLoaded', { path: filePath }) || `Project loaded from ${filePath} `);
-      } else {
-        addLog('error', t('logs.invalidFormat') || 'Failed to parse project file (Invalid Format).');
+  // Load a project into the editor. `parsed` = a result parseProjectXml
+  // already produced. Returns true when the project was loaded.
+  // keepConnection: a project pulled from the target keeps the address it was
+  // pulled from when its XML carries none.
+  const processFileContent = (content, filePath, { keepConnection = false, parsed = null } = {}) => {
+    const result = parsed || parseProjectXml(content);
+    if (!result) return false;
+    try {
+      // Fold any legacy LD/ST POUs into the unified rung model on load.
+      const newStructure = normalizeProjectToRungs(result.projectStructure);
+      const { boardId, plcAddress: savedAddr, sshUser: savedSshUser, sshPort: savedSshPort, apiPassword: savedApiPassword, apiPasswordRedacted, autoRun: savedAutoRun } = result;
+      // Ensure Configuration Resource Exists
+      if (!newStructure.resources || newStructure.resources.length === 0) {
+        newStructure.resources = [
+          {
+            id: 'res_config',
+            name: 'Configuration',
+            type: 'RESOURCE_EDITOR',
+            content: { globalVars: [], tasks: [], instances: [] }
+          }
+        ];
+        addLog('warning', t('logs.missingConfigRestored') || 'Project had no configuration; restored default.');
       }
+
+      // Ensure taskConfig exists for projects saved before Task Manager was added
+      if (!newStructure.taskConfig) {
+        newStructure.taskConfig = { tasks: [] };
+      }
+
+      isLoadingProjectRef.current = true;
+      setProjectStructure(newStructure);
+      setCurrentFilePath(filePath);
+      setActiveId(null);
+      setOpenTabs([]);
+      setBuses(result.buses || []);
+      setBusConfigs(result.busConfigs || {});
+      setWatchTable(result.watchTable || []);
+      setHmiLayout(result.hmiLayout || { pages: [] });
+      setIsProjectOpen(true);
+      // Reset after state batch; setTimeout ensures effects ran first
+      setTimeout(() => { isLoadingProjectRef.current = false; hasUnsavedRef.current = false; }, 0);
+
+      // Restore board from XML
+      if (boardId) {
+        setSelectedBoard(boardId);
+      }
+
+      // Restore connection settings from XML — a project without an address
+      // must not inherit the previous project's target.
+      if (savedAddr) {
+        setPlcAddress(savedAddr);
+        setConnectionEnabled(true);
+      } else if (!keepConnection) {
+        setPlcAddress('');
+      }
+      // A pulled project IS what the target runs; a file from disk is not.
+      if (!keepConnection) {
+        setIsDeployed(false);
+        setIsDirty(false);
+      }
+      if (savedSshUser) {
+        setSshUser(savedSshUser);
+        localStorage.setItem('sshUser', savedSshUser);
+      }
+      if (savedSshPort) {
+        setSshPort(savedSshPort);
+        localStorage.setItem('sshPort', savedSshPort);
+      }
+      // `??`, not `||`: '' is a deliberately disabled API; only a file with no
+      // attribute at all (older project) gets the default.
+      // A copy pulled from the target carries no password (redacted at
+      // Build & Send) — keep the one this editor already has.
+      if (!apiPasswordRedacted) setApiPassword(savedApiPassword ?? 'krontek');
+      if (savedAutoRun !== undefined) {
+        setAutoRun(savedAutoRun);
+      }
+
+      addLog('success', t('logs.projectLoaded', { path: filePath }) || `Project loaded from ${filePath} `);
+      return true;
     } catch (error) {
        console.error(error);
        addLog('error', t('logs.openError', { error: error }) || `Open Error: ${error} `);
+       return false;
     }
   };
 
@@ -1714,6 +1746,7 @@ function App() {
             initialLiveVars[liveKey] = info.defaultValue;
           });
         }
+        rememberConstantKeys(cCode.variableTable?.debugDefaults);
 
         liveVarsRef.current = initialLiveVars;
         setLiveVariables(initialLiveVars);
@@ -1867,6 +1900,12 @@ function App() {
   }, [isRunning, isSimulationMode, addLog]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const doWriteVariable = async (key, value) => {
+    // §6.5.2.2: a CONSTANT is never modified. The runtime refuses too; this
+    // only gives the clearer message without a round trip.
+    if (constantKeysRef.current.has(String(key).toLowerCase())) {
+      addLog('warning', `Write refused for '${key}': it is a CONSTANT (IEC 61131-3 §6.5.2.2).`);
+      return;
+    }
     if (plcClientRef.current && !isSimulationMode) {
       const normalizedValue = (() => {
         if (value === null || value === undefined) return null;
@@ -1901,25 +1940,35 @@ function App() {
     }
   };
 
-  // Auto-start/stop local HMI server when simulation runs
+  // Auto-start/stop local HMI server when simulation runs (only for a project
+  // that has HMI pages). ⚠️ The address is announced, and variables pushed /
+  // writes polled, only after the agent CONFIRMED the start — the host-agent
+  // HMI server is not ported yet and answers 501, and announcing a URL
+  // nothing serves is the fake success this codebase refuses.
+  const [localHmiUp, setLocalHmiUp] = useState(false);
   useEffect(() => {
-    if (!isRunning || !isSimulationMode) return;
+    if (!isRunning || !isSimulationMode || !(hmiLayout?.pages?.length > 0)) return;
+    let live = true;
     const layoutJson = JSON.stringify(hmiLayout);
     host.startHmiServer(hmiPort, layoutJson)
-      .then(() => addLog('info', `HMI available at http://localhost:${hmiPort}/hmi/`))
-      .catch((e) => addLog('warning', `HMI server failed to start: ${e.message || e}`));
-    return () => { host.stopHmiServer().catch(() => {}); };
+      .then(() => {
+        if (!live) return;
+        setLocalHmiUp(true);
+        addLog('info', `HMI available at http://localhost:${hmiPort}/hmi/`);
+      })
+      .catch((e) => addLog('warning', `Local HMI not available: ${e.message || e}`));
+    return () => { live = false; setLocalHmiUp(false); host.stopHmiServer().catch(() => {}); };
   }, [isRunning, isSimulationMode]); // eslint-disable-line
 
   // Push live variables to local HMI server during simulation
   useEffect(() => {
-    if (!isRunning || !isSimulationMode || !liveVariables) return;
+    if (!localHmiUp || !isRunning || !isSimulationMode || !liveVariables) return;
     host.pushHmiVariables(JSON.stringify(liveVariables)).catch(() => {});
-  }, [isRunning, isSimulationMode, liveVariables]);
+  }, [localHmiUp, isRunning, isSimulationMode, liveVariables]);
 
   // Poll HMI write requests from local server during simulation
   useEffect(() => {
-    if (!isRunning || !isSimulationMode) return;
+    if (!localHmiUp || !isRunning || !isSimulationMode) return;
     const interval = setInterval(async () => {
       try {
         const writes = await host.pollHmiWrites();
@@ -1929,10 +1978,10 @@ function App() {
           // from an old HMI page is ignored — every write is one-shot.
           writes.forEach((w) => handleWriteVariable(w.key, w.value));
         }
-      } catch (_) {}
+      } catch (_) { /* agent busy or gone — the next tick retries */ }
     }, 200);
     return () => clearInterval(interval);
-  }, [isRunning, isSimulationMode, handleWriteVariable]);
+  }, [localHmiUp, isRunning, isSimulationMode, handleWriteVariable]);
 
   const checkTaskAssignments = () => {
     const tasks = projectStructure?.taskConfig?.tasks || [];
@@ -2139,16 +2188,43 @@ function App() {
       // OLD code executing (overwriting runtime.bin on disk doesn't touch the
       // live process). Restart only when it SHOULD run: AutoRun on, or it was
       // already running (the confirm dialog already warned state is lost).
+      //
+      // ⚠️ With a restart this step IS the deploy: the new code only runs once
+      // it succeeds. KronServer answers 500 (+ "error") when the start fails,
+      // and a spawned runtime can still die at once (missing library, bad
+      // image) — so the project is marked deployed only after the status and
+      // a /status check say the runtime runs. Without a restart a failure only
+      // loses the AutoRun/HMI-port settings, which stays a warning.
       const shouldRestart = autoRun || isRunning;
+      let cfgResp;
       try {
-        await fetch(`http://${plcAddress}/deploy/config`, {
+        if (shouldRestart) addLog('info', 'Restarting runtime with new code...');
+        cfgResp = await fetch(`http://${plcAddress}/deploy/config`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ auto_run: autoRun, hmi_port: hmiPort, restart: shouldRestart }),
         });
-        if (shouldRestart) addLog('info', 'Restarting runtime with new code...');
       } catch (cfgErr) {
+        if (shouldRestart) throw new Error(`runtime restart failed: ${cfgErr.message || cfgErr}`);
         addLog('warning', categorize(ERROR_CATEGORY.DEPLOY, `Runtime config deploy skipped: ${cfgErr.message}`));
+      }
+      if (cfgResp && !cfgResp.ok) {
+        const body = await cfgResp.json().catch(() => ({}));
+        const msg = body.error || `${cfgResp.status} ${cfgResp.statusText}`;
+        if (shouldRestart) throw new Error(`runtime restart failed: ${msg}`);
+        addLog('warning', categorize(ERROR_CATEGORY.DEPLOY, `Runtime config deploy failed: ${msg}`));
+      }
+      if (shouldRestart && cfgResp) {
+        // Give a runtime that dies on start the time to do so, then ask.
+        await new Promise((r) => setTimeout(r, 1000));
+        const stResp = await fetch(`http://${plcAddress}/status`);
+        const st = stResp.ok ? await stResp.json().catch(() => null) : null;
+        if (!st?.running) {
+          const ev = st?.last_runtime_event;
+          const why = ev ? ` (${ev.kind || ''} ${ev.status || ''}${ev.detail ? `: ${ev.detail}` : ''})` : '';
+          throw new Error(`the new runtime is not running after the restart${why} — check the target's runtime logs`);
+        }
+        addLog('success', 'Runtime restarted with the new code.');
       }
 
       setIsDeployed(true);
@@ -2159,6 +2235,7 @@ function App() {
       if (fieldHotSwap) { setFieldHotSwap(false); setIsHotSwap(false); }
 
       // Store debug defaults for live variable display
+      rememberConstantKeys(cCode.variableTable?.debugDefaults);
       if (cCode.variableTable && cCode.variableTable.debugDefaults) {
         let initialLiveVars = {};
         const remoteKeys = [];
@@ -2872,6 +2949,7 @@ function App() {
       setPendingOnlineChange(false);
       let carried = 0;
       const newDefaults = cCode.variableTable?.debugDefaults || {};
+      rememberConstantKeys(newDefaults);
       for (const key of Object.keys(newDefaults)) {
         if (!(key in preserved)) continue;             // new variable — starts fresh
         if (key.startsWith('prog____exec_us')) continue; // diagnostics, not state
@@ -2887,6 +2965,10 @@ function App() {
         // Identified by the transpiler's flag — a name regex also caught user
         // variables like `in_start` and silently reset them on every restart.
         if (newDefaults[key]?.isPinShadow) continue;
+        // A CONSTANT starts from its (possibly just edited) declared value —
+        // carrying the old one would revert the edit, and the runtime refuses
+        // the write anyway.
+        if (newDefaults[key]?.constant) continue;
         const v = preserved[key];
         if (v === null || v === undefined || typeof v === 'object') continue; // composites/NaN
         try { await host.writeVariable(key, v); carried++; } catch { /* type changed / no slot — skip */ }
@@ -3630,6 +3712,8 @@ function App() {
                         onStartHotSwap={startHotSwapSession}
                         onStopHotSwap={stopHotSwapSession}
                         askRequest={agentAsk}
+                        buses={buses}
+                        busConfigs={busConfigs}
                       />
                     </div>
                   )}

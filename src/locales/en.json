@@ -149,7 +149,14 @@
         "unassignedPrograms": "Unassigned Programs",
         "noProgramsAssigned": "No programs assigned to this task",
         "assignProgram": "Assign Program",
-        "allProgramsAssigned": "✓ All programs assigned"
+        "allProgramsAssigned": "✓ All programs assigned",
+        "taskPriority": "Priority",
+        "taskPriorityHint": "0 = high · {{max}} = low",
+        "taskPriorityHelp": "IEC 61131-3 task priority: 0 is the highest, {{max}} the lowest. Runs at Linux SCHED_FIFO 99 - priority; 0 also outranks kernel real-time threads.",
+        "backgroundPrograms": "These run in the BACKGROUND task: lowest priority, restarted as soon as they finish (IEC 61131-3 §6.8.2 d).",
+        "runtimeErrors": "Run-time errors",
+        "rteReport": "Report, keep running",
+        "rteStop": "Stop PLC (safe state)"
     },
     "resources": {
         "globalVariables": "Global Variables"
@@ -168,7 +175,7 @@
     "errors": {
         "nameRequired": "Name is required",
         "nameExists": "Name already exists",
-        "invalidIdentifier": "Invalid Identifier: \"{name}\". Must start with a letter/underscore and contain only alphanumeric characters.",
+        "invalidIdentifier": "Invalid Identifier: \"{{name}}\". Must start with a letter/underscore and contain only alphanumeric characters.",
         "varExistsScope": "Variable name '{{name}}' already exists in this scope!",
         "varExistsOtherScope": "Variable name '{{name}}' already exists as a local variable in another program/block!",
         "varExistsWithType": "Variable with name '{{name}}' and type '{{type}}' already exists!",

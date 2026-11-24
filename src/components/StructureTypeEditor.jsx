@@ -1,6 +1,6 @@
 import { DataTypeSelector } from './common/Selectors';
 
-const StructureTypeEditor = ({ content, onContentChange, projectStructure, currentId, derivedTypes = [] }) => {
+const StructureTypeEditor = ({ content, onContentChange, derivedTypes = [] }) => {
     const members = content.members || [];
 
     const update = (newMembers) => {

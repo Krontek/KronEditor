@@ -266,9 +266,28 @@ the Go writer is `hotswaplib/shmcmd`, shared by both agents.
   address; mmap bases are page-aligned, so the offset alignment suffices).
   STRING (64-byte, read-only) stays a `memcpy`: a torn display line is possible
   and tolerated.
-- **One-way mirror.** The runtime writes every slot from PlcState after each
+- **One-way mirror.** The runtime writes slots from PlcState at the end of a
   scan and never reads a slot back; nothing else ever stores into a slot while
   a runtime runs. A write from outside is a mailbox command.
+- ⚠️ **Mirroring principle (developer decision, 2026-11-24).**
+  1. **Each slot has ONE owner task** that mirrors it (`plc_shm_sync_<i>`): a
+     program's slots → the first task running that program; globals and
+     runtime-wide counters → the fastest timed task (the ring's rule), else the
+     background task. No task mirrors another task's slots.
+  2. **Addressed slots are mirrored on every scan of their owner**, always —
+     REST, the HMI and the ring read them with no editor connected.
+  3. **Non-addressed slots are mirrored only while an editor streams** (target
+     builds): the owner skips them while the mailbox **idle** word (+40) is 1.
+     KronServer sets it to 1 while no `/stream/vars` / `StreamVars` stream is
+     open (`IPCManager.AcquireLiveReader`). A non-addressed slot therefore holds
+     its last mirrored (or initial) value while idle — never read it without a
+     live reader.
+  4. **The local simulation mirrors everything, always** (the gate is not even
+     emitted when `simMode`): performance does not matter there and one
+     behaviour is simpler to reason about.
+  - ⚠️ **Fail-open:** idle `0` = mirror everything, and 0 is what an agent that
+    predates the word leaves — an old KronServer with a new runtime keeps the old
+    behaviour, never a frozen value. That is why this needed no layout bump.
 - **No forcing.** v2 had a per-variable flag region `[32768, 61440)` and a
   forced-value shadow in PlcState to HOLD a value against the logic; v3
   removed both (that range is data space now). Every write is one-shot.
@@ -288,7 +307,8 @@ Header (64 bytes):
 | 20 | u32 | consumer try-lock | runtime task threads |
 | 24 | u64 | head — last posted seq | **writer** |
 | 32 | u64 | ack — last consumed seq (release) | runtime |
-| 40 | u64 | reserved | — |
+| 40 | u32 | idle — 1 = no live reader: the runtime may skip NON-addressed slots; 0 = mirror all (fail-open). The runtime never writes it and its init leaves it alone | **writer** (`Mailbox.SetIdle`) |
+| 44 | u32 | reserved | — |
 
 Entry `seq % capacity` at `61440 + 64 + slot × 32`:
 
@@ -296,7 +316,7 @@ Entry `seq % capacity` at `61440 + 64 + slot × 32`:
 |---|---|---|
 | 0 | u64 | seq — published LAST by the writer (release); valid ⇔ `== seq` |
 | 8 | u32 | variable index (the table's `mb_index`) |
-| 12 | u32 | status: 0 pending → runtime CASes 1 (claimed) → 2 applied / 3 bad index / 4 bad size / 5 read-only / 6 bad op; a timed-out writer CASes 0 → `0xFFFFFFFF` (cancelled) |
+| 12 | u32 | status: 0 pending → runtime CASes 1 (claimed) → 2 applied / 3 bad index / 4 bad size / 5 read-only (STRING, or a CONSTANT) / 6 bad op; a timed-out writer CASes 0 → `0xFFFFFFFF` (cancelled) |
 | 16 | u8 | op: 2 WRITE (the only one; v2's 1 FORCE / 3 UNFORCE / 4 CLEAR_ALL → 6 bad op) |
 | 17 | u8 | value size (must equal the variable's size) |
 | 18 | u8 | reserved (0) |

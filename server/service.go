@@ -149,6 +149,7 @@ func connectCodeFor(err error) connect.Code {
 // is the editor's debug stream, not the user-tunable API stream.
 func (s *PLCService) StreamVars(ctx context.Context, _ *connect.Request[plcv1.StreamVarsRequest], stream *connect.ServerStream[plcv1.VarsUpdate]) error {
 	slog.Info("StreamVars started", "remote", ctx.Value(remoteAddrKey{}))
+	defer s.ipc.AcquireLiveReader()() // full snapshot incl. non-addressed slots
 	ticker := time.NewTicker(streamInterval)
 	defer ticker.Stop()
 

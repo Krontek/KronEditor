@@ -255,8 +255,8 @@ export default function TaskManager({
                                 <div style={{ display: 'flex', alignItems: 'center', gap: 5 }}>
                                     <span
                                         style={{ fontSize: 10, color: '#666', marginRight: 2, textTransform: 'uppercase', letterSpacing: '0.06em' }}
-                                        title={t('messages.taskPriorityHelp') || `IEC 61131-3 task priority: 0 is the highest, ${TASK_PRIORITY_MAX} the lowest. Runs at SCHED_FIFO 99 - priority; 0 also outranks kernel real-time threads.`}
-                                    >{t('messages.taskPriority') || 'Priority'}</span>
+                                        title={t('messages.taskPriorityHelp', { max: TASK_PRIORITY_MAX })}
+                                    >{t('messages.taskPriority')}</span>
                                     <input
                                         type="number" min={0} max={TASK_PRIORITY_MAX}
                                         value={taskIecPriority(task)}
@@ -264,6 +264,9 @@ export default function TaskManager({
                                         onChange={e => setPriority(task.id, e.target.value)}
                                         style={{ width: 46, background: '#1e1e1e', border: '1px solid #3a3a3a', borderRadius: 3, color: '#ccc', fontSize: 12, padding: '3px 6px', textAlign: 'right', outline: 'none', MozAppearance: 'textfield' }}
                                     />
+                                    <span style={{ fontSize: 10, color: '#666', whiteSpace: 'nowrap' }}>
+                                        {t('messages.taskPriorityHint', { max: TASK_PRIORITY_MAX })}
+                                    </span>
                                 </div>
 
                                 <button

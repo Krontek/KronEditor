@@ -165,6 +165,14 @@ type IPCManager struct {
 	// tableGen counts applied variable tables. A stream that resolved offsets
 	// from one table ends when it moves (/api/v1/stream/buffered).
 	tableGen uint64
+
+	// liveReaders counts open EDITOR streams (/stream/vars SSE, StreamVars
+	// RPC) — the only readers of NON-addressed variables. While it is 0 the
+	// mailbox idle word is 1 and a target runtime mirrors only the addressed
+	// slots (server/RING_FORMAT.md § Variable segment). Guarded by liveMu,
+	// never by mu: the word is published under the same lock as the count.
+	liveMu      sync.Mutex
+	liveReaders int
 }
 
 // ensureShmDir makes /dev/shm usable on minimal images (BusyBox/Yocto init
@@ -247,7 +255,50 @@ func NewIPCManager(shmName string, shmSize int) (*IPCManager, error) {
 	} else {
 		slog.Warn("Shared memory too small for the write mailbox — writes are refused", "size", shmSize, "need", shmcmd.SegmentSize)
 	}
+	m.publishIdle() // no editor stream exists yet → idle
 	return m, nil
+}
+
+// AcquireLiveReader registers an editor stream that reads NON-addressed
+// variables and returns its release; call release exactly once (defer it).
+// The first reader clears the mailbox idle word, the last one sets it again,
+// so a target runtime mirrors the non-addressed slots only while someone looks.
+// ⚠️ Every reader of non-addressed slots must hold one — without it the values
+// it serves are whatever the runtime mirrored last (frozen, not live). REST,
+// the HMI and the ring read addressed slots only and need none.
+func (m *IPCManager) AcquireLiveReader() (release func()) {
+	m.liveMu.Lock()
+	m.liveReaders++
+	m.publishIdleLocked()
+	m.liveMu.Unlock()
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			m.liveMu.Lock()
+			m.liveReaders--
+			m.publishIdleLocked()
+			m.liveMu.Unlock()
+		})
+	}
+}
+
+// LiveReaders is the number of open editor streams (/status).
+func (m *IPCManager) LiveReaders() int {
+	m.liveMu.Lock()
+	defer m.liveMu.Unlock()
+	return m.liveReaders
+}
+
+func (m *IPCManager) publishIdle() {
+	m.liveMu.Lock()
+	m.publishIdleLocked()
+	m.liveMu.Unlock()
+}
+
+func (m *IPCManager) publishIdleLocked() {
+	if m.mbox != nil {
+		m.mbox.SetIdle(m.liveReaders == 0)
+	}
 }
 
 // SetRuntimeAlive registers the "is the runtime process running" probe used
@@ -438,6 +489,10 @@ func (m *IPCManager) ResetMailbox() {
 	if m.mbox != nil {
 		m.mbox.Reset()
 	}
+	// Re-assert the idle word for the runtime about to start: it survives a
+	// restart anyway (the runtime never writes it), but a segment someone else
+	// touched in between must not start the new runtime in the wrong mode.
+	m.publishIdle()
 }
 
 // VariableCount returns the number of loaded variables.
